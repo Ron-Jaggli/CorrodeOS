@@ -22,25 +22,34 @@
 //!
 //! ```text
 //!   rax  syscall number          -> status (0 = ok, else CapError::code)
-//!   rdi  capability slot         -> (call) sending task id
-//!   rsi  message label           -> (call) reply label
-//!   rdx  word 0                  -> (call) reply word 0 / (identify) kind+rights
-//!   r10  word 1                  -> (call) reply word 1
-//!   r8   word 2                  -> (call) reply word 2
-//!   r9   word 3                  -> (call) reply word 3
+//!   rdi  capability slot         -> sending task id
+//!   rsi  message label           -> message label
+//!   rdx  word 0                  -> word 0 / (identify) kind and rights
+//!   r10  word 1                  -> word 1
+//!   r8   word 2                  -> word 2
+//!   r9   word 3                  -> word 3
 //! ```
+//!
+//! `SYS_RECV` is the one that reads differently: `rsi` and `rdx` carry the
+//! slots for an incoming capability and for the reply capability, since a
+//! receive has no message to send.
 //!
 //! `r10` rather than `rcx` for the fourth argument. Nothing forces that today --
 //! we arrive through an `int` gate, which preserves rcx -- but `syscall`
 //! clobbers rcx with the return address, so using r10 now means moving to fast
 //! syscalls later does not change the ABI underneath existing user code.
 //!
-//! # Not yet
+//! # Receiving
 //!
-//! No receive. A ring 3 task can be a client but not a server, because a server
-//! also needs to nominate slots for transferred and reply capabilities and that
-//! is a wider boundary than anything here is tested against. Kernel tasks serve;
-//! user tasks call. Lifting that is the next increment.
+//! A server needs to nominate two more slots than a client: one for a
+//! capability transferred with a message, one for the capability that answers a
+//! call. Both are passed to `SYS_RECV` as slot indices, or [`NO_SLOT`].
+//!
+//! What a receive deliberately does *not* return is whether a reply capability
+//! arrived. The receiver named the slot, so it can simply ask what is in it
+//! with `SYS_IDENTIFY` -- which is the capability-shaped question anyway, and
+//! costs no register in an ABI where the spare ones (`rcx`, `r11`) are exactly
+//! the two that fast syscalls clobber.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -58,6 +67,17 @@ pub const SYS_IDENTIFY: u64 = 1;
 pub const SYS_SEND: u64 = 2;
 /// Send and block for an answer. Needs WRITE, same as a send.
 pub const SYS_CALL: u64 = 3;
+/// Block until a message arrives on an endpoint capability. Needs READ.
+pub const SYS_RECV: u64 = 4;
+/// Answer a caller, spending the reply capability a receive produced.
+pub const SYS_REPLY: u64 = 5;
+
+/// Slot argument meaning "nowhere".
+///
+/// A sentinel rather than a separate flags word: every real slot is a small
+/// index, so the one value that can never be a slot is free to mean the absence
+/// of one.
+pub const NO_SLOT: u64 = u64::MAX;
 
 /// Status returned for a syscall number we do not implement.
 ///
@@ -112,6 +132,30 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
             frame.rax = status(ipc::send(slot, message, None));
         }
 
+        SYS_RECV => {
+            // Read both slot arguments before anything overwrites them: rdx is
+            // an argument on the way in and a message word on the way out.
+            let into = optional_slot(frame.rsi);
+            let reply_into = optional_slot(frame.rdx);
+
+            match ipc::recv(slot, into, reply_into) {
+                Ok(received) => {
+                    frame.rax = STATUS_OK;
+                    frame.rdi = received.from as u64;
+                    frame.rsi = received.message.label;
+                    frame.rdx = received.message.words[0];
+                    frame.r10 = received.message.words[1];
+                    frame.r8 = received.message.words[2];
+                    frame.r9 = received.message.words[3];
+                }
+                Err(error) => frame.rax = error.code(),
+            }
+        }
+
+        SYS_REPLY => {
+            frame.rax = status(ipc::reply(slot, message, None));
+        }
+
         SYS_CALL => match ipc::call(slot, message, None, None) {
             Ok(answer) => {
                 frame.rax = STATUS_OK;
@@ -129,6 +173,20 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
     }
 
     frame as *mut TrapFrame
+}
+
+/// Decode a slot argument, where [`NO_SLOT`] means none was given.
+///
+/// Any other value is passed through untouched, including one far past the end
+/// of the capability space. Clamping or rejecting here would duplicate a check
+/// the capability space already makes, and duplicated checks drift: `OutOfRange`
+/// should be decided in exactly one place.
+fn optional_slot(value: u64) -> Option<usize> {
+    if value == NO_SLOT {
+        None
+    } else {
+        Some(value as usize)
+    }
 }
 
 fn status(result: Result<(), CapError>) -> u64 {

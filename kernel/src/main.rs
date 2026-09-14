@@ -156,6 +156,7 @@ pub extern "C" fn kmain() -> ! {
         });
         cap_check("spawned a ring 3 task", user.is_some());
         serve_user();
+        call_user_service();
     }
 
     #[cfg(feature = "user-test")]
@@ -633,6 +634,21 @@ const LABEL_USER_ECHO: u64 = 6;
 const USER_PING: u64 = u64::from_le_bytes(*b"userping");
 const USER_PING_LEN: u64 = 8;
 
+/// A third endpoint, this one served *by* a ring 3 task and called by the
+/// kernel. Bootstrap keeps the send half; the server gets receive-only.
+const SERVICE_ENDPOINT: cap::CapPtr = 12;
+
+/// Slots inside the ring 3 server's capability space.
+const SERVICE_TASK_ENDPOINT: cap::CapPtr = 0;
+const SERVICE_TASK_REPLY: cap::CapPtr = 1;
+
+/// The service's protocol: add one to a number and hand it back.
+///
+/// Deliberately trivial. What is being demonstrated is not the arithmetic but
+/// which side of the ring boundary it happened on.
+const LABEL_INCREMENT: u64 = 7;
+const SERVICE_INPUT: u64 = 41;
+
 /// Slots inside the server's capability space.
 const SERVER_ENDPOINT: cap::CapPtr = 0;
 const SERVER_CONSOLE: cap::CapPtr = 1;
@@ -693,6 +709,17 @@ fn cap_bootstrap() {
         cap::mint(
             0,
             USER_ENDPOINT,
+            cap::Object::Endpoint(ipc::Endpoint::new()),
+            cap::Rights::ALL,
+        )
+        .is_ok(),
+    );
+
+    cap_check(
+        "mint the ring 3 service's Endpoint into slot 12",
+        cap::mint(
+            0,
+            SERVICE_ENDPOINT,
             cap::Object::Endpoint(ipc::Endpoint::new()),
             cap::Rights::ALL,
         )
@@ -1152,6 +1179,132 @@ extern "C" fn user_program() {
         label_echo = const LABEL_USER_ECHO,
         ping = const USER_PING,
     )
+}
+
+/// A **service** that runs in ring 3.
+///
+/// This is the shape every userspace driver has to take: receive, act, answer,
+/// repeat. It holds a receive-only endpoint capability, so it cannot send on
+/// the endpoint it serves and therefore cannot impersonate one of its own
+/// clients -- and it still answers them, because a reply capability is separate
+/// authority that the kernel hands over per call.
+#[unsafe(naked)]
+extern "C" fn user_service() {
+    core::arch::naked_asm!(
+        "2:",
+        // Receive. No slot for a transferred capability, but one for the
+        // capability that lets us answer.
+        "mov rax, {recv}",
+        "mov rdi, {endpoint}",
+        "mov rsi, {no_slot}",
+        "mov rdx, {reply_slot}",
+        "int {gate}",
+        // Anything other than success means there is nobody to answer, so
+        // going round again would spin. Park instead.
+        "test rax, rax",
+        "jnz 3f",
+
+        // The work: add one. rdx holds word 0 of what arrived.
+        "mov rbx, rdx",
+
+        // Before answering, try to *send* on the endpoint we serve. We hold it
+        // read-only, so this must be refused -- a server that could send on its
+        // own endpoint could answer its clients' requests by impersonating one
+        // of them. r12 rather than rcx or r11 to hold the result: those two are
+        // the registers fast syscalls clobber.
+        "mov rax, {send}",
+        "mov rdi, {endpoint}",
+        "xor rsi, rsi",
+        "xor rdx, rdx",
+        "xor r10, r10",
+        "xor r8, r8",
+        "xor r9, r9",
+        "int {gate}",
+        "mov r12, rax",
+
+        // Answer, carrying both the result and the status of that attempt --
+        // the only way a task with no console can report on itself.
+        "mov rax, {reply}",
+        "mov rdi, {reply_slot}",
+        "mov rsi, {label_result}",
+        "lea rdx, [rbx + 1]",
+        "mov r10, r12",
+        "xor r8, r8",
+        "xor r9, r9",
+        "int {gate}",
+        "jmp 2b",
+
+        "3:",
+        "mov rax, {yield_op}",
+        "int {gate}",
+        "jmp 3b",
+
+        recv = const syscall::SYS_RECV,
+        reply = const syscall::SYS_REPLY,
+        send = const syscall::SYS_SEND,
+        yield_op = const syscall::SYS_YIELD,
+        no_slot = const syscall::NO_SLOT,
+        gate = const vectors::SYSCALL,
+        endpoint = const SERVICE_TASK_ENDPOINT,
+        reply_slot = const SERVICE_TASK_REPLY,
+        label_result = const LABEL_RESULT,
+    )
+}
+
+/// Hand the ring 3 service the receive half of its endpoint, and call it.
+///
+/// The kernel is the client here, which is the microkernel argument at its
+/// sharpest: the privileged side asking an unprivileged task to do work, and
+/// having no way to do it except by holding a capability to that task's
+/// endpoint.
+fn call_user_service() {
+    let service = x86_64::without_interrupts(|| {
+        let service = task::spawn_user("user-srv", user_service);
+        if let Some(id) = service {
+            cap_check(
+                "grant the ring 3 service a receive-only endpoint capability",
+                cap::grant(
+                    id,
+                    SERVICE_ENDPOINT,
+                    SERVICE_TASK_ENDPOINT,
+                    cap::Rights::READ,
+                ) == Ok(cap::Rights::READ),
+            );
+        }
+        service
+    });
+
+    if service.is_none() {
+        cap_check("spawned a ring 3 service", false);
+        return;
+    }
+
+    match ipc::call(
+        SERVICE_ENDPOINT,
+        ipc::Message::from_word(LABEL_INCREMENT, SERVICE_INPUT),
+        None,
+        None,
+    ) {
+        Ok(answer) => {
+            println!(
+                "service    : kernel asked ring 3 for {} + 1, got {}",
+                SERVICE_INPUT, answer.message.words[0]
+            );
+            cap_check(
+                "a ring 3 server answered a call from the kernel",
+                answer.message.label == LABEL_RESULT
+                    && answer.message.words[0] == SERVICE_INPUT + 1,
+            );
+            cap_check(
+                "the ring 3 server cannot send on the endpoint it serves",
+                answer.message.words[1] == cap::CapError::InsufficientRights.code(),
+            );
+        }
+        Err(error) => {
+            println!("service    : call into ring 3 failed: {:?}", error);
+            cap_check("a ring 3 server answered a call from the kernel", false);
+        }
+    }
 }
 
 /// A ring 3 program that reaches for kernel memory. Off by default: it ends the

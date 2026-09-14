@@ -143,9 +143,11 @@ answers clients that hold nothing but a send-only endpoint.
 
 Userspace: tasks that run in ring 3, on their own user stacks, reaching the
 kernel only through one syscall gate that takes capability slots and no
-pointers. `./corrode user-test` proves a ring 3 task cannot read kernel memory.
+pointers. Ring 3 tasks can be clients *and* servers — the kernel calls into a
+userspace service and gets an answer back. `./corrode user-test` proves a ring 3
+task cannot read kernel memory.
 
-Not yet: SMP, per-task address spaces, user-side servers.
+Not yet: SMP, per-task address spaces.
 
 ### W^X
 
@@ -397,14 +399,39 @@ gets an answer back. The check that it was genuinely in ring 3 reads the CS the
 **CPU** wrote into the trap frame, which is the one claim the measured code
 could not have faked.
 
-Known gaps: there is still a single CR3. Kernel memory is unreachable from ring
+#### Servers in ring 3
+
+A client is the easy half. The architecture only pays off when the *services*
+are unprivileged too — a driver is a task that receives requests, acts, and
+answers — so ring 3 gets `SYS_RECV` and `SYS_REPLY` as well.
+
+A receiver nominates two more slots than a client: one for a capability
+transferred with a message, one for the capability that answers a call. What a
+receive deliberately does not report is whether a reply capability arrived. The
+receiver named the slot, so it can ask what is in it with `SYS_IDENTIFY` —
+which is the capability-shaped question anyway, and costs no register in an ABI
+whose only spare ones, `rcx` and `r11`, are exactly the two fast syscalls
+clobber.
+
+The demo inverts the usual direction: the **kernel** is the client and a ring 3
+task is the server. That is the microkernel argument at its sharpest — the
+privileged side asking an unprivileged task to do work, with no way to do it
+except by holding a capability to that task's endpoint.
+
+The service holds its endpoint **receive-only**, and proves it: before
+answering, it tries to send on the endpoint it serves, and reports the refusal
+in the reply it sends back, since a task with no console has no other way to
+report on itself. A server that could send on its own endpoint could answer its
+clients by impersonating one of them. It still replies, because a reply
+capability is separate authority the kernel issues per call — exactly the
+separation reply capabilities exist to provide, now demonstrated across the ring
+boundary rather than only within the kernel.
+
+Known gap: there is still a single CR3. Kernel memory is unreachable from ring
 3 because kernel mappings lack the USER bit, so the ring boundary holds — but
 user tasks share the lower half with each other, so one could read another's
 stack. Per-task address spaces are what fixes that, and they want a capability
-for the address space itself rather than a flag on a task. There is also no
-receive syscall yet: a ring 3 task can be a client but not a server, because a
-server must also nominate slots for transferred and reply capabilities, and
-that is a wider boundary than anything is tested against today.
+for the address space itself rather than a flag on a task.
 
 ### The scheduler
 
@@ -463,11 +490,12 @@ Five run on every boot, so a regression shows up immediately rather than three
 subsystems later: an `int3` that must trap *and resume*, a frame alloc/free
 round-trip that must balance, a heap exercise that must both balance its bytes
 and collapse back to a single free block, a timer check that counts both tick
-sources against one second of polled wall time, and fifty-five capability, IPC
+sources against one second of polled wall time, and fifty-nine capability, IPC
 and ring 3 checks covering narrowing, denial, type confusion, the GRANT rule,
 the rendezvous in both orderings, capability transfer, reply-capability expiry,
-call refusal, and a user task being denied, answered, and confirmed to have
-been in ring 3.
+call refusal, a user task being denied, answered and confirmed to have been in
+ring 3, and a ring 3 server answering a call from the kernel while unable to
+send on the endpoint it serves.
 
 That last one earns its place. Deriving "elapsed seconds" from a tick counter
 and then using it to judge that same counter is circular, and hides exactly the
