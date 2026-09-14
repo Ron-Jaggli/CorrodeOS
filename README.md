@@ -141,13 +141,13 @@ Synchronous IPC over endpoints, with call/reply and one-shot reply
 capabilities. A console server holds the only writable console capability and
 answers clients that hold nothing but a send-only endpoint.
 
-Userspace: tasks that run in ring 3, on their own user stacks, reaching the
-kernel only through one syscall gate that takes capability slots and no
+Userspace: tasks that run in ring 3, each in its own address space, reaching
+the kernel only through one syscall gate that takes capability slots and no
 pointers. Ring 3 tasks can be clients *and* servers — the kernel calls into a
 userspace service and gets an answer back. `./corrode user-test` proves a ring 3
 task cannot read kernel memory.
 
-Not yet: SMP, per-task address spaces.
+Not yet: SMP.
 
 ### W^X
 
@@ -427,11 +427,50 @@ capability is separate authority the kernel issues per call — exactly the
 separation reply capabilities exist to provide, now demonstrated across the ring
 boundary rather than only within the kernel.
 
-Known gap: there is still a single CR3. Kernel memory is unreachable from ring
-3 because kernel mappings lack the USER bit, so the ring boundary holds — but
-user tasks share the lower half with each other, so one could read another's
-stack. Per-task address spaces are what fixes that, and they want a capability
-for the address space itself rather than a flag on a task.
+#### One address space each
+
+Every user task gets its own PML4, forked from the kernel's so that the upper
+256 entries — and only those — are copied. Both spaces then point at the *same*
+lower-level kernel tables, which is what lets a trap taken in ring 3 land on a
+mapped kernel stack whichever space was installed, and means a kernel mapping
+added later appears in every space at once because the table it is written into
+is shared.
+
+The exception is a kernel mapping that needs a *new* PML4 entry: that writes
+into one top-level table only, and spaces forked earlier will not see it.
+Nothing does that today — the direct map, heap, stack area and kernel image each
+occupy one slot, all established at boot before any user space exists — but it
+would stop being true if the stack area ever outgrew its 512 GiB slot.
+
+Because the lower half starts empty, user addresses are **fixed rather than
+handed out from a cursor**. Every user task has its code at 0x400000 and its
+stack at the same place, backed by different memory. One task cannot name
+another's stack, because in its own address space that address means its own.
+
+CR3 is written only when the incoming task's space differs from the installed
+one. Writing it flushes every non-global TLB entry, so doing it on a switch that
+changes nothing would throw the kernel's translations away a few hundred times a
+second for nothing.
+
+The check for this walks the page tables rather than observing behaviour. Two
+tasks that happen not to collide prove nothing, and arranging a collision to
+watch it fail means racing them; reading the tables answers the actual question,
+which is whether one address means different memory over there:
+
+```
+address    : user 0x10004000 -> 0x1fbe6000 in one space, 0x1fbd9000 in the other
+```
+
+A kernel address is checked the other way, and must resolve identically in both.
+
+#### Frames handed to ring 3 are wiped
+
+A frame just off the free list holds whatever its last owner left there —
+including the allocator's own list pointers, since the free list is threaded
+through the free frames themselves. Mapping one into ring 3 without clearing it
+is a kernel memory disclosure through a mapping we created on purpose, so every
+user stack frame is zeroed through the HHDM before it is mapped. It also means
+the null return address at the top of a fresh user stack is already there.
 
 ### The scheduler
 
@@ -490,12 +529,13 @@ Five run on every boot, so a regression shows up immediately rather than three
 subsystems later: an `int3` that must trap *and resume*, a frame alloc/free
 round-trip that must balance, a heap exercise that must both balance its bytes
 and collapse back to a single free block, a timer check that counts both tick
-sources against one second of polled wall time, and fifty-nine capability, IPC
+sources against one second of polled wall time, and sixty-three capability, IPC
 and ring 3 checks covering narrowing, denial, type confusion, the GRANT rule,
 the rendezvous in both orderings, capability transfer, reply-capability expiry,
 call refusal, a user task being denied, answered and confirmed to have been in
-ring 3, and a ring 3 server answering a call from the kernel while unable to
-send on the endpoint it serves.
+ring 3, a ring 3 server answering a call from the kernel while unable to send on
+the endpoint it serves, and two user tasks proving by page-table walk that one
+address means different memory in each of them.
 
 That last one earns its place. Deriving "elapsed seconds" from a tick counter
 and then using it to judge that same counter is circular, and hides exactly the

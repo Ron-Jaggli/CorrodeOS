@@ -41,6 +41,7 @@ const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
 const PAGE_4K: u64 = 4096;
 const PAGE_2M: u64 = 2 * 1024 * 1024;
+const PAGE_1G: u64 = 1024 * 1024 * 1024;
 
 /// Index into the table at `level` (4 = PML4 .. 1 = PT) for a virtual address.
 const fn index(va: u64, level: u32) -> usize {
@@ -48,6 +49,12 @@ const fn index(va: u64, level: u32) -> usize {
     ((va >> shift) & 0x1ff) as usize
 }
 
+/// An address space: a PML4 and the offset that reaches physical memory.
+///
+/// `Copy` because it is two numbers and owns nothing. Dropping one frees no
+/// frames -- tearing an address space down means walking it, and nothing here
+/// destroys one yet.
+#[derive(Clone, Copy)]
 pub struct Mapper {
     /// Physical address of the PML4.
     root: u64,
@@ -131,6 +138,93 @@ impl Mapper {
         // SAFETY: `slot` is a valid entry in a live table.
         unsafe { slot.write(next.addr() | PRESENT | WRITABLE | (leaf_flags & USER)) };
         Some(next.addr())
+    }
+
+    /// Build a new address space that shares this one's kernel half.
+    ///
+    /// The upper 256 PML4 entries are copied by value, so both spaces point at
+    /// the *same* lower-level kernel tables. That is what makes a trap taken in
+    /// ring 3 land on a mapped kernel stack whichever address space was active,
+    /// and it means a kernel mapping added later -- another task stack, another
+    /// heap page -- appears in every space at once, because the table it is
+    /// written into is shared.
+    ///
+    /// The exception is a kernel mapping that needs a *new* PML4 entry. That
+    /// writes into this space's top-level table only, and spaces forked earlier
+    /// will not see it. Nothing does that today: the direct map, heap, stack
+    /// area and kernel image each occupy one slot, established at boot before
+    /// any user space exists. It would stop being true if the stack area ever
+    /// grew past its 512 GiB slot.
+    ///
+    /// The lower half is left empty, which is the whole point: user mappings go
+    /// there, and one space's are invisible to another's.
+    pub fn fork_kernel_half(&self) -> Option<Mapper> {
+        let frame = frame::alloc()?;
+        let forked = Mapper {
+            root: frame.addr(),
+            hhdm: self.hhdm,
+        };
+
+        // SAFETY: the frame came from the allocator, so it is real RAM covered
+        // by the HHDM and owned exclusively by us.
+        unsafe { forked.zero(frame.addr()) };
+
+        for slot in 256..512 {
+            // SAFETY: both roots are live page tables and `slot` is in range.
+            unsafe {
+                let entry = self.entry(self.root, slot).read();
+                self.entry(forked.root, slot).write(entry);
+            }
+        }
+
+        Some(forked)
+    }
+
+    /// Physical address a virtual address resolves to in *this* space.
+    ///
+    /// Walks the tables rather than consulting the TLB or the active CR3, so it
+    /// answers for an address space that is not currently installed -- which is
+    /// the only way one address space can be compared against another.
+    pub fn translate(&self, va: u64) -> Option<u64> {
+        // SAFETY: `self.root` is a live PML4 and every table reached from it by
+        // a PRESENT entry is a live table of the next level down.
+        unsafe {
+            let p4 = self.entry(self.root, index(va, 4)).read();
+            if p4 & PRESENT == 0 {
+                return None;
+            }
+
+            let p3 = self.entry(p4 & ADDR_MASK, index(va, 3)).read();
+            if p3 & PRESENT == 0 {
+                return None;
+            }
+            if p3 & HUGE != 0 {
+                return Some((p3 & ADDR_MASK) + (va & (PAGE_1G - 1)));
+            }
+
+            let p2 = self.entry(p3 & ADDR_MASK, index(va, 2)).read();
+            if p2 & PRESENT == 0 {
+                return None;
+            }
+            if p2 & HUGE != 0 {
+                return Some((p2 & ADDR_MASK) + (va & (PAGE_2M - 1)));
+            }
+
+            let p1 = self.entry(p2 & ADDR_MASK, index(va, 1)).read();
+            if p1 & PRESENT == 0 {
+                return None;
+            }
+            Some((p1 & ADDR_MASK) + (va & (PAGE_4K - 1)))
+        }
+    }
+
+    /// Wipe a freshly allocated frame before anything else can see it.
+    ///
+    /// # Safety
+    /// `pa` must be a page-aligned frame this caller exclusively owns.
+    pub unsafe fn zero_frame(&self, pa: u64) {
+        // SAFETY: forwarded from the caller's guarantee.
+        unsafe { self.zero(pa) }
     }
 
     /// Map one 4 KiB page. `flags` should not include the address or PRESENT.
@@ -295,6 +389,26 @@ pub fn kernel_phys_of(va: u64) -> Option<u64> {
 
 pub fn set_kernel_mapper(mapper: Mapper) {
     *KERNEL_MAPPER.lock() = Some(mapper);
+}
+
+/// Physical address of the kernel address space's PML4.
+pub fn kernel_root() -> Option<u64> {
+    Some(KERNEL_MAPPER.lock().as_ref()?.root)
+}
+
+/// Install an address space by root.
+///
+/// # Safety
+/// `root` must be a live PML4 that maps the kernel half -- the code executing
+/// this instruction, the stack it is on, and the tables themselves all have to
+/// stay reachable across the write, because the very next instruction fetch
+/// goes through the new tables.
+pub unsafe fn activate_root(root: u64) {
+    // SAFETY: forwarded from the caller. The write to CR3 also flushes every
+    // non-global TLB entry.
+    unsafe {
+        core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+    }
 }
 
 /// Run `f` against the kernel address space, if it has been installed.

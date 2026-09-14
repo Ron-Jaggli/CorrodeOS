@@ -81,6 +81,12 @@ pub struct Task {
     pub kernel_stack_top: u64,
     /// True once this task has been placed in ring 3.
     pub user: bool,
+    /// This task's address space, or `None` to run in the kernel's.
+    ///
+    /// Only user tasks have one. Kernel tasks share the kernel address space
+    /// because they *are* the kernel -- separating them would buy nothing, as
+    /// they can already reach every byte of it by construction.
+    pub space: Option<crate::mm::paging::Mapper>,
 }
 
 /// Slots per capability space.
@@ -107,6 +113,13 @@ struct Scheduler {
     /// id: the scheduler skips the idle task during normal selection, so a
     /// wrong value here means a real task is permanently skipped.
     idle: Option<usize>,
+    /// PML4 currently installed in CR3, so a switch between two tasks that
+    /// share an address space costs nothing.
+    ///
+    /// Writing CR3 flushes every non-global TLB entry, so doing it on a switch
+    /// that changes nothing would throw away the kernel's translations several
+    /// hundred times a second for no reason.
+    installed_root: u64,
 }
 
 static SCHEDULER: SpinLock<Option<Scheduler>> = SpinLock::new(None);
@@ -139,11 +152,13 @@ pub fn init() {
             // allocated nor knows the extent of.
             kernel_stack_top: 0,
             user: false,
+            space: None,
         }];
         *guard = Some(Scheduler {
             tasks,
             current: 0,
             idle: None,
+            installed_root: crate::mm::paging::kernel_root().unwrap_or(0),
         });
     });
 
@@ -276,6 +291,7 @@ fn spawn_inner(name: &'static str, entry_rip: u64, image: Option<user::Image>) -
             call_seq: 0,
             kernel_stack_top: stack.top,
             user,
+            space: image.map(|image| image.space),
         });
         Some(id)
     })?;
@@ -390,6 +406,26 @@ pub fn on_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
         gdt::set_kernel_stack(top);
     }
 
+    // Install the incoming task's address space.
+    //
+    // Safe to do here, mid-switch, for one reason: every address space shares
+    // the kernel's upper half, so this code, the stack it is running on, the
+    // frame it is about to return, and the page tables themselves are all
+    // mapped identically on both sides of the write. Nothing under RIP or RSP
+    // moves; only the lower half does.
+    let root = scheduler.tasks[next]
+        .space
+        .map(|space| space.root())
+        .or_else(crate::mm::paging::kernel_root)
+        .unwrap_or(scheduler.installed_root);
+
+    if root != scheduler.installed_root && root != 0 {
+        scheduler.installed_root = root;
+        // SAFETY: `root` is a live PML4, forked from the kernel's, so it maps
+        // the whole kernel half -- including the instruction after this one.
+        unsafe { crate::mm::paging::activate_root(root) };
+    }
+
     scheduler.tasks[next].saved_rsp as *mut TrapFrame
 }
 
@@ -437,6 +473,11 @@ impl Default for TaskInfo {
 /// is made from the contents of that space, never from this number.
 pub fn current_id() -> Option<usize> {
     x86_64::without_interrupts(|| Some(SCHEDULER.lock().as_ref()?.current))
+}
+
+/// The address space a task runs in, if it has one of its own.
+pub fn space_of(id: usize) -> Option<crate::mm::paging::Mapper> {
+    x86_64::without_interrupts(|| SCHEDULER.lock().as_ref()?.tasks.get(id)?.space)
 }
 
 /// Operate on one task's capability space.

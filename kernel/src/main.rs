@@ -156,7 +156,8 @@ pub extern "C" fn kmain() -> ! {
         });
         cap_check("spawned a ring 3 task", user.is_some());
         serve_user();
-        call_user_service();
+        let service = call_user_service();
+        check_address_spaces(user, service);
     }
 
     #[cfg(feature = "user-test")]
@@ -1257,7 +1258,7 @@ extern "C" fn user_service() {
 /// sharpest: the privileged side asking an unprivileged task to do work, and
 /// having no way to do it except by holding a capability to that task's
 /// endpoint.
-fn call_user_service() {
+fn call_user_service() -> Option<usize> {
     let service = x86_64::without_interrupts(|| {
         let service = task::spawn_user("user-srv", user_service);
         if let Some(id) = service {
@@ -1276,7 +1277,7 @@ fn call_user_service() {
 
     if service.is_none() {
         cap_check("spawned a ring 3 service", false);
-        return;
+        return None;
     }
 
     match ipc::call(
@@ -1305,6 +1306,55 @@ fn call_user_service() {
             cap_check("a ring 3 server answered a call from the kernel", false);
         }
     }
+
+    service
+}
+
+/// Compare the two ring 3 tasks' address spaces directly.
+///
+/// This walks the page tables rather than observing behaviour, which is the
+/// point: two tasks that happen not to collide prove nothing, and arranging a
+/// collision to watch it fail means racing them. Reading the tables answers the
+/// actual question -- does this address mean different memory over there.
+fn check_address_spaces(user: Option<usize>, service: Option<usize>) {
+    let (Some(first), Some(second)) = (
+        user.and_then(task::space_of),
+        service.and_then(task::space_of),
+    ) else {
+        cap_check("each ring 3 task got its own address space", false);
+        return;
+    };
+
+    cap_check(
+        "each ring 3 task got its own address space",
+        first.root() != second.root(),
+    );
+
+    // The same address in both, deliberately: once the spaces are separate,
+    // every user task can put its stack in the same place.
+    let stack_page = task::user::STACK_TOP - 4096;
+    let (a, b) = (first.translate(stack_page), second.translate(stack_page));
+    println!(
+        "address    : user {:#x} -> {:#x} in one space, {:#x} in the other",
+        stack_page,
+        a.unwrap_or(0),
+        b.unwrap_or(0)
+    );
+    cap_check(
+        "the same user address is mapped in both",
+        a.is_some() && b.is_some(),
+    );
+    cap_check("...and backed by different memory", a != b);
+
+    // The kernel half is shared, which is what lets a trap taken in ring 3 land
+    // on a mapped kernel stack whichever space happened to be installed.
+    let shared = alloc::boxed::Box::new(0u64);
+    let kernel_va = &*shared as *const u64 as u64;
+    cap_check(
+        "a kernel address resolves identically in both",
+        first.translate(kernel_va) == second.translate(kernel_va)
+            && first.translate(kernel_va).is_some(),
+    );
 }
 
 /// A ring 3 program that reaches for kernel memory. Off by default: it ends the

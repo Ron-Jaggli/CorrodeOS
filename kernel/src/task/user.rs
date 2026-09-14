@@ -7,14 +7,14 @@
 //! a user task that dereferences a kernel address takes a page fault, which
 //! `./corrode user-test` demonstrates on purpose.
 //!
-//! # One address space, for now
+//! # One address space each
 //!
-//! There is still a single CR3. Kernel memory is unreachable from ring 3
-//! because the kernel's mappings lack the USER bit, so the ring boundary holds
-//! -- but user tasks share the lower half with each other, so one could read
-//! another's stack. Per-task address spaces are what fixes that, and they want
-//! a capability for the address space itself rather than a flag on a task.
-//! Recorded as a real gap rather than implied to be finished.
+//! Every user task gets its own PML4, forked from the kernel's so the upper
+//! half -- and only the upper half -- is shared. The lower half starts empty,
+//! which is why the addresses below can be *fixed* rather than handed out from
+//! a cursor: every user task has its code and its stack at the same virtual
+//! addresses, backed by different memory. One task cannot name another's stack,
+//! because in its address space that address means its own.
 //!
 //! # Where the code comes from
 //!
@@ -27,32 +27,28 @@
 //! the compiler cannot be told that this one function may not touch anything
 //! outside its own page.
 
-use core::sync::atomic::{AtomicU64, Ordering};
-
 use crate::mm::frame;
-use crate::mm::paging;
+use crate::mm::paging::{self, Mapper};
 
 const PAGE: u64 = 4096;
 
-/// Lower-half base for aliased user code. Well clear of the null page, so a
+/// Where every user program's code goes. Well clear of the null page, so a
 /// jump through a zeroed pointer still faults.
-const CODE_AREA_BASE: u64 = 0x0000_0000_0040_0000;
+pub const CODE_BASE: u64 = 0x0000_0000_0040_0000;
 /// Pages mapped per program. Two, so a routine that straddles a page boundary
 /// is still fully mapped; there is no loader to tell us the real length.
 const CODE_PAGES: u64 = 2;
 
-/// Lower-half base for user stacks, far enough above the code area that an
+/// Where every user program's stack goes, far enough above the code that an
 /// overrun cannot reach it.
-const STACK_AREA_BASE: u64 = 0x0000_0000_1000_0000;
+pub const STACK_GUARD: u64 = 0x0000_0000_1000_0000;
 const STACK_PAGES: u64 = 4;
-const GUARD_PAGES: u64 = 1;
-const STACK_SLOT: u64 = (STACK_PAGES + GUARD_PAGES) * PAGE;
+const STACK_BOTTOM: u64 = STACK_GUARD + PAGE;
+/// One past the highest mapped stack byte, in every user address space.
+pub const STACK_TOP: u64 = STACK_BOTTOM + STACK_PAGES * PAGE;
 
-static NEXT_CODE: AtomicU64 = AtomicU64::new(CODE_AREA_BASE);
-static NEXT_STACK: AtomicU64 = AtomicU64::new(STACK_AREA_BASE);
-
-/// Where a user program's code and stack ended up.
-#[derive(Debug, Clone, Copy)]
+/// Where a user program's code and stack ended up, and the space they are in.
+#[derive(Clone, Copy)]
 pub struct Image {
     /// Ring 3 address of the entry point.
     pub entry: u64,
@@ -60,31 +56,29 @@ pub struct Image {
     pub stack_top: u64,
     /// The unmapped page below the user stack.
     pub stack_guard: u64,
+    /// The address space all of the above live in.
+    pub space: Mapper,
 }
 
-/// Map a kernel-image function and a fresh stack into ring 3.
+/// Build a fresh address space holding one program and one stack.
 ///
 /// `entry` is the kernel virtual address of the program's first instruction.
 pub fn create(entry: u64) -> Option<Image> {
-    let user_entry = map_code(entry)?;
-    let (stack_top, stack_guard) = map_stack()?;
+    let mut space = paging::with_kernel_mapper(|kernel| kernel.fork_kernel_half())??;
 
-    // A user entry has nowhere to return to -- there is no ring 3 runtime
-    // beneath it -- so leave a null return address. Returning then faults at 0
-    // with the culprit still on the stack, rather than jumping somewhere that
-    // happens to be mapped.
-    let rsp = stack_top - 8;
-    // SAFETY: `stack_top - 8` is inside the range `map_stack` just mapped
-    // writable, in the address space that is currently active, and nothing else
-    // refers to this stack yet.
-    unsafe {
-        (rsp as *mut u64).write(0);
-    }
+    let user_entry = map_code(&mut space, entry)?;
+    map_stack(&mut space)?;
 
     Some(Image {
         entry: user_entry,
-        stack_top: rsp,
-        stack_guard,
+        // A user entry has nowhere to return to -- there is no ring 3 runtime
+        // beneath it -- so it starts on a null return address. Returning faults
+        // at 0 with the culprit still on the stack, rather than jumping
+        // somewhere that happens to be mapped. The word is already zero because
+        // every user frame is wiped before it is mapped.
+        stack_top: STACK_TOP - 8,
+        stack_guard: STACK_GUARD,
+        space,
     })
 }
 
@@ -93,44 +87,48 @@ pub fn create(entry: u64) -> Option<Image> {
 /// Not writable, so W^X holds on this side of the ring boundary too: a user
 /// program cannot rewrite its own code, and the kernel's copy of those same
 /// frames stays read-only through its own mapping.
-fn map_code(entry: u64) -> Option<u64> {
+///
+/// The frames are shared with the kernel's mapping of them rather than copied.
+/// That is safe precisely because they are not writable from either side: the
+/// text of a program is not private state.
+fn map_code(space: &mut Mapper, entry: u64) -> Option<u64> {
     let page = entry & !(PAGE - 1);
     let offset = entry & (PAGE - 1);
     let phys = paging::kernel_phys_of(page)?;
 
-    let base = NEXT_CODE.fetch_add(CODE_PAGES * PAGE, Ordering::Relaxed);
     for i in 0..CODE_PAGES {
-        let mapped = paging::with_kernel_mapper(|mapper| {
-            mapper.map_4k(base + i * PAGE, phys + i * PAGE, paging::USER)
-        });
-        if mapped != Some(true) {
+        if !space.map_4k(CODE_BASE + i * PAGE, phys + i * PAGE, paging::USER) {
             return None;
         }
     }
 
-    Some(base + offset)
+    Some(CODE_BASE + offset)
 }
 
-/// Carve out one user stack with a guard page below it.
-fn map_stack() -> Option<(u64, u64)> {
-    let slot = NEXT_STACK.fetch_add(STACK_SLOT, Ordering::Relaxed);
-    let guard = slot;
-    let bottom = slot + GUARD_PAGES * PAGE;
-    let top = bottom + STACK_PAGES * PAGE;
-
+/// Map this space's stack, with a guard page below it.
+///
+/// Every frame is zeroed first. A frame just off the free list holds whatever
+/// the last owner left in it -- including the allocator's own list pointers,
+/// since the free list is threaded through free frames -- and handing that to
+/// ring 3 would be a kernel memory disclosure through a mapping we created
+/// deliberately.
+fn map_stack(space: &mut Mapper) -> Option<()> {
     for i in 0..STACK_PAGES {
         let frame = frame::alloc()?;
-        let mapped = paging::with_kernel_mapper(|mapper| {
-            mapper.map_4k(
-                bottom + i * PAGE,
-                frame.addr(),
-                paging::USER | paging::WRITABLE | paging::NO_EXECUTE,
-            )
-        });
-        if mapped != Some(true) {
+
+        // SAFETY: the frame came from the allocator, so it is real RAM covered
+        // by the HHDM and owned exclusively by us. Zeroing happens through the
+        // HHDM, which is why it works before the user mapping exists.
+        unsafe { space.zero_frame(frame.addr()) };
+
+        if !space.map_4k(
+            STACK_BOTTOM + i * PAGE,
+            frame.addr(),
+            paging::USER | paging::WRITABLE | paging::NO_EXECUTE,
+        ) {
             return None;
         }
     }
 
-    Some((top, guard))
+    Some(())
 }
