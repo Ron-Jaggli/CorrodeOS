@@ -448,15 +448,22 @@ impl IdtEntry {
         zero: 0,
     };
 
-    fn set(&mut self, handler: extern "C" fn(), ist: u8) {
+    fn set(&mut self, handler: extern "C" fn(), ist: u8, dpl: u8) {
         let addr = handler as usize as u64;
         self.offset_low = addr as u16;
         self.offset_mid = (addr >> 16) as u16;
         self.offset_high = (addr >> 32) as u32;
         self.selector = gdt::KERNEL_CODE;
         self.ist = ist & 0x7;
-        // Present, DPL 0, 64-bit interrupt gate (clears IF on entry).
-        self.type_attr = 0x8e;
+        // Present, 64-bit interrupt gate (clears IF on entry), DPL as given.
+        //
+        // DPL is the privilege needed to raise this vector with `int`, and it
+        // is the whole ring 3 attack surface: every gate is DPL 0 except the
+        // syscall vector, so a user task executing `int` on anything else
+        // takes a #GP instead of entering a handler it was never meant to
+        // reach. Hardware-delivered interrupts ignore DPL, so nothing is lost
+        // by keeping it at 0 everywhere else.
+        self.type_attr = 0x8e | ((dpl & 3) << 5);
         self.zero = 0;
     }
 }
@@ -485,7 +492,13 @@ pub fn init() {
             } else {
                 0
             };
-            (*idt)[vector].set(*stub, ist);
+            // The one gate ring 3 may enter deliberately.
+            let dpl = if vector == vectors::SYSCALL as usize {
+                3
+            } else {
+                0
+            };
+            (*idt)[vector].set(*stub, ist, dpl);
         }
 
         let idtr = DescriptorTablePointer {
@@ -574,6 +587,12 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
         vectors::YIELD => {
             // Software interrupt, so there is nothing to acknowledge.
             return crate::task::on_tick(frame);
+        }
+        vectors::SYSCALL => {
+            // Returns a frame because a syscall may block: the task that made
+            // it can end up parked in IPC, and the frame handed back is then
+            // some other task's. Same mechanism as a timer tick.
+            return crate::syscall::dispatch(frame_ref);
         }
         vectors::IOAPIC_TIMER => {
             pit::on_tick();

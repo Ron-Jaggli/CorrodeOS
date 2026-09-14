@@ -19,6 +19,7 @@ mod limine;
 mod mm;
 mod serial;
 mod sync;
+mod syscall;
 mod task;
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -144,6 +145,21 @@ pub extern "C" fn kmain() -> ! {
         )
         .is_ok(),
     );
+
+    // Ring 3. Spawn and grant without preemption in between, as above.
+    #[cfg(not(feature = "user-test"))]
+    {
+        let user = x86_64::without_interrupts(|| {
+            let user = task::spawn_user("user", user_program);
+            user_grants(user);
+            user
+        });
+        cap_check("spawned a ring 3 task", user.is_some());
+        serve_user();
+    }
+
+    #[cfg(feature = "user-test")]
+    user_fault_test();
 
     task::spawn("worker", worker_a);
     task::spawn("yielder", worker_b);
@@ -350,6 +366,7 @@ fn init_paging() {
 
     // Keep the address space around: the heap maps through it next, and the
     // APIC will want MMIO mappings later.
+    mm::paging::set_kernel_image_base(virt_base, phys_base);
     mm::paging::set_kernel_mapper(mapper);
 }
 
@@ -595,6 +612,27 @@ static FRAME_CAP_ADDR: AtomicU64 = AtomicU64::new(0);
 /// send-only and receive-only copies.
 const BOOT_ENDPOINT: cap::CapPtr = 9;
 
+/// A second endpoint, served by the bootstrap task itself, for the ring 3 task.
+/// Separate from the console server's so the two conversations cannot interleave
+/// and make the boot log order-dependent.
+const USER_ENDPOINT: cap::CapPtr = 10;
+const USER_REPLY: cap::CapPtr = 11;
+
+/// The user task's only capability: a send-only handle on [`USER_ENDPOINT`].
+const USER_TASK_ENDPOINT: cap::CapPtr = 0;
+/// A slot the user task holds nothing in, so it can demonstrate being denied.
+const USER_TASK_EMPTY: cap::CapPtr = 5;
+
+/// Labels the ring 3 task uses. It cannot print, so everything it wants
+/// observed it has to say through the one capability it was given.
+const LABEL_USER_DENIED: u64 = 5;
+const LABEL_USER_ECHO: u64 = 6;
+
+/// Eight bytes the user task asks the kernel to count, chosen so the expected
+/// answer is simply its length.
+const USER_PING: u64 = u64::from_le_bytes(*b"userping");
+const USER_PING_LEN: u64 = 8;
+
 /// Slots inside the server's capability space.
 const SERVER_ENDPOINT: cap::CapPtr = 0;
 const SERVER_CONSOLE: cap::CapPtr = 1;
@@ -644,6 +682,17 @@ fn cap_bootstrap() {
         cap::mint(
             0,
             BOOT_ENDPOINT,
+            cap::Object::Endpoint(ipc::Endpoint::new()),
+            cap::Rights::ALL,
+        )
+        .is_ok(),
+    );
+
+    cap_check(
+        "mint the ring 3 task's Endpoint into slot 10",
+        cap::mint(
+            0,
+            USER_ENDPOINT,
             cap::Object::Endpoint(ipc::Endpoint::new()),
             cap::Rights::ALL,
         )
@@ -1025,6 +1074,184 @@ extern "C" fn ipc_client() {
     );
 }
 
+/// A program that runs in **ring 3**.
+///
+/// Naked assembly, and it has to be: this function's frames get mapped a second
+/// time at a user address, and nothing else in the kernel does. A call to
+/// another function or a `&str` in `.rodata` would be a reference to an address
+/// ring 3 cannot reach, and the compiler has no way to be told that. Hand-written
+/// assembly is the only way to be sure the code touches nothing but its own page
+/// and its own stack.
+///
+/// It holds exactly one capability -- a send-only endpoint -- and so the only
+/// way it can report anything at all is to say it through that. Which is the
+/// whole argument: a task with an empty capability space is not restricted, it
+/// is inert.
+#[unsafe(naked)]
+extern "C" fn user_program() {
+    core::arch::naked_asm!(
+        // Try to call through a slot holding nothing. Expect a refusal, and
+        // keep it: this is the only evidence we can produce that being denied
+        // is what actually happened.
+        "mov rax, {call}",
+        "mov rdi, {empty_slot}",
+        "mov rsi, {label_count}",
+        "xor rdx, rdx",
+        "xor r10, r10",
+        "xor r8, r8",
+        "xor r9, r9",
+        "int {gate}",
+        "mov rbx, rax",
+
+        // Report that refusal through the capability we do hold.
+        "mov rax, {send}",
+        "mov rdi, {endpoint}",
+        "mov rsi, {label_denied}",
+        "mov rdx, rbx",
+        "xor r10, r10",
+        "xor r8, r8",
+        "xor r9, r9",
+        "int {gate}",
+
+        // A real request, and one with an answer: how long is this word?
+        "mov rax, {call}",
+        "mov rdi, {endpoint}",
+        "mov rsi, {label_count}",
+        "movabs rdx, {ping}",
+        "xor r10, r10",
+        "xor r8, r8",
+        "xor r9, r9",
+        "int {gate}",
+        "mov rbx, rdx",
+
+        // Echo the answer back, so the kernel can see we received it.
+        "mov rax, {send}",
+        "mov rdi, {endpoint}",
+        "mov rsi, {label_echo}",
+        "mov rdx, rbx",
+        "xor r10, r10",
+        "xor r8, r8",
+        "xor r9, r9",
+        "int {gate}",
+
+        // Done talking. Stay a live ring 3 task in the rotation rather than
+        // returning -- there is no ring 3 runtime to return to.
+        "2:",
+        "mov rax, {yield_op}",
+        "int {gate}",
+        "jmp 2b",
+
+        call = const syscall::SYS_CALL,
+        send = const syscall::SYS_SEND,
+        yield_op = const syscall::SYS_YIELD,
+        gate = const vectors::SYSCALL,
+        endpoint = const USER_TASK_ENDPOINT,
+        empty_slot = const USER_TASK_EMPTY,
+        label_count = const LABEL_COUNT,
+        label_denied = const LABEL_USER_DENIED,
+        label_echo = const LABEL_USER_ECHO,
+        ping = const USER_PING,
+    )
+}
+
+/// A ring 3 program that reaches for kernel memory. Off by default: it ends the
+/// boot, which is the proof.
+#[cfg(feature = "user-test")]
+#[unsafe(naked)]
+extern "C" fn user_fault_program() {
+    core::arch::naked_asm!(
+        // A kernel address, mapped and readable -- from ring 0. The USER bit is
+        // absent, so from here this must fault.
+        "movabs rax, {kernel_address}",
+        "mov rax, [rax]",
+        "2:",
+        "mov rax, {yield_op}",
+        "int {gate}",
+        "jmp 2b",
+        kernel_address = sym kmain,
+        yield_op = const syscall::SYS_YIELD,
+        gate = const vectors::SYSCALL,
+    )
+}
+
+/// Hand the ring 3 task the one capability it gets.
+fn user_grants(user: Option<usize>) {
+    let Some(id) = user else { return };
+
+    cap_check(
+        "grant the user task a send-only endpoint capability",
+        cap::grant(id, USER_ENDPOINT, USER_TASK_ENDPOINT, cap::Rights::WRITE)
+            == Ok(cap::Rights::WRITE),
+    );
+    cap_check(
+        "the user task holds exactly one capability",
+        cap::slots_used(id) == Some(1),
+    );
+}
+
+/// Serve the ring 3 task from the bootstrap task.
+///
+/// Three messages, in the order it sends them, so nothing here depends on
+/// scheduling. The middle one is a call and gets answered.
+fn serve_user() {
+    for _ in 0..3 {
+        let received = match ipc::recv(USER_ENDPOINT, None, Some(USER_REPLY)) {
+            Ok(received) => received,
+            Err(error) => {
+                println!("user       : recv failed: {:?}", error);
+                return;
+            }
+        };
+
+        match received.message.label {
+            LABEL_USER_DENIED => {
+                println!(
+                    "user       : ring 3 task reported status {} calling an empty slot",
+                    received.message.words[0]
+                );
+                cap_check(
+                    "ring 3 call through an empty slot was denied",
+                    received.message.words[0] == cap::CapError::Empty.code(),
+                );
+            }
+
+            LABEL_COUNT => {
+                let mut buffer = [0u8; ipc::TEXT_CAPACITY];
+                let length = received.message.text_bytes(&mut buffer);
+                let text = core::str::from_utf8(&buffer[..length]).unwrap_or("<non-utf8>");
+                println!("user       : ring 3 task called with {text:?}");
+
+                let Some(slot) = received.reply else {
+                    cap_check("ring 3 call arrived with a reply capability", false);
+                    continue;
+                };
+                cap_check(
+                    "answered the ring 3 task's call",
+                    ipc::reply(
+                        slot,
+                        ipc::Message::from_word(LABEL_RESULT, length as u64),
+                        None,
+                    )
+                    .is_ok(),
+                );
+            }
+
+            LABEL_USER_ECHO => {
+                cap_check(
+                    "ring 3 task received the answer to its call",
+                    received.message.words[0] == USER_PING_LEN,
+                );
+            }
+
+            other => println!("user       : unexpected label {other}"),
+        }
+    }
+
+    // The CPU writes CS into the trap frame on the way in, so this is the one
+    // claim about privilege the measured code could not have faked.
+    cap_check("syscalls arrived from ring 3", syscall::seen_cs() & 3 == 3);
+}
+
 /// Holds rw-: can print, cannot pass the console on.
 extern "C" fn scribe_task() {
     if let Err(error) = cap::console_write(0, "cap        : scribe printed via its capability\n") {
@@ -1105,8 +1332,12 @@ fn report_tasks() {
         .filter(|i| i.state != task::State::Finished)
     {
         print!(
-            " {}:{} {:?} {}sw |",
-            info.id, info.name, info.state, info.switches
+            " {}:{}{} {:?} {}sw |",
+            info.id,
+            info.name,
+            if info.user { "(r3)" } else { "" },
+            info.state,
+            info.switches
         );
     }
     println!(" ({finished} finished)");
@@ -1332,6 +1563,20 @@ fn fault_test() {
     unsafe {
         core::ptr::read_volatile(0xdead_0000usize as *const u64);
     }
+}
+
+/// Put a ring 3 task in front of kernel memory and let it reach. The USER bit
+/// is absent from every kernel mapping, so this must fault -- if it returns,
+/// the ring boundary is decorative and everything above it is theatre.
+///
+/// Off by default: it ends the boot, which is the point.
+#[cfg(feature = "user-test")]
+fn user_fault_test() {
+    println!();
+    println!("user test  : ring 3 task reading a kernel address (should fault)");
+    x86_64::without_interrupts(|| {
+        task::spawn_user("user-bomb", user_fault_program);
+    });
 }
 
 /// Try to write to `.text`. With W^X in force this must page-fault; if it

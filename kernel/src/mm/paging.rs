@@ -23,8 +23,13 @@ use crate::sync::SpinLock;
 
 pub const PRESENT: u64 = 1 << 0;
 pub const WRITABLE: u64 = 1 << 1;
-// Bit 2 is USER. Deliberately absent until there is a ring 3 to grant it to --
-// an unused permission flag is an invitation to set it by accident.
+/// Reachable from ring 3.
+///
+/// The CPU ANDs this bit down the whole walk, so a leaf marked USER under an
+/// interior entry that is not stays unreachable. `descend` therefore propagates
+/// it upward, which is safe in the other direction too: a kernel leaf under a
+/// USER interior entry is still kernel-only, because both have to agree.
+pub const USER: u64 = 1 << 2;
 pub const WRITE_THROUGH: u64 = 1 << 3;
 pub const NO_CACHE: u64 = 1 << 4;
 pub const HUGE: u64 = 1 << 7;
@@ -92,7 +97,7 @@ impl Mapper {
     /// # Safety
     /// `table` must be the physical address of a live page table at the level
     /// above the one being returned.
-    unsafe fn descend(&self, table: u64, index: usize) -> Option<u64> {
+    unsafe fn descend(&self, table: u64, index: usize, leaf_flags: u64) -> Option<u64> {
         // SAFETY: caller guarantees `table` is a page table.
         let slot = unsafe { self.entry(table, index) };
         // SAFETY: as above; the slot is inside that table.
@@ -103,6 +108,14 @@ impl Mapper {
             // coarser granularity; splitting it is not something we do.
             if value & HUGE != 0 {
                 return None;
+            }
+            // An interior entry on the path to a ring 3 page has to allow ring
+            // 3, or the AND down the walk denies the leaf. Widening here cannot
+            // expose a kernel leaf underneath: that leaf still has to carry
+            // USER itself, and it does not.
+            if leaf_flags & USER != 0 && value & USER == 0 {
+                // SAFETY: `slot` is a valid entry in a live table.
+                unsafe { slot.write(value | USER) };
             }
             return Some(value & ADDR_MASK);
         }
@@ -116,7 +129,7 @@ impl Mapper {
         // In particular NX must NOT be set on an interior entry, or everything
         // below it becomes non-executable.
         // SAFETY: `slot` is a valid entry in a live table.
-        unsafe { slot.write(next.addr() | PRESENT | WRITABLE) };
+        unsafe { slot.write(next.addr() | PRESENT | WRITABLE | (leaf_flags & USER)) };
         Some(next.addr())
     }
 
@@ -125,13 +138,13 @@ impl Mapper {
         // SAFETY: `self.root` is the PML4 we allocated and every `descend`
         // returns a live table of the next level down.
         unsafe {
-            let Some(p3) = self.descend(self.root, index(va, 4)) else {
+            let Some(p3) = self.descend(self.root, index(va, 4), flags) else {
                 return false;
             };
-            let Some(p2) = self.descend(p3, index(va, 3)) else {
+            let Some(p2) = self.descend(p3, index(va, 3), flags) else {
                 return false;
             };
-            let Some(p1) = self.descend(p2, index(va, 2)) else {
+            let Some(p1) = self.descend(p2, index(va, 2), flags) else {
                 return false;
             };
             self.entry(p1, index(va, 1))
@@ -145,10 +158,10 @@ impl Mapper {
         // SAFETY: as `map_4k`, stopping one level higher and setting HUGE so
         // the CPU treats the entry as a leaf rather than a table pointer.
         unsafe {
-            let Some(p3) = self.descend(self.root, index(va, 4)) else {
+            let Some(p3) = self.descend(self.root, index(va, 4), flags) else {
                 return false;
             };
-            let Some(p2) = self.descend(p3, index(va, 3)) else {
+            let Some(p2) = self.descend(p3, index(va, 3), flags) else {
                 return false;
             };
             self.entry(p2, index(va, 2))
@@ -255,6 +268,31 @@ impl Mapper {
 static KERNEL_MAPPER: SpinLock<Option<Mapper>> = SpinLock::new(None);
 
 /// Hand the kernel address space over for safekeeping.
+/// Where the kernel image sits, as Limine reported it: virtual base and the
+/// physical base it was loaded at.
+///
+/// Recorded because the kernel image is the one thing whose physical address
+/// cannot be recovered from a pointer -- the HHDM inverts trivially, the image
+/// mapping does not. Ring 3 needs it: a user program's code lives in the kernel
+/// image, and running it from ring 3 means mapping those same frames a second
+/// time at a user address.
+static KERNEL_IMAGE: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
+
+pub fn set_kernel_image_base(virtual_base: u64, physical_base: u64) {
+    *KERNEL_IMAGE.lock() = Some((virtual_base, physical_base));
+}
+
+/// Physical address backing a kernel-image virtual address.
+///
+/// Only valid for addresses inside the image; the HHDM, the heap and task
+/// stacks are mapped by different rules and this would give a wrong answer for
+/// them, so it returns `None` rather than guessing.
+pub fn kernel_phys_of(va: u64) -> Option<u64> {
+    let (virtual_base, physical_base) = (*KERNEL_IMAGE.lock())?;
+    let offset = va.checked_sub(virtual_base)?;
+    Some(physical_base + offset)
+}
+
 pub fn set_kernel_mapper(mapper: Mapper) {
     *KERNEL_MAPPER.lock() = Some(mapper);
 }

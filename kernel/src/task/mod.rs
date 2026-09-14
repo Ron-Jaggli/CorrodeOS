@@ -16,6 +16,7 @@
 //! is exactly where it would be anyway.
 
 pub mod stack;
+pub mod user;
 
 use alloc::vec::Vec;
 use core::mem::size_of;
@@ -71,6 +72,15 @@ pub struct Task {
     /// Monotonic per-task call counter. Supplies the `seq` above and is never
     /// reused, so a stale token can only ever compare unequal.
     pub call_seq: u64,
+    /// Top of this task's kernel stack, or 0 if it has none of its own.
+    ///
+    /// This is what the TSS points at while the task runs, so a trap taken in
+    /// ring 3 lands on a stack belonging to the task that took it. Kernel tasks
+    /// carry it too -- they simply never trigger the privilege change that
+    /// makes the CPU read it.
+    pub kernel_stack_top: u64,
+    /// True once this task has been placed in ring 3.
+    pub user: bool,
 }
 
 /// Slots per capability space.
@@ -83,6 +93,7 @@ pub struct TaskInfo {
     pub name: &'static str,
     pub state: State,
     pub switches: u64,
+    pub user: bool,
 }
 
 struct Scheduler {
@@ -124,6 +135,10 @@ pub fn init() {
             reply_slot: None,
             awaiting_reply: None,
             call_seq: 0,
+            // Task 0 runs on the stack Limine gave us, which it neither
+            // allocated nor knows the extent of.
+            kernel_stack_top: 0,
+            user: false,
         }];
         *guard = Some(Scheduler {
             tasks,
@@ -153,7 +168,28 @@ extern "C" fn idle_entry() {
 ///
 /// `entry` may return; it lands in [`task_exit`] if it does.
 pub fn spawn(name: &'static str, entry: extern "C" fn()) -> Option<usize> {
+    spawn_inner(name, entry as *const () as u64, None)
+}
+
+/// Create a task that starts in **ring 3**.
+///
+/// `entry` is an ordinary kernel-image function address; [`user::create`] maps
+/// its frames a second time at a user address and hands back a stack. What
+/// makes the task a user task is nothing more than the selectors in its initial
+/// frame -- `iretq` into a CS with RPL 3 is the privilege drop, and there is no
+/// other mechanism involved.
+///
+/// Like every other task it starts with an **empty capability space**. A user
+/// task with nothing in it cannot print, cannot send, and cannot name a single
+/// object; whatever it can do, its parent granted explicitly.
+pub fn spawn_user(name: &'static str, entry: extern "C" fn()) -> Option<usize> {
+    let image = user::create(entry as *const () as u64)?;
+    spawn_inner(name, image.entry, Some(image))
+}
+
+fn spawn_inner(name: &'static str, entry_rip: u64, image: Option<user::Image>) -> Option<usize> {
     let stack = stack::allocate()?;
+    let user = image.is_some();
 
     // Lay out the new task's stack exactly as an interrupt would have left it.
     //
@@ -170,6 +206,18 @@ pub fn spawn(name: &'static str, entry: extern "C" fn()) -> Option<usize> {
     unsafe {
         (entry_rsp as *mut u64).write(task_exit as *const () as u64);
     }
+
+    // A user task resumes onto its *user* stack and its own selectors; this
+    // kernel stack is only where its trap frames land. A kernel task resumes
+    // onto the stack the frame itself sits on.
+    let (rsp, cs, ss) = match image {
+        Some(image) => (
+            image.stack_top,
+            gdt::USER_CODE as u64,
+            gdt::USER_DATA as u64,
+        ),
+        None => (entry_rsp, gdt::KERNEL_CODE as u64, gdt::KERNEL_DATA as u64),
+    };
 
     let frame_addr = entry_rsp - size_of::<TrapFrame>() as u64;
 
@@ -195,13 +243,15 @@ pub fn spawn(name: &'static str, entry: extern "C" fn()) -> Option<usize> {
             // Never inspected on the way out; the stub just drops these two.
             vector: 0,
             error_code: 0,
-            rip: entry as *const () as u64,
-            cs: gdt::KERNEL_CODE as u64,
+            rip: entry_rip,
+            cs,
             // Bit 9 (IF) set so the task is preemptible from its first
-            // instruction, bit 1 is reserved and must be 1.
+            // instruction, bit 1 is reserved and must be 1. Note what is *not*
+            // here: IOPL stays 0, so a ring 3 task executing `in` or `out`
+            // takes a #GP rather than talking to a device directly.
             rflags: 0x202,
-            rsp: entry_rsp,
-            ss: gdt::KERNEL_DATA as u64,
+            rsp,
+            ss,
         });
     }
 
@@ -224,6 +274,8 @@ pub fn spawn(name: &'static str, entry: extern "C" fn()) -> Option<usize> {
             reply_slot: None,
             awaiting_reply: None,
             call_seq: 0,
+            kernel_stack_top: stack.top,
+            user,
         });
         Some(id)
     })?;
@@ -233,14 +285,24 @@ pub fn spawn(name: &'static str, entry: extern "C" fn()) -> Option<usize> {
     // this the only place in the kernel with that lock order -- the kind of
     // asymmetry that is fine until the console is served by a task and then is
     // a deadlock.
-    crate::println!(
-        "task {}     : {:<10} stack {:#x}..{:#x}, guard {:#x}",
-        id,
-        name,
-        stack.bottom,
-        stack.top,
-        stack.guard
-    );
+    match image {
+        Some(image) => crate::println!(
+            "task {}     : {:<10} ring 3, entry {:#x}, stack {:#x}, guard {:#x}",
+            id,
+            name,
+            image.entry,
+            image.stack_top,
+            image.stack_guard
+        ),
+        None => crate::println!(
+            "task {}     : {:<10} stack {:#x}..{:#x}, guard {:#x}",
+            id,
+            name,
+            stack.bottom,
+            stack.top,
+            stack.guard
+        ),
+    }
     Some(id)
 }
 
@@ -317,6 +379,17 @@ pub fn on_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
         scheduler.tasks[next].switches += 1;
     }
     scheduler.tasks[next].state = State::Running;
+
+    // Tell the CPU where to put a trap frame if this task traps in ring 3.
+    // Done on every switch, not once at spawn: the TSS holds one pointer and
+    // it has to name whichever task is about to run. Task 0 has no stack of
+    // its own, and needs none -- it never runs in ring 3, so nothing ever
+    // reads this for it.
+    let top = scheduler.tasks[next].kernel_stack_top;
+    if top != 0 {
+        gdt::set_kernel_stack(top);
+    }
+
     scheduler.tasks[next].saved_rsp as *mut TrapFrame
 }
 
@@ -338,6 +411,7 @@ pub fn snapshot(buffer: &mut [TaskInfo]) -> usize {
                 name: task.name,
                 state: task.state,
                 switches: task.switches,
+                user: task.user,
             };
         }
         count
@@ -351,6 +425,7 @@ impl Default for TaskInfo {
             name: "",
             state: State::Finished,
             switches: 0,
+            user: false,
         }
     }
 }

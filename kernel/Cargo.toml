@@ -24,3 +24,7 @@ wx-test = []
 # Overflow a task stack; must fault on the guard page rather than corrupt
 # whatever is mapped below.
 stack-test = []
+
+# Put a ring 3 task in front of a kernel address; the missing USER bit must
+# turn the read into a page fault.
+user-test = []

@@ -9,6 +9,15 @@ pub mod vectors {
     pub const IOAPIC_TIMER: u8 = 0x41;
     /// Voluntary reschedule, raised by software with `int`.
     pub const YIELD: u8 = 0x42;
+    /// The system call gate, and the only IDT entry reachable from ring 3.
+    ///
+    /// Deliberately an ordinary trap vector rather than `syscall`/`sysret`.
+    /// The stubs already normalise every entry into one `TrapFrame`, which is
+    /// also what a context switch saves and restores -- so a syscall that
+    /// blocks is just a frame the scheduler hands to someone else, with no
+    /// second entry path to keep in sync. Fast syscalls are an optimisation to
+    /// make later, against a mechanism that already works.
+    pub const SYSCALL: u8 = 0x80;
     /// Raised by the LAPIC when an interrupt is withdrawn before delivery.
     /// Must never be acknowledged.
     pub const SPURIOUS: u8 = 0xff;

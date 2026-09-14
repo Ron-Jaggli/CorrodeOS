@@ -39,7 +39,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 # VNC display number; :0 is TCP 5900, which is what ./corrode publishes.
 VNC_DISPLAY ?= 0
 
-.PHONY: all kernel iso run run-gui boot-test fault-test wx-test stack-test screenshot check fmt clippy clean-artifacts
+.PHONY: all kernel iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot check fmt clippy clean-artifacts
 
 all: iso
 
@@ -128,6 +128,10 @@ wx-test:
 # Prove stack guard pages: overflowing a task stack must trap.
 stack-test:
 	$(MAKE) FEATURES=stack-test boot-test
+
+# Prove the ring boundary: a ring 3 task reading kernel memory must trap.
+user-test:
+	$(MAKE) FEATURES=user-test boot-test
 
 # Only ever removes build output this Makefile created.
 clean-artifacts:

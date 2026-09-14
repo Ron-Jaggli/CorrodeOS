@@ -37,6 +37,7 @@ Then:
 ./corrode screenshot  # boot and dump the framebuffer to build/frame.png
 ./corrode fault-test  # boot into a deliberate page fault
 ./corrode wx-test     # boot and prove .text is not writable
+./corrode user-test   # boot and prove ring 3 cannot read kernel memory
 ./corrode check       # cargo check
 ./corrode shell       # drop into the build container
 ```
@@ -60,6 +61,8 @@ kernel/          the privileged kernel
   src/task/        tasks and the preemptive scheduler
   src/cap/         capabilities — objects, rights, capability spaces
   src/ipc.rs       synchronous IPC — endpoints, call/reply, reply capabilities
+  src/syscall.rs   the ring 3 boundary — capability slots in, no pointers
+  src/task/user.rs user address space — aliased code pages, user stacks
   build.rs         makes cargo notice linker.ld changes
   linker.ld        higher-half layout at -2GB, page-aligned sections
 render/          the rendering interface
@@ -138,7 +141,11 @@ Synchronous IPC over endpoints, with call/reply and one-shot reply
 capabilities. A console server holds the only writable console capability and
 answers clients that hold nothing but a send-only endpoint.
 
-Not yet: SMP, userspace.
+Userspace: tasks that run in ring 3, on their own user stacks, reaching the
+kernel only through one syscall gate that takes capability slots and no
+pointers. `./corrode user-test` proves a ring 3 task cannot read kernel memory.
+
+Not yet: SMP, per-task address spaces, user-side servers.
 
 ### W^X
 
@@ -316,6 +323,89 @@ neither exists yet. Note what it is not — the caller picked that server by
 holding a capability to its endpoint, so it is a service you trusted failing
 you, not something any task can do to any other.
 
+### Userspace
+
+A ring 3 task is not a different kind of object. It is a task whose initial
+trap frame names user selectors: `iretq` into a CS with RPL 3 is the privilege
+drop, and there is no other mechanism involved. It starts with an **empty
+capability space**, like every other task, which for a user task is the whole
+point — it cannot print, cannot send, and cannot name a single object until its
+parent hands something over.
+
+Three things have to line up, and each is easy to get quietly wrong:
+
+- every user page carries the USER bit, and the CPU ANDs that bit down the
+  entire walk — so `descend` propagates it to interior entries. Widening an
+  interior entry is safe in the other direction: a kernel leaf underneath still
+  has to carry USER itself, and does not;
+- the TSS `rsp0` is updated on **every context switch**, not once at spawn.
+  There is one TSS and one pointer in it, and it has to name whichever task is
+  about to run, or a trap from ring 3 lands on somebody else's stack;
+- IOPL stays 0 in the initial rflags, so a user task executing `in` or `out`
+  takes a #GP rather than talking to a device directly.
+
+The one IDT gate ring 3 may enter is the syscall vector, which is the only
+entry with DPL 3. A user task executing `int` on anything else takes a #GP
+instead of reaching a handler never meant for it. Hardware-delivered interrupts
+ignore DPL, so keeping every other gate at DPL 0 costs nothing.
+
+`./corrode user-test` puts a ring 3 task in front of a kernel address and
+requires the read to fault. It reports error code 0x5 — protection violation,
+user mode — with `cs 0x23`, `ss 0x1b` and CR2 holding the kernel address it
+reached for. Without that test the ring boundary is a claim about descriptor
+bits rather than an observed property.
+
+#### The syscall boundary takes no pointers
+
+A syscall that takes a user pointer must validate it: in range, mapped,
+user-accessible, and still all three when the kernel dereferences it. That
+check is a classic place to get owned, and nothing here needs it. An IPC message
+is a label and four words, so it crosses the boundary **by value, in registers**.
+The kernel never follows a pointer the caller supplied, because the caller
+cannot supply one.
+
+That is a forcing function rather than a permanent restriction. Bulk transfer,
+when it is needed, should be a shared Frame the receiver already holds a
+capability for — authority it was granted, not an address it asserted.
+
+The fourth argument goes in `r10` rather than `rcx`. Nothing requires that
+today, since entry is through an `int` gate that preserves rcx, but `syscall`
+clobbers rcx with the return address; using r10 now means fast syscalls later
+will not change the ABI under existing user code.
+
+Syscalls arrive through the ordinary trap path rather than `syscall`/`sysret`.
+The stubs already normalise every entry into one `TrapFrame`, which is also what
+a context switch saves and restores — so a syscall that blocks in IPC is just a
+frame handed to somebody else, with no second entry path to keep in sync. Fast
+syscalls are an optimisation to make against a mechanism that already works.
+
+#### Where user code comes from
+
+There is no loader and no filesystem, so a user program is a function in the
+kernel image whose frames are mapped a second time at a user address, read and
+execute, never writable. It follows that such a function must be entirely
+self-contained: a call to another kernel function, or a `&str` in `.rodata`,
+would be a reference to an address ring 3 cannot reach. The compiler has no way
+to be told that, which is why user programs here are naked assembly — not for
+speed, but because it is the only way to be certain the code touches nothing
+but its own page and its own stack.
+
+The demo task holds exactly one capability, a send-only endpoint. It is denied
+when it calls through an empty slot, and the only way it can report that denial
+is to say so through the capability it does hold. It then makes a real call and
+gets an answer back. The check that it was genuinely in ring 3 reads the CS the
+**CPU** wrote into the trap frame, which is the one claim the measured code
+could not have faked.
+
+Known gaps: there is still a single CR3. Kernel memory is unreachable from ring
+3 because kernel mappings lack the USER bit, so the ring boundary holds — but
+user tasks share the lower half with each other, so one could read another's
+stack. Per-task address spaces are what fixes that, and they want a capability
+for the address space itself rather than a flag on a task. There is also no
+receive syscall yet: a ring 3 task can be a client but not a server, because a
+server must also nominate slots for transferred and reply capabilities, and
+that is a wider boundary than anything is tested against today.
+
 ### The scheduler
 
 Preemptive round-robin over kernel threads. No userspace yet, so every task runs
@@ -373,17 +463,19 @@ Five run on every boot, so a regression shows up immediately rather than three
 subsystems later: an `int3` that must trap *and resume*, a frame alloc/free
 round-trip that must balance, a heap exercise that must both balance its bytes
 and collapse back to a single free block, a timer check that counts both tick
-sources against one second of polled wall time, and forty-seven capability and
-IPC checks covering narrowing, denial, type confusion, the GRANT rule, the
-rendezvous in both orderings, capability transfer, reply-capability expiry and
-call refusal.
+sources against one second of polled wall time, and fifty-five capability, IPC
+and ring 3 checks covering narrowing, denial, type confusion, the GRANT rule,
+the rendezvous in both orderings, capability transfer, reply-capability expiry,
+call refusal, and a user task being denied, answered, and confirmed to have
+been in ring 3.
 
 That last one earns its place. Deriving "elapsed seconds" from a tick counter
 and then using it to judge that same counter is circular, and hides exactly the
 case where a timer runs at the wrong rate — which is how a broken calibration
 went unnoticed until it was measured against something independent.
 
-Three more are opt-in because they end the boot: `./corrode fault-test` takes a
+Four more are opt-in because they end the boot: `./corrode fault-test` takes a
 deliberate page fault to exercise trap reporting, `./corrode wx-test` is
-described above, and `./corrode stack-test` overflows a task stack to prove the
-guard pages work.
+described above, `./corrode stack-test` overflows a task stack to prove the
+guard pages work, and `./corrode user-test` has a ring 3 task read a kernel
+address to prove it cannot.

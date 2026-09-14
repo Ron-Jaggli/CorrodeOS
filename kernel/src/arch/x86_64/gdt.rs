@@ -16,6 +16,11 @@ use core::ptr::addr_of;
 
 pub const KERNEL_CODE: u16 = 0x08;
 pub const KERNEL_DATA: u16 = 0x10;
+/// Ring 3 selectors. The low two bits are the requested privilege level, and
+/// they are part of the selector a user task actually runs with: `iretq` into a
+/// CS whose RPL is 3 is what drops the CPU to ring 3 in the first place.
+pub const USER_DATA: u16 = 0x18 | 3;
+pub const USER_CODE: u16 = 0x20 | 3;
 pub const TSS_SELECTOR: u16 = 0x28;
 
 /// IST slot used by the double-fault handler. 1-based, as the CPU numbers them.
@@ -38,7 +43,8 @@ static mut DF_STACK: [u8; DF_STACK_SIZE] = [0; DF_STACK_SIZE];
 struct Tss {
     reserved0: u32,
     /// Stack pointers for privilege levels 0-2. rsp[0] is what the CPU switches
-    /// to on a ring 3 -> ring 0 transition; unused until there's userspace.
+    /// to on a ring 3 -> ring 0 transition, kept current by the scheduler via
+    /// [`set_kernel_stack`].
     rsp: [u64; 3],
     reserved1: u64,
     /// Interrupt Stack Table. Entry n-1 here is what IST value n selects.
@@ -88,6 +94,27 @@ fn tss_descriptor(base: u64) -> (u64, u64) {
     let high = (base >> 32) & 0xffff_ffff;
 
     (low, high)
+}
+
+/// Point the TSS at the kernel stack to use for the next ring 3 -> ring 0 trap.
+///
+/// The scheduler calls this with the incoming task's own kernel stack, so a
+/// trap from ring 3 lands on a stack belonging to the task that took it rather
+/// than on whichever one happened to be there. It is only ever consulted on a
+/// privilege change, and a task in ring 3 has by definition unwound its kernel
+/// stack, so the top is always the right value.
+pub fn set_kernel_stack(top: u64) {
+    // SAFETY: the TSS is a single static the CPU reads on privilege changes.
+    // This is the only writer of rsp[0], and it runs with interrupts disabled
+    // inside the scheduler, so no trap can observe a half-written pointer --
+    // and a u64 store is single-instruction regardless.
+    unsafe {
+        // Via a raw pointer rather than a reference: `&mut TSS` on a mutable
+        // static is exactly the aliasing claim we cannot make, since the CPU
+        // reads this structure behind our back on every privilege change.
+        let tss = &raw mut TSS;
+        (*tss).rsp[0] = top;
+    }
 }
 
 /// Install the GDT, load the TSS, and reload every segment register.

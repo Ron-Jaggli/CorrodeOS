@@ -71,6 +71,14 @@ impl Rights {
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
+
+    /// The raw bits, for reporting across the syscall boundary.
+    ///
+    /// Read-only on purpose: there is no constructor from bits, so this cannot
+    /// become a way to build a rights set that was never derived from one.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
 }
 
 impl core::fmt::Debug for Rights {
@@ -132,13 +140,17 @@ impl core::fmt::Debug for Object {
     }
 }
 
+/// Discriminants are explicit and stable: a ring 3 task reads these out of
+/// `SYS_IDENTIFY`, so reordering the variants would silently change what a
+/// compiled user program sees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum ObjectKind {
-    Console,
-    Frame,
-    Task,
-    Endpoint,
-    Reply,
+    Console = 1,
+    Frame = 2,
+    Task = 3,
+    Endpoint = 4,
+    Reply = 5,
 }
 
 impl Object {
@@ -203,6 +215,27 @@ pub enum CapError {
     /// never parked on an answer that could not come, and the receiver never
     /// silently swallows a question it cannot reply to.
     Refused,
+}
+
+impl CapError {
+    /// Stable number for this error on the far side of a syscall.
+    ///
+    /// Written out rather than derived from the enum's discriminant: a user
+    /// program compiled against these numbers must not be broken by someone
+    /// reordering the variants, and zero is reserved for success so a status
+    /// register reads the obvious way.
+    pub const fn code(self) -> u64 {
+        match self {
+            CapError::Empty => 1,
+            CapError::OutOfRange => 2,
+            CapError::Occupied => 3,
+            CapError::InsufficientRights => 4,
+            CapError::WrongType => 5,
+            CapError::NoSuchTask => 6,
+            CapError::Stale => 7,
+            CapError::Refused => 8,
+        }
+    }
 }
 
 /// A task's capability space: a flat table of slots.
