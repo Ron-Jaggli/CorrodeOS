@@ -1,0 +1,26 @@
+[package]
+name = "corrode-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "corrode"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+corrode-render = { path = "../render" }
+
+[features]
+# Deliberately take a page fault at the end of boot to exercise the trap
+# reporting path. Ends the boot, so it is never on by default.
+fault-test = []
+
+# Write to .text after paging is up; must page-fault if W^X actually holds.
+wx-test = []
+
+# Overflow a task stack; must fault on the guard page rather than corrupt
+# whatever is mapped below.
+stack-test = []

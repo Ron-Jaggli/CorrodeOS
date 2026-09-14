@@ -1,0 +1,8 @@
+# Pinned to the exact toolchain baked into the corrode-dev image.
+#
+# Deliberately NOT "stable": a floating channel makes rustup hit the network on
+# every build, and the build container runs with --network=none. Bump this and
+# the Dockerfile's base image together.
+[toolchain]
+channel = "1.98.1"
+targets = ["x86_64-unknown-none"]

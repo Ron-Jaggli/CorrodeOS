@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+#
+# The only thing you run on the host. Everything it does happens inside a
+# container whose sole mount is this project directory.
+#
+#   ./corrode iso          build the bootable ISO
+#   ./corrode run          build and boot it in QEMU (Ctrl-A X to quit)
+#   ./corrode boot-test    boot headless, capture serial to build/serial.log
+#   ./corrode check        cargo check
+#   ./corrode shell        drop into the build container
+#
+# Env knobs:
+#   ENGINE=docker   use docker instead of podman
+#   NO_KVM=1        force TCG; don't hand /dev/kvm to the container
+#   NET=1           allow the container network access (normally none)
+
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENGINE="${ENGINE:-podman}"
+IMAGE="${IMAGE:-corrode-dev}"
+
+if ! command -v "$ENGINE" >/dev/null 2>&1; then
+    echo "corrode: '$ENGINE' not found on PATH" >&2
+    exit 1
+fi
+
+args=(--rm -i)
+[ -t 0 ] && args+=(-t)
+
+# The project tree, read-write, and nothing else from the host filesystem.
+args+=(-v "$PROJECT_DIR:/src:Z" -w /src)
+
+# Keep file ownership sane on rootless podman so build output isn't root-owned.
+if [ "$(basename "$ENGINE")" = "podman" ]; then
+    args+=(--userns=keep-id)
+fi
+
+CMD="${1:-}"
+VNC_PORT="${VNC_PORT:-5900}"
+
+# No dependencies come from crates.io, so the build genuinely needs no network.
+#
+# run-gui is the exception: publishing a port requires the container to have a
+# network namespace at all. It's clamped to host loopback, so the VNC socket is
+# reachable from this machine and nowhere else. Corrode itself still gets
+# -net none inside QEMU -- the guest has no network either way.
+if [ "$CMD" = "run-gui" ]; then
+    args+=(-p "127.0.0.1:${VNC_PORT}:5900")
+    echo "corrode: VNC published on 127.0.0.1:${VNC_PORT} (loopback only)" >&2
+elif [ "${NET:-0}" = "1" ]; then
+    echo "corrode: container networking ENABLED" >&2
+else
+    args+=(--network=none)
+fi
+
+# CPU virtualisation only. This is the one host device the container ever sees,
+# and it is not passthrough of any real peripheral.
+if [ -e /dev/kvm ] && [ "${NO_KVM:-0}" != "1" ]; then
+    args+=(--device /dev/kvm)
+fi
+
+# Hardening: no new privileges, drop every capability we don't need.
+args+=(--security-opt no-new-privileges --cap-drop=ALL)
+
+if [ "${1:-}" = "shell" ]; then
+    exec "$ENGINE" run "${args[@]}" "$IMAGE" bash
+fi
+
+exec "$ENGINE" run "${args[@]}" "$IMAGE" make "$@"

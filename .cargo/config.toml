@@ -1,0 +1,12 @@
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = [
+    # Higher-half kernel at -2GB: static relocs, kernel code model.
+    "-C", "relocation-model=static",
+    "-C", "code-model=kernel",
+    # rust-lld is invoked directly here, not via a cc driver, so only real lld
+    # flags work -- no -nostartfiles/-static.
+    "-C", "link-arg=-Tkernel/linker.ld",
+]
