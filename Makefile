@@ -6,6 +6,9 @@ LIMINE_DIR ?= /opt/limine
 ISO        := build/corrode.iso
 ISO_ROOT   := build/iso_root
 MEM        ?= 512M
+# Cores handed to the guest. More than one is the point of the SMP code; set
+# CPUS=1 to check the kernel still comes up on a uniprocessor.
+CPUS       ?= 4
 BOOT_TIMEOUT ?= 30
 
 ifeq ($(PROFILE),release)
@@ -27,7 +30,7 @@ endif
 # QEMU sees no host disk, no host network and no passthrough hardware.
 ACCEL := $(shell [ -w /dev/kvm ] && echo "-enable-kvm -cpu host" || echo "-cpu qemu64")
 
-QEMU_BASE := -M q35 -m $(MEM) \
+QEMU_BASE := -M q35 -m $(MEM) -smp $(CPUS) \
              -cdrom $(ISO) -boot d \
              -net none \
              -no-reboot -no-shutdown \

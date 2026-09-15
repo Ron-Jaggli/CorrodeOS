@@ -13,6 +13,7 @@
 #   ENGINE=docker   use docker instead of podman
 #   NO_KVM=1        force TCG; don't hand /dev/kvm to the container
 #   NET=1           allow the container network access (normally none)
+#   CPUS=n          cores to give the guest (default 4); CPUS=1 for uniprocessor
 
 set -euo pipefail
 
@@ -38,6 +39,14 @@ fi
 
 CMD="${1:-}"
 VNC_PORT="${VNC_PORT:-5900}"
+
+# Build knobs the Makefile reads. Forwarded explicitly rather than by exporting
+# the whole environment, so what reaches the build is a short list you can see.
+for knob in CPUS MEM PROFILE FEATURES BOOT_TIMEOUT; do
+    if [ -n "${!knob:-}" ]; then
+        args+=(-e "$knob=${!knob}")
+    fi
+done
 
 # No dependencies come from crates.io, so the build genuinely needs no network.
 #

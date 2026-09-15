@@ -5,7 +5,7 @@
 //! boot, paging and interrupt work.
 
 use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::arch::x86_64;
 use crate::arch::x86_64::port::{inb, outb};
@@ -71,18 +71,28 @@ impl Write for SerialPort {
     }
 }
 
-/// Dead-simple spinlock. There is exactly one CPU running at this stage, but
-/// the console is the one thing guaranteed to be touched from a panic path, so
-/// it gets a lock from day one rather than a retrofit later.
+/// Dead-simple spinlock, which records *which CPU* holds it.
 ///
 /// It is always taken with interrupts disabled -- see [`_print`] for why that
 /// is load-bearing rather than tidiness.
+///
+/// The owner is not bookkeeping. The panic and trap paths have to break this
+/// lock, because the CPU taking the fault may be the one holding it, and
+/// waiting for itself is a silent hang exactly when a message matters most.
+/// Breaking it is only sound if the holder really is us: on more than one CPU,
+/// stealing a lock another core is still using produces two writers on one UART
+/// and output interleaved character by character.
 struct SpinLock {
     locked: AtomicBool,
+    owner: AtomicUsize,
 }
+
+/// No CPU holds the console.
+const NO_OWNER: usize = usize::MAX;
 
 static LOCK: SpinLock = SpinLock {
     locked: AtomicBool::new(false),
+    owner: AtomicUsize::new(NO_OWNER),
 };
 
 static mut PORT: Option<SerialPort> = None;
@@ -120,6 +130,7 @@ pub fn _print(args: fmt::Arguments) {
         {
             core::hint::spin_loop();
         }
+        LOCK.owner.store(x86_64::cpu::index(), Ordering::Relaxed);
 
         // SAFETY: the spinlock above grants exclusive access to `PORT` for the
         // duration of this block, so the `&mut` is unique.
@@ -130,18 +141,27 @@ pub fn _print(args: fmt::Arguments) {
             }
         }
 
+        LOCK.owner.store(NO_OWNER, Ordering::Relaxed);
         LOCK.locked.store(false, Ordering::Release);
     });
 }
 
-/// Force-release the console lock. Only for the panic path, where the panicking
-/// CPU may itself be the lock holder and we would otherwise deadlock printing
-/// the panic message.
+/// Break the console lock, but only if this CPU is the one holding it.
+///
+/// For the panic and trap paths, where the faulting CPU may itself be the
+/// holder and would otherwise wait for itself forever. The owner check is what
+/// makes that safe with other CPUs running: a lock held by a different core is
+/// left alone and simply waited for, because that core is still writing through
+/// it and will release it shortly.
 ///
 /// # Safety
-/// Caller must be on a path that never returns to normal execution.
+/// Caller must be on a path that never returns to normal execution, so the
+/// interrupted print is never resumed.
 pub unsafe fn force_unlock() {
-    LOCK.locked.store(false, Ordering::Release);
+    if LOCK.owner.load(Ordering::Relaxed) == x86_64::cpu::index() {
+        LOCK.owner.store(NO_OWNER, Ordering::Relaxed);
+        LOCK.locked.store(false, Ordering::Release);
+    }
 }
 
 #[macro_export]

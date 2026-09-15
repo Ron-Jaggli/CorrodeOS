@@ -18,6 +18,7 @@ mod ipc;
 mod limine;
 mod mm;
 mod serial;
+mod smp;
 mod sync;
 mod syscall;
 mod task;
@@ -111,29 +112,37 @@ pub extern "C" fn kmain() -> ! {
 
     timer_check();
 
-    // Scheduler last: it adopts the current context as task 0, and from the
+    // Scheduler next: it adopts the current context as task 0, and from the
     // next timer tick onwards this function is running under preemption.
     task::init();
+
+    // Other CPUs last of all, because an AP's first act is to become a task,
+    // which needs the scheduler to exist. From here on "this CPU" is a real
+    // question and the answer is `cpu::index()`.
+    let (online, reported) = smp::start_aps();
+    println!(
+        "smp        : {} of {} cpu(s) online, {} Hz tick on each",
+        online, reported, TICK_HZ
+    );
+    smp_check(online);
 
     // Seed the capability system, then check its invariants while execution is
     // still single-threaded and the output is deterministic.
     cap_bootstrap();
     cap_checks();
 
-    // Spawn and grant without preemption in between. A spawned task is Ready
-    // immediately, and one scheduled before it has been given its capabilities
-    // would correctly -- but confusingly -- report that it holds nothing.
-    x86_64::without_interrupts(|| {
-        let scribe = task::spawn("scribe", scribe_task);
-        let mute = task::spawn("mute", mute_task);
-        cap_grants(scribe, mute);
-    });
+    // Spawn, grant, then start. Masking interrupts would not do here: a task
+    // created on this CPU can be picked up by another one, and disabling
+    // interrupts binds only the core that does it. `start` is the ordering.
+    let scribe = task::spawn("scribe", scribe_task);
+    let mute = task::spawn("mute", mute_task);
+    cap_grants(scribe, mute);
+    start_all(&[scribe, mute]);
 
-    x86_64::without_interrupts(|| {
-        let server = task::spawn("console-srv", console_server);
-        let client = task::spawn("ipc-client", ipc_client);
-        ipc_grants(server, client);
-    });
+    let server = task::spawn("console-srv", console_server);
+    let client = task::spawn("ipc-client", ipc_client);
+    ipc_grants(server, client);
+    start_all(&[server, client]);
 
     // Blocks until the server picks it up, which is the rendezvous working.
     cap_check(
@@ -146,15 +155,13 @@ pub extern "C" fn kmain() -> ! {
         .is_ok(),
     );
 
-    // Ring 3. Spawn and grant without preemption in between, as above.
+    // Ring 3. Spawn, grant, start, as above.
     #[cfg(not(feature = "user-test"))]
     {
-        let user = x86_64::without_interrupts(|| {
-            let user = task::spawn_user("user", user_program);
-            user_grants(user);
-            user
-        });
+        let user = task::spawn_user("user", user_program);
+        user_grants(user);
         cap_check("spawned a ring 3 task", user.is_some());
+        start_all(&[user]);
         serve_user();
         let service = call_user_service();
         check_address_spaces(user, service);
@@ -163,11 +170,17 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(feature = "user-test")]
     user_fault_test();
 
-    task::spawn("worker", worker_a);
-    task::spawn("yielder", worker_b);
+    start_all(&[
+        task::spawn("worker", worker_a),
+        task::spawn("yielder", worker_b),
+    ]);
     #[cfg(feature = "stack-test")]
-    task::spawn("stack-bomb", stack_bomb);
-    println!("sched      : preemptive round-robin at {} Hz", TICK_HZ);
+    start_all(&[task::spawn("stack-bomb", stack_bomb)]);
+    println!(
+        "sched      : preemptive round-robin at {} Hz across {} cpu(s)",
+        TICK_HZ,
+        smp::online()
+    );
 
     #[cfg(feature = "fault-test")]
     fault_test();
@@ -692,6 +705,14 @@ const LABEL_DONATE: u64 = 2;
 const LABEL_COUNT: u64 = 3;
 /// The server's answer to [`LABEL_COUNT`].
 const LABEL_RESULT: u64 = 4;
+
+/// Let a batch of freshly spawned tasks run, now that they have been granted
+/// whatever they were going to be granted.
+fn start_all(tasks: &[Option<usize>]) {
+    for id in tasks.iter().flatten() {
+        task::start(*id);
+    }
+}
 
 /// Report one capability invariant.
 fn cap_check(name: &str, ok: bool) {
@@ -1346,21 +1367,19 @@ extern "C" fn user_service() {
 /// having no way to do it except by holding a capability to that task's
 /// endpoint.
 fn call_user_service() -> Option<usize> {
-    let service = x86_64::without_interrupts(|| {
-        let service = task::spawn_user("user-srv", user_service);
-        if let Some(id) = service {
-            cap_check(
-                "grant the ring 3 service a receive-only endpoint capability",
-                cap::grant(
-                    id,
-                    SERVICE_ENDPOINT,
-                    SERVICE_TASK_ENDPOINT,
-                    cap::Rights::READ,
-                ) == Ok(cap::Rights::READ),
-            );
-        }
-        service
-    });
+    let service = task::spawn_user("user-srv", user_service);
+    if let Some(id) = service {
+        cap_check(
+            "grant the ring 3 service a receive-only endpoint capability",
+            cap::grant(
+                id,
+                SERVICE_ENDPOINT,
+                SERVICE_TASK_ENDPOINT,
+                cap::Rights::READ,
+            ) == Ok(cap::Rights::READ),
+        );
+    }
+    start_all(&[service]);
 
     if service.is_none() {
         cap_check("spawned a ring 3 service", false);
@@ -1666,10 +1685,11 @@ fn report_tasks() {
         .filter(|i| i.state != task::State::Finished)
     {
         print!(
-            " {}:{}{} {:?} {}sw |",
+            " {}:{}{}@{} {:?} {}sw |",
             info.id,
             info.name,
             if info.user { "(r3)" } else { "" },
+            info.cpu,
             info.state,
             info.switches
         );
@@ -1679,6 +1699,45 @@ fn report_tasks() {
         "work       : worker={} yielder={}",
         WORK[0].load(Ordering::Relaxed),
         WORK[1].load(Ordering::Relaxed)
+    );
+}
+
+/// Check every CPU that came online is actually taking its own timer
+/// interrupts.
+///
+/// Measured against PIT channel 2, polled, exactly as [`timer_check`] is and
+/// for the same reason: judging the CPUs' timers by a counter those timers
+/// drive is circular, and hides the case that matters -- a core that reported
+/// itself online and then went quiet. A CPU whose LAPIC timer never starts
+/// looks perfectly healthy from the bootstrap processor, right up until a task
+/// pinned to it never runs again.
+fn smp_check(online: usize) {
+    let mut before = [0u64; arch::x86_64::cpu::MAX_CPUS];
+    for (cpu, slot) in before.iter_mut().enumerate().take(online) {
+        *slot = lapic::ticks_on(cpu);
+    }
+
+    const WINDOW_US: u32 = 200_000;
+    pit::delay_us(WINDOW_US);
+    let expected = (TICK_HZ as u64 * WINDOW_US as u64) / 1_000_000;
+
+    // Half the expected rate is the bar. The bootstrap processor is
+    // preemptible by now, so the polled window can stretch, and the question
+    // being asked is "is this core ticking at all", not "to what accuracy".
+    let mut all_ticking = true;
+    print!("smp check  : {WINDOW_US}us wall ->");
+    for (cpu, was) in before.iter().enumerate().take(online) {
+        let delta = lapic::ticks_on(cpu) - was;
+        print!(" cpu{cpu}={delta}");
+        if delta < expected / 2 {
+            all_ticking = false;
+        }
+    }
+    println!(" (expect ~{expected} each)");
+
+    cap_check(
+        "every online cpu is taking its own timer ticks",
+        all_ticking,
     );
 }
 
@@ -1879,11 +1938,21 @@ fn idle_loop() -> ! {
 /// that the LAPIC and the I/O APIC are each delivering.
 fn report_timers(seconds: u64) {
     println!(
-        "timer      : {}s -- lapic {} ticks, pit via ioapic {} ticks",
+        "timer      : {}s -- lapic {} ticks, pit via ioapic {} ticks, {} across all cpus",
         seconds,
         lapic::ticks(),
-        pit::ticks()
+        pit::ticks(),
+        lapic::ticks_total()
     );
+
+    // Per CPU as well as in total. A single number cannot distinguish four
+    // cores ticking correctly from one core ticking four times as fast, and
+    // "the other CPUs are alive" is exactly what needs proving here.
+    print!("cpu ticks  :");
+    for cpu in 0..smp::online() {
+        print!(" cpu{}={}", cpu, lapic::ticks_on(cpu));
+    }
+    println!();
 }
 
 /// Deliberately take a page fault, to check the handler reports something
@@ -1908,9 +1977,7 @@ fn fault_test() {
 fn user_fault_test() {
     println!();
     println!("user test  : ring 3 task reading a kernel address (should fault)");
-    x86_64::without_interrupts(|| {
-        task::spawn_user("user-bomb", user_fault_program);
-    });
+    start_all(&[task::spawn_user("user-bomb", user_fault_program)]);
 }
 
 /// Try to write to `.text`. With W^X in force this must page-fault; if it
@@ -1930,9 +1997,12 @@ fn wx_test() {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // SAFETY: we never return from this function, so stealing the console lock
-    // cannot corrupt a print that will later resume. Without this a panic while
-    // holding the lock would deadlock and we would lose the message.
+    // Stop the other CPUs first, for the same reasons as an unhandled trap.
+    lapic::broadcast(vectors::HALT);
+
+    // SAFETY: we never return from this function, so breaking the console lock
+    // cannot corrupt a print that will later resume. It is only broken if this
+    // CPU holds it; one held elsewhere is waited for.
     unsafe { serial::force_unlock() };
 
     println!();

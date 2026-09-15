@@ -13,6 +13,7 @@
 
 use core::cell::UnsafeCell;
 use core::ffi::c_char;
+use core::sync::atomic::AtomicU64;
 
 const MAGIC0: u64 = 0xc7b1_dd30_df4c_8b88;
 const MAGIC1: u64 = 0x0a82_e883_a194_f07b;
@@ -314,4 +315,68 @@ pub static RSDP: RsdpRequest = RsdpRequest {
     id: [MAGIC0, MAGIC1, 0xc5e7_7b6b_397e_7b43, 0x2763_7845_accd_cf3c],
     revision: 0,
     response: ResponsePtr::null(),
+};
+
+// ---------------------------------------------------------------------------
+// Symmetric multiprocessing
+// ---------------------------------------------------------------------------
+
+/// One application processor, as the bootloader describes it.
+///
+/// `goto_address` is the whole protocol. The bootloader has already brought
+/// this CPU out of reset, through real mode and into 64-bit long mode, and
+/// parked it spinning on this field; writing a function pointer there is what
+/// sets it running. That is worth not reimplementing -- the alternative is an
+/// INIT-SIPI-SIPI sequence and a hand-written real-mode trampoline copied below
+/// 1 MiB, which is a large amount of fragile code to own for no gain.
+#[repr(C)]
+pub struct SmpInfo {
+    pub processor_id: u32,
+    pub lapic_id: u32,
+    reserved: u64,
+    /// Written to start this AP. The bootloader polls it.
+    pub goto_address: AtomicU64,
+    /// Passed to the entry function in its first argument.
+    pub extra_argument: AtomicU64,
+}
+
+#[repr(C)]
+pub struct SmpResponse {
+    pub revision: u64,
+    pub flags: u32,
+    /// LAPIC ID of the processor this kernel booted on.
+    pub bsp_lapic_id: u32,
+    pub cpu_count: u64,
+    cpus: *mut *mut SmpInfo,
+}
+
+impl SmpResponse {
+    /// Every CPU the firmware reported, including the one we are running on.
+    pub fn cpus(&self) -> impl Iterator<Item = &'static SmpInfo> + '_ {
+        (0..self.cpu_count).filter_map(move |i| {
+            if self.cpus.is_null() {
+                return None;
+            }
+            // SAFETY: `i < cpu_count`, and the bootloader guarantees `cpus`
+            // points at that many valid `SmpInfo` pointers.
+            Some(unsafe { &**self.cpus.add(i as usize) })
+        })
+    }
+}
+
+#[repr(C)]
+pub struct SmpRequest {
+    id: [u64; 4],
+    revision: u64,
+    pub response: ResponsePtr<SmpResponse>,
+    pub flags: u64,
+}
+
+#[used]
+#[link_section = ".requests"]
+pub static SMP: SmpRequest = SmpRequest {
+    id: [MAGIC0, MAGIC1, 0x95a6_7b81_9a1b_857e, 0xa0b6_1b72_3b6a_73e0],
+    revision: 0,
+    response: ResponsePtr::null(),
+    flags: 0,
 };

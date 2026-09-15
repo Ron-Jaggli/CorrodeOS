@@ -9,6 +9,8 @@ pub mod vectors {
     pub const IOAPIC_TIMER: u8 = 0x41;
     /// Voluntary reschedule, raised by software with `int`.
     pub const YIELD: u8 = 0x42;
+    /// Sent to every other CPU when this one has decided the machine is over.
+    pub const HALT: u8 = 0x43;
     /// The system call gate, and the only IDT entry reachable from ring 3.
     ///
     /// Deliberately an ordinary trap vector rather than `syscall`/`sysret`.
@@ -23,6 +25,7 @@ pub mod vectors {
     pub const SPURIOUS: u8 = 0xff;
 }
 
+pub mod cpu;
 pub mod gdt;
 pub mod idt;
 pub mod ioapic;

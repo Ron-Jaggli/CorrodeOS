@@ -42,7 +42,8 @@ Then:
 ./corrode shell       # drop into the build container
 ```
 
-Env knobs: `ENGINE=docker`, `NO_KVM=1` to force TCG, `NET=1` to give the
+Env knobs: `CPUS=n` for guest cores (default 4; `CPUS=1` for uniprocessor),
+`ENGINE=docker`, `NO_KVM=1` to force TCG, `NET=1` to give the
 container network access (off by default — there are no crates.io dependencies,
 so the build genuinely doesn't need it).
 
@@ -63,6 +64,8 @@ kernel/          the privileged kernel
   src/ipc.rs       synchronous IPC — endpoints, call/reply, reply capabilities
   src/syscall.rs   the ring 3 boundary — capability slots in, no pointers
   src/task/user.rs user address space — aliased code pages, user stacks
+  src/smp.rs       starting the other CPUs
+  src/arch/x86_64/cpu.rs  which CPU is this
   build.rs         makes cargo notice linker.ld changes
   linker.ld        higher-half layout at -2GB, page-aligned sections
 render/          the rendering interface
@@ -133,7 +136,7 @@ The MADT is parsed for the interrupt controllers; the local APIC timer drives a
 100 Hz tick and the I/O APIC routes device lines, with the 8259s masked off.
 
 A preemptive round-robin scheduler over kernel threads, each with its own
-guard-paged stack.
+guard-paged stack, running on every CPU the firmware reports.
 
 Capabilities: objects, rights, and a per-task capability space.
 
@@ -147,7 +150,7 @@ pointers. Ring 3 tasks can be clients *and* servers — the kernel calls into a
 userspace service and gets an answer back. `./corrode user-test` proves a ring 3
 task cannot read kernel memory.
 
-Not yet: SMP.
+Not yet: migrating a task between CPUs, reclaiming frames and stacks.
 
 ### W^X
 
@@ -498,6 +501,108 @@ is a kernel memory disclosure through a mapping we created on purpose, so every
 user stack frame is zeroed through the HHDM before it is mapped. It also means
 the null return address at the top of a fresh user stack is already there.
 
+### SMP
+
+Limine has already taken every application processor through reset, real mode
+and into 64-bit long mode, and parked each one spinning on a `goto_address`
+field. Writing a function pointer there starts it. That is worth not
+reimplementing: the alternative is INIT-SIPI-SIPI and a hand-written real-mode
+trampoline copied below 1 MiB, which is a lot of fragile code to own for no gain
+over what the bootloader already did.
+
+An AP arrives on the *bootloader's* page tables and stack. Several things that
+look global turn out to be per-CPU registers that have to be set again on every
+core, and missing one fails in a way that looks like anything but the cause:
+
+- `EFER.NXE`. Miss it and bit 63 of a page table entry goes back to being
+  reserved, so every NX page faults **on that core and nowhere else**.
+- `CR0.WP`. Miss it and W^X is decorative on that core alone.
+- `GDTR`, `IDTR`, `TR`, and the local APIC's enable bit, task priority and
+  spurious vector.
+
+Entry is a naked function because of an ordering constraint: the kernel stack we
+allocated for an AP lives in the kernel half of *our* address space, which the
+bootloader's tables do not have. CR3 has to be loaded before the stack can be
+switched, and between those two instructions there is no usable stack, so
+nothing may be pushed, called or spilled.
+
+Each CPU gets its own TSS — `rsp0` names the kernel stack for whatever is
+running *on that CPU* — and its own double-fault stack, because two cores can
+double-fault at once and sharing one IST stack turns two diagnosable faults into
+one unreadable mess. Every descriptor is built on the bootstrap processor before
+any AP starts, so no CPU is ever editing a GDT another is using.
+
+#### Tasks are pinned, and that is the whole safety argument
+
+The scheduler is per-CPU: each core has its own `current`, its own idle task,
+and picks only from tasks assigned to it. Tasks are assigned round-robin at
+spawn and never move.
+
+Pinning is not a simplification to be undone later for performance; it is what
+makes this safe. Between storing a task's `saved_rsp` and actually leaving its
+stack, a CPU is *still executing on that stack* — the call frame for the
+dispatch routine is sitting below the saved frame. A second CPU that picked the
+task up in that window would resume it onto a stack the first core is still
+using, and the two would write over each other. The window is small and the
+corruption is silent, which is the worst combination.
+
+Migration therefore needs a handshake for exactly that window: a per-task flag
+saying "a CPU is still on this stack", which any core wanting the task spins on
+before touching it. Pinning removes the window instead — one task, one CPU, so
+no two cores are ever near the same stack. The cost is no load balancing, and
+that is the honest trade recorded here rather than a gap nobody noticed.
+
+The same reasoning is why a task now starts in a `New` state and needs an
+explicit `start`. On one CPU it was enough to spawn a task with interrupts
+disabled and grant it capabilities before re-enabling them. With more than one
+CPU that guarantees nothing, because masking interrupts binds only the core
+doing it, and another core can pick the task up meanwhile. Making "may run" an
+explicit step is the only version that actually holds.
+
+#### Measuring it
+
+A total tick count cannot tell four cores ticking correctly from one core
+ticking four times as fast, so ticks are counted per CPU and checked against
+PIT channel 2, polled — the same independent reference `timer_check` uses, for
+the same reason. A core that reports itself online and then goes quiet looks
+perfectly healthy from the bootstrap processor, right up until a task pinned to
+it never runs again:
+
+```
+smp check  : 200000us wall -> cpu0=20 cpu1=20 cpu2=20 cpu3=20 (expect ~20 each)
+```
+
+For the same reason the wall clock is one core's tick count rather than the sum.
+Every CPU ticks at `TICK_HZ`, so a total advances N times too fast — a
+throughput measure wearing a clock's clothes.
+
+#### Two bugs SMP exposed
+
+Both were correct on one CPU and wrong the moment there were two, and neither
+would have been found by reasoning about the new code alone.
+
+**Breaking the console lock.** The trap and panic paths steal the console lock,
+because the faulting CPU may be the one holding it and waiting for itself is a
+silent hang exactly when a message matters most. That argument is *explicitly*
+uniprocessor — "we never return, so the interrupted print is never resumed" —
+and on more than one core it rips the lock out from under a core that is still
+writing. The result is two writers on one UART:
+
+```
+c*h*e*c kU N H:A NcDlLieEDnt T sReAnPd  r*e*n*d
+```
+
+The lock now records which CPU holds it, and is only broken by its owner; one
+held elsewhere is waited for instead.
+
+**A fatal trap stopped one core, not the machine.** `halt_forever` halts the CPU
+that calls it, so the others carried on running tasks and printing over the
+report. An unhandled trap and a panic now broadcast a halt IPI first, using the
+"all excluding self" destination shorthand so there is no CPU list to get wrong.
+The honest limit: a fixed IPI is not taken by a core that has interrupts
+disabled, so this stops cores running normally, not one wedged inside a critical
+section. Stopping those needs an NMI, which brings its own re-entrancy problems.
+
 ### The scheduler
 
 Preemptive round-robin over kernel threads. No userspace yet, so every task runs
@@ -555,14 +660,15 @@ Five run on every boot, so a regression shows up immediately rather than three
 subsystems later: an `int3` that must trap *and resume*, a frame alloc/free
 round-trip that must balance, a heap exercise that must both balance its bytes
 and collapse back to a single free block, a timer check that counts both tick
-sources against one second of polled wall time, and sixty-eight capability, IPC
-and ring 3 checks covering narrowing, denial, type confusion, the GRANT rule,
+sources against one second of polled wall time, and sixty-nine capability, IPC,
+ring 3 and SMP checks covering narrowing, denial, type confusion, the GRANT rule,
 the rendezvous in both orderings, capability transfer, reply-capability expiry,
 call refusal, a user task being denied, answered and confirmed to have been in
 ring 3, a ring 3 task narrowing and handing over a capability under the same
 rules the kernel follows, a ring 3 server answering a call from the kernel while
 unable to send on the endpoint it serves, and two user tasks proving by
-page-table walk that one address means different memory in each of them.
+page-table walk that one address means different memory in each of them, and
+every online CPU taking its own timer ticks.
 
 That last one earns its place. Deriving "elapsed seconds" from a tick counter
 and then using it to judge that same counter is circular, and hides exactly the

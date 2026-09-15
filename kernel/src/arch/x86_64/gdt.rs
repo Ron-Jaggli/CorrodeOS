@@ -12,7 +12,8 @@
 
 use core::arch::asm;
 use core::mem::size_of;
-use core::ptr::addr_of;
+
+use super::cpu::MAX_CPUS;
 
 pub const KERNEL_CODE: u16 = 0x08;
 pub const KERNEL_DATA: u16 = 0x10;
@@ -21,7 +22,15 @@ pub const KERNEL_DATA: u16 = 0x10;
 /// CS whose RPL is 3 is what drops the CPU to ring 3 in the first place.
 pub const USER_DATA: u16 = 0x18 | 3;
 pub const USER_CODE: u16 = 0x20 | 3;
-pub const TSS_SELECTOR: u16 = 0x28;
+
+/// Selector of the first TSS descriptor. Each CPU gets its own, two GDT slots
+/// apart, because a 64-bit TSS descriptor is 16 bytes.
+const TSS_BASE_SELECTOR: u16 = 0x28;
+
+/// Selector naming `cpu`'s TSS.
+pub const fn tss_selector(cpu: usize) -> u16 {
+    TSS_BASE_SELECTOR + (cpu as u16) * 16
+}
 
 /// IST slot used by the double-fault handler. 1-based, as the CPU numbers them.
 pub const IST_DOUBLE_FAULT: u8 = 1;
@@ -34,10 +43,12 @@ const KDATA: u64 = 0x00cf_9200_0000_ffff;
 const UDATA: u64 = 0x00cf_f200_0000_ffff;
 const UCODE: u64 = 0x00af_fa00_0000_ffff;
 
-/// Backing stack for double faults. Never touched unless things have already
-/// gone badly wrong.
+/// Backing stack for double faults, one per CPU. Never touched unless things
+/// have already gone badly wrong -- but two CPUs can go badly wrong at once,
+/// and sharing one stack between them turns two diagnosable faults into one
+/// unreadable mess.
 const DF_STACK_SIZE: usize = 16 * 1024;
-static mut DF_STACK: [u8; DF_STACK_SIZE] = [0; DF_STACK_SIZE];
+static mut DF_STACKS: [[u8; DF_STACK_SIZE]; MAX_CPUS] = [[0; DF_STACK_SIZE]; MAX_CPUS];
 
 #[repr(C, packed)]
 struct Tss {
@@ -54,7 +65,7 @@ struct Tss {
     iomap_base: u16,
 }
 
-static mut TSS: Tss = Tss {
+const EMPTY_TSS: Tss = Tss {
     reserved0: 0,
     rsp: [0; 3],
     reserved1: 0,
@@ -66,13 +77,30 @@ static mut TSS: Tss = Tss {
     iomap_base: size_of::<Tss>() as u16,
 };
 
-/// null, kcode, kdata, udata, ucode, then the TSS descriptor (which is 16 bytes,
-/// so it occupies two slots).
+/// One TSS per CPU. They cannot be shared: `rsp[0]` names the kernel stack for
+/// whatever is running *on that CPU*, and two CPUs run different things.
+static mut TSS: [Tss; MAX_CPUS] = [EMPTY_TSS; MAX_CPUS];
+
+/// GDT slots: null, kcode, kdata, udata, ucode, then two per CPU for that CPU's
+/// TSS descriptor.
+///
+/// The descriptors themselves are shared -- a code segment is a code segment on
+/// every CPU -- so there is one table, loaded by all of them. Only which TSS
+/// selector each CPU loads into its task register differs.
 ///
 /// NOTE: this ordering is chosen for clarity, not for SYSRET. When fast syscalls
 /// go in, SYSRET's fixed CS/SS arithmetic off STAR[63:48] will pin the user
 /// selectors to a specific order and this table will need revisiting.
-static mut GDT: [u64; 7] = [NULL, KCODE, KDATA, UDATA, UCODE, 0, 0];
+const GDT_LEN: usize = 5 + 2 * MAX_CPUS;
+static mut GDT: [u64; GDT_LEN] = {
+    let mut table = [0u64; GDT_LEN];
+    table[0] = NULL;
+    table[1] = KCODE;
+    table[2] = KDATA;
+    table[3] = UDATA;
+    table[4] = UCODE;
+    table
+};
 
 #[repr(C, packed)]
 struct DescriptorTablePointer {
@@ -103,45 +131,72 @@ fn tss_descriptor(base: u64) -> (u64, u64) {
 /// than on whichever one happened to be there. It is only ever consulted on a
 /// privilege change, and a task in ring 3 has by definition unwound its kernel
 /// stack, so the top is always the right value.
-pub fn set_kernel_stack(top: u64) {
-    // SAFETY: the TSS is a single static the CPU reads on privilege changes.
-    // This is the only writer of rsp[0], and it runs with interrupts disabled
-    // inside the scheduler, so no trap can observe a half-written pointer --
-    // and a u64 store is single-instruction regardless.
+pub fn set_kernel_stack(cpu: usize, top: u64) {
+    if cpu >= MAX_CPUS {
+        return;
+    }
+    // SAFETY: the TSS array is a static the CPU reads on privilege changes.
+    // Each CPU writes only its own entry, so there is no cross-CPU aliasing --
+    // which is why this needs no lock despite being reached from every CPU at
+    // once. Within a CPU it runs with interrupts disabled inside the scheduler,
+    // so no trap can observe a half-written pointer, and a u64 store is a
+    // single instruction regardless.
     unsafe {
         // Via a raw pointer rather than a reference: `&mut TSS` on a mutable
         // static is exactly the aliasing claim we cannot make, since the CPU
         // reads this structure behind our back on every privilege change.
         let tss = &raw mut TSS;
-        (*tss).rsp[0] = top;
+        (*tss)[cpu].rsp[0] = top;
     }
 }
 
-/// Install the GDT, load the TSS, and reload every segment register.
+/// Build the GDT, including a TSS descriptor for every CPU, and install it on
+/// the bootstrap processor.
 ///
-/// Call once, early, before `idt::init`.
+/// Call once, early, before `idt::init`. Every descriptor for every CPU is
+/// built here, while there is still only one CPU running: an AP coming up later
+/// then only has to *load* the table, never modify it, so no CPU is ever
+/// editing a GDT another CPU is using.
 pub fn init() {
     // SAFETY: single-threaded early boot, called exactly once. These statics are
     // not reachable from anywhere else at this point, so taking raw pointers to
     // them and writing through them is unaliased.
     unsafe {
-        let df_top = addr_of!(DF_STACK) as u64 + DF_STACK_SIZE as u64;
-        // Stacks grow down and the CPU requires 16-byte alignment on entry.
         let tss = &raw mut TSS;
-        (*tss).ist[(IST_DOUBLE_FAULT - 1) as usize] = df_top & !0xf;
-
-        let (low, high) = tss_descriptor(tss as u64);
+        let stacks = &raw mut DF_STACKS;
         let gdt = &raw mut GDT;
-        (*gdt)[5] = low;
-        (*gdt)[6] = high;
 
+        for cpu in 0..MAX_CPUS {
+            // Stacks grow down and the CPU requires 16-byte alignment on entry.
+            let df_top = (*stacks)[cpu].as_ptr() as u64 + DF_STACK_SIZE as u64;
+            (*tss)[cpu].ist[(IST_DOUBLE_FAULT - 1) as usize] = df_top & !0xf;
+
+            let (low, high) = tss_descriptor(&raw mut (*tss)[cpu] as u64);
+            (*gdt)[5 + cpu * 2] = low;
+            (*gdt)[6 + cpu * 2] = high;
+        }
+    }
+
+    load(0);
+}
+
+/// Install the GDT on this CPU and point its task register at its own TSS.
+///
+/// Called by the bootstrap processor through [`init`], and by each AP as it
+/// comes up.
+pub fn load(cpu: usize) {
+    // SAFETY: `init` filled every descriptor before any AP was started, so the
+    // table is complete and constant by the time this runs anywhere. Each CPU
+    // loads a different TSS selector, and `ltr` marks only that descriptor busy.
+    unsafe {
+        let gdt = &raw mut GDT;
         let gdtr = DescriptorTablePointer {
-            limit: (size_of::<[u64; 7]>() - 1) as u16,
+            limit: (size_of::<[u64; GDT_LEN]>() - 1) as u16,
             base: gdt as u64,
         };
 
         load_gdt(&gdtr);
-        load_tss(TSS_SELECTOR);
+        load_tss(tss_selector(cpu.min(MAX_CPUS - 1)));
     }
 }
 

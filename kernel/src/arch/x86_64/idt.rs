@@ -500,14 +500,26 @@ pub fn init() {
             };
             (*idt)[vector].set(*stub, ist, dpl);
         }
+    }
 
+    load();
+}
+
+/// Point this CPU at the IDT.
+///
+/// The table itself is shared -- every CPU wants the same handlers for the same
+/// vectors -- but `lidt` is a per-CPU register, so each one has to be told where
+/// it is. Called by the bootstrap processor through [`init`], and by each AP as
+/// it comes up.
+pub fn load() {
+    // SAFETY: `init` filled the table before any AP was started, so it is
+    // complete and constant by the time this runs anywhere. Every present entry
+    // points at a real stub with a valid code selector.
+    unsafe {
         let idtr = DescriptorTablePointer {
             limit: (size_of::<[IdtEntry; IDT_LEN]>() - 1) as u16,
             base: addr_of!(IDT) as u64,
         };
-
-        // SAFETY: `idtr` describes the table we just filled, and every present
-        // entry points at a real stub with a valid code selector.
         asm!("lidt [{}]", in(reg) &idtr, options(readonly, nostack, preserves_flags));
     }
 }
@@ -594,6 +606,13 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
             // some other task's. Same mechanism as a timer tick.
             return crate::syscall::dispatch(frame_ref);
         }
+        vectors::HALT => {
+            // Another CPU has hit something fatal and is about to report it.
+            // Stop so its output is the last word and nothing further runs on
+            // a machine whose state is already in question.
+            lapic::end_of_interrupt();
+            halt_forever();
+        }
         vectors::IOAPIC_TIMER => {
             pit::on_tick();
             lapic::end_of_interrupt();
@@ -630,9 +649,17 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
         .copied()
         .unwrap_or("interrupt");
 
-    // This path never returns, so the console lock can be stolen. Without
-    // this, faulting while kmain holds it would deadlock and we would lose the
-    // one message that explains what happened.
+    // Stop the other CPUs before saying anything. They are still running tasks
+    // on a machine whose state is now in question, and their output would
+    // interleave with the report line by line. This is also what makes
+    // breaking the console lock below meaningful rather than a race.
+    lapic::broadcast(vectors::HALT);
+
+    // This path never returns, so the console lock can be broken -- but only if
+    // this CPU is the one holding it. Without that, faulting while holding it
+    // would deadlock and we would lose the one message that explains what
+    // happened; with it, a lock held by another core is waited for instead of
+    // stolen.
     // SAFETY: `halt_forever` at the end of this function guarantees we never
     // resume the interrupted code, so no in-progress print can be corrupted.
     unsafe { crate::serial::force_unlock() };

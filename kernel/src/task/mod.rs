@@ -21,12 +21,21 @@ pub mod user;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
-use crate::arch::x86_64::{self, gdt, idt::TrapFrame, vectors};
+use crate::arch::x86_64::{self, cpu, cpu::MAX_CPUS, gdt, idt::TrapFrame, vectors};
 use crate::cap::CSpace;
 use crate::sync::SpinLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
+    /// Created, granted nothing yet, and not runnable. A task stays here until
+    /// its parent calls [`start`].
+    ///
+    /// This is not decoration. On one CPU it was enough to spawn a task with
+    /// interrupts disabled and grant it capabilities before re-enabling them;
+    /// with more than one CPU that guarantees nothing, because another core can
+    /// pick the task up while this one still has interrupts off. Making "may
+    /// run" an explicit step is the only version of this that is actually safe.
+    New,
     Ready,
     Running,
     /// Waiting on something -- today that means an IPC rendezvous. The
@@ -81,6 +90,18 @@ pub struct Task {
     pub kernel_stack_top: u64,
     /// True once this task has been placed in ring 3.
     pub user: bool,
+    /// The CPU this task runs on. Assigned once, at spawn, and never changed.
+    ///
+    /// Pinning is what makes this scheduler safe on more than one CPU, and the
+    /// reason is the kernel stack. Between storing a task's `saved_rsp` and
+    /// actually leaving its stack, a CPU is still executing on it -- so a second
+    /// CPU that picked the task up in that window would resume it onto a stack
+    /// the first is still using. Migration needs a handshake for exactly that
+    /// window. Pinning removes the window instead: one task, one CPU, so no two
+    /// CPUs are ever near the same stack.
+    pub cpu: usize,
+    /// Whether this is a CPU's idle task, which the rotation skips.
+    pub is_idle: bool,
     /// This task's address space, or `None` to run in the kernel's.
     ///
     /// Only user tasks have one. Kernel tasks share the kernel address space
@@ -100,26 +121,32 @@ pub struct TaskInfo {
     pub state: State,
     pub switches: u64,
     pub user: bool,
+    pub cpu: usize,
 }
 
 struct Scheduler {
     tasks: Vec<Task>,
-    current: usize,
+    /// What each CPU is running. Indexed by [`cpu::index`].
+    current: [usize; MAX_CPUS],
     /// Task run only when nothing else can be. Guarantees the scheduler always
     /// has something to return, even with every other task blocked -- without
     /// it, a fully blocked system would resume a blocked task.
     ///
-    /// `None` until the idle task exists. It must not be given a placeholder
-    /// id: the scheduler skips the idle task during normal selection, so a
-    /// wrong value here means a real task is permanently skipped.
-    idle: Option<usize>,
+    /// `None` until that CPU's idle task exists. It must not be given a
+    /// placeholder id: the scheduler skips idle tasks during normal selection,
+    /// so a wrong value here means a real task is permanently skipped.
+    ///
+    /// One per CPU, because two CPUs with nothing to do both need something to
+    /// run, and it cannot be the same task -- that would be two CPUs on one
+    /// stack, which is the thing this design exists to prevent.
+    idle: [Option<usize>; MAX_CPUS],
     /// PML4 currently installed in CR3, so a switch between two tasks that
     /// share an address space costs nothing.
     ///
     /// Writing CR3 flushes every non-global TLB entry, so doing it on a switch
     /// that changes nothing would throw away the kernel's translations several
     /// hundred times a second for no reason.
-    installed_root: u64,
+    installed_root: [u64; MAX_CPUS],
 }
 
 static SCHEDULER: SpinLock<Option<Scheduler>> = SpinLock::new(None);
@@ -139,6 +166,8 @@ pub fn init() {
             id: 0,
             name: "bootstrap",
             state: State::Running,
+            cpu: 0,
+            is_idle: false,
             saved_rsp: 0,
             switches: 1,
             cspace: CSpace::new(CSPACE_SLOTS),
@@ -154,22 +183,75 @@ pub fn init() {
             user: false,
             space: None,
         }];
+        let root = crate::mm::paging::kernel_root().unwrap_or(0);
         *guard = Some(Scheduler {
             tasks,
-            current: 0,
-            idle: None,
-            installed_root: crate::mm::paging::kernel_root().unwrap_or(0),
+            current: [0; MAX_CPUS],
+            idle: [None; MAX_CPUS],
+            installed_root: [root; MAX_CPUS],
         });
     });
 
     // Must come after the scheduler exists, since spawning needs it.
-    if let Some(id) = spawn("idle", idle_entry) {
-        x86_64::without_interrupts(|| {
-            if let Some(scheduler) = SCHEDULER.lock().as_mut() {
-                scheduler.idle = Some(id);
-            }
+    make_idle(0, idle_entry);
+}
+
+/// Give `cpu` an idle task of its own.
+fn make_idle(cpu_index: usize, entry: extern "C" fn()) {
+    let Some(id) = spawn_on("idle", entry, cpu_index) else {
+        return;
+    };
+    x86_64::without_interrupts(|| {
+        if let Some(scheduler) = SCHEDULER.lock().as_mut() {
+            scheduler.tasks[id].is_idle = true;
+            scheduler.tasks[id].state = State::Ready;
+            scheduler.idle[cpu_index] = Some(id);
+        }
+    });
+}
+
+/// Adopt the context an application processor is already running as that CPU's
+/// idle task.
+///
+/// An AP arrives running a halt loop on a stack we gave it, which is precisely
+/// what an idle task is -- so rather than spawn one and switch to it, the
+/// context becomes it. The alternative is a CPU with nothing to switch *away*
+/// from when its first tick lands.
+pub fn adopt_as_idle(cpu_index: usize, stack_top: u64) {
+    x86_64::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let Some(scheduler) = guard.as_mut() else {
+            return;
+        };
+
+        let id = scheduler.tasks.len();
+        scheduler.tasks.push(Task {
+            id,
+            name: "ap-idle",
+            state: State::Running,
+            cpu: cpu_index,
+            is_idle: true,
+            // Filled in by this CPU's first tick, exactly like task 0's.
+            saved_rsp: 0,
+            switches: 1,
+            cspace: CSpace::new(CSPACE_SLOTS),
+            pending_in: None,
+            pending_out: None,
+            recv_slot: None,
+            reply_slot: None,
+            awaiting_reply: None,
+            call_seq: 0,
+            kernel_stack_top: stack_top,
+            user: false,
+            space: None,
         });
-    }
+
+        scheduler.current[cpu_index] = id;
+        scheduler.idle[cpu_index] = Some(id);
+        scheduler.installed_root[cpu_index] = crate::mm::paging::kernel_root().unwrap_or(0);
+    });
+
+    gdt::set_kernel_stack(cpu_index, stack_top);
 }
 
 /// The idle task: park the CPU until something happens.
@@ -183,7 +265,45 @@ extern "C" fn idle_entry() {
 ///
 /// `entry` may return; it lands in [`task_exit`] if it does.
 pub fn spawn(name: &'static str, entry: extern "C" fn()) -> Option<usize> {
-    spawn_inner(name, entry as *const () as u64, None)
+    spawn_on(name, entry, next_cpu())
+}
+
+/// Spawn onto a named CPU.
+pub fn spawn_on(name: &'static str, entry: extern "C" fn(), cpu_index: usize) -> Option<usize> {
+    spawn_inner(name, entry as *const () as u64, None, cpu_index)
+}
+
+/// Round-robin the CPUs that are actually running kernel code.
+///
+/// Only online ones: a task pinned to a CPU that never came up would never run
+/// at all, which is a worse failure than an uneven split.
+fn next_cpu() -> usize {
+    static NEXT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let online = crate::smp::online().clamp(1, MAX_CPUS);
+    NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) % online
+}
+
+/// Let a task run.
+///
+/// Separate from [`spawn`] on purpose. A task is created holding nothing, and
+/// its parent grants it capabilities before it may execute a single
+/// instruction; on more than one CPU there is no way to arrange that with
+/// interrupt masking, because the masking only binds the CPU doing it. Making
+/// "may run" its own step is the only ordering that actually holds.
+pub fn start(id: usize) -> bool {
+    x86_64::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let Some(scheduler) = guard.as_mut() else {
+            return false;
+        };
+        match scheduler.tasks.get_mut(id) {
+            Some(task) if task.state == State::New => {
+                task.state = State::Ready;
+                true
+            }
+            _ => false,
+        }
+    })
 }
 
 /// Create a task that starts in **ring 3**.
@@ -199,10 +319,15 @@ pub fn spawn(name: &'static str, entry: extern "C" fn()) -> Option<usize> {
 /// object; whatever it can do, its parent granted explicitly.
 pub fn spawn_user(name: &'static str, entry: extern "C" fn()) -> Option<usize> {
     let image = user::create(entry as *const () as u64)?;
-    spawn_inner(name, image.entry, Some(image))
+    spawn_inner(name, image.entry, Some(image), next_cpu())
 }
 
-fn spawn_inner(name: &'static str, entry_rip: u64, image: Option<user::Image>) -> Option<usize> {
+fn spawn_inner(
+    name: &'static str,
+    entry_rip: u64,
+    image: Option<user::Image>,
+    cpu_index: usize,
+) -> Option<usize> {
     let stack = stack::allocate()?;
     let user = image.is_some();
 
@@ -277,7 +402,10 @@ fn spawn_inner(name: &'static str, entry_rip: u64, image: Option<user::Image>) -
         scheduler.tasks.push(Task {
             id,
             name,
-            state: State::Ready,
+            // Not runnable until `start`.
+            state: State::New,
+            cpu: cpu_index.min(MAX_CPUS - 1),
+            is_idle: false,
             saved_rsp: frame_addr,
             switches: 0,
             // Deliberately empty. A new task starts with no authority at all;
@@ -303,17 +431,19 @@ fn spawn_inner(name: &'static str, entry_rip: u64, image: Option<user::Image>) -
     // a deadlock.
     match image {
         Some(image) => crate::println!(
-            "task {}     : {:<10} ring 3, entry {:#x}, stack {:#x}, guard {:#x}",
+            "task {}     : {:<10} cpu{} ring 3, entry {:#x}, stack {:#x}, guard {:#x}",
             id,
             name,
+            cpu_index,
             image.entry,
             image.stack_top,
             image.stack_guard
         ),
         None => crate::println!(
-            "task {}     : {:<10} stack {:#x}..{:#x}, guard {:#x}",
+            "task {}     : {:<10} cpu{} stack {:#x}..{:#x}, guard {:#x}",
             id,
             name,
+            cpu_index,
             stack.bottom,
             stack.top,
             stack.guard
@@ -325,8 +455,9 @@ fn spawn_inner(name: &'static str, entry_rip: u64, image: Option<user::Image>) -
 /// Where a task goes if its entry function returns.
 extern "C" fn task_exit() -> ! {
     x86_64::without_interrupts(|| {
+        let this_cpu = cpu::index();
         if let Some(scheduler) = SCHEDULER.lock().as_mut() {
-            let current = scheduler.current;
+            let current = scheduler.current[this_cpu];
             scheduler.tasks[current].state = State::Finished;
         }
     });
@@ -355,42 +486,47 @@ pub fn yield_now() {
 /// Called from interrupt context with interrupts already disabled by the gate.
 /// Returns the frame to resume: the one passed in if nothing else is runnable.
 pub fn on_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
+    let this_cpu = cpu::index();
+
     let mut guard = SCHEDULER.lock();
     let Some(scheduler) = guard.as_mut() else {
         return frame;
     };
 
     // Where this task's state now lives.
-    let current = scheduler.current;
+    let current = scheduler.current[this_cpu];
     scheduler.tasks[current].saved_rsp = frame as u64;
     if scheduler.tasks[current].state == State::Running {
         scheduler.tasks[current].state = State::Ready;
     }
 
-    // Round-robin over everything except idle. `current` is considered too, at
+    // Round-robin over this CPU's own tasks. `current` is considered too, at
     // the final offset, so a task with no competition keeps running.
+    //
+    // The `cpu` filter is load-bearing rather than an optimisation: a task
+    // belongs to one CPU, and picking somebody else's would put two cores on
+    // one kernel stack.
     let count = scheduler.tasks.len();
-    let idle = scheduler.idle;
     let mut chosen = None;
     for offset in 1..=count {
         let candidate = (current + offset) % count;
-        // Skip idle here; it is the fallback below, not a peer in the rotation.
-        // Only skip it once we actually know which task it is.
-        if Some(candidate) == idle {
+        let task = &scheduler.tasks[candidate];
+        // Idle tasks are the fallback below, not peers in the rotation.
+        if task.is_idle || task.cpu != this_cpu {
             continue;
         }
-        if scheduler.tasks[candidate].state == State::Ready {
+        if task.state == State::Ready {
             chosen = Some(candidate);
             break;
         }
     }
 
-    // Nothing runnable: fall back to idle rather than resuming a task that is
-    // blocked or finished. Before the idle task exists nothing can block, so
-    // staying on the current task is safe in that window.
-    let next = chosen.or(idle).unwrap_or(current);
+    // Nothing runnable here: fall back to this CPU's idle task rather than
+    // resuming one that is blocked or finished. Before that task exists nothing
+    // can block, so staying put is safe in that window.
+    let next = chosen.or(scheduler.idle[this_cpu]).unwrap_or(current);
 
-    scheduler.current = next;
+    scheduler.current[this_cpu] = next;
     if next != current {
         scheduler.tasks[next].switches += 1;
     }
@@ -403,7 +539,7 @@ pub fn on_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
     // reads this for it.
     let top = scheduler.tasks[next].kernel_stack_top;
     if top != 0 {
-        gdt::set_kernel_stack(top);
+        gdt::set_kernel_stack(this_cpu, top);
     }
 
     // Install the incoming task's address space.
@@ -417,10 +553,10 @@ pub fn on_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
         .space
         .map(|space| space.root())
         .or_else(crate::mm::paging::kernel_root)
-        .unwrap_or(scheduler.installed_root);
+        .unwrap_or(scheduler.installed_root[this_cpu]);
 
-    if root != scheduler.installed_root && root != 0 {
-        scheduler.installed_root = root;
+    if root != scheduler.installed_root[this_cpu] && root != 0 {
+        scheduler.installed_root[this_cpu] = root;
         // SAFETY: `root` is a live PML4, forked from the kernel's, so it maps
         // the whole kernel half -- including the instruction after this one.
         unsafe { crate::mm::paging::activate_root(root) };
@@ -448,6 +584,7 @@ pub fn snapshot(buffer: &mut [TaskInfo]) -> usize {
                 state: task.state,
                 switches: task.switches,
                 user: task.user,
+                cpu: task.cpu,
             };
         }
         count
@@ -462,6 +599,7 @@ impl Default for TaskInfo {
             state: State::Finished,
             switches: 0,
             user: false,
+            cpu: 0,
         }
     }
 }
@@ -472,7 +610,7 @@ impl Default for TaskInfo {
 /// "mine", the way a hand is not a permission. Every actual authority decision
 /// is made from the contents of that space, never from this number.
 pub fn current_id() -> Option<usize> {
-    x86_64::without_interrupts(|| Some(SCHEDULER.lock().as_ref()?.current))
+    x86_64::without_interrupts(|| Some(SCHEDULER.lock().as_ref()?.current[cpu::index()]))
 }
 
 /// The address space a task runs in, if it has one of its own.
