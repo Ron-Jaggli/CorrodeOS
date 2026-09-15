@@ -399,6 +399,32 @@ gets an answer back. The check that it was genuinely in ring 3 reads the CS the
 **CPU** wrote into the trap frame, which is the one claim the measured code
 could not have faked.
 
+#### Capabilities are usable from ring 3, not just holdable
+
+Ring 3 gets `SYS_COPY` and `SYS_DELETE`, and a send or a call can carry a
+capability, named by two more registers — `r12` for the slot, `r13` for the mask
+to narrow it by. Without those a user task could use what it was handed and
+nothing else: it could not narrow a capability before passing it on, which is
+the operation the entire model is built around. A userspace driver has to be
+able to give a client authority over one thing without giving away its own.
+
+Every rule holds unchanged on this side of the boundary, because it is the same
+code enforcing it. The demo task asks to copy its own endpoint capability with
+*every* right requested, holds `-w-`, and gets `-w-` back. It then tries to pass
+that copy on, has no `GRANT`, and is refused — and since a failed send transmits
+nothing, it has to report that refusal in a second message that carries no
+capability at all. Finally it hands over a `Frame` it *was* given with `GRANT`,
+narrowed on the way out to read-only, and the kernel confirms what arrived.
+
+A mask crossing the boundary is raw bits, which is worth being precise about. It
+is not a rights set a task holds; it is an argument to a narrowing operation
+that intersects. A caller setting every bit still receives exactly what it
+already had, and there is deliberately no inverse — no way to turn bits into the
+rights *on* a capability — so the only thing a fabricated mask can do is ask for
+too much and be given less. Unknown bits are dropped rather than rejected, so
+bits that gain meaning later cannot be requested by a program compiled before
+they existed.
+
 #### Servers in ring 3
 
 A client is the easy half. The architecture only pays off when the *services*
@@ -529,13 +555,14 @@ Five run on every boot, so a regression shows up immediately rather than three
 subsystems later: an `int3` that must trap *and resume*, a frame alloc/free
 round-trip that must balance, a heap exercise that must both balance its bytes
 and collapse back to a single free block, a timer check that counts both tick
-sources against one second of polled wall time, and sixty-three capability, IPC
+sources against one second of polled wall time, and sixty-eight capability, IPC
 and ring 3 checks covering narrowing, denial, type confusion, the GRANT rule,
 the rendezvous in both orderings, capability transfer, reply-capability expiry,
 call refusal, a user task being denied, answered and confirmed to have been in
-ring 3, a ring 3 server answering a call from the kernel while unable to send on
-the endpoint it serves, and two user tasks proving by page-table walk that one
-address means different memory in each of them.
+ring 3, a ring 3 task narrowing and handing over a capability under the same
+rules the kernel follows, a ring 3 server answering a call from the kernel while
+unable to send on the endpoint it serves, and two user tasks proving by
+page-table walk that one address means different memory in each of them.
 
 That last one earns its place. Deriving "elapsed seconds" from a tick counter
 and then using it to judge that same counter is circular, and hides exactly the

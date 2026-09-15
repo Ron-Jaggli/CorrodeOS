@@ -34,6 +34,30 @@
 //! slots for an incoming capability and for the reply capability, since a
 //! receive has no message to send.
 //!
+//! A send or a call can carry a capability, named by two more registers:
+//!
+//! ```text
+//!   r12  capability to transfer, or NO_SLOT
+//!   r13  mask to narrow it by
+//! ```
+//!
+//! `r12` and `r13` rather than `rbx` or `rbp`: `rcx` and `r11` are out because
+//! fast syscalls clobber them, and of what remains these are the two least
+//! likely to be wanted by a userspace runtime for a frame or thread pointer.
+//!
+//! # Capabilities are usable, not just holdable
+//!
+//! Ring 3 gets `SYS_COPY` and `SYS_DELETE` as well, and can transfer a
+//! capability in a message. Without those a user task could use what it was
+//! handed and nothing more -- it could not narrow a capability before passing
+//! it on, which is the operation the whole model is built around. A userspace
+//! driver has to be able to hand a client authority over one thing without
+//! handing over its own.
+//!
+//! Every rule still holds on this side of the boundary, because it is the same
+//! code enforcing it: narrowing intersects, so asking for more than you hold
+//! gets you less; and transferring requires `GRANT` on what is being sent.
+//!
 //! `r10` rather than `rcx` for the fourth argument. Nothing forces that today --
 //! we arrive through an `int` gate, which preserves rcx -- but `syscall`
 //! clobbers rcx with the return address, so using r10 now means moving to fast
@@ -54,7 +78,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::x86_64::idt::TrapFrame;
-use crate::cap::{self, CapError};
+use crate::cap::{self, CapError, Rights};
 use crate::ipc;
 use crate::task;
 
@@ -71,6 +95,10 @@ pub const SYS_CALL: u64 = 3;
 pub const SYS_RECV: u64 = 4;
 /// Answer a caller, spending the reply capability a receive produced.
 pub const SYS_REPLY: u64 = 5;
+/// Copy a capability within the caller's own space, narrowing by a mask.
+pub const SYS_COPY: u64 = 6;
+/// Drop a capability. The object goes away with its last one.
+pub const SYS_DELETE: u64 = 7;
 
 /// Slot argument meaning "nowhere".
 ///
@@ -129,7 +157,25 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
         },
 
         SYS_SEND => {
-            frame.rax = status(ipc::send(slot, message, None));
+            frame.rax = status(ipc::send(slot, message, transfer(frame)));
+        }
+
+        SYS_COPY => match cap::copy(
+            slot,
+            frame.rsi as usize,
+            Rights::from_mask_bits(frame.rdx as u32),
+        ) {
+            Ok(granted) => {
+                frame.rax = STATUS_OK;
+                // What was actually granted, which may be less than asked for
+                // and can never be more.
+                frame.rdx = granted.bits() as u64;
+            }
+            Err(error) => frame.rax = error.code(),
+        },
+
+        SYS_DELETE => {
+            frame.rax = status(cap::delete(slot));
         }
 
         SYS_RECV => {
@@ -156,7 +202,7 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
             frame.rax = status(ipc::reply(slot, message, None));
         }
 
-        SYS_CALL => match ipc::call(slot, message, None, None) {
+        SYS_CALL => match ipc::call(slot, message, transfer(frame), None) {
             Ok(answer) => {
                 frame.rax = STATUS_OK;
                 frame.rdi = answer.from as u64;
@@ -173,6 +219,17 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
     }
 
     frame as *mut TrapFrame
+}
+
+/// Decode the capability-transfer arguments of a send or a call.
+///
+/// The mask is not checked here. `derive_for_transfer` intersects it against
+/// what the caller holds and requires `GRANT`, so a caller asking for rights it
+/// does not have receives less rather than being refused -- and a caller with
+/// no `GRANT` is refused whatever it asks for.
+fn transfer(frame: &TrapFrame) -> Option<(usize, Rights)> {
+    let slot = optional_slot(frame.r12)?;
+    Some((slot, Rights::from_mask_bits(frame.r13 as u32)))
 }
 
 /// Decode a slot argument, where [`NO_SLOT`] means none was given.

@@ -626,9 +626,25 @@ const USER_TASK_ENDPOINT: cap::CapPtr = 0;
 const USER_TASK_EMPTY: cap::CapPtr = 5;
 
 /// Labels the ring 3 task uses. It cannot print, so everything it wants
-/// observed it has to say through the one capability it was given.
+/// observed it has to say through a capability it was given.
 const LABEL_USER_DENIED: u64 = 5;
 const LABEL_USER_ECHO: u64 = 6;
+/// Rights it got back from narrowing a capability in its own space.
+const LABEL_USER_RIGHTS: u64 = 8;
+/// Status of trying to pass on a capability it has no GRANT for.
+const LABEL_USER_NOGRANT: u64 = 9;
+/// A capability it is handing over.
+const LABEL_USER_GIVE: u64 = 10;
+
+/// Further slots in the user task's capability space.
+const USER_TASK_FRAME: cap::CapPtr = 2;
+const USER_TASK_COPY: cap::CapPtr = 3;
+
+/// Where bootstrap puts a capability the ring 3 task sends it.
+const USER_TRANSFER: cap::CapPtr = 13;
+
+/// Messages the ring 3 task sends before it settles.
+const USER_MESSAGES: usize = 6;
 
 /// Eight bytes the user task asks the kernel to count, chosen so the expected
 /// answer is simply its length.
@@ -1128,6 +1144,7 @@ extern "C" fn user_program() {
         "xor r10, r10",
         "xor r8, r8",
         "xor r9, r9",
+        "mov r12, {no_slot}",
         "int {gate}",
         "mov rbx, rax",
 
@@ -1139,6 +1156,8 @@ extern "C" fn user_program() {
         "xor r10, r10",
         "xor r8, r8",
         "xor r9, r9",
+        // No capability rides along with this one.
+        "mov r12, {no_slot}",
         "int {gate}",
 
         // A real request, and one with an answer: how long is this word?
@@ -1149,6 +1168,7 @@ extern "C" fn user_program() {
         "xor r10, r10",
         "xor r8, r8",
         "xor r9, r9",
+        "mov r12, {no_slot}",
         "int {gate}",
         "mov rbx, rdx",
 
@@ -1160,6 +1180,64 @@ extern "C" fn user_program() {
         "xor r10, r10",
         "xor r8, r8",
         "xor r9, r9",
+        "mov r12, {no_slot}",
+        "int {gate}",
+
+        // Narrow our own endpoint capability into a spare slot, asking for
+        // every right. We hold -w-, so that is what we must get back.
+        "mov rax, {copy}",
+        "mov rdi, {endpoint}",
+        "mov rsi, {copy_slot}",
+        "mov rdx, {rights_all}",
+        "int {gate}",
+        "mov rbx, rdx",
+
+        "mov rax, {send}",
+        "mov rdi, {endpoint}",
+        "mov rsi, {label_rights}",
+        "mov rdx, rbx",
+        "xor r10, r10",
+        "xor r8, r8",
+        "xor r9, r9",
+        "mov r12, {no_slot}",
+        "int {gate}",
+
+        // Try to pass that copy on. It carries no GRANT, so this must fail --
+        // and failing means it sends nothing, so the result has to be reported
+        // by a second message that transfers nothing.
+        "mov rax, {send}",
+        "mov rdi, {endpoint}",
+        "mov rsi, {label_give}",
+        "xor rdx, rdx",
+        "xor r10, r10",
+        "xor r8, r8",
+        "xor r9, r9",
+        "mov r12, {copy_slot}",
+        "mov r13, {rights_all}",
+        "int {gate}",
+        "mov rbx, rax",
+
+        "mov rax, {send}",
+        "mov rdi, {endpoint}",
+        "mov rsi, {label_nogrant}",
+        "mov rdx, rbx",
+        "xor r10, r10",
+        "xor r8, r8",
+        "xor r9, r9",
+        "mov r12, {no_slot}",
+        "int {gate}",
+
+        // Now hand over something we *were* given with GRANT, narrowed on the
+        // way out to read-only.
+        "mov rax, {send}",
+        "mov rdi, {endpoint}",
+        "mov rsi, {label_give}",
+        "xor rdx, rdx",
+        "xor r10, r10",
+        "xor r8, r8",
+        "xor r9, r9",
+        "mov r12, {frame_slot}",
+        "mov r13, {rights_read}",
         "int {gate}",
 
         // Done talking. Stay a live ring 3 task in the rotation rather than
@@ -1171,13 +1249,22 @@ extern "C" fn user_program() {
 
         call = const syscall::SYS_CALL,
         send = const syscall::SYS_SEND,
+        copy = const syscall::SYS_COPY,
         yield_op = const syscall::SYS_YIELD,
+        no_slot = const syscall::NO_SLOT,
         gate = const vectors::SYSCALL,
         endpoint = const USER_TASK_ENDPOINT,
         empty_slot = const USER_TASK_EMPTY,
+        frame_slot = const USER_TASK_FRAME,
+        copy_slot = const USER_TASK_COPY,
+        rights_all = const cap::Rights::ALL.bits(),
+        rights_read = const cap::Rights::READ.bits(),
         label_count = const LABEL_COUNT,
         label_denied = const LABEL_USER_DENIED,
         label_echo = const LABEL_USER_ECHO,
+        label_rights = const LABEL_USER_RIGHTS,
+        label_nogrant = const LABEL_USER_NOGRANT,
+        label_give = const LABEL_USER_GIVE,
         ping = const USER_PING,
     )
 }
@@ -1386,9 +1473,16 @@ fn user_grants(user: Option<usize>) {
         cap::grant(id, USER_ENDPOINT, USER_TASK_ENDPOINT, cap::Rights::WRITE)
             == Ok(cap::Rights::WRITE),
     );
+    // A second capability, and this one carries GRANT: something it is allowed
+    // to hand on to somebody else. Narrowed from bootstrap's own Frame
+    // capability, which holds every right.
     cap_check(
-        "the user task holds exactly one capability",
-        cap::slots_used(id) == Some(1),
+        "grant the user task a Frame capability it may pass on",
+        cap::grant(id, 8, USER_TASK_FRAME, cap::Rights::READ_GRANT) == Ok(cap::Rights::READ_GRANT),
+    );
+    cap_check(
+        "the user task holds exactly two capabilities",
+        cap::slots_used(id) == Some(2),
     );
 }
 
@@ -1397,8 +1491,8 @@ fn user_grants(user: Option<usize>) {
 /// Three messages, in the order it sends them, so nothing here depends on
 /// scheduling. The middle one is a call and gets answered.
 fn serve_user() {
-    for _ in 0..3 {
-        let received = match ipc::recv(USER_ENDPOINT, None, Some(USER_REPLY)) {
+    for _ in 0..USER_MESSAGES {
+        let received = match ipc::recv(USER_ENDPOINT, Some(USER_TRANSFER), Some(USER_REPLY)) {
             Ok(received) => received,
             Err(error) => {
                 println!("user       : recv failed: {:?}", error);
@@ -1445,6 +1539,43 @@ fn serve_user() {
                     received.message.words[0] == USER_PING_LEN,
                 );
             }
+
+            LABEL_USER_RIGHTS => {
+                // It asked for every right while holding only WRITE. The
+                // narrowing rule is the same code on both sides of the ring
+                // boundary, so the answer has to be the same too.
+                cap_check(
+                    "ring 3 narrowing yields only what the task already held",
+                    received.message.words[0] == cap::Rights::WRITE.bits() as u64,
+                );
+            }
+
+            LABEL_USER_NOGRANT => {
+                cap_check(
+                    "ring 3 cannot pass on a capability it has no GRANT for",
+                    received.message.words[0] == cap::CapError::InsufficientRights.code(),
+                );
+            }
+
+            LABEL_USER_GIVE => match received.capability {
+                Some((kind, rights)) => {
+                    println!("user       : ring 3 task handed over a {kind:?} with {rights:?}");
+                    cap_check(
+                        "a capability transferred out of ring 3 arrives narrowed",
+                        kind == cap::ObjectKind::Frame && rights == cap::Rights::READ,
+                    );
+                    cap_check(
+                        "the transferred Frame names the frame bootstrap minted",
+                        cap::frame_address(USER_TRANSFER)
+                            == Ok(FRAME_CAP_ADDR.load(Ordering::Relaxed)),
+                    );
+                    let _ = cap::delete(USER_TRANSFER);
+                }
+                None => cap_check(
+                    "a capability transferred out of ring 3 arrives narrowed",
+                    false,
+                ),
+            },
 
             other => println!("user       : unexpected label {other}"),
         }

@@ -57,7 +57,26 @@ impl Rights {
     pub const GRANT: Rights = Rights(1 << 2);
 
     pub const READ_WRITE: Rights = Rights(0b011);
+    /// May use, and may pass on. The combination a task needs to be able to
+    /// hand a capability to somebody else.
+    pub const READ_GRANT: Rights = Rights(0b101);
     pub const ALL: Rights = Rights(0b111);
+
+    /// Interpret raw bits as a **mask**, for a narrowing operation.
+    ///
+    /// This does not breach the one invariant, and it is worth being precise
+    /// about why. A mask is not a rights set a task holds; it is an argument to
+    /// [`Capability::derive`], which intersects. A caller passing every bit set
+    /// still receives exactly what it already had. There is deliberately no
+    /// inverse -- no way to turn bits into the rights *on* a capability -- so
+    /// the only thing a fabricated value here can do is ask for too much and be
+    /// given less.
+    ///
+    /// Unknown bits are dropped rather than rejected, so bits that gain meaning
+    /// later cannot be requested by a program compiled before they existed.
+    pub const fn from_mask_bits(bits: u32) -> Rights {
+        Rights(bits & Rights::ALL.0)
+    }
 
     pub const fn contains(self, other: Rights) -> bool {
         self.0 & other.0 == other.0
