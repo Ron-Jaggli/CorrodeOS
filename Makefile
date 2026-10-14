@@ -58,6 +58,8 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 # VNC display number; :0 is TCP 5900, which is what ./corrode publishes.
 VNC_DISPLAY ?= 0
 
+
+.PHONY: input-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -75,7 +77,7 @@ kernel:
 # crate built for it. RUSTFLAGS in the environment replaces the ones in
 # .cargo/config.toml outright, and a separate target directory stops the two
 # sets of flags from invalidating each other's build of the crates they share.
-USER_PROGRAMS := edu fault virtio-gpu blob-reader nvidia
+USER_PROGRAMS := edu fault virtio-gpu blob-reader nvidia ps2
 USER_TARGET   := target/user
 USER_BIN      := $(USER_TARGET)/x86_64-unknown-none/release
 USER_RUSTFLAGS := -C relocation-model=static -C strip=debuginfo \
@@ -97,7 +99,7 @@ clippy:
 HOST_TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
 
 test:
-	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci -p corrode-elf -p corrode-virtio -p corrode-nv --target $(HOST_TARGET)
+	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci -p corrode-elf -p corrode-virtio -p corrode-nv -p corrode-input --target $(HOST_TARGET)
 
 # The 3D engine's demo scene, drawn on the build host at each preset, for
 # judging by eye. Built optimised, so the times it prints mean something.
@@ -210,6 +212,24 @@ screenshot: iso
 	@echo "wrote build/frame.png"
 
 SHOT_DELAY ?= 6
+
+# Boot, then type and move the mouse through the QEMU monitor, as a person
+# at the keyboard would: the PS/2 driver in ring 3 hears it, and the serial
+# log and build/input.png show what reached the screen. QEMU's `sendkey`
+# and `mouse_move` drive the emulated controller, not the host's devices.
+INPUT_KEYS ?= shift-h i spc t h e r e ret
+input-test: iso
+	@rm -f build/input.ppm build/input.png
+	@( sleep $(SHOT_DELAY); \
+	   for key in $(INPUT_KEYS); do echo "sendkey $$key"; sleep 0.2; done; \
+	   echo "mouse_move 120 -80"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 0.3; \
+	   echo "sendkey o"; sleep 0.2; echo "sendkey k"; sleep 1; \
+	   echo "screendump build/input.ppm"; sleep 2; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^(input|ps2) " build/serial.log || echo "input-test: nothing from the input path"
+	@test -s build/input.ppm && pnmtopng build/input.ppm > build/input.png 2>/dev/null && rm -f build/input.ppm && echo "wrote build/input.png" || true
 
 # Boot with the deliberate page fault enabled and capture what the handler says.
 fault-test:

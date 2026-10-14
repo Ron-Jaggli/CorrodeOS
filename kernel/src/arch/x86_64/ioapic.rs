@@ -37,6 +37,13 @@ pub struct IoApic {
     entries: u32,
 }
 
+// SAFETY: `base` is a mapping in the kernel half, present in every address
+// space and on every CPU, so the controller can be reached from wherever the
+// value goes. What must not happen is two CPUs using the select/window pair
+// at once; whoever keeps one after boot keeps it behind a lock (see
+// `irq::keep_isa`).
+unsafe impl Send for IoApic {}
+
 impl IoApic {
     /// Map a controller's registers.
     pub fn new(physical_base: u64, gsi_base: u32) -> Option<Self> {

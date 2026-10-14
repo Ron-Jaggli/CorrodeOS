@@ -10,12 +10,14 @@ members = [
     "elf",
     "virtio",
     "nv",
+    "input",
     "user/rt",
     "user/edu",
     "user/fault",
     "user/virtio-gpu",
     "user/blob-reader",
     "user/nvidia",
+    "user/ps2",
 ]
 
 [workspace.package]

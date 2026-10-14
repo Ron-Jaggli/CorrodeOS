@@ -61,6 +61,7 @@ Then:
 ./corrode fault-test  # boot into a deliberate page fault
 ./corrode wx-test     # boot and prove .text is not writable
 ./corrode user-test   # boot and prove ring 3 cannot read kernel memory
+./corrode input-test  # boot, type and move the mouse through QEMU, check what arrived
 ./corrode check       # cargo check
 ./corrode test        # render, text, gfx, pci, elf, virtio and nv unit tests, on the build host
 ./corrode specimen    # draw a sheet of the typeface to build/specimen.png
@@ -97,6 +98,8 @@ kernel/          the privileged kernel
   src/pci.rs       the PCI bus: what is on it, and devices as capabilities
   src/device.rs    a device's registers, mapped into the task that holds them
   src/irq.rs       device interrupts, as messages to whoever holds the line
+  src/ports.rs     I/O ports, read and written for whoever holds a range
+  src/input.rs     keyboard and mouse events, from the driver to the scene
   src/modules.rs   files the bootloader left in RAM
   src/memory.rs    memory a task can map and tell a device about
   src/remote.rs    a Renderer that is a call to a driver in ring 3
@@ -122,6 +125,7 @@ elf/             reading a program file, tested on the build host against liars
 user/            ring 3 programs, each an ELF file loaded as a Limine module
   rt/              the runtime: entry, syscalls, devices, println!, panics
   edu/             a driver for QEMU's teaching device
+  ps2/             the keyboard and mouse driver
   fault/           a program that faults on purpose
   virtio-gpu/      a display driver: the compositor's frames, on a virtio GPU
   blob-reader/     reads 32 MiB it was handed at boot, and says what was in it
@@ -130,6 +134,7 @@ user/            ring 3 programs, each an ELF file loaded as a Limine module
 virtio/          virtqueues and virtio GPU commands, tested against a pretend device
 nv/              NVIDIA chips, VBIOS and firmware files as data, tested on the build host
 pci/             PCI configuration space as arithmetic, tested on the build host
+input/           scancodes and mouse packets to key presses and movements
   src/lib.rs       headers, BARs, capability lists, MSI, what a driver may write
   src/mcfg.rs      the ACPI table that says where configuration space is
 boot/limine.conf lets Limine find the kernel
@@ -433,8 +438,17 @@ after every one compares the screen with a fresh scene painted from scratch at
 that instant. Damage, culling, blending and presenting all have to be right for
 those to match, and breaking any one of them fails it.
 
-Known gaps: layers stack in the order they were added and cannot be
-restacked. And a layer that grows or moves damages its whole old and new
+`Scene::raise` puts a layer back on top, and `Scene::layers_at` says what is
+under a pixel, top first -- the two questions a window manager asks of a
+click. An id is a slot that never changes; what restacking rearranges is a
+separate order, and a raised layer is repainted whole.
+
+The randomised test above had a weakness until restacking was added to it: a
+removed layer's slot is never reused, so its twelve-slot scene filled after
+twelve additions and the rest of the run was spent on an empty one. It now
+has room for every layer it adds, and raises them as it goes.
+
+Known gaps: a layer that grows or moves damages its whole old and new
 rectangles, though for a flat colour only the edges changed.
 
 ### Windows
@@ -513,6 +527,71 @@ cure is two buffers and a swap on commit. A surface has no transparency of
 its own. A commit is found at the next scheduling tick rather than waking the
 painter, which is the same gap as pacing by the tick. And the 3D engine in
 `gfx/` produces exactly these pixels but nothing connects the two yet.
+
+### Input
+
+The keyboard and mouse are a ring 3 driver like any other, holding five
+capabilities: the PS/2 controller's data port, its command port, one
+interrupt line, an endpoint to the compositor and one to the log.
+
+```
+ps2        : keyboard up, mouse up
+input      : the driver found a keyboard                         PASS
+input      : line "Hi there"
+input      : the pointer moved to (760, 320)
+input      : click at (760, 320) on a layer
+```
+
+`./corrode input-test` produces those last lines: QEMU's monitor types
+`shift-h i spc t h e r e ret`, moves the mouse and clicks, and the serial log
+says what reached the scene. It drives QEMU's emulated controller, never the
+host's devices.
+
+#### Ports are a capability too
+
+The controller is reached through I/O ports, and ring 3 has none: IOPL is 0
+and there is no permission bitmap. An **`IoPorts`** capability names a range,
+and `SYS_PORT_IN` and `SYS_PORT_OUT` do the access in the kernel after
+checking it falls inside. The driver gets port 0x60 and port 0x64 as two
+ranges of one, so the ports between them -- 0x61 gates the speaker and
+reports memory parity errors -- are out of its reach. A system call per byte
+is slow and does not matter at the rate keys move.
+
+#### Two devices, one line
+
+The keyboard is ISA interrupt 1 and the mouse ISA interrupt 12. Both mean
+"read port 0x60", and the status register says which device the byte is
+from, so `irq::create_isa` routes both through the I/O APIC to the same
+line: one wait covers both, where two lines would mean waiting on one while
+the other went unheard. The I/O APIC is now kept after boot for this, behind
+a lock, and only edge-triggered lines are accepted -- a level-triggered one
+acknowledged before the driver has read the device would fire for ever.
+
+#### Decoding is a crate
+
+`input/` turns bytes into meaning with no machine in sight: scancode set 1
+with `0xE0` extended keys, the fake shifts keyboards wrap around some of
+them, Pause's six bytes swallowed whole, per-side modifiers, Caps Lock
+turning over once per press however long it auto-repeats; and three-byte
+mouse packets with nine-bit signed motion and overflow, resynchronised on
+the bit that marks a packet's first byte. The tests feed it random bytes and
+require it to recover.
+
+#### Into the scene
+
+A kernel task holds the receive half of the driver's endpoint and queues what
+arrives; the painter takes the queue when it wakes. Mouse movements with the
+same buttons held are added together in the queue, so a fast mouse cannot
+crowd out a key press. The scene gets a pointer -- a white arrow over a dark
+outline, two mask layers moving together, raised above anything added after
+it -- and one line of typed text drawn into the atlas, which grew to 512 rows
+to hold them.
+
+Known gaps: keys go to the one typed line, because which window should get
+them is a window manager's decision and there is none yet. US layout only.
+No USB, so on most real laptops and desktops this is the firmware's PS/2
+emulation or nothing. The pointer has no acceleration, and the cursor and
+line only exist on the boot screen.
 
 ### Devices
 

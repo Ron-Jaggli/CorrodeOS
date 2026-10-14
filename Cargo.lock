@@ -39,6 +39,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "corrode-input"
+version = "0.0.1"
+
+[[package]]
 name = "corrode-kernel"
 version = "0.0.1"
 dependencies = [
@@ -64,6 +68,14 @@ dependencies = [
 [[package]]
 name = "corrode-pci"
 version = "0.0.1"
+
+[[package]]
+name = "corrode-ps2"
+version = "0.0.1"
+dependencies = [
+ "corrode-input",
+ "corrode-rt",
+]
 
 [[package]]
 name = "corrode-render"

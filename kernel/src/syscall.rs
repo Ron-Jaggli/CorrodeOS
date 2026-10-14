@@ -94,6 +94,7 @@ use crate::ipc;
 use crate::irq;
 use crate::memory;
 use crate::pci;
+use crate::ports;
 use crate::surface;
 use crate::task;
 
@@ -104,7 +105,7 @@ use corrode_render::Rect;
 pub use corrode_abi::{
     FROM_HARDWARE, NO_SLOT, STATUS_BAD_SYSCALL, STATUS_OK, SYS_CALL, SYS_COMMIT, SYS_CONFIG_READ,
     SYS_CONFIG_WRITE, SYS_COPY, SYS_DELETE, SYS_EXIT, SYS_IDENTIFY, SYS_MAP, SYS_PHYSICAL,
-    SYS_RECV, SYS_REPLY, SYS_SEND, SYS_YIELD,
+    SYS_PORT_IN, SYS_PORT_OUT, SYS_RECV, SYS_REPLY, SYS_SEND, SYS_YIELD,
 };
 
 /// Every code selector seen entering this gate, OR-ed together.
@@ -263,6 +264,18 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
                 }
                 Err(error) => frame.rax = error.code(),
             }
+        }
+
+        SYS_PORT_IN => match ports::read(slot, frame.rsi, frame.rdx) {
+            Ok(value) => {
+                frame.rax = STATUS_OK;
+                frame.rdx = value as u64;
+            }
+            Err(error) => frame.rax = error.code(),
+        },
+
+        SYS_PORT_OUT => {
+            frame.rax = status(ports::write(slot, frame.rsi, frame.rdx, frame.r10));
         }
 
         SYS_PHYSICAL => match memory::physical(slot, frame.rsi) {

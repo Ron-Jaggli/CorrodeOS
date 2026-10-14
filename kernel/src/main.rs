@@ -14,6 +14,7 @@ mod arch;
 mod blob;
 mod cap;
 mod device;
+mod input;
 mod ipc;
 mod irq;
 mod limine;
@@ -21,6 +22,7 @@ mod memory;
 mod mm;
 mod modules;
 mod pci;
+mod ports;
 mod remote;
 mod serial;
 mod smp;
@@ -211,6 +213,7 @@ pub extern "C" fn kmain() -> ! {
         device_checks();
         blob_checks();
         nvidia_checks();
+        start_input();
     }
 
     #[cfg(feature = "user-test")]
@@ -659,6 +662,13 @@ fn init_apic() -> bool {
             },
         );
     }
+
+    // Kept, so that a driver can later be given an ISA line -- the PS/2
+    // keyboard and mouse have no other kind.
+    irq::keep_isa(
+        io,
+        core::array::from_fn(|line| madt.gsi_for_irq(line as u8)),
+    );
     true
 }
 
@@ -1912,6 +1922,94 @@ fn start_log() {
 
 fn program_check(name: &str, ok: bool) {
     check("program", name, ok);
+}
+
+/// Bootstrap's capabilities for the PS/2 driver: its two ports, its
+/// interrupt, and every right on the endpoint it reports to.
+const PS2_DATA: cap::CapPtr = 56;
+const PS2_COMMAND: cap::CapPtr = 57;
+const PS2_IRQ: cap::CapPtr = 58;
+const INPUT_ENDPOINT: cap::CapPtr = 59;
+/// A read-only copy of the data port, to check what that forbids.
+const PS2_DATA_READ: cap::CapPtr = 60;
+
+/// The controller's ports, and the ISA interrupts of its two devices.
+const PS2_DATA_PORT: u16 = 0x60;
+const PS2_COMMAND_PORT: u16 = 0x64;
+const PS2_KEYBOARD_IRQ: u8 = 1;
+const PS2_MOUSE_IRQ: u8 = 12;
+
+fn input_check(name: &str, ok: bool) {
+    check("input", name, ok);
+}
+
+/// Start the keyboard and mouse driver, and the task that passes what it
+/// says on to the painter.
+///
+/// The driver gets each of the controller's two ports as a range of one,
+/// so the three ports between them -- one of which gates the speaker and
+/// reports memory errors -- are out of its reach.
+fn start_input() {
+    use cap::{CapError, Object, Rights};
+    use corrode_abi::ps2;
+
+    let Some(driver) = spawn_program("ps2") else {
+        input_check("load the keyboard and mouse driver", false);
+        return;
+    };
+    let line = task::cpu_of(driver)
+        .and_then(|cpu| irq::create_isa(&[PS2_KEYBOARD_IRQ, PS2_MOUSE_IRQ], cpu));
+    input_check(
+        "route the keyboard and the mouse to one line",
+        line.is_some(),
+    );
+    let Some(line) = line else { return };
+
+    let ports = |base| Object::IoPorts { base, count: 1 };
+    let minted = cap::mint(0, PS2_DATA, ports(PS2_DATA_PORT), Rights::ALL).is_ok()
+        && cap::mint(0, PS2_COMMAND, ports(PS2_COMMAND_PORT), Rights::ALL).is_ok()
+        && cap::mint(0, PS2_IRQ, Object::Interrupt(line), Rights::ALL).is_ok()
+        && cap::mint(
+            0,
+            INPUT_ENDPOINT,
+            Object::Endpoint(ipc::Endpoint::new()),
+            Rights::ALL,
+        )
+        .is_ok();
+    input_check("mint two ports, an interrupt and an endpoint", minted);
+
+    // The rules, from this side. Only reads and refused writes: a write
+    // that went through would reach the controller.
+    input_check(
+        "a port range reaches only the ports in it",
+        ports::read(PS2_DATA, 1, 1) == Err(CapError::Invalid)
+            && ports::read(PS2_DATA, 0, 2) == Err(CapError::Invalid)
+            && ports::read(PS2_DATA, u64::MAX, 1) == Err(CapError::Invalid)
+            && ports::read(PS2_DATA, 0, 3) == Err(CapError::Invalid),
+    );
+    input_check(
+        "a read-only port range cannot write",
+        cap::copy(PS2_DATA, PS2_DATA_READ, Rights::READ) == Ok(Rights::READ)
+            && ports::write(PS2_DATA_READ, 0, 1, 0xff) == Err(CapError::InsufficientRights),
+    );
+    input_check(
+        "an endpoint is not a port",
+        ports::read(INPUT_ENDPOINT, 0, 1) == Err(CapError::WrongType),
+    );
+
+    let receiver = task::spawn("input", input::receiver);
+    let granted = receiver.is_some_and(|id| {
+        cap::grant(id, INPUT_ENDPOINT, input::TASK_ENDPOINT, Rights::READ).is_ok()
+    }) && cap::grant(driver, PS2_DATA, ps2::DATA, Rights::READ_WRITE).is_ok()
+        && cap::grant(driver, PS2_COMMAND, ps2::COMMAND, Rights::READ_WRITE).is_ok()
+        && cap::grant(driver, PS2_IRQ, ps2::IRQ, Rights::READ).is_ok()
+        && cap::grant(driver, INPUT_ENDPOINT, ps2::EVENTS, Rights::WRITE).is_ok()
+        && cap::grant(driver, LOG_ENDPOINT, ps2::LOG, Rights::WRITE).is_ok();
+    input_check(
+        "grant the driver two ports, a line and an endpoint",
+        granted && cap::slots_used(driver) == Some(5),
+    );
+    start_all(&[receiver, Some(driver)]);
 }
 
 /// Load a program from the bootloader's modules and make a task of it.
@@ -3179,7 +3277,7 @@ fn init_software_renderer() -> Option<SoftwareRenderer> {
 
 /// The mask atlas: room for the boot screen's two lines of text.
 const ATLAS_WIDTH: u32 = 1024;
-const ATLAS_HEIGHT: u32 = 256;
+const ATLAS_HEIGHT: u32 = 512;
 
 /// Where the back buffer is mapped: a gigabyte above the heap, in the same
 /// PML4 slot. That slot is populated before any user address space is forked,
@@ -3362,7 +3460,7 @@ fn label_layer(screen: Rect, src: Rect, y: i32, color: Color, at: u64) -> Layer 
 /// Nothing here advances per frame. Every moving quantity is a formula held by
 /// a layer in the scene, and the scene works out what went stale.
 struct Stage {
-    scene: Scene<12>,
+    scene: Scene<16>,
     block: LayerId,
     veil: LayerId,
     /// Where the veil rests when it is showing.
@@ -3831,25 +3929,27 @@ fn render_loop(renderer: &mut Screen) -> ! {
     if window.is_none() {
         println!("window     : none -- no memory for a surface or its task");
     }
+    let mut desk = input::Desk::new(renderer, &mut stage.scene);
     let screen = stage.scene.screen().area();
 
     // A renderer that fails paints nothing, which is what the counters below
     // would then show. The first failure is reported; a renderer that fails
     // every frame would otherwise fill the log.
     let mut failed = false;
-    let mut frame = |stage: &mut Stage, now| match stage.scene.frame(renderer, now) {
-        Ok(painted) => painted,
-        Err(error) => {
-            if !failed {
-                println!("paint      : the renderer failed: {error:?}");
-                failed = true;
+    let mut frame =
+        |stage: &mut Stage, renderer: &mut Screen, now| match stage.scene.frame(renderer, now) {
+            Ok(painted) => painted,
+            Err(error) => {
+                if !failed {
+                    println!("paint      : the renderer failed: {error:?}");
+                    failed = true;
+                }
+                Painted::default()
             }
-            Painted::default()
-        }
-    };
+        };
 
     let start = time::now_ns();
-    let first = frame(&mut stage, start);
+    let first = frame(&mut stage, renderer, start);
     check(
         "scene check",
         "the first frame paints the whole screen",
@@ -3858,7 +3958,7 @@ fn render_loop(renderer: &mut Screen) -> ! {
     check(
         "scene check",
         "asking again at the same instant paints nothing",
-        frame(&mut stage, start) == Painted::default(),
+        frame(&mut stage, renderer, start) == Painted::default(),
     );
     gpu_first_frame_checks();
     println!();
@@ -3892,7 +3992,10 @@ fn render_loop(renderer: &mut Screen) -> ! {
             window.poll(&mut stage.scene, now);
         }
 
-        let result = frame(&mut stage, now);
+        // What the keyboard and mouse have done since the last look.
+        desk.poll(renderer, &mut stage.scene, now);
+
+        let result = frame(&mut stage, renderer, now);
         wakeups += 1;
         if result.stale > 0 {
             painted += 1;

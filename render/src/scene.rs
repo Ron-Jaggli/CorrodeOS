@@ -149,6 +149,10 @@ const fn clamp_size(size: u32) -> i32 {
 /// The empty rectangle.
 const NOWHERE: Rect = Rect::new(0, 0, 0, 0);
 
+/// A rectangle covering every layer, wherever its corner is: what a layer
+/// has "redrawn" when the whole of it has to be painted again.
+const EVERYWHERE: Rect = Rect::new(i32::MIN / 2, i32::MIN / 2, u32::MAX, u32::MAX);
+
 /// `rect`, `dx` to the right and `dy` down. A rectangle a client supplied can
 /// be anywhere, so this saturates rather than wraps; what is left is clipped
 /// by whoever asked.
@@ -190,6 +194,11 @@ impl Shown {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LayerId(usize);
 
+impl LayerId {
+    /// An id no scene ever issues.
+    pub const NONE: LayerId = LayerId(usize::MAX);
+}
+
 /// What one call to [`Scene::frame`] did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Painted {
@@ -203,8 +212,9 @@ pub struct Painted {
 
 /// Up to `N` layers over a background, in fixed storage.
 ///
-/// Layers stack in the order they were added. A removed layer's place is not
-/// reused, so an id never comes to mean a different layer.
+/// A new layer goes on top, and [`Scene::raise`] brings one to the top again.
+/// A removed layer's place is not reused, so an id never comes to mean a
+/// different layer.
 pub struct Scene<const N: usize> {
     screen: Rect,
     background: Color,
@@ -213,6 +223,10 @@ pub struct Scene<const N: usize> {
     /// The part of each layer its client has redrawn since the last frame,
     /// relative to the layer's corner. Empty when it has not.
     redrawn: [Rect; N],
+    /// Which layer is where in the stack: `order[0]` is at the bottom. An id
+    /// is a layer's slot, which never changes; this is what restacking
+    /// rearranges.
+    order: [usize; N],
     len: usize,
     painted: bool,
 }
@@ -225,6 +239,7 @@ impl<const N: usize> Scene<N> {
             layers: [None; N],
             shown: [Shown::NOTHING; N],
             redrawn: [NOWHERE; N],
+            order: [0; N],
             len: 0,
             painted: false,
         }
@@ -240,8 +255,55 @@ impl<const N: usize> Scene<N> {
             return None;
         }
         self.layers[self.len] = Some(layer);
+        self.order[self.len] = self.len;
         self.len += 1;
         Some(LayerId(self.len - 1))
+    }
+
+    /// Put a layer on top of every other. The next frame repaints it, since
+    /// whatever overlapped it no longer does.
+    pub fn raise(&mut self, id: LayerId) {
+        let stack = &mut self.order[..self.len];
+        let Some(at) = stack.iter().position(|slot| *slot == id.0) else {
+            return;
+        };
+        stack[at..].rotate_left(1);
+        if self.layers[id.0].is_some() {
+            self.redrawn[id.0] = EVERYWHERE;
+        }
+    }
+
+    /// The layer on top, if there are any.
+    pub fn top(&self) -> Option<LayerId> {
+        self.order[..self.len]
+            .iter()
+            .rev()
+            .find(|slot| self.layers[**slot].is_some())
+            .map(|slot| LayerId(*slot))
+    }
+
+    /// The topmost layer showing at the pixel `x`, `y` as of the last frame,
+    /// if any: what a click there lands on.
+    ///
+    /// As of the last frame, because that is what is on the glass and so
+    /// what the person pointing can see. A layer at zero opacity is not
+    /// there to be clicked; a mask is taken whole, holes and all.
+    pub fn layer_at(&self, x: i32, y: i32) -> Option<LayerId> {
+        self.layers_at(x, y).next()
+    }
+
+    /// Every layer showing at the pixel `x`, `y`, from the top down: for
+    /// looking past some of them, as a pointer has to look past itself.
+    pub fn layers_at(&self, x: i32, y: i32) -> impl Iterator<Item = LayerId> + '_ {
+        let point = Rect::new(x, y, 1, 1);
+        self.order[..self.len]
+            .iter()
+            .rev()
+            .filter(move |slot| {
+                let shown = &self.shown[**slot];
+                self.layers[**slot].is_some() && shown.alpha > 0 && shown.rect.contains(&point)
+            })
+            .map(|slot| LayerId(*slot))
     }
 
     /// Take a layer out. The next frame repaints where it was.
@@ -353,10 +415,11 @@ impl<const N: usize> Scene<N> {
 
         // The topmost opaque layer covering all of `stale` hides everything
         // under it, background included.
-        let cover = self
-            .shown
-            .iter()
-            .rposition(|shown| shown.opaque() && shown.rect.contains(&stale));
+        let stack = &self.order[..self.len];
+        let cover = stack.iter().rposition(|slot| {
+            let shown = &self.shown[*slot];
+            shown.opaque() && shown.rect.contains(&stale)
+        });
         let first = cover.unwrap_or(0);
         if cover.is_none() {
             list.push(Command::Clear {
@@ -365,7 +428,7 @@ impl<const N: usize> Scene<N> {
             drawn += stale.area();
         }
 
-        for shown in &self.shown[first..] {
+        for shown in stack[first..].iter().map(|slot| &self.shown[*slot]) {
             let Some(visible) = shown.rect.intersect(&stale) else {
                 continue;
             };
@@ -720,6 +783,46 @@ mod tests {
     }
 
     #[test]
+    fn a_raised_layer_is_drawn_last_and_found_first() {
+        let mut scene = Scene::<4>::new(&INFO, GROUND);
+        let low = scene
+            .add(Layer::solid(Rect::new(0, 0, 20, 20), Color::WHITE))
+            .unwrap();
+        let high = scene
+            .add(Layer::solid(Rect::new(10, 10, 20, 20), Color::BLACK))
+            .unwrap();
+        scene.frame(&mut Recorder::default(), 0).unwrap();
+        assert_eq!(scene.top(), Some(high));
+        assert_eq!(scene.layer_at(15, 15), Some(high));
+        assert_eq!(scene.layer_at(5, 5), Some(low));
+        assert_eq!(scene.layer_at(50, 40), None);
+        assert_eq!(scene.layers_at(15, 15).collect::<Vec<_>>(), [high, low]);
+
+        scene.raise(low);
+        assert_eq!(scene.top(), Some(low));
+        let mut recorder = Recorder::default();
+        let painted = scene.frame(&mut recorder, MS).unwrap();
+        // The whole of the raised layer is repainted, and it goes last.
+        assert_eq!(recorder.presented, [Rect::new(0, 0, 20, 20)]);
+        assert!(painted.stale == 400);
+        assert!(matches!(
+            recorder.commands.last(),
+            Some(Command::FillRect { color, .. }) if *color == Color::WHITE
+        ));
+        assert_eq!(scene.layer_at(15, 15), Some(low));
+
+        // Raising what is already on top changes nothing on the glass but
+        // is still painted once; a layer at zero opacity cannot be pointed
+        // at.
+        scene.layer_mut(low).unwrap().opacity = Animation::rest(Fx::ZERO);
+        scene.frame(&mut Recorder::default(), 2 * MS).unwrap();
+        assert_eq!(scene.layer_at(5, 5), None);
+        assert_eq!(scene.layer_at(15, 15), Some(high));
+        scene.remove(low);
+        assert_eq!(scene.top(), Some(high));
+    }
+
+    #[test]
     fn more_layers_than_one_batch_are_all_drawn() {
         let mut scene = Scene::<40>::new(&INFO, GROUND);
         for i in 0..40 {
@@ -870,6 +973,9 @@ mod tests {
         }
     }
 
+    /// Layer slots in the randomised test.
+    const SLOTS: usize = 256;
+
     /// The property everything else here exists to keep: however a scene got
     /// to its present state -- whichever frames were painted or skipped,
     /// whatever was culled, wherever the damage fell -- the glass shows
@@ -880,10 +986,13 @@ mod tests {
         let mut windows = Windows::new(&mut random);
         let mut glass = Glass::new();
         let mut renderer = glass.renderer(&windows);
-        let mut scene = Scene::<12>::new(&INFO, GROUND);
+        // Enough slots for every layer the run adds: a removed layer's slot
+        // is never reused, so a small scene would fill up early and the
+        // rest of the run would be spent on an empty one.
+        let mut scene = Scene::<SLOTS>::new(&INFO, GROUND);
         let mut ids = Vec::new();
         let mut now = 0u64;
-        let (mut skipped, mut culled, mut redrawn) = (0, 0, 0);
+        let (mut skipped, mut culled, mut redrawn, mut raised) = (0, 0, 0, 0);
 
         for _ in 0..1500 {
             now += random.below(40) * MS;
@@ -920,7 +1029,11 @@ mod tests {
                 1 if !ids.is_empty() => {
                     scene.remove(ids.swap_remove(random.below(ids.len() as u64) as usize));
                 }
-                2..=6 if !ids.is_empty() => {
+                6 if !ids.is_empty() => {
+                    scene.raise(ids[random.below(ids.len() as u64) as usize]);
+                    raised += 1;
+                }
+                2..=5 if !ids.is_empty() => {
                     let id = ids[random.below(ids.len() as u64) as usize];
                     let layer = scene.layer_mut(id).unwrap();
                     match random.below(4) {
@@ -991,8 +1104,9 @@ mod tests {
 
             // The same layers, in a scene that has never painted anything.
             let mut fresh_glass = Glass::new();
-            let mut fresh = Scene::<12>::new(&INFO, GROUND);
+            let mut fresh = Scene::<SLOTS>::new(&INFO, GROUND);
             fresh.layers = scene.layers;
+            fresh.order = scene.order;
             fresh.len = scene.len;
             fresh
                 .frame(&mut fresh_glass.renderer(&windows), now)
@@ -1004,6 +1118,7 @@ mod tests {
         // The run has to have exercised the paths it is vouching for.
         assert!(skipped > 50, "only {skipped} still frames");
         assert!(culled > 50, "only {culled} partial repaints");
-        assert!(redrawn > 20, "only {redrawn} client redraws");
+        assert!(redrawn > 50, "only {redrawn} client redraws");
+        assert!(raised > 50, "only {raised} layers raised");
     }
 }

@@ -177,6 +177,15 @@ pub enum Object {
     /// A file the bootloader loaded, by its place in [`crate::modules`].
     /// READ means may map it and read it. Nothing means may change it.
     Blob(usize),
+    /// A run of I/O ports, `count` of them from `base`. READ means may read
+    /// them, WRITE may write them.
+    ///
+    /// Ring 3 still has no port instructions of its own: IOPL stays 0 and
+    /// there is no I/O permission bitmap. The kernel does the access on the
+    /// holder's behalf, after checking the port is inside the range, so the
+    /// range is exactly the authority and a driver handed the keyboard's two
+    /// ports cannot reach the third one between them.
+    IoPorts { base: u16, count: u16 },
 }
 
 impl core::fmt::Debug for Object {
@@ -193,6 +202,7 @@ impl core::fmt::Debug for Object {
             Object::Interrupt(index) => write!(f, "Interrupt({index})"),
             Object::Memory(index) => write!(f, "Memory({index})"),
             Object::Blob(index) => write!(f, "Blob({index})"),
+            Object::IoPorts { base, count } => write!(f, "IoPorts({base:#x}, {count})"),
         }
     }
 }
@@ -214,6 +224,7 @@ pub enum ObjectKind {
     Interrupt = kind::INTERRUPT,
     Memory = kind::MEMORY,
     Blob = kind::BLOB,
+    IoPorts = kind::IO_PORTS,
 }
 
 impl Object {
@@ -230,6 +241,7 @@ impl Object {
             Object::Interrupt(_) => ObjectKind::Interrupt,
             Object::Memory(_) => ObjectKind::Memory,
             Object::Blob(_) => ObjectKind::Blob,
+            Object::IoPorts { .. } => ObjectKind::IoPorts,
         }
     }
 }
@@ -576,6 +588,16 @@ pub fn blob_of(slot: CapPtr, required: Rights) -> Result<usize, CapError> {
     let object = lookup(slot, required)?;
     match *object {
         Object::Blob(index) => Ok(index),
+        _ => Err(CapError::WrongType),
+    }
+}
+
+/// The ports an IoPorts capability names, as `(base, count)`. Requires
+/// `required`.
+pub fn ports_of(slot: CapPtr, required: Rights) -> Result<(u16, u16), CapError> {
+    let object = lookup(slot, required)?;
+    match *object {
+        Object::IoPorts { base, count } => Ok((base, count)),
         _ => Err(CapError::WrongType),
     }
 }

@@ -7,7 +7,7 @@
 //! nothing to say but "again", so the message is a count of how many times
 //! the device has signalled since the holder last asked.
 //!
-//! # Message signalled only
+//! # Message signalled, and the keyboard
 //!
 //! An MSI is the device writing a word to an address the local APIC listens
 //! on. The word is the vector and the address picks the CPU, so there is no
@@ -17,6 +17,14 @@
 //! configuration space, or an entry of the MSI-X table behind one of its
 //! BARs -- and a driver can do neither, which is what stops it aiming an
 //! interrupt at a vector that is not its own.
+//!
+//! The exception is the old ISA lines, which is where the PS/2 keyboard and
+//! mouse still are. Those go through the I/O APIC, which the kernel kept at
+//! boot for the purpose: [`create_isa`] points one or more of them at a line
+//! of their own, and from there they are the same object, waited on the same
+//! way. Only edge-triggered ones: a level-triggered line stays asserted until
+//! the driver has dealt with the device, and acknowledging it at the local
+//! APIC before then would deliver it again for ever.
 //!
 //! # Nothing is lost and nothing is queued
 //!
@@ -37,11 +45,73 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use corrode_pci::{MSIX_ENTRY_LEN, MSIX_ENTRY_MASKED};
 
-use crate::arch::x86_64::{cpu, idt::TrapFrame, lapic, vectors, without_interrupts};
+use crate::arch::x86_64::{
+    cpu, idt::TrapFrame, ioapic::IoApic, lapic, vectors, without_interrupts,
+};
 use crate::cap::{self, CapError, CapPtr, Rights};
 use crate::mm::paging;
 use crate::pci;
+use crate::sync::SpinLock;
 use crate::task::{self, State};
+
+/// Where each of the sixteen ISA lines arrives: global system interrupt,
+/// active low, level triggered. From the MADT's overrides.
+pub type IsaLines = [(u32, bool, bool); 16];
+
+/// The I/O APIC that owns the ISA lines, kept after boot so a driver can be
+/// given one. Behind a lock because its registers are a select/window pair.
+static ISA: SpinLock<Option<(IoApic, IsaLines)>> = SpinLock::new(None);
+
+/// Keep the controller the ISA lines are on, and where each line landed.
+pub fn keep_isa(io: IoApic, lines: IsaLines) {
+    without_interrupts(|| *ISA.lock() = Some((io, lines)));
+}
+
+/// Take the next line number, if there is one left.
+fn next_line() -> Option<usize> {
+    let index = NEXT.fetch_add(1, Ordering::Relaxed);
+    if index >= LINES {
+        NEXT.store(LINES, Ordering::Relaxed);
+        return None;
+    }
+    Some(index)
+}
+
+/// Make one interrupt line for the ISA interrupts `irqs`, aimed at the CPU
+/// with index `cpu_index`, and return its number.
+///
+/// Several ISA interrupts on one line is deliberate for devices that share a
+/// register: the PS/2 keyboard and mouse both say "read port 0x60", so one
+/// wait covering both is exactly what their driver wants, and two would mean
+/// waiting on one while the other went unheard.
+///
+/// `None` if the I/O APIC was not kept, any of them is level triggered, the
+/// local APIC is not in use, or the lines have run out.
+pub fn create_isa(irqs: &[u8], cpu_index: usize) -> Option<usize> {
+    if !lapic::is_mapped() {
+        return None;
+    }
+    let apic_id = cpu::lapic_id_of(cpu_index)?;
+    without_interrupts(|| {
+        let guard = ISA.lock();
+        let (io, lines) = guard.as_ref()?;
+        let routes = irqs
+            .iter()
+            .map(|irq| lines.get(*irq as usize).copied())
+            .collect::<Option<alloc::vec::Vec<_>>>()?;
+        if routes.iter().any(|(_, _, level)| *level) {
+            return None;
+        }
+        let index = next_line()?;
+        let vector = vectors::DEVICE_BASE + index as u8;
+        for (gsi, active_low, level) in routes {
+            if !io.route(gsi, vector, apic_id as u32, active_low, level) {
+                return None;
+            }
+        }
+        Some(index)
+    })
+}
 
 /// How many interrupt lines there are: one vector each.
 pub const LINES: usize = (vectors::DEVICE_END - vectors::DEVICE_BASE) as usize;
@@ -94,11 +164,7 @@ pub fn create(device: usize, entry: u16, cpu_index: usize) -> Option<usize> {
         return None;
     }
 
-    let index = NEXT.fetch_add(1, Ordering::Relaxed);
-    if index >= LINES {
-        NEXT.store(LINES, Ordering::Relaxed);
-        return None;
-    }
+    let index = next_line()?;
     let vector = vectors::DEVICE_BASE + index as u8;
     let (address, data) = corrode_pci::x86_message(apic_id, vector);
     let config = found.config();

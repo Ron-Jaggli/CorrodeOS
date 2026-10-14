@@ -77,6 +77,13 @@ pub const SYS_EXIT: u64 = 12;
 /// Where one page of a memory capability is in physical memory, for telling
 /// a device. Needs WRITE. `rsi` is the page; the address comes back in `rdx`.
 pub const SYS_PHYSICAL: u64 = 13;
+/// Read an I/O port in a port-range capability. Needs READ. `rsi` is the
+/// offset into the range and `rdx` the width in bytes: 1, 2 or 4. The value
+/// comes back in `rdx`.
+pub const SYS_PORT_IN: u64 = 14;
+/// Write one. Needs WRITE. `rsi` is the offset, `rdx` the width, `r10` the
+/// value.
+pub const SYS_PORT_OUT: u64 = 15;
 
 /// Slot argument meaning "nowhere".
 ///
@@ -138,6 +145,7 @@ pub mod kind {
     pub const INTERRUPT: u8 = 9;
     pub const MEMORY: u8 = 10;
     pub const BLOB: u8 = 11;
+    pub const IO_PORTS: u8 = 12;
 }
 
 /// Rights, as bits: in the low byte of what `SYS_IDENTIFY` reports, and as
@@ -171,6 +179,35 @@ pub mod log {
     pub const LINE: u64 = 2;
     /// Bytes in one message.
     pub const CAPACITY: usize = 32;
+}
+
+/// The PS/2 driver and what it tells the compositor.
+///
+/// The slots are where the kernel puts the driver's capabilities before it
+/// runs. Each event is one message on the `EVENTS` endpoint.
+pub mod ps2 {
+    /// The controller's data port, 0x60, and nothing else.
+    pub const DATA: usize = 0;
+    /// Its status and command port, 0x64, and nothing else.
+    pub const COMMAND: usize = 1;
+    /// The keyboard's and the mouse's interrupts, which share one line: both
+    /// are read from the same port, so one wait covers both.
+    pub const IRQ: usize = 2;
+    /// A send-only endpoint to the compositor.
+    pub const EVENTS: usize = 3;
+    /// A send-only endpoint to the log.
+    pub const LOG: usize = 4;
+
+    /// A key went down or came up. Word 0 is the key, as
+    /// `corrode_input::Key`; word 1 is 1 for down and 0 for up; word 2 is the
+    /// character it types, or zero; word 3 the modifier bits.
+    pub const LABEL_KEY: u64 = 50;
+    /// The mouse moved or a button changed. Words 0 and 1 are how far right
+    /// and down, as signed numbers; word 2 the buttons held.
+    pub const LABEL_POINTER: u64 = 51;
+    /// The driver is up: word 0 is 1 if a keyboard answered, word 1 is 1 if a
+    /// mouse did.
+    pub const LABEL_READY: u64 = 52;
 }
 
 /// The boot-time conversation between the kernel and the `edu` driver, which
@@ -275,7 +312,7 @@ pub mod gpu {
     /// Enough for 1920 by 1080.
     pub const SCREEN_PAGES: usize = 2048;
     pub const ATLAS_WIDTH: u32 = 1024;
-    pub const ATLAS_HEIGHT: u32 = 256;
+    pub const ATLAS_HEIGHT: u32 = 512;
 
     /// Labels of the kernel's calls. The answer's label is zero for done,
     /// or an error code.
