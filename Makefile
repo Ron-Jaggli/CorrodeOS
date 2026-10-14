@@ -30,11 +30,19 @@ endif
 # QEMU sees no host disk, no host network and no passthrough hardware.
 ACCEL := $(shell [ -w /dev/kvm ] && echo "-enable-kvm -cpu host" || echo "-cpu qemu64")
 
-QEMU_BASE := -M q35 -m $(MEM) -smp $(CPUS) \
+# The machine QEMU pretends to be. q35 has PCI Express and an MCFG table;
+# MACHINE=pc is the older board with neither, which is how the port-pair
+# path to configuration space gets booted at all.
+MACHINE ?= q35
+# Extra devices for one run, e.g. a bridge with something behind it. Emulated
+# ones only: nothing here may name a host device.
+QEMU_EXTRA ?=
+
+QEMU_BASE := -M $(MACHINE) -m $(MEM) -smp $(CPUS) \
              -cdrom $(ISO) -boot d \
              -net none \
              -no-reboot -no-shutdown \
-             $(ACCEL)
+             $(ACCEL) $(QEMU_EXTRA)
 
 QEMU_COMMON := $(QEMU_BASE) -display none
 QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
@@ -62,7 +70,7 @@ clippy:
 HOST_TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
 
 test:
-	cargo test -p corrode-render -p corrode-text -p corrode-gfx --target $(HOST_TARGET)
+	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci --target $(HOST_TARGET)
 
 # The 3D engine's demo scene, drawn on the build host at each preset, for
 # judging by eye. Built optimised, so the times it prints mean something.

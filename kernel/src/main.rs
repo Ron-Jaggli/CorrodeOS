@@ -15,6 +15,7 @@ mod cap;
 mod ipc;
 mod limine;
 mod mm;
+mod pci;
 mod serial;
 mod smp;
 mod surface;
@@ -112,6 +113,8 @@ pub extern "C" fn kmain() -> ! {
         pic::unmask(pit::IRQ);
     }
 
+    init_pci();
+
     // Still before interrupts: a handler inside the measurement window would
     // skew it, and nothing can run one yet.
     match time::init() {
@@ -152,6 +155,7 @@ pub extern "C" fn kmain() -> ! {
     // still single-threaded and the output is deterministic.
     cap_bootstrap();
     cap_checks();
+    pci_checks();
     anim_checks();
     blend_checks();
     text_checks();
@@ -516,6 +520,21 @@ fn heap_test() {
     );
 }
 
+/// Where the firmware's ACPI root pointer is, physically, and the direct map
+/// offset to read it through.
+fn rsdp() -> Option<(u64, u64)> {
+    let (rsdp, hhdm) = (limine::RSDP.response.get()?, limine::HHDM.response.get()?);
+    // Limine has handed this back as a physical address in some base revisions
+    // and an HHDM pointer in others, so normalise rather than assume.
+    let raw = rsdp.address;
+    let physical = if raw >= hhdm.offset {
+        raw - hhdm.offset
+    } else {
+        raw
+    };
+    Some((physical, hhdm.offset))
+}
+
 /// Bring up the APIC: parse the MADT, start the LAPIC timer, and route the PIT
 /// through the I/O APIC.
 ///
@@ -524,24 +543,14 @@ fn heap_test() {
 /// two independent counters advancing proves both the LAPIC *and* the I/O APIC
 /// delivery paths, which a single timer would not.
 fn init_apic() -> bool {
-    let (Some(rsdp), Some(hhdm)) = (limine::RSDP.response.get(), limine::HHDM.response.get())
-    else {
+    let Some((rsdp_phys, hhdm)) = rsdp() else {
         println!("acpi       : no RSDP from the bootloader");
         return false;
     };
 
-    // Limine has handed this back as a physical address in some base revisions
-    // and an HHDM pointer in others, so normalise rather than assume.
-    let raw = rsdp.address;
-    let rsdp_phys = if raw >= hhdm.offset {
-        raw - hhdm.offset
-    } else {
-        raw
-    };
-
     // SAFETY: the bootloader guarantees this points at the firmware's RSDP, and
     // init_paging mapped every region the memory map reports, ACPI included.
-    let Some(madt) = (unsafe { acpi::find_madt(rsdp_phys, hhdm.offset) }) else {
+    let Some(madt) = (unsafe { acpi::find_madt(rsdp_phys, hhdm) }) else {
         println!("acpi       : MADT not found or failed checksum");
         return false;
     };
@@ -634,6 +643,205 @@ fn init_apic() -> bool {
         );
     }
     true
+}
+
+/// Walk the PCI bus and say what is on it.
+///
+/// Nothing here hands a device to anybody. The scan fills a table; authority
+/// over an entry in it is a capability, minted later for whichever task is to
+/// drive that device.
+fn init_pci() {
+    // SAFETY: as for the MADT -- the bootloader's RSDP, read through a direct
+    // map that covers every region the memory map reports.
+    let mcfg = rsdp().and_then(|(physical, hhdm)| unsafe { acpi::find_mcfg(physical, hhdm) });
+
+    let Some(summary) = pci::init(mcfg) else {
+        println!("pci        : no ECAM and no configuration ports -- no bus");
+        return;
+    };
+
+    match summary.mechanism {
+        pci::Mechanism::Ecam(ecam) => println!(
+            "pci        : ECAM at {:#x} for buses {}..={} (ACPI MCFG), {} pages mapped",
+            ecam.base,
+            ecam.first_bus,
+            ecam.last_bus,
+            pci::ecam_pages()
+        ),
+        pci::Mechanism::Ports => {
+            println!("pci        : no usable MCFG, configuration space through ports 0xcf8/0xcfc")
+        }
+    }
+
+    for index in 0..summary.functions {
+        let Some(device) = pci::device(index) else {
+            continue;
+        };
+        print!(
+            "pci        : {} {:04x}:{:04x} {}",
+            device.address,
+            device.header.vendor,
+            device.header.device,
+            device.header.class_name()
+        );
+        for (bar, decoded) in device.bars.iter().enumerate() {
+            match *decoded {
+                corrode_pci::Bar::Memory { address, size, .. } if size < 1024 => {
+                    print!(", bar{bar} {size} bytes at {address:#x}")
+                }
+                corrode_pci::Bar::Memory { address, size, .. } => {
+                    print!(", bar{bar} {} KiB at {address:#x}", size / 1024)
+                }
+                corrode_pci::Bar::Io { port, size } => {
+                    print!(", bar{bar} {size} ports at {port:#x}")
+                }
+                corrode_pci::Bar::None => {}
+            }
+        }
+        if let Some((_, size)) = device.rom {
+            print!(", rom {} KiB", size / 1024);
+        }
+        if device.msi.is_some() {
+            print!(", msi");
+        }
+        if let Some(msix) = device.msix {
+            print!(", msi-x {}", msix.entries);
+        }
+        println!();
+    }
+    println!(
+        "pci        : {} function(s) on {} bus(es)",
+        summary.functions, summary.buses
+    );
+
+    check(
+        "pci check",
+        "the host bridge is at 00:00.0",
+        pci::device(0).is_some_and(|device| {
+            device.address == corrode_pci::Address::new(0, 0, 0, 0) && device.header.class == 0x06
+        }),
+    );
+    // Two paths to the same registers that share no code below the decoder.
+    // Skipped, not passed, on a machine with only one of them.
+    if summary.cross_checked > 0 {
+        check(
+            "pci check",
+            "ECAM and the port pair agree on every function",
+            summary.agreed == summary.cross_checked && summary.agreed == summary.functions,
+        );
+    }
+}
+
+/// Bootstrap's capability to the first device on the bus, with every right.
+const BOOT_PCI: cap::CapPtr = 16;
+/// A read-only copy of it.
+const BOOT_PCI_READ: cap::CapPtr = 17;
+/// Bootstrap's capability to one BAR of some device.
+const BOOT_BAR: cap::CapPtr = 18;
+
+/// A device and its memory, as capabilities.
+///
+/// The scan is the kernel reading the bus for itself. These are the rules a
+/// task is held to when it is handed one entry from that table.
+fn pci_checks() {
+    use cap::{CapError, ObjectKind, Rights};
+    use corrode_pci::{ConfigSpace, BAR0, COMMAND, VENDOR_ID};
+
+    let Some(first) = pci::device(0) else {
+        return;
+    };
+    check(
+        "pci check",
+        "mint a PciDevice capability into slot 16",
+        cap::mint(0, BOOT_PCI, cap::Object::PciDevice(0), Rights::ALL).is_ok()
+            && cap::identify(BOOT_PCI) == Ok((ObjectKind::PciDevice, Rights::ALL)),
+    );
+    check(
+        "pci check",
+        "the capability reads the device the scan found",
+        pci::config_read(BOOT_PCI, VENDOR_ID as u64, 2) == Ok(first.header.vendor as u32)
+            && pci::config_read(BOOT_PCI, VENDOR_ID as u64, 4)
+                == Ok((first.header.device as u32) << 16 | first.header.vendor as u32),
+    );
+    check(
+        "pci check",
+        "a Console capability is not a device",
+        pci::config_read(0, 0, 4) == Err(CapError::WrongType),
+    );
+    check(
+        "pci check",
+        "reading past the end of config space is Invalid",
+        pci::config_read(BOOT_PCI, 4096, 4) == Err(CapError::Invalid)
+            && pci::config_read(BOOT_PCI, u64::MAX, 1) == Err(CapError::Invalid),
+    );
+    check(
+        "pci check",
+        "a misaligned or three-byte read is Invalid",
+        pci::config_read(BOOT_PCI, 1, 2) == Err(CapError::Invalid)
+            && pci::config_read(BOOT_PCI, 0, 3) == Err(CapError::Invalid),
+    );
+
+    let command = pci::config_read(BOOT_PCI, COMMAND as u64, 2);
+    check(
+        "pci check",
+        "a read-only device capability cannot write",
+        cap::copy(BOOT_PCI, BOOT_PCI_READ, Rights::READ) == Ok(Rights::READ)
+            && command.is_ok_and(|value| {
+                pci::config_write(BOOT_PCI_READ, COMMAND as u64, 2, value as u64)
+                    == Err(CapError::InsufficientRights)
+            }),
+    );
+    // Written with what it already holds: this is a check of the rule, not a
+    // reason to reconfigure the host bridge.
+    check(
+        "pci check",
+        "the command register is the holder's to write",
+        command.is_ok_and(|value| {
+            pci::config_write(BOOT_PCI, COMMAND as u64, 2, value as u64).is_ok()
+                && pci::config_read(BOOT_PCI, COMMAND as u64, 2) == Ok(value)
+        }),
+    );
+    let bar = pci::config_read(BOOT_PCI, BAR0 as u64, 4);
+    check(
+        "pci check",
+        "a BAR is not, whatever rights are held",
+        pci::config_write(BOOT_PCI, BAR0 as u64, 4, 0xffff_ffff) == Err(CapError::Invalid)
+            && pci::config_read(BOOT_PCI, BAR0 as u64, 4) == bar,
+    );
+
+    // Memory: the first BAR of anything that has one.
+    let Some(region) = pci::region(0) else {
+        println!("pci        : no device has a memory BAR");
+        return;
+    };
+    let Some(owner) = pci::device(region.device) else {
+        return;
+    };
+    check(
+        "pci check",
+        "mint a DeviceMemory capability into slot 18",
+        cap::mint(0, BOOT_BAR, cap::Object::DeviceMemory(0), Rights::ALL).is_ok()
+            && cap::identify(BOOT_BAR) == Ok((ObjectKind::DeviceMemory, Rights::ALL)),
+    );
+    check(
+        "pci check",
+        "a BAR is a power of two in size, and aligned to it",
+        region.len.is_power_of_two() && region.physical % region.len == 0,
+    );
+    // The register itself, read back now through the port pair if there is
+    // one: sizing wrote all ones to it and should have left no trace.
+    let low = owner.config().read32(BAR0 + 4 * region.bar as u16);
+    check(
+        "pci check",
+        "sizing a BAR left it where the firmware put it",
+        (low & !0xf) as u64 == region.physical & 0xffff_ffff,
+    );
+    check(
+        "pci check",
+        "device memory is not a device, nor the reverse",
+        pci::config_read(BOOT_BAR, 0, 4) == Err(CapError::WrongType)
+            && cap::device_memory_of(BOOT_PCI, Rights::READ).err() == Some(CapError::WrongType),
+    );
 }
 
 /// Physical address of the frame minted into slot 8, so the checks can confirm

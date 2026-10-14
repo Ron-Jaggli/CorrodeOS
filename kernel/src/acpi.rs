@@ -1,9 +1,9 @@
-//! Just enough ACPI to find the interrupt controllers.
+//! Just enough ACPI to find the interrupt controllers and the PCI bus.
 //!
 //! We read the RSDP, follow it to the XSDT (or RSDT on ACPI 1.0), and pull out
-//! the MADT, which is the only table we need right now: it tells us where the
-//! local APIC and I/O APICs live, and how the legacy ISA IRQs have been
-//! remapped onto global system interrupts.
+//! two tables. The MADT tells us where the local APIC and I/O APICs live, and
+//! how the legacy ISA IRQs have been remapped onto global system interrupts.
+//! The MCFG tells us where PCI configuration space is mapped.
 //!
 //! No AML, no interpreter, no ACPICA. Those are needed for power management and
 //! device enumeration, not for interrupts, and each one is a large subproject.
@@ -105,14 +105,17 @@ unsafe fn checksum_ok(ptr: *const u8, len: usize) -> bool {
     sum == 0
 }
 
-/// Find and parse the MADT.
+/// Find a system description table by its four-byte signature.
+///
+/// Returns where it is, through the HHDM, and its length. The table has
+/// passed its own checksum; what is in it is the caller's to interpret.
 ///
 /// `rsdp` is a physical address; `hhdm` is the direct map offset.
 ///
 /// # Safety
 /// `rsdp` must point at a genuine ACPI RSDP and the HHDM must cover the
 /// firmware's ACPI regions.
-pub unsafe fn find_madt(rsdp: u64, hhdm: u64) -> Option<Madt> {
+pub unsafe fn find_table(rsdp: u64, hhdm: u64, wanted: &[u8; 4]) -> Option<(*const u8, usize)> {
     let base = (rsdp + hhdm) as *const u8;
 
     // SAFETY: caller guarantees `rsdp` points at an RSDP reachable via HHDM.
@@ -177,13 +180,45 @@ pub unsafe fn find_madt(rsdp: u64, hhdm: u64) -> Option<Madt> {
         let table = (table_phys + hhdm) as *const u8;
         // SAFETY: entries in the RSDT/XSDT point at ACPI tables.
         let signature: [u8; 4] = unsafe { read_at(table, 0) };
-        if &signature == b"APIC" {
-            // SAFETY: signature matched, so this is a MADT.
-            return unsafe { parse_madt(table) };
+        if &signature != wanted {
+            continue;
         }
+        // SAFETY: every table starts with the common header, length at 4.
+        let length = unsafe { read_at::<u32>(table, 4) } as usize;
+        // SAFETY: length is from the table's own header.
+        if length < SDT_HEADER_LEN || !unsafe { checksum_ok(table, length) } {
+            return None;
+        }
+        return Some((table, length));
     }
 
     None
+}
+
+/// Find and parse the MADT.
+///
+/// # Safety
+/// As [`find_table`].
+pub unsafe fn find_madt(rsdp: u64, hhdm: u64) -> Option<Madt> {
+    // SAFETY: forwarded from the caller.
+    let (table, _) = unsafe { find_table(rsdp, hhdm, b"APIC") }?;
+    // SAFETY: signature and checksum matched, so this is a MADT.
+    unsafe { parse_madt(table) }
+}
+
+/// Find the MCFG, which says where PCI configuration space is in memory.
+///
+/// Returned as bytes for [`corrode_pci::mcfg`] to read: the layout is that
+/// crate's business, and it is tested there.
+///
+/// # Safety
+/// As [`find_table`].
+pub unsafe fn find_mcfg(rsdp: u64, hhdm: u64) -> Option<&'static [u8]> {
+    // SAFETY: forwarded from the caller.
+    let (table, length) = unsafe { find_table(rsdp, hhdm, b"MCFG") }?;
+    // SAFETY: `find_table` checksummed `length` bytes at `table`, so they are
+    // readable, and firmware tables are never unmapped or rewritten.
+    Some(unsafe { core::slice::from_raw_parts(table, length) })
 }
 
 /// # Safety

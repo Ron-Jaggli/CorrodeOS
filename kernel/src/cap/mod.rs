@@ -153,6 +153,18 @@ pub enum Object {
     /// crossing it. A task does not tell the kernel where its pixels are; it
     /// holds this, and the kernel tells the task.
     Surface(usize),
+    /// One function on the PCI bus, by its place in [`crate::pci`]'s table:
+    /// its configuration space. READ means may read its registers, WRITE
+    /// means may write the ones that are a driver's to write.
+    ///
+    /// Holding this is the only way to learn the device exists. There is no
+    /// call that takes a bus address.
+    PciDevice(usize),
+    /// A run of a device's memory -- one BAR -- by its place in the same
+    /// table. It is a separate object from the device on purpose: a task can
+    /// be given a device's registers without its configuration space, or the
+    /// other way about.
+    DeviceMemory(usize),
 }
 
 impl core::fmt::Debug for Object {
@@ -164,6 +176,8 @@ impl core::fmt::Debug for Object {
             Object::Endpoint(_) => write!(f, "Endpoint"),
             Object::Reply(token) => write!(f, "Reply(task {})", token.caller()),
             Object::Surface(index) => write!(f, "Surface({index})"),
+            Object::PciDevice(index) => write!(f, "PciDevice({index})"),
+            Object::DeviceMemory(index) => write!(f, "DeviceMemory({index})"),
         }
     }
 }
@@ -180,6 +194,8 @@ pub enum ObjectKind {
     Endpoint = 4,
     Reply = 5,
     Surface = 6,
+    PciDevice = 7,
+    DeviceMemory = 8,
 }
 
 impl Object {
@@ -191,6 +207,8 @@ impl Object {
             Object::Endpoint(_) => ObjectKind::Endpoint,
             Object::Reply(_) => ObjectKind::Reply,
             Object::Surface(_) => ObjectKind::Surface,
+            Object::PciDevice(_) => ObjectKind::PciDevice,
+            Object::DeviceMemory(_) => ObjectKind::DeviceMemory,
         }
     }
 }
@@ -248,6 +266,11 @@ pub enum CapError {
     /// Nowhere to put a mapping: the caller has no address space of its own,
     /// or there is no memory left for the page tables.
     NoSpace,
+    /// The capability is good and the request is not: an offset past the end
+    /// of the object, a width that does not exist, a register the kernel
+    /// keeps to itself. Distinct from `InsufficientRights` because no right
+    /// would have made it legal.
+    Invalid,
 }
 
 impl CapError {
@@ -268,14 +291,15 @@ impl CapError {
             CapError::Stale => 7,
             CapError::Refused => 8,
             CapError::NoSpace => 9,
+            CapError::Invalid => 10,
         }
     }
 }
 
 /// A task's capability space: a flat table of slots.
 ///
-/// Flat rather than a radix tree because sixteen slots is plenty for now and a
-/// tree would be structure without a purpose. The slot index is the only name a
+/// Flat rather than a radix tree because a few dozen slots is plenty for now
+/// and a tree would be structure without a purpose. The slot index is the only name a
 /// task has for an object.
 pub struct CSpace {
     slots: Vec<Option<Capability>>,
@@ -475,6 +499,32 @@ pub fn surface_of(slot: CapPtr, required: Rights) -> Result<(usize, Rights), Cap
         }
         match *cap.object {
             Object::Surface(index) => Ok((index, cap.rights)),
+            _ => Err(CapError::WrongType),
+        }
+    })
+    .ok_or(CapError::NoSuchTask)?
+}
+
+/// The device a PciDevice capability names. Requires `required`.
+pub fn pci_device_of(slot: CapPtr, required: Rights) -> Result<usize, CapError> {
+    let object = lookup(slot, required)?;
+    match *object {
+        Object::PciDevice(index) => Ok(index),
+        _ => Err(CapError::WrongType),
+    }
+}
+
+/// The region a DeviceMemory capability names, and the rights it is held
+/// with. Requires `required`.
+pub fn device_memory_of(slot: CapPtr, required: Rights) -> Result<(usize, Rights), CapError> {
+    let current = task::current_id().ok_or(CapError::NoSuchTask)?;
+    task::with_cspace(current, |cspace| {
+        let cap = cspace.get(slot)?;
+        if !cap.rights.contains(required) {
+            return Err(CapError::InsufficientRights);
+        }
+        match *cap.object {
+            Object::DeviceMemory(index) => Ok((index, cap.rights)),
             _ => Err(CapError::WrongType),
         }
     })

@@ -39,7 +39,7 @@ Then:
 ./corrode wx-test     # boot and prove .text is not writable
 ./corrode user-test   # boot and prove ring 3 cannot read kernel memory
 ./corrode check       # cargo check
-./corrode test        # render, text and gfx crate unit tests, on the build host
+./corrode test        # render, text, gfx and pci crate unit tests, on the build host
 ./corrode specimen    # draw a sheet of the typeface to build/specimen.png
 ./corrode shell       # drop into the build container
 ```
@@ -47,7 +47,9 @@ Then:
 Env knobs: `CPUS=n` for guest cores (default 4; `CPUS=1` for uniprocessor),
 `ENGINE=docker`, `NO_KVM=1` to force TCG, `NET=1` to give the
 container network access (off by default — there are no crates.io dependencies,
-so the build genuinely doesn't need it).
+so the build genuinely doesn't need it), `MACHINE=pc` for QEMU's older board
+with no PCI Express, and `QEMU_EXTRA='-device …'` to plug emulated devices in
+for one run.
 
 ## Layout
 
@@ -68,6 +70,7 @@ kernel/          the privileged kernel
   src/task/user.rs user address space — aliased code pages, user stacks
   src/smp.rs       starting the other CPUs
   src/surface.rs   pixels a task draws and the compositor shows
+  src/pci.rs       the PCI bus: what is on it, and devices as capabilities
   src/time.rs      monotonic nanosecond clock, off the TSC
   src/arch/x86_64/cpu.rs  which CPU is this
   build.rs         makes cargo notice linker.ld changes
@@ -83,6 +86,9 @@ gfx/             the 3D engine: integer-only, software, not yet on screen
 text/            the text engine
   src/lib.rs       strings to coverage: measuring, placing, inking
   src/font.rs      the typeface, as pen strokes you can read and edit
+pci/             PCI configuration space as arithmetic, tested on the build host
+  src/lib.rs       headers, BARs, capability lists, MSI, what a driver may write
+  src/mcfg.rs      the ACPI table that says where configuration space is
 boot/limine.conf lets Limine find the kernel
 docker/          the build environment
 scripts/         check-image.sh — guards against orphan sections
@@ -186,6 +192,10 @@ the kernel only through one syscall gate that takes capability slots and no
 pointers. Ring 3 tasks can be clients *and* servers — the kernel calls into a
 userspace service and gets an answer back. `./corrode user-test` proves a ring 3
 task cannot read kernel memory.
+
+The PCI bus: every function found at boot, through ECAM or the legacy ports,
+and a device's configuration space and each of its BARs as capability
+objects. See "Devices" below.
 
 Not yet: migrating a task between CPUs, reclaiming frames and stacks.
 
@@ -440,6 +450,96 @@ cure is two buffers and a swap on commit. A surface has no transparency of
 its own. A commit is found at the next scheduling tick rather than waking the
 painter, which is the same gap as pacing by the tick. And the 3D engine in
 `gfx/` produces exactly these pixels but nothing connects the two yet.
+
+### Devices
+
+The road to a GPU driver in userspace starts with the kernel knowing what is
+plugged in and being able to hand one device, and nothing else, to one task.
+
+#### The bus is read once
+
+```
+pci        : ECAM at 0xb0000000 for buses 0..=255 (ACPI MCFG), 39 pages mapped
+pci        : 00:00.0 8086:29c0 host bridge
+pci        : 00:01.0 1234:1111 VGA controller, bar0 16384 KiB at 0xfd000000, bar2 4 KiB at 0xfebf0000, rom 64 KiB
+pci        : 00:1f.2 8086:2922 SATA controller, bar4 32 ports at 0xc040, bar5 4 KiB at 0xfebf1000, msi
+pci        : 5 function(s) on 1 bus(es)
+```
+
+Configuration space is reached through ECAM where ACPI's MCFG table says
+there is one, and through ports 0xCF8/0xCFC otherwise. A function's 4 KiB is
+mapped, uncached, when the scan first reaches it, so the mapping costs what
+is plugged in rather than 256 MiB of page tables. The scan starts at bus 0
+and follows bridges down, keeping a bit per bus so a bridge that names its
+own bus cannot send it round in a circle.
+
+On a machine with both mechanisms each function's identity is read through
+both and compared. They share nothing below the decoder -- one is a memory
+read, the other two port instructions under a lock -- so agreement means
+something, in the way two timers counted against a third do:
+
+```
+pci check  : ECAM and the port pair agree on every function      PASS
+```
+
+`MACHINE=pc ./corrode boot-test` boots QEMU's older board, which has no
+MCFG, and is how the port path gets run on its own.
+
+#### The decoding lives where it can be tested
+
+`pci/` is a crate with no kernel in it. A BAR does not say how big it is:
+the size is found by writing all ones and seeing which bits stuck, and a
+64-bit BAR is two registers that have to be sized together. Capability lists
+are a chain of one-byte pointers inside the device's own registers, exactly
+as trustworthy as the device. Those are the parts that are easy to get
+subtly wrong, and none of them needs a machine. `./corrode test` runs them
+against a device made of an array, which hard-wires the low bits of a BAR to
+zero and clears status bits written as one, as the specification says a real
+one does.
+
+Accesses carry their width. The status register is write-one-to-clear and
+shares a doubleword with the command register, so building a 16-bit write
+out of a 32-bit read and write acknowledges every error the device had
+latched. The first test this crate failed was its own bounds check, which
+added a width to an offset before comparing it: an overflow, on a number
+that will arrive from ring 3.
+
+#### A device is a capability, and so is each BAR
+
+Nothing takes a bus address. A task cannot ask for "07:00.0": it holds a
+capability to a device or it does not, and a task that holds none cannot
+find out what is on the bus at all.
+
+- **`PciDevice`** is one function's configuration space. READ reads its
+  registers. WRITE writes the ones that are a driver's to write.
+- **`DeviceMemory`** is one BAR. It is a separate object on purpose, so a
+  task can be given a device's registers without its configuration space.
+
+Holding a device is not holding the bus. Three kinds of register decide where
+a device sits among the others, and the kernel keeps those whatever rights a
+capability carries: the BARs and the ROM address, because moving a device's
+memory is how it gets put on top of someone else's; the MSI and MSI-X
+capabilities, because the message in them names a vector on a CPU, and a
+driver that could write one could raise any interrupt in the machine; and
+everything in a bridge. A write to one of those is `Invalid`, a new error
+that means the capability is good and the request is not -- kept apart from
+`InsufficientRights` because no right would have made it legal.
+
+```
+pci check  : a read-only device capability cannot write          PASS
+pci check  : the command register is the holder's to write       PASS
+pci check  : a BAR is not, whatever rights are held              PASS
+```
+
+Known gaps: one segment, and only the buses firmware already numbered -- a
+bridge left at bus 0 is recorded and not descended into, and nothing assigns
+BARs the firmware did not. I/O-port BARs are listed and are not objects: ring
+3 has IOPL 0 and no way to be given a port. The command register is the
+driver's, and that includes the bus-master bit: **there is no IOMMU support,
+so a driver that can make its device do DMA can reach all of physical
+memory.** The capability model bounds what a driver can ask the kernel for;
+it does not yet bound what the driver's hardware can do on its behalf. No
+hotplug, no AML, no power management.
 
 ### Text
 
@@ -1038,7 +1138,9 @@ every online CPU taking its own timer ticks. The monotonic clock is checked
 against the PIT, and six animation checks confirm on the target itself what the
 host tests establish against a reference: a spring starts and ends where it
 should, overshoots only when underdamped, keeps position and velocity through a
-retarget, and gives the same answer whatever order it is sampled in. Three
+retarget, and gives the same answer whatever order it is sampled in. Fourteen PCI checks cover the
+scan agreeing with itself through two mechanisms, and a device and a BAR as
+capabilities: what reads, what writes, what is refused and why. Three
 blend checks confirm a fade is exact at both ends and seamless over its own
 colour, two text checks that letters stay inside the block measured for them
 and a stroke is the thickness its weight says, and two scene checks that the

@@ -111,7 +111,7 @@ pub struct Task {
 }
 
 /// Slots per capability space.
-pub const CSPACE_SLOTS: usize = 16;
+pub const CSPACE_SLOTS: usize = 32;
 
 /// A copy of a task's status, for reporting without holding the lock.
 #[derive(Debug, Clone, Copy)]

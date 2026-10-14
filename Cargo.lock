@@ -13,9 +13,14 @@ dependencies = [
 name = "corrode-kernel"
 version = "0.0.1"
 dependencies = [
+ "corrode-pci",
  "corrode-render",
  "corrode-text",
 ]
+
+[[package]]
+name = "corrode-pci"
+version = "0.0.1"
 
 [[package]]
 name = "corrode-render"
