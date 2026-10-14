@@ -10,6 +10,7 @@
 //! just handing back a bad frame, which is why `free` is `unsafe` and carries a
 //! real contract.
 
+use crate::arch::x86_64::without_interrupts;
 use crate::limine::{MemmapEntry, MEMMAP_USABLE};
 use crate::sync::SpinLock;
 
@@ -133,19 +134,27 @@ pub fn init(hhdm: u64, entries: impl Iterator<Item = &'static MemmapEntry>) {
     }
 }
 
+/// Take one frame.
+///
+/// The lock is held with interrupts off, here and below. Mapping a surface
+/// into a task allocates page tables from inside a system call, which runs
+/// with interrupts disabled; it must never find this lock held by a task it
+/// preempted on the same CPU.
 pub fn alloc() -> Option<Frame> {
-    ALLOCATOR.lock().alloc()
+    without_interrupts(|| ALLOCATOR.lock().alloc())
 }
 
 /// # Safety
 /// See [`FrameAllocator::free`].
 pub unsafe fn free(frame: Frame) {
     // SAFETY: forwarding the caller's obligation unchanged.
-    unsafe { ALLOCATOR.lock().free(frame) };
+    without_interrupts(|| unsafe { ALLOCATOR.lock().free(frame) });
 }
 
 /// `(free, total)` frame counts.
 pub fn stats() -> (usize, usize) {
-    let allocator = ALLOCATOR.lock();
-    (allocator.free_frames(), allocator.total_frames())
+    without_interrupts(|| {
+        let allocator = ALLOCATOR.lock();
+        (allocator.free_frames(), allocator.total_frames())
+    })
 }

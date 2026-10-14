@@ -39,7 +39,7 @@ Then:
 ./corrode wx-test     # boot and prove .text is not writable
 ./corrode user-test   # boot and prove ring 3 cannot read kernel memory
 ./corrode check       # cargo check
-./corrode test        # render and text crate unit tests, on the build host
+./corrode test        # render, text and gfx crate unit tests, on the build host
 ./corrode specimen    # draw a sheet of the typeface to build/specimen.png
 ./corrode shell       # drop into the build container
 ```
@@ -67,6 +67,7 @@ kernel/          the privileged kernel
   src/syscall.rs   the ring 3 boundary — capability slots in, no pointers
   src/task/user.rs user address space — aliased code pages, user stacks
   src/smp.rs       starting the other CPUs
+  src/surface.rs   pixels a task draws and the compositor shows
   src/time.rs      monotonic nanosecond clock, off the TSC
   src/arch/x86_64/cpu.rs  which CPU is this
   build.rs         makes cargo notice linker.ld changes
@@ -78,6 +79,7 @@ render/          the rendering interface
   src/damage.rs    which pixels are stale
   src/blend.rs     alpha blending, exact, two multiplies a pixel
   src/scene.rs     layers, and the least repainting that keeps up with them
+gfx/             the 3D engine: integer-only, software, not yet on screen
 text/            the text engine
   src/lib.rs       strings to coverage: measuring, placing, inking
   src/font.rs      the typeface, as pen strokes you can read and edit
@@ -161,6 +163,10 @@ stands on; see "Motion" below.
 Text: a second engine, separate from the renderer, that turns strings into
 anti-aliased coverage at any size from a built-in stroke typeface. The renderer
 draws coverage through a mask atlas in any colour. See "Text" below.
+
+A window: a ring 3 task holding one capability, to a surface, draws pixels
+into memory it shares with the compositor and says which ones changed. The
+kernel shows them as a layer and repaints what was named. See "Windows" below.
 
 A kernel heap at PML4 slot 320, so `alloc` types (`Box`, `Vec`, `String`) work.
 The MADT is parsed for the interrupt controllers; the local APIC timer drives a
@@ -354,11 +360,86 @@ after every one compares the screen with a fresh scene painted from scratch at
 that instant. Damage, culling, blending and presenting all have to be right for
 those to match, and breaking any one of them fails it.
 
-Known gaps: a layer is one colour, solid or through a mask. A window needs pixels of its own, which is a
-shared `Frame` and a capability to it -- the next step, and the first one that
-crosses the ring boundary. Layers stack in the order they were added and cannot
-be restacked. And a layer that grows or moves damages its whole old and new
+Known gaps: layers stack in the order they were added and cannot be
+restacked. And a layer that grows or moves damages its whole old and new
 rectangles, though for a flat colour only the edges changed.
+
+### Windows
+
+A layer can be pixels instead of a colour: a **surface**, which is memory a
+client draws into. This is the first thing to cross the ring boundary in bulk,
+and it does it without a pointer crossing.
+
+```
+window     : the painter's first commit is its whole surface     PASS
+window     : the kernel reads the pixels ring 3 wrote            PASS
+window     : both are looking at the same memory                 PASS
+window     : a later commit names only what was redrawn          PASS
+```
+
+#### Shared, not sent
+
+A surface is a run of physical frames mapped twice: read-only in the kernel
+half, where the renderer reads them, and in the lower half of whichever task
+holds a capability to it. There is no copy from the client to the compositor:
+the pixels go from where they were drawn into the back buffer, like anything
+else. A window that is opaque and on a screen with the usual layout is copied
+a row at a time and never looked at.
+
+Two syscalls, both taking a capability slot and numbers in registers:
+
+- `SYS_MAP` -- put this surface in my address space. The kernel chooses the
+  address and *returns* it with the size. The syscall boundary still takes no
+  pointers; this is one going the other way. READ gets a mapping, WRITE makes
+  it writable, and it is never executable.
+- `SYS_COMMIT` -- I have redrawn this rectangle. Needs WRITE: only whoever can
+  draw can claim to have.
+
+A commit is advice about when to look, not a statement the kernel relies on.
+The rectangle is clipped to the surface before anything uses it, so any four
+numbers are safe, and a client that lies gets a window that is out of date.
+The compositor reads whatever is in the pixels and trusts none of it: a
+client writing while it reads can tear a picture and cannot do anything else,
+because the address and size came from the kernel.
+
+#### The first commit is the window appearing
+
+Nothing is on screen for a surface until its client commits. An empty window
+is never shown, and no one has to say "map me": the layer is added, fading in
+on a curve and rising on a spring, the first time there is something in it.
+After that a commit becomes `Scene::damage` on that layer -- the one way the
+glass goes stale without a formula having moved, since the scene never reads
+pixels and so has to be told.
+
+Commits wake nobody. One sets a rectangle under a lock; the painter takes it
+when it next paints. A client that draws a thousand times between frames
+costs one repaint of the union.
+
+The division of labour is the point. The client in the boot screen draws a
+picture once and then keeps a strip of it moving, a column at a time; where
+the window *is* on the screen is not its business, and the compositor moves
+it with the client not scheduled at all.
+
+```
+paint      : 716 wakeups, 585 painted, 75586 KiB shown, 145060 KiB drawn (2864000 KiB had each one repainted)
+```
+
+More frames are painted than before there was a window, because something
+now changes every tick, and almost nothing more is drawn: each of those
+frames is a column 16 pixels tall.
+
+That client is ring 3 assembly with no clock syscall, so it takes its time
+from `rdtsc`: the column it should have reached is a function of the
+timestamp, not of how many times it has been round its loop. Scheduled late,
+it draws the columns it missed and commits them as one rectangle.
+
+Known gaps: surfaces are made by the kernel at boot and never destroyed --
+there is no compositor service to ask for one. The client draws into the
+memory the compositor reads, so a repaint can catch a frame half drawn; the
+cure is two buffers and a swap on commit. A surface has no transparency of
+its own. A commit is found at the next scheduling tick rather than waking the
+painter, which is the same gap as pacing by the tick. And the 3D engine in
+`gfx/` produces exactly these pixels but nothing connects the two yet.
 
 ### Text
 
@@ -643,6 +724,9 @@ reached for. Without that test the ring boundary is a claim about descriptor
 bits rather than an observed property.
 
 #### The syscall boundary takes no pointers
+
+(One has since crossed it, outward: `SYS_MAP` returns the address the kernel
+chose for a surface. See "Windows". Nothing a caller says is dereferenced.)
 
 A syscall that takes a user pointer must validate it: in range, mapped,
 user-accessible, and still all three when the kernel dereferences it. That

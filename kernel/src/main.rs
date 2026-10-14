@@ -17,6 +17,7 @@ mod limine;
 mod mm;
 mod serial;
 mod smp;
+mod surface;
 mod sync;
 mod syscall;
 mod task;
@@ -2339,17 +2340,351 @@ impl Stage {
     }
 }
 
+/// The window's size, in pixels.
+const WINDOW_WIDTH: u32 = 256;
+const WINDOW_HEIGHT: u32 = 192;
+/// Rows at the bottom of the window that its client keeps redrawing.
+const WINDOW_STRIP: u32 = 16;
+/// How far in from the screen's top-right corner the window rests.
+const WINDOW_MARGIN: i32 = 48;
+/// How far below its resting place the window starts.
+const WINDOW_RISE: i32 = 40;
+
+/// Bootstrap's capability to the window's surface, with every right.
+const BOOT_SURFACE: cap::CapPtr = 14;
+/// A read-only copy of it, to check what read-only forbids.
+const BOOT_SURFACE_READ: cap::CapPtr = 15;
+/// The painter's one capability: the surface, to draw on and not to pass on.
+const PAINTER_SURFACE: cap::CapPtr = 0;
+
+/// The painter's clock is the timestamp counter shifted down by this much:
+/// about a hundred columns a second on a 3 GHz machine.
+const PAINTER_RATE: u32 = 25;
+const STRIP_BRIGHT: u32 = 0x00f2_eee8;
+const STRIP_DARK: u32 = 0x0040_1a08;
+
+/// A pixel of the painter's picture the kernel looks at, and what it should
+/// find there: `v = x ^ y`, as red `v`, green `v / 2`, blue `v / 8`.
+const PROBE: (u32, u32) = (200, 77);
+const PROBE_PIXEL: u32 = {
+    let v = (PROBE.0 ^ PROBE.1) & 0xff;
+    (v << 16) | ((v >> 1) << 8) | (v >> 3)
+};
+
+fn window_check(name: &str, ok: bool) {
+    check("window", name, ok);
+}
+
+/// A program in **ring 3** that draws a window.
+///
+/// It holds one capability, to a surface, and no other way to affect
+/// anything. It asks where the surface is, draws a picture into it, says so,
+/// and from then on keeps a strip along the bottom moving -- writing a column
+/// or two at a time and committing exactly those.
+///
+/// Where the strip has got to is a function of the timestamp counter, not a
+/// count of times round the loop: scheduled late, it draws the columns it
+/// missed in one go rather than falling behind. The window's place on the
+/// screen is none of its business. The compositor springs it into view and
+/// could move it anywhere without this task being scheduled at all.
+#[unsafe(naked)]
+extern "C" fn user_painter() {
+    core::arch::naked_asm!(
+        // Where are my pixels? The kernel answers; we never tell it.
+        "mov rax, {map}",
+        "mov rdi, {surface}",
+        "int {gate}",
+        "test rax, rax",
+        "jnz 9f",
+        "mov rbx, rdx", // base
+        "mov r12, r10", // width
+        "mov r13, r8",  // height
+        "mov r14, r9",  // bytes from one row to the next
+
+        // The picture: v = x ^ y, in rust.
+        "xor r8d, r8d",
+        "mov rdi, rbx",
+        "2:",
+        "xor ecx, ecx",
+        "3:",
+        "mov eax, ecx",
+        "xor eax, r8d",
+        "and eax, 0xff",
+        "mov edx, eax",
+        "shl edx, 16",
+        "mov esi, eax",
+        "shr esi, 1",
+        "shl esi, 8",
+        "or edx, esi",
+        "shr eax, 3",
+        "or edx, eax",
+        "mov [rdi + rcx * 4], edx",
+        "inc ecx",
+        "cmp ecx, r12d",
+        "jb 3b",
+        "add rdi, r14",
+        "inc r8d",
+        "cmp r8d, r13d",
+        "jb 2b",
+
+        // All of it is new.
+        "mov rax, {commit}",
+        "mov rdi, {surface}",
+        "xor esi, esi",
+        "xor edx, edx",
+        "mov r10, r12",
+        "mov r8, r13",
+        "int {gate}",
+
+        // r15 counts columns drawn. Start from now.
+        "rdtsc",
+        "shl rdx, 32",
+        "or rax, rdx",
+        "shr rax, {rate}",
+        "mov r15, rax",
+
+        // How many columns should there have been by now?
+        "4:",
+        "rdtsc",
+        "shl rdx, 32",
+        "or rax, rdx",
+        "shr rax, {rate}",
+        "mov rbp, rax",
+        "cmp r15, rbp",
+        "jae 8f",
+        // More than a whole strip behind: the oldest are already overdrawn.
+        "mov rax, rbp",
+        "sub rax, r15",
+        "cmp rax, r12",
+        "jbe 5f",
+        "mov r15, rbp",
+        "sub r15, r12",
+        "5:",
+        "mov r9, r15",
+
+        // Column c is at x = c mod width, and each pass along the strip
+        // alternates between the two colours.
+        "6:",
+        "mov rax, r15",
+        "xor edx, edx",
+        "div r12",
+        "mov ecx, {bright}",
+        "mov esi, {dark}",
+        "test al, 1",
+        "cmovnz ecx, esi",
+        "mov rax, r13",
+        "sub rax, {strip}",
+        "imul rax, r14",
+        "add rax, rbx",
+        "lea rdi, [rax + rdx * 4]",
+        "mov eax, {strip}",
+        "7:",
+        "mov [rdi], ecx",
+        "add rdi, r14",
+        "dec eax",
+        "jnz 7b",
+        "inc r15",
+        "cmp r15, rbp",
+        "jb 6b",
+
+        // Say what changed and no more: the columns just drawn, or the
+        // whole strip if they ran off its end and round.
+        "mov rax, r9",
+        "xor edx, edx",
+        "div r12",
+        "mov rsi, rdx",
+        "mov r10, rbp",
+        "sub r10, r9",
+        "lea rax, [rsi + r10]",
+        "cmp rax, r12",
+        "jbe 12f",
+        "xor esi, esi",
+        "mov r10, r12",
+        "12:",
+        "mov rdx, r13",
+        "sub rdx, {strip}",
+        "mov r8, {strip}",
+        "mov rax, {commit}",
+        "mov rdi, {surface}",
+        "int {gate}",
+
+        "8:",
+        "mov rax, {yield_op}",
+        "int {gate}",
+        "jmp 4b",
+
+        // No surface, so nothing to do and no way to say so.
+        "9:",
+        "mov rax, {yield_op}",
+        "int {gate}",
+        "jmp 9b",
+
+        map = const syscall::SYS_MAP,
+        commit = const syscall::SYS_COMMIT,
+        yield_op = const syscall::SYS_YIELD,
+        gate = const vectors::SYSCALL,
+        surface = const PAINTER_SURFACE,
+        rate = const PAINTER_RATE,
+        strip = const WINDOW_STRIP,
+        bright = const STRIP_BRIGHT,
+        dark = const STRIP_DARK,
+    )
+}
+
+/// A window: a surface, the ring 3 task drawing in it, and -- once that task
+/// has drawn something -- the layer showing it.
+struct Window {
+    surface: usize,
+    client: usize,
+    layer: Option<LayerId>,
+    /// Whether a commit after the first has been looked at yet.
+    seen_update: bool,
+}
+
+impl Window {
+    /// Make a surface, show it to the renderer, and start a task that holds
+    /// a capability to it and nothing else.
+    fn open(renderer: &mut SoftwareRenderer) -> Option<Self> {
+        use cap::{CapError, Rights};
+
+        let surface = surface::create(WINDOW_WIDTH, WINDOW_HEIGHT)?;
+        let (base, width, height) = surface::pixels(surface)?;
+        // SAFETY: `surface::create` mapped `width * height` pixels at `base`
+        // from frames fresh off the allocator, page-aligned, so they overlap
+        // nothing. The mapping is never removed.
+        unsafe { renderer.attach_surface(surface as u32, base, width, height) }.ok()?;
+
+        window_check(
+            "mint a Surface capability into slot 14",
+            cap::mint(0, BOOT_SURFACE, cap::Object::Surface(surface), Rights::ALL).is_ok(),
+        );
+
+        // The rules, tried from this side before anybody else holds it.
+        let whole = Rect::new(0, 0, width, height);
+        window_check(
+            "a kernel task has nowhere to map a surface",
+            surface::map(BOOT_SURFACE).err() == Some(CapError::NoSpace),
+        );
+        window_check(
+            "a read-only surface capability cannot commit",
+            cap::copy(BOOT_SURFACE, BOOT_SURFACE_READ, Rights::READ) == Ok(Rights::READ)
+                && surface::commit(BOOT_SURFACE_READ, whole) == Err(CapError::InsufficientRights),
+        );
+        window_check(
+            "a Frame capability is not a surface",
+            surface::commit(8, whole) == Err(CapError::WrongType),
+        );
+        window_check(
+            "a commit outside the surface claims nothing",
+            surface::commit(BOOT_SURFACE, Rect::new(width as i32, 0, 50, 50)).is_ok()
+                && surface::take_redrawn(surface).is_none(),
+        );
+        window_check(
+            "a commit is clipped to the surface",
+            surface::commit(BOOT_SURFACE, Rect::new(-10, -10, 20, 20)).is_ok()
+                && surface::take_redrawn(surface) == Some(Rect::new(0, 0, 10, 10)),
+        );
+
+        let client = task::spawn_user("painter", user_painter)?;
+        window_check(
+            "grant the painter a surface to draw on, not pass on",
+            cap::grant(client, BOOT_SURFACE, PAINTER_SURFACE, Rights::READ_WRITE)
+                == Ok(Rights::READ_WRITE)
+                && cap::slots_used(client) == Some(1),
+        );
+        start_all(&[Some(client)]);
+
+        Some(Self {
+            surface,
+            client,
+            layer: None,
+            seen_update: false,
+        })
+    }
+
+    /// Take whatever the client has committed since the last look.
+    ///
+    /// The first commit is what puts the window on the screen: until a
+    /// client has drawn something there is nothing to show, so an empty
+    /// window is never seen. Every later one becomes damage to that layer.
+    fn poll<const N: usize>(&mut self, scene: &mut Scene<N>, now: u64) {
+        let Some(redrawn) = surface::take_redrawn(self.surface) else {
+            return;
+        };
+        let Some((base, width, height)) = surface::pixels(self.surface) else {
+            return;
+        };
+
+        if let Some(layer) = self.layer {
+            if !self.seen_update {
+                self.seen_update = true;
+                let strip = Rect::new(0, (height - WINDOW_STRIP) as i32, width, WINDOW_STRIP);
+                window_check(
+                    "a later commit names only what was redrawn",
+                    strip.contains(&redrawn),
+                );
+            }
+            scene.damage(layer, redrawn);
+            return;
+        }
+
+        window_check(
+            "the painter's first commit is its whole surface",
+            redrawn == Rect::new(0, 0, width, height),
+        );
+        // SAFETY: PROBE is inside the surface, whose pixels are mapped
+        // readable at `base` for good. Read by value: ring 3 may be writing.
+        let probe = unsafe {
+            base.add((PROBE.1 * width + PROBE.0) as usize)
+                .read_volatile()
+        };
+        window_check(
+            "the kernel reads the pixels ring 3 wrote",
+            probe == PROBE_PIXEL,
+        );
+        let theirs = task::space_of(self.client)
+            .and_then(|space| space.translate(surface::user_address(self.surface)));
+        window_check(
+            "both are looking at the same memory",
+            theirs.is_some() && theirs == surface::frame_of(self.surface, 0),
+        );
+
+        let screen = scene.screen();
+        let x = screen.width as i32 - width as i32 - WINDOW_MARGIN;
+        let mut layer = Layer::surface(
+            x,
+            WINDOW_MARGIN + WINDOW_RISE,
+            self.surface as u32,
+            width,
+            height,
+        );
+        layer.opacity = Animation::ease(now, 400, Fx::ZERO, Fx::from_int(255), Ease::Out);
+        layer.y = Animation::spring(
+            now,
+            Fx::from_int(WINDOW_MARGIN + WINDOW_RISE),
+            Fx::from_int(WINDOW_MARGIN),
+            Velocity::ZERO,
+            Spring::SMOOTH,
+        );
+        self.layer = scene.add(layer);
+    }
+}
+
 /// Paint what moved, then sleep until the next interrupt.
 ///
 /// There is no animation task behind this and no frame timer. The loop wakes
 /// on the scheduling tick the kernel already takes, asks the formulas where
 /// things are at the current nanosecond, and writes only the pixels that
 /// answer changed.
-fn render_loop(renderer: &mut impl Renderer) -> ! {
+fn render_loop(renderer: &mut SoftwareRenderer) -> ! {
     let Some(mut stage) = Stage::new(renderer, time::now_ns()) else {
         println!("scene      : no room for the boot screen's layers");
         idle_loop()
     };
+    let mut window = Window::open(renderer);
+    if window.is_none() {
+        println!("window     : none -- no memory for a surface or its task");
+    }
     let screen = stage.scene.screen().area();
 
     // A renderer that fails paints nothing, which is what the counters below
@@ -2391,6 +2726,12 @@ fn render_loop(renderer: &mut impl Renderer) -> ! {
                 next_step = 0;
                 cycle_start += SCRIPT_MS * 1_000_000;
             }
+        }
+
+        // Has the window's client drawn anything? One lock and a compare;
+        // the client itself is not asked and need not be running.
+        if let Some(window) = window.as_mut() {
+            window.poll(&mut stage.scene, now);
         }
 
         let result = frame(&mut stage, now);

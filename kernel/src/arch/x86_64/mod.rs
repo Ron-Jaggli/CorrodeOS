@@ -46,6 +46,21 @@ pub unsafe fn enable_interrupts() {
     }
 }
 
+/// Forget what this CPU has cached about one page's mapping.
+///
+/// Needed after changing an entry that was already present. A new mapping
+/// where there was none needs nothing: there is no stale entry to evict.
+/// Other CPUs are not told, which is right only for an address space that is
+/// installed on this one alone -- true of every user space while tasks do not
+/// migrate.
+pub fn flush_page(va: u64) {
+    // SAFETY: `invlpg` drops a TLB entry and touches no memory. At worst the
+    // next access to that page walks the tables again.
+    unsafe {
+        core::arch::asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
+    }
+}
+
 /// Halt until the next interrupt arrives.
 ///
 /// Requires interrupts to be enabled -- with IF clear this parks the CPU

@@ -145,6 +145,14 @@ pub enum Object {
     /// it is a *debt*. It names a caller that is parked waiting, and it stops
     /// meaning anything the moment that caller is released.
     Reply(crate::ipc::ReplyToken),
+    /// A block of pixels the compositor shows: a window's contents, by its
+    /// number in [`crate::surface`]. READ means may map it and look, WRITE
+    /// means may draw in it and say so.
+    ///
+    /// This is how bulk data crosses the ring boundary without a pointer
+    /// crossing it. A task does not tell the kernel where its pixels are; it
+    /// holds this, and the kernel tells the task.
+    Surface(usize),
 }
 
 impl core::fmt::Debug for Object {
@@ -155,6 +163,7 @@ impl core::fmt::Debug for Object {
             Object::Task(id) => write!(f, "Task({id})"),
             Object::Endpoint(_) => write!(f, "Endpoint"),
             Object::Reply(token) => write!(f, "Reply(task {})", token.caller()),
+            Object::Surface(index) => write!(f, "Surface({index})"),
         }
     }
 }
@@ -170,6 +179,7 @@ pub enum ObjectKind {
     Task = 3,
     Endpoint = 4,
     Reply = 5,
+    Surface = 6,
 }
 
 impl Object {
@@ -180,6 +190,7 @@ impl Object {
             Object::Task(_) => ObjectKind::Task,
             Object::Endpoint(_) => ObjectKind::Endpoint,
             Object::Reply(_) => ObjectKind::Reply,
+            Object::Surface(_) => ObjectKind::Surface,
         }
     }
 }
@@ -234,6 +245,9 @@ pub enum CapError {
     /// never parked on an answer that could not come, and the receiver never
     /// silently swallows a question it cannot reply to.
     Refused,
+    /// Nowhere to put a mapping: the caller has no address space of its own,
+    /// or there is no memory left for the page tables.
+    NoSpace,
 }
 
 impl CapError {
@@ -253,6 +267,7 @@ impl CapError {
             CapError::NoSuchTask => 6,
             CapError::Stale => 7,
             CapError::Refused => 8,
+            CapError::NoSpace => 9,
         }
     }
 }
@@ -443,6 +458,27 @@ pub fn frame_address(slot: CapPtr) -> Result<u64, CapError> {
         Object::Frame(address) => Ok(address),
         _ => Err(CapError::WrongType),
     }
+}
+
+/// The surface a Surface capability names, and the rights it is held with.
+/// Requires `required`.
+///
+/// The rights come back because what a mapping allows depends on them: the
+/// same call gives a holder of WRITE somewhere to draw and a holder of READ
+/// alone somewhere to look.
+pub fn surface_of(slot: CapPtr, required: Rights) -> Result<(usize, Rights), CapError> {
+    let current = task::current_id().ok_or(CapError::NoSuchTask)?;
+    task::with_cspace(current, |cspace| {
+        let cap = cspace.get(slot)?;
+        if !cap.rights.contains(required) {
+            return Err(CapError::InsufficientRights);
+        }
+        match *cap.object {
+            Object::Surface(index) => Ok((index, cap.rights)),
+            _ => Err(CapError::WrongType),
+        }
+    })
+    .ok_or(CapError::NoSuchTask)?
 }
 
 /// The task a Task capability names. Requires READ.

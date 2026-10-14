@@ -241,15 +241,20 @@ impl LockedHeap {
 // touched concurrently. `alloc` returns either null or a pointer to a region
 // removed from the free list, which no other allocation can hand out until it
 // is returned via `dealloc`.
+//
+// The lock is only ever held with interrupts off. A system call allocates --
+// a reply capability is an `Arc` -- and arrives with interrupts already
+// disabled, so if it could find the lock held by a task it had preempted on
+// the same CPU, it would spin on it for ever.
 unsafe impl GlobalAlloc for LockedHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: forwarding the caller's `GlobalAlloc` obligations.
-        unsafe { self.0.lock().alloc(layout) }
+        crate::arch::x86_64::without_interrupts(|| unsafe { self.0.lock().alloc(layout) })
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: as above.
-        unsafe { self.0.lock().dealloc(ptr, layout) }
+        crate::arch::x86_64::without_interrupts(|| unsafe { self.0.lock().dealloc(ptr, layout) })
     }
 }
 

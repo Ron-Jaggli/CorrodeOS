@@ -18,6 +18,11 @@
 //! needed, should be a shared Frame the receiver already holds a capability for
 //! -- authority it was granted, not an address it asserted.
 //!
+//! The first case of that is a window's pixels. `SYS_MAP` takes a surface
+//! capability and *returns* an address: the kernel decides where the memory
+//! goes and says so, and the caller never names an address at all. See
+//! [`crate::surface`].
+//!
 //! # Register convention
 //!
 //! ```text
@@ -80,7 +85,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::arch::x86_64::idt::TrapFrame;
 use crate::cap::{self, CapError, Rights};
 use crate::ipc;
+use crate::surface;
 use crate::task;
+
+use corrode_render::Rect;
 
 /// Give up the rest of this time slice.
 pub const SYS_YIELD: u64 = 0;
@@ -99,6 +107,14 @@ pub const SYS_REPLY: u64 = 5;
 pub const SYS_COPY: u64 = 6;
 /// Drop a capability. The object goes away with its last one.
 pub const SYS_DELETE: u64 = 7;
+/// Map a surface capability into the caller's address space. Needs READ, and
+/// WRITE as well for the mapping to be writable. Returns the address in
+/// `rdx`, the width and height in pixels in `r10` and `r8`, and the bytes
+/// from one row to the next in `r9`.
+pub const SYS_MAP: u64 = 8;
+/// Say that a rectangle of a surface has been redrawn. Needs WRITE. `rsi`
+/// and `rdx` are its left and top, `r10` and `r8` its width and height.
+pub const SYS_COMMIT: u64 = 9;
 
 /// Slot argument meaning "nowhere".
 ///
@@ -214,6 +230,33 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
             }
             Err(error) => frame.rax = error.code(),
         },
+
+        // The kernel picks the address and hands it back: the first pointer
+        // to cross this boundary, and it goes outward. Nothing the caller
+        // says is ever dereferenced.
+        SYS_MAP => match surface::map(slot) {
+            Ok(mapped) => {
+                frame.rax = STATUS_OK;
+                frame.rdx = mapped.address;
+                frame.r10 = mapped.width as u64;
+                frame.r8 = mapped.height as u64;
+                frame.r9 = mapped.pitch as u64;
+            }
+            Err(error) => frame.rax = error.code(),
+        },
+
+        SYS_COMMIT => {
+            // Four numbers from ring 3, truncated to the width a rectangle
+            // holds. Any values at all are safe: the rectangle is clipped to
+            // the surface before it is used for anything.
+            let rect = Rect::new(
+                frame.rsi as i32,
+                frame.rdx as i32,
+                frame.r10 as u32,
+                frame.r8 as u32,
+            );
+            frame.rax = status(surface::commit(slot, rect));
+        }
 
         _ => frame.rax = STATUS_BAD_SYSCALL,
     }

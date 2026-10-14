@@ -25,10 +25,14 @@
 //! and everything below is skipped. Under a maximised window the wallpaper is
 //! never drawn again, however much moves on top of it.
 //!
-//! A layer is one colour, either filling its rectangle or pushed through a
-//! stencil from the mask atlas -- which is what text is. Windows need pixels
-//! of their own, which is a shared buffer and a capability to it; this is the
-//! part that decides where those pixels go and when.
+//! # What a layer shows
+//!
+//! One colour filling its rectangle, one colour pushed through a stencil from
+//! the mask atlas -- which is what text is -- or pixels of its own, which is
+//! what a window is. Those pixels belong to a client, and a client changing
+//! them is the one thing that makes the glass stale without any formula
+//! having moved, so it has to be said: [`Scene::damage`]. The scene decides
+//! where the pixels go and when; it never looks at them.
 
 use crate::anim::{Animation, Fx};
 use crate::damage::Damage;
@@ -45,6 +49,14 @@ pub enum Content {
     /// A block of the mask atlas, its top-left corner at the layer's. The
     /// layer's rectangle crops it, so animating the width wipes it in.
     Mask { src: Rect },
+    /// Pixels of its own: the surface the renderer knows as `id`, which is
+    /// `width` by `height`, its top-left corner at the layer's. The layer's
+    /// rectangle crops it and is never larger than it, so there is no part of
+    /// the layer the surface does not cover. The layer's colour is not used.
+    ///
+    /// The layer must not outlast the surface: the scene takes it that an
+    /// opaque one hides what is under it.
+    Surface { id: u32, width: u32, height: u32 },
 }
 
 /// One rectangle of colour, in motion or not.
@@ -86,14 +98,27 @@ impl Layer {
         layer
     }
 
+    /// The surface `id`, all `width` by `height` of it, with its top-left
+    /// corner at `x`, `y`.
+    pub const fn surface(x: i32, y: i32, id: u32, width: u32, height: u32) -> Self {
+        let mut layer = Self::solid(Rect::new(x, y, width, height), Color::BLACK);
+        layer.content = Content::Surface { id, width, height };
+        layer
+    }
+
     fn at(&self, now: u64) -> Shown {
         let whole = |animation: &Animation| animation.sample(now).value.round();
+        // A surface has no pixels past its own edge to show.
+        let (most_wide, most_tall) = match self.content {
+            Content::Surface { width, height, .. } => (width, height),
+            _ => (u32::MAX, u32::MAX),
+        };
         Shown {
             rect: Rect::new(
                 whole(&self.x),
                 whole(&self.y),
-                whole(&self.width).max(0) as u32,
-                whole(&self.height).max(0) as u32,
+                (whole(&self.width).max(0) as u32).min(most_wide),
+                (whole(&self.height).max(0) as u32).min(most_tall),
             ),
             alpha: whole(&self.opacity).clamp(0, 255) as u8,
             color: self.color,
@@ -121,6 +146,21 @@ const fn clamp_size(size: u32) -> i32 {
     }
 }
 
+/// The empty rectangle.
+const NOWHERE: Rect = Rect::new(0, 0, 0, 0);
+
+/// `rect`, `dx` to the right and `dy` down. A rectangle a client supplied can
+/// be anywhere, so this saturates rather than wraps; what is left is clipped
+/// by whoever asked.
+fn moved(rect: Rect, dx: i32, dy: i32) -> Rect {
+    Rect::new(
+        rect.x.saturating_add(dx),
+        rect.y.saturating_add(dy),
+        rect.width,
+        rect.height,
+    )
+}
+
 /// What a layer looked like the last time it was painted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Shown {
@@ -138,10 +178,11 @@ impl Shown {
         content: Content::Solid,
     };
 
-    /// Whether every pixel of the rectangle is this layer's colour and
-    /// nothing else. A mask never is: it has holes by design.
+    /// Whether every pixel of the rectangle is this layer's and nothing
+    /// else. A mask never is: it has holes by design. A surface is, because
+    /// its pixels carry no transparency of their own.
     fn opaque(&self) -> bool {
-        self.alpha == 255 && self.content == Content::Solid
+        self.alpha == 255 && !matches!(self.content, Content::Mask { .. })
     }
 }
 
@@ -169,6 +210,9 @@ pub struct Scene<const N: usize> {
     background: Color,
     layers: [Option<Layer>; N],
     shown: [Shown; N],
+    /// The part of each layer its client has redrawn since the last frame,
+    /// relative to the layer's corner. Empty when it has not.
+    redrawn: [Rect; N],
     len: usize,
     painted: bool,
 }
@@ -180,6 +224,7 @@ impl<const N: usize> Scene<N> {
             background,
             layers: [None; N],
             shown: [Shown::NOTHING; N],
+            redrawn: [NOWHERE; N],
             len: 0,
             painted: false,
         }
@@ -203,6 +248,20 @@ impl<const N: usize> Scene<N> {
     pub fn remove(&mut self, id: LayerId) {
         if let Some(slot) = self.layers.get_mut(id.0) {
             *slot = None;
+            self.redrawn[id.0] = NOWHERE;
+        }
+    }
+
+    /// Say that the pixels behind a layer have changed inside `rect`, which
+    /// is relative to the layer's own corner. The next frame repaints that
+    /// much of it, wherever the layer is by then.
+    ///
+    /// This is for a surface whose client has drawn into it. Nothing else
+    /// needs it: a layer's place, size, colour and opacity are compared with
+    /// what is on the glass every frame, but the scene never reads pixels.
+    pub fn damage(&mut self, id: LayerId, rect: Rect) {
+        if let Some(Some(_)) = self.layers.get(id.0) {
+            self.redrawn[id.0] = self.redrawn[id.0].union(&rect);
         }
     }
 
@@ -235,12 +294,24 @@ impl<const N: usize> Scene<N> {
             damage.add(self.screen);
         }
 
-        for (layer, shown) in self.layers.iter().zip(self.shown.iter_mut()) {
+        let layers = self.layers.iter().zip(self.redrawn.iter_mut());
+        for ((layer, redrawn), shown) in layers.zip(self.shown.iter_mut()) {
             let now_shown = match layer {
                 Some(layer) => layer.at(now),
                 None => Shown::NOTHING,
             };
+            let redrawn = core::mem::replace(redrawn, NOWHERE);
             if now_shown == *shown {
+                // In the same place looking the same, as far as the scene can
+                // tell -- but its client says otherwise about part of it.
+                if now_shown.alpha > 0 {
+                    let stale = moved(redrawn, now_shown.rect.x, now_shown.rect.y)
+                        .intersect(&now_shown.rect)
+                        .and_then(|rect| rect.intersect(&self.screen));
+                    if let Some(stale) = stale {
+                        damage.add(stale);
+                    }
+                }
                 continue;
             }
             // Where it was has to be repainted as well as where it is.
@@ -321,6 +392,13 @@ impl<const N: usize> Scene<N> {
                         src.height.min(shown.rect.height),
                     ),
                     color: shown.color,
+                    alpha,
+                },
+                (Content::Surface { id, .. }, alpha) => Command::Image {
+                    x: shown.rect.x,
+                    y: shown.rect.y,
+                    src: Rect::new(0, 0, shown.rect.width, shown.rect.height),
+                    surface: id,
                     alpha,
                 },
             };
@@ -523,6 +601,125 @@ mod tests {
     }
 
     #[test]
+    fn a_surface_is_drawn_whole_and_hides_what_is_under_it() {
+        let mut scene = Scene::<4>::new(&INFO, GROUND);
+        scene.add(Layer::solid(Rect::new(0, 0, 64, 48), Color::WHITE));
+        scene.add(Layer::surface(8, 6, 5, 20, 10));
+        let mut recorder = Recorder::default();
+        scene.frame(&mut recorder, 0).unwrap();
+
+        let image = recorder.commands.iter().find_map(|command| match *command {
+            Command::Image {
+                x,
+                y,
+                src,
+                surface,
+                alpha,
+            } => Some((x, y, src, surface, alpha)),
+            _ => None,
+        });
+        assert_eq!(image, Some((8, 6, Rect::new(0, 0, 20, 10), 5, 255)));
+
+        // Something moving entirely behind it is not drawn at all.
+        let mut scene = Scene::<4>::new(&INFO, GROUND);
+        let mover = scene
+            .add(Layer::solid(Rect::new(10, 8, 4, 4), Color::WHITE))
+            .unwrap();
+        scene.add(Layer::surface(8, 6, 5, 20, 10));
+        scene.frame(&mut Recorder::default(), 0).unwrap();
+        scene.layer_mut(mover).unwrap().x = Animation::rest(Fx::from_int(14));
+        let mut recorder = Recorder::default();
+        scene.frame(&mut recorder, MS).unwrap();
+        assert!(recorder
+            .commands
+            .iter()
+            .all(|command| matches!(command, Command::Scissor { .. } | Command::Image { .. })));
+    }
+
+    #[test]
+    fn a_surface_layer_is_never_larger_than_its_surface() {
+        let mut scene = Scene::<4>::new(&INFO, GROUND);
+        let id = scene.add(Layer::surface(0, 0, 1, 20, 10)).unwrap();
+        // Asked to be bigger than it has pixels for, and then smaller.
+        scene.layer_mut(id).unwrap().width = Animation::rest(Fx::from_int(50));
+        scene.layer_mut(id).unwrap().height = Animation::rest(Fx::from_int(4));
+        let mut recorder = Recorder::default();
+        scene.frame(&mut recorder, 0).unwrap();
+        assert!(recorder.commands.iter().any(|command| matches!(
+            command,
+            Command::Image { src, .. } if *src == Rect::new(0, 0, 20, 4)
+        )));
+
+        // So the part it does not cover is not taken to be hidden: a change
+        // there is painted from the background up.
+        let mut recorder = Recorder::default();
+        let mut veil = Layer::solid(Rect::new(30, 0, 4, 4), Color::WHITE);
+        veil.opacity = Animation::rest(Fx::from_int(128));
+        scene.add(veil);
+        scene.frame(&mut recorder, MS).unwrap();
+        assert!(recorder
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Clear { .. })));
+    }
+
+    #[test]
+    fn what_a_client_redrew_is_repainted_and_nothing_else() {
+        let mut scene = Scene::<4>::new(&INFO, GROUND);
+        let id = scene.add(Layer::surface(10, 20, 0, 30, 20)).unwrap();
+        scene.frame(&mut Recorder::default(), 0).unwrap();
+
+        // Two changes before the next frame are one repaint.
+        scene.damage(id, Rect::new(2, 3, 4, 5));
+        scene.damage(id, Rect::new(4, 3, 4, 2));
+        let mut recorder = Recorder::default();
+        let painted = scene.frame(&mut recorder, MS).unwrap();
+        assert_eq!(recorder.presented, [Rect::new(12, 23, 6, 5)]);
+        assert_eq!((painted.stale, painted.drawn), (30, 30));
+
+        // Said once, repainted once.
+        assert_eq!(
+            scene.frame(&mut Recorder::default(), 2 * MS).unwrap(),
+            Painted::default()
+        );
+
+        // A rectangle from a client is clipped to the layer, wherever and
+        // however large it claims to be.
+        for wild in [
+            Rect::new(-5, -5, 10, 10),
+            Rect::new(i32::MIN, i32::MIN, u32::MAX, u32::MAX),
+            Rect::new(i32::MAX, i32::MAX, u32::MAX, u32::MAX),
+            Rect::new(0, 0, u32::MAX, u32::MAX),
+        ] {
+            scene.damage(id, wild);
+            let mut recorder = Recorder::default();
+            scene.frame(&mut recorder, 3 * MS).unwrap();
+            for rect in &recorder.presented {
+                assert!(
+                    Rect::new(10, 20, 30, 20).contains(rect),
+                    "{wild:?} -> {rect:?}"
+                );
+            }
+        }
+
+        // An invisible layer has nothing on the glass to be out of date, and
+        // a layer that is gone has no pixels to speak of.
+        scene.layer_mut(id).unwrap().opacity = Animation::rest(Fx::ZERO);
+        scene.frame(&mut Recorder::default(), 4 * MS).unwrap();
+        scene.damage(id, Rect::new(0, 0, 30, 20));
+        assert_eq!(
+            scene.frame(&mut Recorder::default(), 5 * MS).unwrap(),
+            Painted::default()
+        );
+        scene.remove(id);
+        scene.damage(id, Rect::new(0, 0, 30, 20));
+        assert_eq!(
+            scene.frame(&mut Recorder::default(), 6 * MS).unwrap(),
+            Painted::default()
+        );
+    }
+
+    #[test]
     fn more_layers_than_one_batch_are_all_drawn() {
         let mut scene = Scene::<40>::new(&INFO, GROUND);
         for i in 0..40 {
@@ -565,6 +762,47 @@ mod tests {
         back: Vec<u32>,
     }
 
+    /// Side lengths of the test surfaces.
+    const WINDOW: (u32, u32) = (40, 30);
+
+    /// Two clients' worth of pixels, which every renderer in a test is shown.
+    /// Written through the same pointers the renderers read through, the way
+    /// a client writes while a compositor reads.
+    struct Windows {
+        _pixels: [Vec<u32>; 2],
+        base: [*mut u32; 2],
+    }
+
+    impl Windows {
+        fn new(random: &mut Random) -> Self {
+            let mut pixels = [(); 2].map(|_| {
+                (0..WINDOW.0 * WINDOW.1)
+                    .map(|_| random.next() as u32 & 0x00ff_ffff)
+                    .collect::<Vec<u32>>()
+            });
+            let base = [pixels[0].as_mut_ptr(), pixels[1].as_mut_ptr()];
+            Self {
+                _pixels: pixels,
+                base,
+            }
+        }
+
+        /// Draw something new inside `rect` of one surface.
+        fn scribble(&mut self, surface: usize, rect: Rect, random: &mut Random) {
+            for y in rect.y as u32..rect.y as u32 + rect.height {
+                for x in rect.x as u32..rect.x as u32 + rect.width {
+                    // SAFETY: callers keep `rect` inside WINDOW, and the
+                    // vector behind `base` is that many pixels.
+                    unsafe {
+                        self.base[surface]
+                            .add((y * WINDOW.0 + x) as usize)
+                            .write(random.next() as u32 & 0x00ff_ffff);
+                    }
+                }
+            }
+        }
+    }
+
     impl Glass {
         fn new() -> Self {
             let pixels = (INFO.width * INFO.height) as usize;
@@ -576,13 +814,19 @@ mod tests {
             }
         }
 
-        fn renderer(&mut self) -> SoftwareRenderer {
+        fn renderer(&mut self, windows: &Windows) -> SoftwareRenderer {
             // SAFETY: both vectors are `pitch * height` bytes, separate, and
-            // only touched through the renderer while it is in use.
+            // only touched through the renderer while it is in use. Each
+            // window is WINDOW pixels of its own and outlives the renderer.
             unsafe {
                 let mut renderer =
                     SoftwareRenderer::new(self.front.as_mut_ptr().cast(), INFO).unwrap();
                 renderer.attach_back_buffer(self.back.as_mut_ptr().cast());
+                for (id, base) in windows.base.iter().enumerate() {
+                    renderer
+                        .attach_surface(id as u32, *base, WINDOW.0, WINDOW.1)
+                        .unwrap();
+                }
 
                 // Every renderer gets the same stencils: a fixed scramble
                 // with plenty of 0s and 255s among the in-betweens.
@@ -633,12 +877,13 @@ mod tests {
     #[test]
     fn repainting_only_the_damage_matches_repainting_everything() {
         let mut random = Random(7);
+        let mut windows = Windows::new(&mut random);
         let mut glass = Glass::new();
-        let mut renderer = glass.renderer();
+        let mut renderer = glass.renderer(&windows);
         let mut scene = Scene::<12>::new(&INFO, GROUND);
         let mut ids = Vec::new();
         let mut now = 0u64;
-        let (mut skipped, mut culled) = (0, 0);
+        let (mut skipped, mut culled, mut redrawn) = (0, 0, 0);
 
         for _ in 0..1500 {
             now += random.below(40) * MS;
@@ -662,6 +907,13 @@ mod tests {
                             rect.height,
                         );
                         layer.content = Content::Mask { src };
+                    } else {
+                        // A window, often asked to be larger than it is.
+                        layer.content = Content::Surface {
+                            id: random.below(2) as u32,
+                            width: WINDOW.0,
+                            height: WINDOW.1,
+                        };
                     }
                     ids.extend(scene.add(layer));
                 }
@@ -698,6 +950,38 @@ mod tests {
                         }
                     }
                 }
+                // A client draws into its window and says where.
+                7..=9 => {
+                    let window =
+                        ids.iter()
+                            .copied()
+                            .find_map(|id| match scene.layer(id)?.content {
+                                Content::Surface { id: surface, .. } => Some(surface),
+                                _ => None,
+                            });
+                    if let Some(surface) = window {
+                        let x = random.below(WINDOW.0 as u64 - 1) as u32;
+                        let y = random.below(WINDOW.1 as u64 - 1) as u32;
+                        let rect = Rect::new(
+                            x as i32,
+                            y as i32,
+                            1 + random.below((WINDOW.0 - x - 1).min(12) as u64 + 1) as u32,
+                            1 + random.below((WINDOW.1 - y - 1).min(12) as u64 + 1) as u32,
+                        );
+                        windows.scribble(surface as usize, rect, &mut random);
+                        // Every layer showing that surface is now out of date.
+                        for other in &ids {
+                            if let Some(Content::Surface { id: shows, .. }) =
+                                scene.layer(*other).map(|layer| layer.content)
+                            {
+                                if shows == surface {
+                                    scene.damage(*other, rect);
+                                }
+                            }
+                        }
+                        redrawn += 1;
+                    }
+                }
                 _ => {}
             }
 
@@ -710,7 +994,9 @@ mod tests {
             let mut fresh = Scene::<12>::new(&INFO, GROUND);
             fresh.layers = scene.layers;
             fresh.len = scene.len;
-            fresh.frame(&mut fresh_glass.renderer(), now).unwrap();
+            fresh
+                .frame(&mut fresh_glass.renderer(&windows), now)
+                .unwrap();
 
             assert_eq!(glass.front, fresh_glass.front, "at {} ms", now / MS);
         }
@@ -718,5 +1004,6 @@ mod tests {
         // The run has to have exercised the paths it is vouching for.
         assert!(skipped > 50, "only {skipped} still frames");
         assert!(culled > 50, "only {culled} partial repaints");
+        assert!(redrawn > 20, "only {redrawn} client redraws");
     }
 }

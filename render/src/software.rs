@@ -18,6 +18,16 @@
 //!   fast to fill and very slow to read back. Blending onto the screen would
 //!   put that read on every pixel of every fade. The back buffer is ordinary
 //!   cached RAM, and the screen is only ever written.
+//!
+//! # Pixels that are not ours
+//!
+//! A window's contents live in memory its client draws into, and the renderer
+//! is shown that memory rather than given a copy: [`Command::Image`] reads it
+//! in place. The client can be writing while we read. That is a torn picture
+//! at worst -- every bit pattern is a pixel -- and never a bad pointer,
+//! because the address and the size came from whoever attached the surface
+//! and not from the client. Nothing here ever forms a reference to those
+//! bytes.
 
 use crate::blend::Blend;
 use crate::damage::Damage;
@@ -30,6 +40,21 @@ pub enum Error {
     /// A mask was uploaded with no atlas attached, outside the atlas, or
     /// with the wrong number of bytes for its rectangle.
     BadMask,
+    /// A surface was attached under a number past [`SURFACES`], or with no
+    /// pixels in it.
+    BadSurface,
+}
+
+/// How many surfaces can be attached at once.
+pub const SURFACES: usize = 8;
+
+/// A client's pixels for [`Command::Image`] to draw from: rows of `width`
+/// pixels, each `0x00RRGGBB`.
+#[derive(Clone, Copy)]
+struct Pixels {
+    base: *const u32,
+    width: u32,
+    height: u32,
 }
 
 /// Coverage for [`Command::Mask`] to draw through: one byte per pixel.
@@ -46,6 +71,7 @@ pub struct SoftwareRenderer {
     /// pitch is `width * 4`, whatever padding the screen's rows carry.
     back: Option<*mut u8>,
     atlas: Option<Atlas>,
+    surfaces: [Option<Pixels>; SURFACES],
     info: SurfaceInfo,
 }
 
@@ -75,6 +101,7 @@ impl SoftwareRenderer {
             front: base,
             back: None,
             atlas: None,
+            surfaces: [None; SURFACES],
             info,
         })
     }
@@ -112,6 +139,47 @@ impl SoftwareRenderer {
             width,
             height: height.min(u32::MAX as u64) as u32,
         });
+    }
+
+    /// Show the renderer a block of pixels to draw [`Command::Image`] from,
+    /// under the number `surface`. Replaces whatever had that number.
+    ///
+    /// # Safety
+    /// * `base` must be aligned for `u32` and point at a readable mapping of
+    ///   at least `width * height * 4` bytes that overlaps neither the
+    ///   framebuffer nor the back buffer.
+    /// * It must stay mapped until the surface is detached or the renderer
+    ///   is gone.
+    ///
+    /// Nothing is required of the contents. They may be changing as they are
+    /// read.
+    pub unsafe fn attach_surface(
+        &mut self,
+        surface: u32,
+        base: *const u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Error> {
+        let slot = self
+            .surfaces
+            .get_mut(surface as usize)
+            .ok_or(Error::BadSurface)?;
+        if width == 0 || height == 0 {
+            return Err(Error::BadSurface);
+        }
+        *slot = Some(Pixels {
+            base,
+            width,
+            height,
+        });
+        Ok(())
+    }
+
+    /// Forget a surface. Commands that name it draw nothing from then on.
+    pub fn detach_surface(&mut self, surface: u32) {
+        if let Some(slot) = self.surfaces.get_mut(surface as usize) {
+            *slot = None;
+        }
     }
 
     /// The first of `x1 - x0` pixels on row `y` of whatever is being drawn to.
@@ -275,6 +343,82 @@ impl SoftwareRenderer {
         }
     }
 
+    fn image(
+        &mut self,
+        (x, y): (i32, i32),
+        src: Rect,
+        surface: u32,
+        alpha: u8,
+        scissor: Option<Rect>,
+    ) {
+        if alpha == 0 {
+            return;
+        }
+        let Some(Some(pixels)) = self.surfaces.get(surface as usize).copied() else {
+            return;
+        };
+        // As for a mask: clip the source to what there is of it, and move
+        // the destination by whatever came off the top and left.
+        let Some(inside) = src.intersect(&Rect::new(0, 0, pixels.width, pixels.height)) else {
+            return;
+        };
+        let (left, top) = (
+            x as i64 + (inside.x as i64 - src.x as i64),
+            y as i64 + (inside.y as i64 - src.y as i64),
+        );
+        if left.abs() > i32::MAX as i64 || top.abs() > i32::MAX as i64 {
+            return;
+        }
+        let target = Rect::new(left as i32, top as i32, inside.width, inside.height);
+        let Some((x0, y0, x1, y1)) = self.clip(target, scissor) else {
+            return;
+        };
+
+        let format = self.info.format;
+        // A surface's layout is the commonest screen layout, on purpose: an
+        // opaque window is then copied a row at a time and never looked at.
+        let same_layout = format == crate::PixelFormat::XRGB8888;
+        let width = (x1 - x0) as usize;
+        for row_y in y0..y1 {
+            let (down, across) = (row_y as i64 - top, x0 as i64 - left);
+            let start = (inside.y as i64 + down) as usize * pixels.width as usize
+                + (inside.x as i64 + across) as usize;
+            // SAFETY: `inside` is within the surface and the clip only shrank
+            // it, so `start` and the `width` pixels after it are among the
+            // `width * height` that `attach_surface` was promised.
+            let source = unsafe { pixels.base.add(start) };
+            // SAFETY: `clip` returned bounds already intersected with the
+            // target.
+            let row = unsafe { self.target_row(x0, row_y) };
+
+            if alpha == 255 && same_layout {
+                // SAFETY: both spans are `width` pixels inside their buffers,
+                // and `attach_surface` was promised they do not overlap.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        source.cast::<u8>(),
+                        row.cast::<u8>(),
+                        width * 4,
+                    );
+                }
+                continue;
+            }
+            for offset in 0..width {
+                // SAFETY: `offset < width` keeps both pixels inside the spans
+                // described above. Read by value: the client may be writing.
+                unsafe {
+                    let pixel = source.add(offset).read_volatile();
+                    let color = Color::rgb((pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8);
+                    let target = row.add(offset);
+                    target.write_unaligned(match alpha {
+                        255 => format.pack(color),
+                        _ => Blend::new(&format, color, alpha).over(target.read_unaligned()),
+                    });
+                }
+            }
+        }
+    }
+
     fn clear(&mut self, color: Color, scissor: Option<Rect>) {
         self.fill_rect(
             Rect::new(0, 0, self.info.width, self.info.height),
@@ -307,6 +451,13 @@ impl Renderer for SoftwareRenderer {
                     color,
                     alpha,
                 } => self.mask((x, y), src, color, alpha, scissor),
+                Command::Image {
+                    x,
+                    y,
+                    src,
+                    surface,
+                    alpha,
+                } => self.image((x, y), src, surface, alpha, scissor),
                 Command::Scissor { rect } => scissor = Some(rect),
             }
         }
@@ -634,6 +785,183 @@ mod tests {
         assert!(renderer
             .upload_mask(Rect::new(-1, 0, 2, 2), &[0; 4])
             .is_err());
+    }
+
+    /// Side of the test surface, which is smaller than the screen.
+    const PICTURE: u32 = 4;
+
+    /// A surface where every pixel says where it is.
+    fn picture() -> [u32; (PICTURE * PICTURE) as usize] {
+        core::array::from_fn(|i| 0x0010_2000 + i as u32)
+    }
+
+    /// Render `commands` over grey with [`picture`] attached as surface 3.
+    fn pictured(commands: &[Command]) -> [u32; (SIDE * SIDE) as usize] {
+        let picture = picture();
+        let mut pixels = [0u32; (SIDE * SIDE) as usize];
+        let info = SurfaceInfo {
+            width: SIDE,
+            height: SIDE,
+            pitch: SIDE * 4,
+            format: PixelFormat::XRGB8888,
+        };
+        // SAFETY: `pixels` is exactly pitch * height writable bytes, and
+        // `picture` is PICTURE * PICTURE pixels somewhere else. Both outlive
+        // the renderer.
+        let mut renderer = unsafe {
+            let mut renderer = SoftwareRenderer::new(pixels.as_mut_ptr().cast(), info).unwrap();
+            renderer
+                .attach_surface(3, picture.as_ptr(), PICTURE, PICTURE)
+                .unwrap();
+            renderer
+        };
+        submit(
+            &mut renderer,
+            &[Command::Clear {
+                color: Color::rgb(100, 100, 100),
+            }],
+        );
+        submit(&mut renderer, commands);
+        pixels
+    }
+
+    const GREY: u32 = 0x0064_6464;
+
+    fn whole_picture(x: i32, y: i32, alpha: u8) -> Command {
+        Command::Image {
+            x,
+            y,
+            src: Rect::new(0, 0, PICTURE, PICTURE),
+            surface: 3,
+            alpha,
+        }
+    }
+
+    #[test]
+    fn an_image_puts_each_of_its_pixels_where_it_belongs() {
+        let pixels = pictured(&[whole_picture(2, 3, 255)]);
+        let picture = picture();
+        for y in 0..SIDE {
+            for x in 0..SIDE {
+                let inside = (2..2 + PICTURE).contains(&x) && (3..3 + PICTURE).contains(&y);
+                let expected = if inside {
+                    picture[((y - 3) * PICTURE + (x - 2)) as usize]
+                } else {
+                    GREY
+                };
+                assert_eq!(pixels[(y * SIDE + x) as usize], expected, "at {x}, {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_image_is_blended_at_its_alpha() {
+        let pixels = pictured(&[whole_picture(0, 0, 77)]);
+        let picture = picture();
+        for (i, source) in picture.iter().enumerate() {
+            let (x, y) = (i as u32 % PICTURE, i as u32 / PICTURE);
+            let channel = |shift: u32| crate::blend::mix((source >> shift) as u8, 100, 77) as u32;
+            assert_eq!(
+                pixels[(y * SIDE + x) as usize],
+                (channel(16) << 16) | (channel(8) << 8) | channel(0)
+            );
+        }
+        assert_eq!(pictured(&[whole_picture(0, 0, 0)]), [GREY; 64]);
+    }
+
+    #[test]
+    fn an_image_reaching_outside_its_surface_or_the_screen_is_clipped() {
+        let picture = picture();
+
+        // A source hanging off every side of the surface: what is drawn is
+        // the part that exists, and it lands where that part belongs.
+        let pixels = pictured(&[Command::Image {
+            x: 0,
+            y: 0,
+            src: Rect::new(-2, -1, 40, 40),
+            surface: 3,
+            alpha: 255,
+        }]);
+        assert_eq!(pixels[0], GREY);
+        assert_eq!(pixels[(SIDE + 2) as usize], picture[0]);
+        assert_eq!(pixels[(4 * SIDE + 5) as usize], picture[15]);
+        assert_eq!(pixels.iter().filter(|p| **p != GREY).count(), 16);
+
+        // Off the top-left of the screen: only the bottom-right pixel shows.
+        let pixels = pictured(&[whole_picture(-3, -3, 255)]);
+        assert_eq!(pixels[0], picture[15]);
+        assert_eq!(pixels.iter().filter(|p| **p != GREY).count(), 1);
+
+        // Under a scissor, and half blended so the other path is clipped too.
+        for alpha in [255, 128] {
+            let pixels = pictured(&[
+                Command::Scissor {
+                    rect: Rect::new(1, 1, 2, 1),
+                },
+                whole_picture(0, 0, alpha),
+            ]);
+            assert_eq!(pixels.iter().filter(|p| **p != GREY).count(), 2);
+            assert_ne!(pixels[(SIDE + 1) as usize], GREY);
+            assert_ne!(pixels[(SIDE + 2) as usize], GREY);
+        }
+    }
+
+    #[test]
+    fn an_image_of_a_surface_that_is_not_there_draws_nothing() {
+        let mut command = whole_picture(0, 0, 255);
+        for missing in [0, 7, 8, u32::MAX] {
+            if let Command::Image { surface, .. } = &mut command {
+                *surface = missing;
+            }
+            assert_eq!(pictured(&[command]), [GREY; 64]);
+        }
+    }
+
+    #[test]
+    fn a_surface_can_be_refused_replaced_and_detached() {
+        let (first, second) = ([0x11u32; 4], [0x22u32; 4]);
+        let mut pixels = [0u32; (SIDE * SIDE) as usize];
+        let info = SurfaceInfo {
+            width: SIDE,
+            height: SIDE,
+            pitch: SIDE * 4,
+            format: PixelFormat::XRGB8888,
+        };
+        let image = Command::Image {
+            x: 0,
+            y: 0,
+            src: Rect::new(0, 0, 2, 2),
+            surface: 0,
+            alpha: 255,
+        };
+        // SAFETY: as in `pictured`; each surface is 2 * 2 pixels of its own.
+        unsafe {
+            let mut renderer = SoftwareRenderer::new(pixels.as_mut_ptr().cast(), info).unwrap();
+            assert!(renderer
+                .attach_surface(SURFACES as u32, first.as_ptr(), 2, 2)
+                .is_err());
+            assert!(renderer.attach_surface(0, first.as_ptr(), 0, 2).is_err());
+
+            renderer.attach_surface(0, first.as_ptr(), 2, 2).unwrap();
+            submit(&mut renderer, &[image]);
+            assert_eq!(pixels[0], 0x11);
+
+            renderer.attach_surface(0, second.as_ptr(), 2, 2).unwrap();
+            submit(&mut renderer, &[image]);
+            assert_eq!(pixels[0], 0x22);
+
+            renderer.detach_surface(0);
+            submit(
+                &mut renderer,
+                &[
+                    Command::Clear {
+                        color: Color::BLACK,
+                    },
+                    image,
+                ],
+            );
+            assert_eq!(pixels[0], 0);
+        }
     }
 
     #[test]

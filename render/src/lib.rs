@@ -199,6 +199,25 @@ pub enum Command {
         color: Color,
         alpha: u8,
     },
+    /// Put a block of somebody else's pixels on the target: a window's
+    /// contents, at `alpha` out of 255.
+    ///
+    /// `surface` is a number the backend was given pixels for -- memory it
+    /// was shown here, an imported texture on a GPU -- so the command stays
+    /// plain data, the same as [`Command::Mask`] naming the atlas by
+    /// position. `src` is the block to take and `x`, `y` where its top-left
+    /// corner goes. A `src` reaching outside the surface is clipped to it,
+    /// and a surface the backend does not have draws nothing.
+    ///
+    /// Surface pixels are `0x00RRGGBB` whatever the screen's own layout is.
+    /// A client draws without knowing what it is being shown on.
+    Image {
+        x: i32,
+        y: i32,
+        src: Rect,
+        surface: u32,
+        alpha: u8,
+    },
     /// Confine every later command in this list, `Clear` included, to `rect`.
     ///
     /// This is what makes repainting a damaged region cost that region's
