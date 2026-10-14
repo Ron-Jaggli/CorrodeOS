@@ -1,4 +1,5 @@
-FROM docker.io/library/rust:1-slim-bookworm
+# Pinned to match rust-toolchain.toml: the build has no network to fetch another.
+FROM docker.io/library/rust:1.98.1-slim-bookworm
 
 # Everything Corrode needs to build and boot lives in here. The host stays clean.
 RUN apt-get update && apt-get install -y --no-install-recommends \

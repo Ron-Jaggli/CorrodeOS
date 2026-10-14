@@ -43,7 +43,11 @@ impl<'a> Assets<'a> {
 
     /// Build the demo's models and textures in the storage given. `None` if
     /// any slice is the wrong length.
-    pub fn new(vertices: &'a mut [Vertex], indices: &'a mut [u16], texels: &'a mut [u32]) -> Option<Self> {
+    pub fn new(
+        vertices: &'a mut [Vertex],
+        indices: &'a mut [u16],
+        texels: &'a mut [u32],
+    ) -> Option<Self> {
         if texels.len() != Self::TEXELS {
             return None;
         }
@@ -53,7 +57,12 @@ impl<'a> Assets<'a> {
         if !texture::checker(tiles, TEXTURE_SIZE, 2, pale, dark) {
             return None;
         }
-        if !texture::bricks(bricks, TEXTURE_SIZE, Color::rgb(183, 65, 14), Color::rgb(170, 165, 150)) {
+        if !texture::bricks(
+            bricks,
+            TEXTURE_SIZE,
+            Color::rgb(183, 65, 14),
+            Color::rgb(170, 165, 150),
+        ) {
             return None;
         }
         Some(Self {
@@ -71,7 +80,8 @@ impl<'a> Assets<'a> {
         const TARGET: Vec3 = Vec3::f(0.0, 0.9, 0.0);
         let (sin, cos) = Angle::sway(now_ns, 40_000, Angle::degrees(32)).sin_cos();
         let bob = Angle::spin(now_ns, 17_000).sin();
-        let eye = Vec3::fx(sin, Fx::ZERO, cos).scale(DISTANCE) + Vec3::fx(Fx::ZERO, Fx(HEIGHT.0 + bob.0 / 2), Fx::ZERO);
+        let eye = Vec3::fx(sin, Fx::ZERO, cos).scale(DISTANCE)
+            + Vec3::fx(Fx::ZERO, Fx(HEIGHT.0 + bob.0 / 2), Fx::ZERO);
         Camera::look_at(eye, TARGET).fov(Angle::degrees(58))
     }
 
@@ -97,14 +107,21 @@ impl<'a> Assets<'a> {
                 .rotate_y(Angle::spin(at, 24_000))
                 .scale(const { fx(2.0) })
         };
-        scene.draw_moving(&mesh::CUBE, block(now_ns), block(before), Material::textured(&self.bricks));
+        scene.draw_moving(
+            &mesh::CUBE,
+            block(now_ns),
+            block(before),
+            Material::textured(&self.bricks),
+        );
 
         // A mirror ball.
         const MIRROR: Vec3 = Vec3::f(0.3, 1.2, -1.4);
         scene.draw(
             &self.ball,
             Transform::at(MIRROR).scale(const { fx(2.4) }),
-            Material::color(Color::rgb(235, 235, 240)).reflect(235).shine(230),
+            Material::color(Color::rgb(235, 235, 240))
+                .reflect(235)
+                .shine(230),
         );
 
         // A red ball next to a white pillar, close enough to colour it.
@@ -115,7 +132,8 @@ impl<'a> Assets<'a> {
         );
         scene.draw(
             &mesh::CUBE,
-            Transform::at(const { Vec3::f(3.9, 1.9, 0.5) }).stretch(const { Vec3::f(0.7, 3.8, 2.4) }),
+            Transform::at(const { Vec3::f(3.9, 1.9, 0.5) })
+                .stretch(const { Vec3::f(0.7, 3.8, 2.4) }),
             Material::color(Color::rgb(232, 230, 224)),
         );
 
@@ -232,7 +250,11 @@ mod tests {
             let started = std::time::Instant::now();
             let stats = engine.render(&scene, &settings, now, &mut out);
             let took = started.elapsed();
-            println!("{name:>10}: {:>6.1} ms, {} triangles", took.as_secs_f64() * 1000.0, stats.triangles);
+            println!(
+                "{name:>10}: {:>6.1} ms, {} triangles",
+                took.as_secs_f64() * 1000.0,
+                stats.triangles
+            );
 
             let mut file = format!("P6\n{width} {height}\n255\n").into_bytes();
             for pixel in &out {

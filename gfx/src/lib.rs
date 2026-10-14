@@ -83,8 +83,8 @@ pub use corrode_render::Color;
 pub use math::{fx, Angle, Fx, Transform, Vec3};
 pub use mesh::{Mesh, Vertex};
 pub use scene::{
-    AmbientOcclusion, AntiAliasing, Bloom, Camera, DepthOfField, GlobalIllumination, Material, MotionBlur,
-    PointLight, Reflections, Scene, Settings, Shadows, Sky, Sun,
+    AmbientOcclusion, AntiAliasing, Bloom, Camera, DepthOfField, GlobalIllumination, Material,
+    MotionBlur, PointLight, Reflections, Scene, Settings, Shadows, Sky, Sun,
 };
 pub use texture::Texture;
 
@@ -217,7 +217,8 @@ impl<'a> Engine<'a> {
             };
             let moving = settings.motion_blur.is_some();
             for item in scene.items() {
-                stats.triangles += raster::draw(&lens, &mut buffers, item, &view, &previous_view, moving);
+                stats.triangles +=
+                    raster::draw(&lens, &mut buffers, item, &view, &previous_view, moving);
             }
         }
 
@@ -266,7 +267,9 @@ impl<'a> Engine<'a> {
 
         // Light.
         match &settings.ambient_occlusion {
-            Some(occlusion) => light::occlusion(&eye, self.shape, self.spare, self.light, occlusion),
+            Some(occlusion) => {
+                light::occlusion(&eye, self.shape, self.spare, self.light, occlusion)
+            }
             None => self.light.fill(255 << 48),
         }
 
@@ -306,7 +309,15 @@ impl<'a> Engine<'a> {
 
         // Lens.
         if let Some(reflections) = &settings.reflections {
-            post::reflections(&eye, &heaven, self.surface, self.shape, self.light, self.spare, reflections);
+            post::reflections(
+                &eye,
+                &heaven,
+                self.surface,
+                self.shape,
+                self.light,
+                self.spare,
+                reflections,
+            );
             self.swap();
         }
         if let Some(blur) = &settings.motion_blur {
@@ -337,8 +348,12 @@ impl<'a> Engine<'a> {
             tonemap: settings.tonemap,
             exposure: settings.exposure.0.max(0) as i64,
             glow,
-            aberration: settings.chromatic_aberration.map_or(0, |amount| amount.0.max(0) as i64),
-            vignette: settings.vignette.map_or(0, |amount| amount.0.clamp(0, 1 << 16) as i64),
+            aberration: settings
+                .chromatic_aberration
+                .map_or(0, |amount| amount.0.max(0) as i64),
+            vignette: settings
+                .vignette
+                .map_or(0, |amount| amount.0.clamp(0, 1 << 16) as i64),
         };
         post::resolve(width, height, self.light, self.spare, &grade);
 
@@ -384,7 +399,11 @@ mod tests {
     }
 
     fn channels(pixel: u32) -> [i32; 3] {
-        [(pixel >> 16) as i32 & 0xff, (pixel >> 8) as i32 & 0xff, pixel as i32 & 0xff]
+        [
+            (pixel >> 16) as i32 & 0xff,
+            (pixel >> 8) as i32 & 0xff,
+            pixel as i32 & 0xff,
+        ]
     }
 
     fn at(picture: &[u32], x: usize, y: usize) -> [i32; 3] {
@@ -414,7 +433,10 @@ mod tests {
         assert!(cube[0] > 2 * cube[1] && cube[0] > 60, "cube is {cube:?}");
         // Floor at the bottom: grey.
         let floor = at(&out, 4, HEIGHT - 2);
-        assert!((floor[0] - floor[2]).abs() < 40 && floor[0] > 60, "floor is {floor:?}");
+        assert!(
+            (floor[0] - floor[2]).abs() < 40 && floor[0] > 60,
+            "floor is {floor:?}"
+        );
     }
 
     #[test]
@@ -459,9 +481,18 @@ mod tests {
                 .count()
         };
         let normal = red(&picture(&Settings::OFF, |_| {}).0);
-        let wide = red(&picture(&Settings::OFF, |scene| scene.camera.fov = Angle::degrees(100)).0);
-        let narrow = red(&picture(&Settings::OFF, |scene| scene.camera.fov = Angle::degrees(30)).0);
-        assert!(wide * 2 < normal && normal * 2 < narrow, "{wide} {normal} {narrow}");
+        let wide = red(&picture(&Settings::OFF, |scene| {
+            scene.camera.fov = Angle::degrees(100)
+        })
+        .0);
+        let narrow = red(&picture(&Settings::OFF, |scene| {
+            scene.camera.fov = Angle::degrees(30)
+        })
+        .0);
+        assert!(
+            wide * 2 < normal && normal * 2 < narrow,
+            "{wide} {normal} {narrow}"
+        );
     }
 
     #[test]
@@ -470,15 +501,72 @@ mod tests {
         let with = |settings: Settings| picture(&settings, |_| {}).0;
         let off = Settings::OFF;
         let effects: [(&str, Settings); 9] = [
-            ("shadows", Settings { shadows: Settings::LOW.shadows, ..off }),
-            ("occlusion", Settings { ambient_occlusion: Settings::HIGH.ambient_occlusion, ..off }),
-            ("bounce", Settings { global_illumination: Settings::HIGH.global_illumination, ..off }),
-            ("depth of field", Settings { depth_of_field: Settings::CINEMATIC.depth_of_field, ..off }),
-            ("bloom", Settings { bloom: Some(Bloom { threshold: fx(0.3), strength: fx(1.0) }), ..off }),
-            ("smoothing", Settings { anti_aliasing: AntiAliasing::Fxaa, ..off }),
-            ("fringing", Settings { chromatic_aberration: Some(fx(0.02)), ..off }),
-            ("vignette", Settings { vignette: Some(fx(0.5)), ..off }),
-            ("grain", Settings { film_grain: Some(fx(0.05)), ..off }),
+            (
+                "shadows",
+                Settings {
+                    shadows: Settings::LOW.shadows,
+                    ..off
+                },
+            ),
+            (
+                "occlusion",
+                Settings {
+                    ambient_occlusion: Settings::HIGH.ambient_occlusion,
+                    ..off
+                },
+            ),
+            (
+                "bounce",
+                Settings {
+                    global_illumination: Settings::HIGH.global_illumination,
+                    ..off
+                },
+            ),
+            (
+                "depth of field",
+                Settings {
+                    depth_of_field: Settings::CINEMATIC.depth_of_field,
+                    ..off
+                },
+            ),
+            (
+                "bloom",
+                Settings {
+                    bloom: Some(Bloom {
+                        threshold: fx(0.3),
+                        strength: fx(1.0),
+                    }),
+                    ..off
+                },
+            ),
+            (
+                "smoothing",
+                Settings {
+                    anti_aliasing: AntiAliasing::Fxaa,
+                    ..off
+                },
+            ),
+            (
+                "fringing",
+                Settings {
+                    chromatic_aberration: Some(fx(0.02)),
+                    ..off
+                },
+            ),
+            (
+                "vignette",
+                Settings {
+                    vignette: Some(fx(0.5)),
+                    ..off
+                },
+            ),
+            (
+                "grain",
+                Settings {
+                    film_grain: Some(fx(0.05)),
+                    ..off
+                },
+            ),
         ];
         for (name, settings) in effects {
             assert_ne!(with(settings), plain, "{name} did nothing");
@@ -510,7 +598,10 @@ mod tests {
                 (a[0] - a[1]).abs() < 30 && b[0] > b[1] + 40
             })
             .count();
-        assert!(redder > 30, "only {redder} pixels of floor reflect the cube");
+        assert!(
+            redder > 30,
+            "only {redder} pixels of floor reflect the cube"
+        );
     }
 
     #[test]
@@ -547,7 +638,11 @@ mod tests {
             });
         })
         .0;
-        let brighter = unlit.iter().zip(&lit).filter(|(a, b)| channels(**b)[1] > channels(**a)[1] + 30).count();
+        let brighter = unlit
+            .iter()
+            .zip(&lit)
+            .filter(|(a, b)| channels(**b)[1] > channels(**a)[1] + 30)
+            .count();
         assert!(brighter > 200, "only {brighter} pixels are lit by the lamp");
     }
 }

@@ -64,7 +64,13 @@ pub(crate) struct Eye {
 }
 
 impl Eye {
-    pub(crate) fn new(width: usize, height: usize, focal: i64, near: i32, view: &Transform) -> Self {
+    pub(crate) fn new(
+        width: usize,
+        height: usize,
+        focal: i64,
+        near: i32,
+        view: &Transform,
+    ) -> Self {
         Self {
             width,
             height,
@@ -81,7 +87,10 @@ impl Eye {
     pub(crate) fn ray(&self, x: usize, y: usize) -> [i64; 2] {
         let across = 2 * x as i64 + 1 - self.width as i64;
         let up = self.height as i64 - 1 - 2 * y as i64;
-        [(across * self.inverse_focal) >> 1, (up * self.inverse_focal) >> 1]
+        [
+            (across * self.inverse_focal) >> 1,
+            (up * self.inverse_focal) >> 1,
+        ]
     }
 
     /// The view-space point a pixel shows.
@@ -107,7 +116,7 @@ impl Eye {
             return None;
         }
         let depth = depth_of(p[2] as i64);
-        let scale = |c: i32| ((c as i64 * self.focal) as i128 * depth as i128 >> 42) as i64;
+        let scale = |c: i32| (((c as i64 * self.focal) as i128 * depth as i128) >> 42) as i64;
         let x = ((self.width as i64) << 15) + scale(p[0]);
         let y = ((self.height as i64) << 15) - scale(p[1]);
         if x < 0 || y < 0 {
@@ -148,7 +157,8 @@ impl Heaven {
             let glow = power(toward, 96) >> 2;
             let disc = (toward - (UNIT - 12)).clamp(0, 8) * (UNIT / 8) * 6;
             for (channel, sun) in sky.iter_mut().zip(self.sun) {
-                *channel = (*channel as i64 + ((sun as i64 * (glow + disc)) >> 14)).min(color::MAX as i64) as i32;
+                *channel = (*channel as i64 + ((sun as i64 * (glow + disc)) >> 14))
+                    .min(color::MAX as i64) as i32;
             }
         }
         sky
@@ -205,7 +215,8 @@ impl Shade<'_> {
     /// each, so the edge of a shadow is a ramp a texel or two wide rather
     /// than a staircase.
     fn lit(&self, p: [i32; 3], n: [i32; 3]) -> i64 {
-        let lifted = [0, 1, 2].map(|i| p[i].saturating_add(((n[i] as i64 * self.offset as i64) >> 14) as i32));
+        let lifted = [0, 1, 2]
+            .map(|i| p[i].saturating_add(((n[i] as i64 * self.offset as i64) >> 14) as i32));
         let l = self.to_light.point(lifted);
         let size = self.map.size as i64;
         let on_map = |c: i32| ((c as i64 * self.scale) >> 16) + size * 128 - 128;
@@ -336,7 +347,8 @@ pub(crate) fn occlusion(
                 if dot(s, n) < 0 {
                     s = s.map(|c| -c);
                 }
-                let q = [0, 1, 2].map(|i| origin[i].saturating_add(((s[i] as i64 * radius) >> 14) as i32));
+                let q = [0, 1, 2]
+                    .map(|i| origin[i].saturating_add(((s[i] as i64 * radius) >> 14) as i32));
                 let Some((sx, sy, at)) = eye.project(q) else {
                     continue;
                 };
@@ -369,7 +381,7 @@ pub(crate) fn occlusion(
                     }
                 }
             }
-            let open = if count == 0 { 255 } else { sum / count };
+            let open = sum.checked_div(count).unwrap_or(255);
             out[index] = open << 48;
         }
     }
@@ -440,7 +452,8 @@ pub(crate) fn shade(
             add(heaven.sun_direction, heaven.sun, sun);
 
             for lamp in lamps {
-                let away = [0, 1, 2].map(|i| lamp.position[i].saturating_sub(p[i]).clamp(-FAR, FAR));
+                let away =
+                    [0, 1, 2].map(|i| lamp.position[i].saturating_sub(p[i]).clamp(-FAR, FAR));
                 let square = dot(away, away) >> 16;
                 let fade = (1 << 16) - ((square * lamp.inverse_square) >> 16);
                 if fade > 0 {
@@ -494,7 +507,7 @@ pub(crate) fn bounce(
             let n = normal(shape[index]);
             let p = eye.position(x, y, depth);
             // How many pixels the gathering radius spans at this distance.
-            let reach = ((radius * eye.focal) / (p[2] as i64).max(1) >> 16).clamp(6, 96);
+            let reach = (((radius * eye.focal) / (p[2] as i64).max(1)) >> 16).clamp(6, 96);
 
             let first = (((x >> 1) & 1) + 2 * ((y >> 1) & 1)) * BOUNCE_SAMPLES;
             let mut sum = [0i64; 3];
@@ -541,7 +554,13 @@ pub(crate) fn bounce(
 /// Each pixel takes the average of the gathered values around it that lie
 /// on about the same depth, which both fills in the pixels that were
 /// skipped and smooths over the few samples each one took.
-pub(crate) fn bounce_apply(eye: &Eye, surface: &[u64], shape: &[u64], gathered: &[u64], light: &mut [u64]) {
+pub(crate) fn bounce_apply(
+    eye: &Eye,
+    surface: &[u64],
+    shape: &[u64],
+    gathered: &[u64],
+    light: &mut [u64],
+) {
     for y in 0..eye.height {
         for x in 0..eye.width {
             let index = y * eye.width + x;
@@ -572,7 +591,8 @@ pub(crate) fn bounce_apply(eye: &Eye, surface: &[u64], shape: &[u64], gathered: 
             }
             let albedo = color::linear_packed(surface[index] as u32);
             let now = color::unpack(light[index]);
-            let lit = [0, 1, 2].map(|i| now[i] + ((albedo[i] as i64 * sum[i] / count) >> 12) as i32);
+            let lit =
+                [0, 1, 2].map(|i| now[i] + ((albedo[i] as i64 * sum[i] / count) >> 12) as i32);
             light[index] = color::pack(lit) | (light[index] & !RGB);
         }
     }
@@ -586,7 +606,13 @@ mod tests {
 
     fn eye() -> Eye {
         let camera = Camera::look_at(Vec3::new(0, 0, 5), Vec3::ZERO);
-        Eye::new(320, 200, camera.focal(200), camera.near_plane(), &camera.view())
+        Eye::new(
+            320,
+            200,
+            camera.focal(200),
+            camera.near_plane(),
+            &camera.view(),
+        )
     }
 
     #[test]
@@ -595,7 +621,10 @@ mod tests {
             for exponent in [1u32, 2, 7, 64, 259] {
                 let got = power((base * 16384.0) as i64, exponent) as f64 / 16384.0;
                 let exact = f64::powi(base, exponent as i32);
-                assert!((got - exact).abs() < 2e-3, "{base}^{exponent}: {got} vs {exact}");
+                assert!(
+                    (got - exact).abs() < 2e-3,
+                    "{base}^{exponent}: {got} vs {exact}"
+                );
             }
         }
     }
@@ -603,13 +632,21 @@ mod tests {
     #[test]
     fn a_point_projects_to_the_pixel_it_came_from() {
         let eye = eye();
-        for (x, y, z) in [(0, 0, 3.0), (319, 199, 1.0), (160, 100, 40.0), (17, 180, 0.25)] {
+        for (x, y, z) in [
+            (0, 0, 3.0),
+            (319, 199, 1.0),
+            (160, 100, 40.0),
+            (17, 180, 0.25),
+        ] {
             let depth = depth_of((z * 65536.0) as i64);
             let p = eye.position(x, y, depth);
             // Against the pinhole formula, in floating point.
             let f = eye.focal as f64 / 65536.0;
             let back = z_of(depth) as f64 / 65536.0;
-            let exact = [(x as f64 + 0.5 - 160.0) / f * back, (100.0 - y as f64 - 0.5) / f * back];
+            let exact = [
+                (x as f64 + 0.5 - 160.0) / f * back,
+                (100.0 - y as f64 - 0.5) / f * back,
+            ];
             assert!((p[0] as f64 / 65536.0 - exact[0]).abs() < back * 2e-4);
             assert!((p[1] as f64 / 65536.0 - exact[1]).abs() < back * 2e-4);
             let (sx, sy, there) = eye.project(p).unwrap();
@@ -645,11 +682,19 @@ mod tests {
     #[test]
     fn the_sample_patterns_are_where_they_should_be() {
         for point in BALL {
-            let length = point.iter().map(|c| (*c as f64 / 16384.0).powi(2)).sum::<f64>().sqrt();
+            let length = point
+                .iter()
+                .map(|c| (*c as f64 / 16384.0).powi(2))
+                .sum::<f64>()
+                .sqrt();
             assert!((0.3..=1.0).contains(&length));
         }
         for point in DISC {
-            let length = point.iter().map(|c| (*c as f64 / 256.0).powi(2)).sum::<f64>().sqrt();
+            let length = point
+                .iter()
+                .map(|c| (*c as f64 / 256.0).powi(2))
+                .sum::<f64>()
+                .sqrt();
             assert!((0.18..=1.0).contains(&length));
         }
         // Spread about evenly: the average is near the middle.

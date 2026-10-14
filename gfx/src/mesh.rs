@@ -316,7 +316,10 @@ pub fn parse_obj<'a>(
                 let mut corners = 0;
                 for corner in words {
                     let mut parts = corner.split('/');
-                    let position = parts.next().and_then(|p| resolve(p, positions)).ok_or(bad)?;
+                    let position = parts
+                        .next()
+                        .and_then(|p| resolve(p, positions))
+                        .ok_or(bad)?;
                     let uv = match parts.next() {
                         None | Some("") => None,
                         Some(t) => Some(resolve(t, uvs).ok_or(bad)?),
@@ -399,7 +402,10 @@ mod tests {
             assert!(real(vertex.position).iter().all(|c| c.abs() == 0.5));
         }
         faces_outwards(&PLANE);
-        assert!(PLANE.vertices.iter().all(|v| v.normal == Vec3::Y && v.position.y == Fx::ZERO));
+        assert!(PLANE
+            .vertices
+            .iter()
+            .all(|v| v.normal == Vec3::Y && v.position.y == Fx::ZERO));
     }
 
     #[test]
@@ -485,7 +491,10 @@ mod tests {
         };
         assert_eq!(run("v 0 0 0\nv 1 0 x"), Err(ObjError::Malformed(2)));
         assert_eq!(run("v 0 0 0\nf 1 2 3"), Err(ObjError::Malformed(2)));
-        assert_eq!(run("v 0 0 0\nv 0 0 0\nv 0 0 0\nv 0 0 0"), Err(ObjError::TooBig));
+        assert_eq!(
+            run("v 0 0 0\nv 0 0 0\nv 0 0 0\nv 0 0 0"),
+            Err(ObjError::TooBig)
+        );
         assert_eq!(run("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3"), Ok(1));
     }
 }

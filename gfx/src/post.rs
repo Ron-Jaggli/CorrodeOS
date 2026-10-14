@@ -73,7 +73,9 @@ pub(crate) fn reflections(
             // further the ray has gone: what is far away is small on screen.
             let first = (p[2] as i64 >> 6).max(1 << 9);
             let lifted = [0, 1, 2].map(|i| p[i] + ((n[i] as i64 * first) >> 15) as i32);
-            let along = |t: i64| [0, 1, 2].map(|i| lifted[i].saturating_add(((away[i] as i64 * t) >> 14) as i32));
+            let along = |t: i64| {
+                [0, 1, 2].map(|i| lifted[i].saturating_add(((away[i] as i64 * t) >> 14) as i32))
+            };
 
             // Whether the ray, `t` along, has gone behind what is drawn
             // there -- and not so far behind that it has passed something
@@ -134,7 +136,8 @@ pub(crate) fn reflections(
             };
 
             let base = color::unpack(light[index]);
-            let shown = [0, 1, 2].map(|i| base[i] + (((reflected[i] - base[i]) as i64 * amount) >> 14) as i32);
+            let shown = [0, 1, 2]
+                .map(|i| base[i] + (((reflected[i] - base[i]) as i64 * amount) >> 14) as i32);
             out[index] = color::pack(shown) | (light[index] & !RGB);
         }
     }
@@ -181,7 +184,8 @@ pub(crate) fn motion_blur(
                     sum[i] += seen[i] as i64;
                 }
             }
-            out[index] = color::pack(sum.map(|c| (c / MOTION_SAMPLES) as i32)) | (light[index] & !RGB);
+            out[index] =
+                color::pack(sum.map(|c| (c / MOTION_SAMPLES) as i32)) | (light[index] & !RGB);
         }
     }
 }
@@ -287,7 +291,13 @@ pub(crate) const BLOOM_SCALE: usize = 4;
 /// Pick out what is brighter than `threshold` (linear Q12), at a quarter
 /// size: each output pixel is the average of a four-by-four block with the
 /// threshold's worth of brightness taken off.
-pub(crate) fn bloom_extract(width: usize, height: usize, light: &[u64], out: &mut [u64], threshold: i64) {
+pub(crate) fn bloom_extract(
+    width: usize,
+    height: usize,
+    light: &[u64],
+    out: &mut [u64],
+    threshold: i64,
+) {
     let (small_width, small_height) = (width / BLOOM_SCALE, height / BLOOM_SCALE);
     for y in 0..small_height {
         for x in 0..small_width {
@@ -336,7 +346,8 @@ pub(crate) fn bloom_blur(width: usize, height: usize, a: &mut [u64], b: &mut [u6
                         sum[i] += seen[i] as i64 * weight;
                     }
                 }
-                to[y as usize * width + x as usize] = color::pack(sum.map(|c| ((c + 128) >> 8) as i32));
+                to[y as usize * width + x as usize] =
+                    color::pack(sum.map(|c| ((c + 128) >> 8) as i32));
             }
         }
     };
@@ -353,7 +364,8 @@ fn bloom_at(small: &[u64], small_width: usize, small_height: usize, x: usize, y:
     // The centre of full-size pixel x, in quarter-size pixels, less the
     // half that puts sample points at centres. 1/256.
     let place = |v: usize, limit: usize| {
-        let at = ((2 * v as i64 + 1) * 128 / BLOOM_SCALE as i64 - 128).clamp(0, (limit as i64 - 1) << 8);
+        let at =
+            ((2 * v as i64 + 1) * 128 / BLOOM_SCALE as i64 - 128).clamp(0, (limit as i64 - 1) << 8);
         let whole = (at >> 8) as usize;
         (whole, (whole + 1).min(limit - 1), at & 0xff)
     };
@@ -420,7 +432,13 @@ fn channel_at(light: &[u64], width: usize, height: usize, x: i64, y: i64, shift:
 /// they do: glow is added, the corners are darkened, and red and blue are
 /// read from slightly further out and further in than green, which is the
 /// colour fringing of a simple lens.
-pub(crate) fn resolve(width: usize, height: usize, light: &[u64], out: &mut [u64], grade: &Grade<'_>) {
+pub(crate) fn resolve(
+    width: usize,
+    height: usize,
+    light: &[u64],
+    out: &mut [u64],
+    grade: &Grade<'_>,
+) {
     let (w, h) = (width as i64, height as i64);
     // Distances from the centre are kept doubled, so that pixel centres are
     // whole numbers.
@@ -494,7 +512,11 @@ fn pixel_at(picture: &[u64], width: usize, height: usize, x: i64, y: i64) -> u32
     let (x1, y1) = ((x0 + 1).min(width - 1), (y0 + 1).min(height - 1));
     let (fx, fy) = ((x & 0xff) as u32, (y & 0xff) as u32);
     let read = |x: usize, y: usize| picture[y * width + x] as u32;
-    mix(mix(read(x0, y0), read(x1, y0), fx), mix(read(x0, y1), read(x1, y1), fx), fy)
+    mix(
+        mix(read(x0, y0), read(x1, y0), fx),
+        mix(read(x0, y1), read(x1, y1), fx),
+        fy,
+    )
 }
 
 /// The smoothed colour of one pixel, or `None` if it is not on an edge.
@@ -524,7 +546,15 @@ fn smooth(picture: &[u64], width: usize, height: usize, x: usize, y: usize) -> O
     let (dx, dy) = (span(dx), span(dy));
 
     let (cx, cy) = ((2 * x as i64 + 1) * 128, (2 * y as i64 + 1) * 128);
-    let tap = |scale: i64| pixel_at(picture, width, height, cx + dx * scale / 6, cy + dy * scale / 6);
+    let tap = |scale: i64| {
+        pixel_at(
+            picture,
+            width,
+            height,
+            cx + dx * scale / 6,
+            cy + dy * scale / 6,
+        )
+    };
     let narrow = mix(tap(-1), tap(1), 128);
     let wide = mix(narrow, mix(tap(-3), tap(3), 128), 128);
     // If the wide average has wandered off the edge onto something else,
@@ -646,7 +676,10 @@ mod tests {
         let glow = color::unpack(out[1]);
         // Dimmer than it was, and the same hue: red still twice green.
         assert!(glow[0] > 4000 && glow[0] < 16384, "{glow:?}");
-        assert!((glow[0] - 2 * glow[1]).abs() <= 2 && glow[2] == 0, "{glow:?}");
+        assert!(
+            (glow[0] - 2 * glow[1]).abs() <= 2 && glow[2] == 0,
+            "{glow:?}"
+        );
     }
 
     fn plain(tonemap: Tonemap) -> Grade<'static> {
@@ -661,7 +694,11 @@ mod tests {
 
     #[test]
     fn white_resolves_to_white_and_black_to_black() {
-        let light = [color::pack([0, 0, 0]), color::pack([color::ONE; 3]), color::pack([65535; 3])];
+        let light = [
+            color::pack([0, 0, 0]),
+            color::pack([color::ONE; 3]),
+            color::pack([65535; 3]),
+        ];
         let mut out = [0u64; 3];
         resolve(3, 1, &light, &mut out, &plain(Tonemap::Clip));
         assert_eq!(out, [0x000000, 0xffffff, 0xffffff]);
@@ -704,7 +741,13 @@ mod tests {
         resolve(width, height, &light, &mut out, &grade);
         let row = &out[4 * width..5 * width];
         let first = |shift: u32| row.iter().position(|p| (p >> shift) & 0xff > 40).unwrap();
-        assert!(first(16) < first(8) && first(8) < first(0), "{} {} {}", first(16), first(8), first(0));
+        assert!(
+            first(16) < first(8) && first(8) < first(0),
+            "{} {} {}",
+            first(16),
+            first(8),
+            first(0)
+        );
         // The middle column is untouched.
         assert_eq!(out[4 * width + 32], 0);
     }
@@ -724,7 +767,10 @@ mod tests {
         let mut out = vec![0u32; width * height];
         finish(width, height, &picture, &mut out, true, None);
 
-        let greys = out.iter().filter(|p| **p != 0 && **p != 0x00ff_ffff).count();
+        let greys = out
+            .iter()
+            .filter(|p| **p != 0 && **p != 0x00ff_ffff)
+            .count();
         assert!(greys > 20, "only {greys} pixels were blended");
         // Well away from the edge nothing changed.
         assert_eq!(out[2 * width + 28], 0);
@@ -740,7 +786,12 @@ mod tests {
         let picture = vec![0x0080_8080u64; width * height];
         let mut one = vec![0u32; width * height];
         let mut two = vec![0u32; width * height];
-        let grain = |seed| Some(Grain { strength: 1 << 13, seed });
+        let grain = |seed| {
+            Some(Grain {
+                strength: 1 << 13,
+                seed,
+            })
+        };
         finish(width, height, &picture, &mut one, false, grain(1));
         finish(width, height, &picture, &mut two, false, grain(2));
         assert_ne!(one, two);

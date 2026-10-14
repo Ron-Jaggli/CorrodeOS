@@ -236,7 +236,12 @@ impl<'a, const N: usize> Scene<'a, N> {
     }
 
     /// Put a model in the world. `false` if there is no room for it.
-    pub fn draw(&mut self, mesh: &'a Mesh<'a>, transform: Transform, material: Material<'a>) -> bool {
+    pub fn draw(
+        &mut self,
+        mesh: &'a Mesh<'a>,
+        transform: Transform,
+        material: Material<'a>,
+    ) -> bool {
         self.draw_moving(mesh, transform, transform, material)
     }
 
@@ -489,7 +494,10 @@ mod tests {
             let camera = Camera::look_at(Vec3::Z, Vec3::ZERO).fov(Angle::degrees(degrees));
             let exact = height as f64 / 2.0 / ((degrees as f64).to_radians() / 2.0).tan();
             let got = camera.focal(height) as f64 / 65536.0;
-            assert!((got - exact).abs() < exact * 1e-5, "{degrees}: {got} vs {exact}");
+            assert!(
+                (got - exact).abs() < exact * 1e-5,
+                "{degrees}: {got} vs {exact}"
+            );
         }
     }
 

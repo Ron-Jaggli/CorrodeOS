@@ -300,12 +300,12 @@ impl Setup {
 
         // The top-left rule: a pixel centre exactly on an edge belongs to
         // the triangle only if that edge is its top or its left.
-        for i in 0..3 {
+        for (i, w) in w.iter_mut().enumerate() {
             let (a, b) = ((i + 1) % 3, (i + 2) % 3);
             let (dx, dy) = (x[b] - x[a], y[b] - y[a]);
             let top_left = dy < 0 || (dy == 0 && dx > 0);
             if !top_left {
-                w[i] -= 1;
+                *w -= 1;
             }
         }
 
@@ -326,7 +326,8 @@ impl Setup {
     /// How a value that is `a` at each corner varies across the triangle.
     fn plane(&self, a: [i64; 3]) -> Plane {
         let (d1, d2) = ((a[1] - a[0]) as i128, (a[2] - a[0]) as i128);
-        let blend = |weights: [i128; 2], shift: u32| ((weights[0] * d1 + weights[1] * d2) >> shift) as i64;
+        let blend =
+            |weights: [i128; 2], shift: u32| ((weights[0] * d1 + weights[1] * d2) >> shift) as i64;
         Plane {
             v: a[0].wrapping_add(blend(self.start, 52)),
             dx: blend(self.across, 60),
@@ -394,13 +395,18 @@ fn lod_constant(lens: &Lens, texture: &Texture<'_>, c: &[Corner; 3]) -> i32 {
         e1[2] * e2[0] - e1[0] * e2[2],
         e1[0] * e2[1] - e1[1] * e2[0],
     ];
-    let square: u128 = cross.iter().map(|c| (*c as i128 * *c as i128) as u128).sum();
+    let square: u128 = cross
+        .iter()
+        .map(|c| (*c as i128 * *c as i128) as u128)
+        .sum();
     let uv = |i: usize, k: usize| c[i].uv[k] as i64 - c[0].uv[k] as i64;
     let uv_area = (uv(1, 0) * uv(2, 1) - uv(2, 0) * uv(1, 1)).unsigned_abs();
     if square == 0 || uv_area == 0 {
         return 0;
     }
-    let toward: i128 = (0..3).map(|k| cross[k] as i128 * (c[0].p[k] as i128 >> 4)).sum();
+    let toward: i128 = (0..3)
+        .map(|k| cross[k] as i128 * (c[0].p[k] as i128 >> 4))
+        .sum();
 
     // Twice the triangle's area in world units, as a logarithm; then the
     // distance to its plane, the texel density, and the focal length.
@@ -516,14 +522,14 @@ fn fill(
                 // come back.
                 break;
             }
-            for i in 0..3 {
-                w[i] = w[i].wrapping_add(setup.wx[i]);
+            for (w, step) in w.iter_mut().zip(setup.wx) {
+                *w = w.wrapping_add(step);
             }
             depth_here = depth_here.wrapping_add(depth_plane.dx);
         }
 
-        for i in 0..3 {
-            w_row[i] = w_row[i].wrapping_add(setup.wy[i]);
+        for (w, step) in w_row.iter_mut().zip(setup.wy) {
+            *w = w.wrapping_add(step);
         }
         depth_row = depth_row.wrapping_add(depth_plane.dy);
     }
@@ -564,16 +570,21 @@ pub(crate) fn draw(
         Some(Corner {
             p: to_view.point(position),
             n: normalize(normals.map(|row| (dot(row, n) >> 12) as i32), 14),
-            uv: vertex.uv.map(|c| ((c.0 as i64 * tiling) >> 16).clamp(-limit, limit) as i32),
+            uv: vertex
+                .uv
+                .map(|c| ((c.0 as i64 * tiling) >> 16).clamp(-limit, limit) as i32),
             q: was_view.point(position),
         })
     };
 
     let mut drawn = 0;
     let mut polygon = [Corner::default(); POLYGON];
-    for triangle in item.mesh.indices.chunks_exact(3) {
-        let (Some(a), Some(b), Some(c)) = (corner(triangle[0]), corner(triangle[1]), corner(triangle[2]))
-        else {
+    for triangle in item.mesh.indices.as_chunks::<3>().0 {
+        let (Some(a), Some(b), Some(c)) = (
+            corner(triangle[0]),
+            corner(triangle[1]),
+            corner(triangle[2]),
+        ) else {
             continue;
         };
         let corners = [a, b, c];
@@ -587,7 +598,13 @@ pub(crate) fn draw(
         };
         let mut any = false;
         for i in 1..count - 1 {
-            any |= fill(lens, out, &surface, lod, [polygon[0], polygon[i], polygon[i + 1]]);
+            any |= fill(
+                lens,
+                out,
+                &surface,
+                lod,
+                [polygon[0], polygon[i], polygon[i + 1]],
+            );
         }
         drawn += any as u32;
     }
@@ -666,13 +683,13 @@ impl ShadowMap<'_> {
                 } else if entered {
                     break;
                 }
-                for i in 0..3 {
-                    w[i] = w[i].wrapping_add(setup.wx[i]);
+                for (w, step) in w.iter_mut().zip(setup.wx) {
+                    *w = w.wrapping_add(step);
                 }
                 depth_here = depth_here.wrapping_add(plane.dx);
             }
-            for i in 0..3 {
-                w_row[i] = w_row[i].wrapping_add(setup.wy[i]);
+            for (w, step) in w_row.iter_mut().zip(setup.wy) {
+                *w = w.wrapping_add(step);
             }
             depth_row = depth_row.wrapping_add(plane.dy);
         }
@@ -690,9 +707,12 @@ impl ShadowMap<'_> {
             let on_map = |c: i32| (((c as i64 * scale) >> 16) + centre).clamp(-limit, limit) as i32;
             Some(([on_map(p[0]), on_map(p[1])], p[2]))
         };
-        for triangle in item.mesh.indices.chunks_exact(3) {
-            let (Some(a), Some(b), Some(c)) = (corner(triangle[0]), corner(triangle[1]), corner(triangle[2]))
-            else {
+        for triangle in item.mesh.indices.as_chunks::<3>().0 {
+            let (Some(a), Some(b), Some(c)) = (
+                corner(triangle[0]),
+                corner(triangle[1]),
+                corner(triangle[2]),
+            ) else {
                 continue;
             };
             self.fill([a.0, b.0, c.0], [a.1, b.1, c.1]);
@@ -746,7 +766,8 @@ mod tests {
     fn strictly_inside(s: &[[i32; 2]; 3], x: i32, y: i32) -> Option<bool> {
         let p = [(x as f64 + 0.5) * 256.0, (y as f64 + 0.5) * 256.0];
         let edge = |a: [i32; 2], b: [i32; 2]| {
-            (b[0] - a[0]) as f64 * (p[1] - a[1] as f64) - (b[1] - a[1]) as f64 * (p[0] - a[0] as f64)
+            (b[0] - a[0]) as f64 * (p[1] - a[1] as f64)
+                - (b[1] - a[1]) as f64 * (p[0] - a[0] as f64)
         };
         let e = [edge(s[0], s[1]), edge(s[1], s[2]), edge(s[2], s[0])];
         if e.contains(&0.0) {
@@ -760,7 +781,12 @@ mod tests {
     fn coverage_matches_a_point_in_triangle_test() {
         let mut random = Random(0x1234_5678);
         for _ in 0..400 {
-            let s = [0; 3].map(|_| [random.below(60 * 256) - 6 * 256, random.below(60 * 256) - 6 * 256]);
+            let s = [0; 3].map(|_| {
+                [
+                    random.below(60 * 256) - 6 * 256,
+                    random.below(60 * 256) - 6 * 256,
+                ]
+            });
             let mut counts = vec![0u32; (SIDE * SIDE) as usize];
             cover(&mut counts, s);
             for y in 0..SIDE {
@@ -769,7 +795,10 @@ mod tests {
                         let got = counts[(y * SIDE + x) as usize];
                         // Slivers are dropped whole, which only ever loses
                         // pixels.
-                        assert!(got == inside as u32 || (got == 0 && inside), "{s:?} at {x},{y}");
+                        assert!(
+                            got == inside as u32 || (got == 0 && inside),
+                            "{s:?} at {x},{y}"
+                        );
                     }
                 }
             }
@@ -786,7 +815,8 @@ mod tests {
             // Whole and half pixel positions, so that centres on edges and
             // on corners are common rather than vanishingly rare.
             let step = if round % 2 == 0 { 128 } else { 37 };
-            let mut point = |low: i32, high: i32| (low + random.below((high - low) as u32)) / step * step;
+            let mut point =
+                |low: i32, high: i32| (low + random.below((high - low) as u32)) / step * step;
             let centre = [point(16 * 256, 32 * 256), point(16 * 256, 32 * 256)];
             let rim = [
                 [point(0, 12 * 256), point(0, 12 * 256)],
@@ -836,10 +866,15 @@ mod tests {
             let gy = (a2 * (x[1] - x[0]) - a1 * (x[2] - x[0])) / det;
 
             for (px, py) in [(setup.x0, setup.y0), (setup.x1 - 1, setup.y1 - 1), (0, 47)] {
-                let exact = a[0] as f64 + gx * (px as f64 + 0.5 - x[0]) + gy * (py as f64 + 0.5 - y[0]);
-                let got = plane.v + plane.dx * (px - setup.x0) as i64 + plane.dy * (py - setup.y0) as i64;
+                let exact =
+                    a[0] as f64 + gx * (px as f64 + 0.5 - x[0]) + gy * (py as f64 + 0.5 - y[0]);
+                let got =
+                    plane.v + plane.dx * (px - setup.x0) as i64 + plane.dy * (py - setup.y0) as i64;
                 // Values are 44 bits; ask for agreement to a part in 2^30.
-                assert!((got as f64 - exact).abs() < 16384.0, "{s:?}: {got} vs {exact}");
+                assert!(
+                    (got as f64 - exact).abs() < 16384.0,
+                    "{s:?}: {got} vs {exact}"
+                );
             }
         }
     }
@@ -854,7 +889,12 @@ mod tests {
         assert_eq!(velocity(surface), [-127, 90]);
         assert_eq!(velocity(pack_surface(0, 0, [900, -900])), [127, -127]);
 
-        for n in [[16384, 0, 0], [0, -16384, 0], [9459, 9459, -9459], [-3000, 100, 16000]] {
+        for n in [
+            [16384, 0, 0],
+            [0, -16384, 0],
+            [9459, 9459, -9459],
+            [-3000, 100, 16000],
+        ] {
             let shape = pack_shape(0xdead_beef, n);
             assert_eq!(shape as u32, 0xdead_beef);
             let back = normal(shape);
@@ -869,7 +909,10 @@ mod tests {
         for z in [0.1, 1.0, 7.5, 300.0, 20_000.0] {
             let q = (z * 65536.0) as i64;
             let back = z_of(depth_of(q)) as f64 / 65536.0;
-            assert!((back - z).abs() < z * z / 5.0e7 + 1e-4, "{z} came back {back}");
+            assert!(
+                (back - z).abs() < z * z / 5.0e7 + 1e-4,
+                "{z} came back {back}"
+            );
         }
         // Nearer is larger, and nothing real is zero.
         assert!(depth_of(1 << 16) > depth_of(2 << 16));
@@ -894,11 +937,29 @@ mod tests {
         };
         let mut polygon = [Corner::default(); POLYGON];
         let lens = lens();
-        assert_eq!(clip(&lens, [at(-1, 0, 4), at(1, 0, 4), at(0, 1, 4)], &mut polygon), 3);
-        assert_eq!(clip(&lens, [at(-1, 0, -4), at(1, 0, -4), at(0, 1, -4)], &mut polygon), 0);
+        assert_eq!(
+            clip(
+                &lens,
+                [at(-1, 0, 4), at(1, 0, 4), at(0, 1, 4)],
+                &mut polygon
+            ),
+            3
+        );
+        assert_eq!(
+            clip(
+                &lens,
+                [at(-1, 0, -4), at(1, 0, -4), at(0, 1, -4)],
+                &mut polygon
+            ),
+            0
+        );
         // One corner behind the camera: the near plane cuts it to a quad,
         // every corner of which projects.
-        let count = clip(&lens, [at(-1, 0, 4), at(1, 0, 4), at(0, 0, -4)], &mut polygon);
+        let count = clip(
+            &lens,
+            [at(-1, 0, 4), at(1, 0, 4), at(0, 0, -4)],
+            &mut polygon,
+        );
         assert_eq!(count, 4);
         assert!(polygon[..count].iter().all(|c| c.p[2] >= lens.near - 1));
     }

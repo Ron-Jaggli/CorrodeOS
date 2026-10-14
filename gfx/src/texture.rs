@@ -198,7 +198,12 @@ pub fn build_mips(pixels: &mut [u32], width: u32, height: u32) -> bool {
 }
 
 /// Paint level 0 of a texture from a function of the texel's position.
-pub fn paint(pixels: &mut [u32], width: u32, height: u32, mut color: impl FnMut(u32, u32) -> Color) {
+pub fn paint(
+    pixels: &mut [u32],
+    width: u32,
+    height: u32,
+    mut color: impl FnMut(u32, u32) -> Color,
+) {
     let rows = pixels.chunks_exact_mut(width.max(1) as usize);
     for (y, row) in rows.take(height as usize).enumerate() {
         for (x, pixel) in row.iter_mut().enumerate() {
@@ -273,7 +278,9 @@ mod tests {
     #[test]
     fn a_texel_centre_reads_back_exactly() {
         let mut pixels = [0u32; 16];
-        paint(&mut pixels, 4, 4, |x, y| Color::rgb(x as u8 * 60, y as u8 * 60, 7));
+        paint(&mut pixels, 4, 4, |x, y| {
+            Color::rgb(x as u8 * 60, y as u8 * 60, 7)
+        });
         let texture = Texture::new(&pixels, 4, 4).unwrap();
         for y in 0..4 {
             for x in 0..4 {

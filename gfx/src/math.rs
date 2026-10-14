@@ -94,7 +94,10 @@ impl Angle {
     /// `(sin, cos)`.
     pub const fn sin_cos(self) -> (Fx, Fx) {
         let (sin, cos) = sin_cos_q30(self.0);
-        (Fx(((sin + (1 << 13)) >> 14) as i32), Fx(((cos + (1 << 13)) >> 14) as i32))
+        (
+            Fx(((sin + (1 << 13)) >> 14) as i32),
+            Fx(((cos + (1 << 13)) >> 14) as i32),
+        )
     }
 
     pub const fn sin(self) -> Fx {
@@ -500,7 +503,9 @@ impl Transform {
     /// into a right one, and anticlockwise into clockwise.
     pub(crate) fn mirrors(&self) -> bool {
         let across = self.cofactors()[0];
-        let determinant: i128 = (0..3).map(|k| self.m[0][k] as i128 * across[k] as i128).sum();
+        let determinant: i128 = (0..3)
+            .map(|k| self.m[0][k] as i128 * across[k] as i128)
+            .sum();
         determinant < 0
     }
 
