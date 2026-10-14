@@ -9,11 +9,13 @@ members = [
     "abi",
     "elf",
     "virtio",
+    "nv",
     "user/rt",
     "user/edu",
     "user/fault",
     "user/virtio-gpu",
     "user/blob-reader",
+    "user/nvidia",
 ]
 
 [workspace.package]

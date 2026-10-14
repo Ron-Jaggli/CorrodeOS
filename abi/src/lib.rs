@@ -298,3 +298,37 @@ pub mod gpu {
     pub const VIRTIO_VENDOR: u16 = 0x1af4;
     pub const VIRTIO_GPU: u16 = 0x1050;
 }
+
+/// The NVIDIA driver's first stage: look, change nothing.
+pub mod nvidia {
+    pub const REPORT: usize = 0;
+    pub const LOG: usize = 1;
+    /// The card's configuration space, READ only.
+    pub const DEVICE: usize = 2;
+    /// BAR0, its registers, READ only: a read-only capability maps
+    /// read-only, so this stage cannot write a register if it tries.
+    pub const BAR0: usize = 3;
+    /// Memory to copy the VBIOS into: [`ROM_PAGES`] pages.
+    pub const ROM: usize = 4;
+    /// The firmware files, as blobs, when the boot medium has them.
+    pub const BOOTER_LOAD: usize = 5;
+    pub const BOOTER_UNLOAD: usize = 6;
+    pub const BOOTLOADER: usize = 7;
+    pub const GSP: usize = 8;
+
+    pub const ROM_PAGES: usize = 256;
+
+    /// Which firmware files parsed, as bits 0 to 3 in the order of the
+    /// slots above; the GSP image's size in KiB; Booter's signature count.
+    pub const LABEL_FIRMWARE: u64 = 40;
+    /// `NV_PMC_BOOT_0`, `NV_PMC_BOOT_42`, the chipset code, and the usable
+    /// framebuffer in MiB.
+    pub const LABEL_CARD: u64 = 41;
+    /// Bytes of VBIOS read, number of images, BIT version, and the FWSEC
+    /// descriptor's offset (all ones if none was found).
+    pub const LABEL_VBIOS: u64 = 42;
+    /// The driver has finished looking.
+    pub const LABEL_DONE: u64 = 43;
+
+    pub const VENDOR: u16 = 0x10de;
+}

@@ -50,6 +50,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "corrode-nv"
+version = "0.0.1"
+
+[[package]]
+name = "corrode-nvidia"
+version = "0.0.1"
+dependencies = [
+ "corrode-nv",
+ "corrode-rt",
+]
+
+[[package]]
 name = "corrode-pci"
 version = "0.0.1"
 

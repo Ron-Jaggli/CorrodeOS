@@ -39,7 +39,7 @@ Then:
 ./corrode wx-test     # boot and prove .text is not writable
 ./corrode user-test   # boot and prove ring 3 cannot read kernel memory
 ./corrode check       # cargo check
-./corrode test        # render, text, gfx, pci, elf and virtio unit tests, on the build host
+./corrode test        # render, text, gfx, pci, elf, virtio and nv unit tests, on the build host
 ./corrode specimen    # draw a sheet of the typeface to build/specimen.png
 ./corrode shell       # drop into the build container
 ```
@@ -102,8 +102,10 @@ user/            ring 3 programs, each an ELF file loaded as a Limine module
   fault/           a program that faults on purpose
   virtio-gpu/      a display driver: the compositor's frames, on a virtio GPU
   blob-reader/     reads 32 MiB it was handed at boot, and says what was in it
+  nvidia/          NVIDIA stage one: identify the card, read its VBIOS, change nothing
   user.ld          where a program's segments go
 virtio/          virtqueues and virtio GPU commands, tested against a pretend device
+nv/              NVIDIA chips, VBIOS and firmware files as data, tested on the build host
 pci/             PCI configuration space as arithmetic, tested on the build host
   src/lib.rs       headers, BARs, capability lists, MSI, what a driver may write
   src/mcfg.rs      the ACPI table that says where configuration space is
@@ -168,6 +170,12 @@ Turing and newer route everything through signed GSP firmware. There is no publi
 ISA documentation. Nouveau took well over a decade to get partway. The GSP-RM
 path is real, but it is a multi-year subproject, not a checkbox — planning should
 not assume it's close.
+
+Where it stands is in "NVIDIA" below, and the short version is: **no NVIDIA
+code here has ever run on an NVIDIA card.** QEMU does not emulate one and the
+only one available is driving the developer's desktop. What can be tested
+without a card is tested on the build host; what cannot is marked "written,
+never run on the card", and means it.
 
 ## Status
 
@@ -914,6 +922,87 @@ it needed. 1 GiB is the most one can be. Nothing checks a firmware file's
 signature or version before a driver gets it -- that is the driver's job,
 and the GPU's, which checks the signature itself.
 
+### NVIDIA
+
+The target is an RTX 3060 Ti: GA104, Ampere, GSP firmware era. The road is
+the one Nova and nouveau take on that generation -- identify the chip, read
+the VBIOS for FWSEC, run FWSEC to carve out WPR2, run Booter on SEC2 to put
+GSP-RM in place, start GSP, and talk to the resource manager inside it over
+shared-memory queues -- and every step of it is somewhere a mistake is
+silent until a card hangs.
+
+So the work is split by what can be checked where.
+
+#### What the build host checks
+
+`nv/` is a crate with no kernel and no card in it: register decoding, the
+VBIOS walk, the firmware file formats, and the FWSEC patch. Its tests run
+against a hand-built VBIOS laid out the way the references describe one --
+a PCI-AT image with a BIT table, an EFI image to be skipped, a FWSEC image
+with a PMU lookup table, a version 3 descriptor, two signatures and a DMEM
+mapper -- and against **the real firmware files** when
+`scripts/fetch-firmware.sh` has put them in `firmware/`:
+
+```
+booter_load: 60416 byte payload, 2 signature(s) of Some(384) bytes, fuse 1, engines 0x1, ucode 3, 1 app(s), patch at 0x8a10
+bootloader: 24576 byte payload, code at 0x1800+0x2900, data at 0x800+0x1000, manifest at 0x0, app version 0x0
+gsp: image 62052 KiB, ga10x signatures 4096 bytes
+```
+
+Every parser takes the whole input as bytes and checks every offset in it;
+the tests corrupt headers a byte at a time and cut files short, and nothing
+may panic.
+
+#### Stage one: look, change nothing
+
+`user/nvidia` is the driver's first stage. **Written, never run on the
+card.** With a card it reads the configuration header and stops if memory
+decoding is off (turning it on would be a change), maps BAR0, reads
+`NV_PMC_BOOT_0` and `NV_PMC_BOOT_42` and names the chip -- GA104 is
+architecture 0x17, implementation 4 -- stopping at all ones, which is a card
+not answering. It reads how far the card's own boot firmware got and how much
+video memory it found, copies the VBIOS out through the PROM window at BAR0 +
+0x300000, image by image, and walks it as far as the FWSEC descriptor.
+
+Read-only is not a promise the program makes; it is what it was given. Its
+device and BAR0 capabilities carry READ alone, so configuration space cannot
+be written and BAR0 is mapped read-only. A write would fault and stop it.
+Reads of BAR0 are what Nova does at probe and are believed harmless, but a
+read of a device register is not guaranteed to have no effect, and that is
+the one thing this stage cannot rule out by construction.
+
+What QEMU does run is the program's other half. It is handed the firmware
+files as blobs when the boot medium carries them, and parses them in ring 3
+with the same crate the host tests check:
+
+```
+nvidia     : no card; starting the driver for its 4 firmware file(s) alone
+nvidia     : booter_load: 59 KiB for SEC2 (engines 0x1, ucode 3), 2 signature(s), fuse version 1
+nvidia     : bootloader: RISC-V, 10 KiB code, 4 KiB data
+nvidia     : gsp: GSP-RM image 60 MiB, 4096 bytes of Ampere signatures
+nvidia     : ring 3 parsed every firmware file it was handed     PASS
+```
+
+#### Where the protocol came from
+
+No code is copied. Layouts were read from Nova (`drivers/gpu/nova-core`,
+GPL-2.0) as of Linux v6.18 -- the last version that reads the `570.144`
+`.bin` files linux-firmware ships; later Nova moved to a TLV packaging --
+and from NVIDIA's open-gpu-kernel-modules (MIT/GPL-2.0), whose structure
+names Nova and this crate both keep so the next reader can find them there.
+Specifically: `NV_PMC_BOOT_0/42` fields and chipset numbers, the IFR header,
+image, PCIR, NPDE, BIT and PMU-lookup layouts, the FWSEC V3 descriptor and
+DMEM-mapper FRTS command, the fuse-to-signature rules, `nvfw_bin_hdr`, the
+HS v2 header family, `RM_RISCV_UCODE_DESC`, and the GSP ELF section names,
+from Nova; one oddity -- VBIOS pointers that skip the EFI image -- kept
+exactly as Nova has it, because getting it "right" would be guessing.
+
+Known gaps: everything that touches a card is untested, which is most of
+what matters. The VBIOS is read only through the PROM window; the fallbacks
+other drivers have (PRAMIN, ACPI, the ROM BAR) are not written. FWSEC
+version 2 descriptors (Turing) are not handled. Nothing beyond reading has
+been started on the card side.
+
 ### Text
 
 There are two engines and they do not know about each other. The **text
@@ -1527,7 +1616,9 @@ a virtio GPU, eight more start its driver in ring 3 and confirm the first
 frame reached the device's memory and the device interrupted when it had
 copied it. Eight blob checks hand 32 MiB from the boot medium to one ring 3
 task read-only and confirm it read what the bootloader loaded, from the
-module's own frames. Three
+module's own frames. With firmware on the boot medium, two NVIDIA checks hand
+the driver's first stage what it may look at, read-only, and confirm it parsed
+every firmware file in ring 3. Three
 blend checks confirm a fade is exact at both ends and seamless over its own
 colour, two text checks that letters stay inside the block measured for them
 and a stroke is the thickness its weight says, and two scene checks that the

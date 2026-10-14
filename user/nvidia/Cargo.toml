@@ -1,0 +1,15 @@
+[package]
+name = "corrode-nvidia"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nvidia"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+corrode-rt = { path = "../rt" }
+corrode-nv = { path = "../../nv" }

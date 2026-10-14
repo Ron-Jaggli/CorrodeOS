@@ -210,6 +210,7 @@ pub extern "C" fn kmain() -> ! {
     {
         device_checks();
         blob_checks();
+        nvidia_checks();
     }
 
     #[cfg(feature = "user-test")]
@@ -2156,6 +2157,134 @@ fn blob_checks() {
                 );
             }
             other => println!("blob       : unexpected label {other}"),
+        }
+    }
+}
+
+/// Bootstrap's capabilities for the NVIDIA driver: its report endpoint, the
+/// card, BAR0, and memory for the VBIOS. Firmware blobs follow.
+const NV_ENDPOINT: cap::CapPtr = 41;
+const NV_DEVICE: cap::CapPtr = 42;
+const NV_BAR0: cap::CapPtr = 43;
+const NV_ROM: cap::CapPtr = 44;
+const NV_FIRMWARE: cap::CapPtr = 45;
+
+fn nvidia_check(name: &str, ok: bool) {
+    check("nvidia", name, ok);
+}
+
+/// Start the NVIDIA driver's first stage, if there is anything for it to
+/// look at: a card, or the firmware for one.
+///
+/// In QEMU there is never a card, so what runs here is the half that reads
+/// the firmware files -- the real ones, if `scripts/fetch-firmware.sh` put
+/// them on the boot medium -- in ring 3, with the parsers the build host
+/// tests. The half that reads a card has never run.
+fn nvidia_checks() {
+    use cap::Rights;
+    use corrode_abi::nvidia;
+
+    let card =
+        pci::find(|device| device.header.vendor == nvidia::VENDOR && device.header.class == 0x03);
+    let files = [
+        (nvidia::BOOTER_LOAD, "booter_load-570.144.bin"),
+        (nvidia::BOOTER_UNLOAD, "booter_unload-570.144.bin"),
+        (nvidia::BOOTLOADER, "bootloader-570.144.bin"),
+        (nvidia::GSP, "gsp-570.144.bin"),
+    ];
+    let present: alloc::vec::Vec<(usize, usize)> = files
+        .iter()
+        .filter_map(|(slot, name)| modules::position(name).map(|(index, _)| (*slot, index)))
+        .collect();
+    if card.is_none() && present.is_empty() {
+        println!("nvidia     : no NVIDIA card and no firmware for one -- nothing to look at");
+        return;
+    }
+    match card {
+        Some((_, found)) => println!(
+            "nvidia     : {:04x}:{:04x} at {}, handing it over read-only",
+            found.header.vendor, found.header.device, found.address
+        ),
+        None => println!(
+            "nvidia     : no card; starting the driver for its {} firmware file(s) alone",
+            present.len()
+        ),
+    }
+
+    let Some(driver) = spawn_program("nvidia") else {
+        nvidia_check("load the driver", false);
+        return;
+    };
+    let mut granted = cap::mint(
+        0,
+        NV_ENDPOINT,
+        cap::Object::Endpoint(ipc::Endpoint::new()),
+        Rights::ALL,
+    )
+    .is_ok()
+        && cap::grant(driver, NV_ENDPOINT, nvidia::REPORT, Rights::WRITE).is_ok()
+        && cap::grant(driver, LOG_ENDPOINT, nvidia::LOG, Rights::WRITE).is_ok();
+    let mut held = 2;
+
+    if let Some((index, _)) = card {
+        // READ, and only READ: what this stage cannot change, it does not.
+        granted &= cap::mint(0, NV_DEVICE, cap::Object::PciDevice(index), Rights::ALL).is_ok()
+            && cap::grant(driver, NV_DEVICE, nvidia::DEVICE, Rights::READ).is_ok();
+        held += 1;
+        if let Some(region) = pci::region_of(index, 0) {
+            granted &= cap::mint(0, NV_BAR0, cap::Object::DeviceMemory(region), Rights::ALL)
+                .is_ok()
+                && cap::grant(driver, NV_BAR0, nvidia::BAR0, Rights::READ).is_ok();
+            held += 1;
+        }
+        if let Some(rom) = memory::create(nvidia::ROM_PAGES, false) {
+            granted &= cap::mint(0, NV_ROM, cap::Object::Memory(rom), Rights::ALL).is_ok()
+                && cap::grant(driver, NV_ROM, nvidia::ROM, Rights::READ_WRITE).is_ok();
+            held += 1;
+        }
+    }
+    for (offset, (slot, index)) in present.iter().enumerate() {
+        let mine = NV_FIRMWARE + offset;
+        granted &= cap::mint(0, mine, cap::Object::Blob(*index), Rights::READ_GRANT).is_ok()
+            && cap::grant(driver, mine, *slot, Rights::READ).is_ok();
+        held += 1;
+    }
+    nvidia_check(
+        "hand the driver what it may look at, read-only",
+        granted && cap::slots_used(driver) == Some(held),
+    );
+    start_all(&[Some(driver)]);
+
+    loop {
+        let Ok(received) = ipc::recv(NV_ENDPOINT, None, None) else {
+            return;
+        };
+        let words = received.message.words;
+        match received.message.label {
+            nvidia::LABEL_FIRMWARE => {
+                let expected = present.iter().fold(0u64, |mask, (slot, _)| {
+                    mask | 1 << (slot - nvidia::BOOTER_LOAD)
+                });
+                if !present.is_empty() {
+                    nvidia_check(
+                        "ring 3 parsed every firmware file it was handed",
+                        words[0] == expected,
+                    );
+                }
+            }
+            nvidia::LABEL_CARD => println!(
+                "nvidia     : BOOT_0 {:#010x}, BOOT_42 {:#010x}, chipset {:#x}, {} MiB",
+                words[0], words[1], words[2], words[3]
+            ),
+            nvidia::LABEL_VBIOS => println!(
+                "nvidia     : {} KiB of VBIOS, {} image(s), BIT {:#06x}, FWSEC at {:#x}",
+                words[0] / 1024,
+                words[1],
+                words[2],
+                words[3]
+            ),
+            nvidia::LABEL_DONE => return,
+            other => println!("nvidia     : unexpected label {other}"),
         }
     }
 }
