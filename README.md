@@ -16,7 +16,30 @@ The container gets exactly one host mount — this directory — and one host de
 block devices, no host network. QEMU's only disk is the ISO we just built, and
 its network is `-net none`.
 
-Don't flash this to a USB stick. Don't dual-boot it.
+It is not ready for real hardware yet: it has only ever run in QEMU, and it
+has no storage drivers. Don't flash it to a USB stick or dual-boot it until it
+says otherwise here.
+
+## Porting to your device
+
+CorrodeOS is a hobby project, built to be as portable as possible. The aim is
+for it to run on almost any retail device that meets its minimum requirements.
+
+If you'd like it on a device it doesn't support yet, open an issue with the
+make and model. I'll look into whether a port is feasible and, if it is, on
+what terms:
+
+- **Temporary install: free.** A port that runs alongside the device's existing
+  system, without replacing it, may be done free of charge as time allows.
+- **Permanent install: sponsored.** A full port meant to replace the existing
+  system is a substantial piece of work. A small sponsorship (around $20) funds
+  about a month of work towards it, after which I'll report back on progress.
+
+Ports are best-effort. Some devices can't be supported at all, for example
+where the bootloader is locked or the hardware is undocumented. A month of work
+is a start towards a permanent install, not a guarantee of one. Installing
+permanently usually means unlocking the bootloader, which typically wipes the
+device and may void its warranty.
 
 ## Build and run
 
