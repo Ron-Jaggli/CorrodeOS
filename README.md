@@ -34,6 +34,7 @@ what terms:
 - **Permanent install: sponsored.** A full port meant to replace the existing
   system is a substantial piece of work. A small sponsorship (around $20) funds
   about a month of work towards it, after which I'll report back on progress.
+  If you need more info make an issue or email me
 
 Ports are best-effort. Some devices can't be supported at all, for example
 where the bootloader is locked or the hardware is undocumented. A month of work
