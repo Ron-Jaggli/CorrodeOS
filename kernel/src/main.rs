@@ -12,7 +12,9 @@ extern crate alloc;
 mod acpi;
 mod arch;
 mod cap;
+mod device;
 mod ipc;
+mod irq;
 mod limine;
 mod mm;
 mod pci;
@@ -194,6 +196,7 @@ pub extern "C" fn kmain() -> ! {
         serve_user();
         let service = call_user_service();
         check_address_spaces(user, service);
+        device_checks();
     }
 
     #[cfg(feature = "user-test")]
@@ -1797,6 +1800,377 @@ fn call_user_service() -> Option<usize> {
     }
 
     service
+}
+
+/// Bootstrap's end of the probe's endpoint, and its capabilities to the test
+/// device, one BAR of it, and its interrupt.
+const PROBE_ENDPOINT: cap::CapPtr = 19;
+const BOOT_EDU: cap::CapPtr = 20;
+const BOOT_EDU_BAR: cap::CapPtr = 21;
+const BOOT_EDU_IRQ: cap::CapPtr = 22;
+/// A copy of the interrupt capability with nothing on it.
+const BOOT_EDU_IRQ_NONE: cap::CapPtr = 23;
+
+/// The probe's four capabilities: somewhere to report, and its device.
+const PROBE_TASK_ENDPOINT: cap::CapPtr = 0;
+const PROBE_TASK_DEVICE: cap::CapPtr = 1;
+const PROBE_TASK_BAR: cap::CapPtr = 2;
+const PROBE_TASK_IRQ: cap::CapPtr = 3;
+
+/// What the probe reports, in the order it reports it.
+const LABEL_PROBE_CONFIG: u64 = 20;
+const LABEL_PROBE_MEMORY: u64 = 21;
+const LABEL_PROBE_RAISED: u64 = 22;
+const LABEL_PROBE_WORKED: u64 = 23;
+const PROBE_MESSAGES: usize = 4;
+
+/// QEMU's `edu` device, from its own documentation (docs/specs/edu.rst).
+const EDU_VENDOR: u16 = 0x1234;
+const EDU_DEVICE: u16 = 0x11e8;
+/// What its identification register reads: version 1.0, then "ed".
+const EDU_IDENT: u64 = 0x0100_00ed;
+/// A number to write to its liveness register, which answers with every bit
+/// turned over.
+const EDU_PROBE: u32 = 0x1234_5678;
+/// What to ask it the factorial of, and the answer.
+const EDU_INPUT: u32 = 10;
+const EDU_FACTORIAL: u64 = 3_628_800;
+
+/// A **driver** in ring 3, in miniature.
+///
+/// It holds a device, one BAR of it, its interrupt, and an endpoint to
+/// report on, and it does what every driver does: reads its device's
+/// identity, turns on memory decoding and bus mastering, maps the registers,
+/// pokes them, and waits for the device to interrupt.
+///
+/// The second interrupt is the one that counts. The first is raised by a
+/// register write, synchronously; the second arrives when the device has
+/// finished working something out, on its own time, with this task blocked
+/// in the kernel and nothing polling.
+#[unsafe(naked)]
+extern "C" fn user_probe() {
+    core::arch::naked_asm!(
+        // No capability rides along with anything this task sends.
+        "mov r12, {no_slot}",
+
+        // Who am I driving? Vendor and device in one doubleword.
+        "mov rax, {config_read}",
+        "mov rdi, {device}",
+        "xor esi, esi",
+        "mov edx, 4",
+        "int {gate}",
+        "mov rbx, rdx",
+
+        // Try to move the device: write all ones to BAR 0. Expect a refusal.
+        "mov rax, {config_write}",
+        "mov rdi, {device}",
+        "mov esi, {bar0}",
+        "mov edx, 4",
+        "mov r10, -1",
+        "int {gate}",
+        "mov r14, rax",
+
+        // The command register is ours. Memory decoding, and bus mastering:
+        // a message signalled interrupt is a write the device makes itself.
+        "mov rax, {config_read}",
+        "mov rdi, {device}",
+        "mov esi, {command}",
+        "mov edx, 2",
+        "int {gate}",
+        "or rdx, {decode_and_master}",
+        "mov r10, rdx",
+        "mov rax, {config_write}",
+        "mov rdi, {device}",
+        "mov esi, {command}",
+        "mov edx, 2",
+        "int {gate}",
+        "mov r15, rax",
+
+        "mov rax, {send}",
+        "mov rdi, {endpoint}",
+        "mov rsi, {label_config}",
+        "mov rdx, rbx",
+        "mov r10, r14",
+        "mov r8, r15",
+        "xor r9, r9",
+        "int {gate}",
+
+        // Where are my registers? The kernel answers; we never tell it.
+        "mov rax, {map}",
+        "mov rdi, {bar}",
+        "int {gate}",
+        "test rax, rax",
+        "jnz 9f",
+        "mov rbx, rdx", // base
+        "mov r14, r10", // length
+
+        // Identification, then liveness: it returns what was written with
+        // every bit turned over, which no stale read could produce.
+        "mov ebp, [rbx]",
+        "mov dword ptr [rbx + 4], {probe}",
+        "mov r15d, [rbx + 4]",
+
+        "mov rax, {send}",
+        "mov rdi, {endpoint}",
+        "mov rsi, {label_memory}",
+        "mov rdx, rbp",
+        "mov r10, r15",
+        "mov r8, r14",
+        "mov r9, rbx",
+        "int {gate}",
+
+        // Tell the device to interrupt, and wait for it to.
+        "mov dword ptr [rbx + 0x60], 1",
+        "mov rax, {recv}",
+        "mov rdi, {irq}",
+        "mov rsi, {no_slot}",
+        "mov rdx, {no_slot}",
+        "int {gate}",
+        "mov r14, rax", // status
+        "mov r15, rdx", // how many
+        "mov r13, rdi", // who from
+        "mov ebp, [rbx + 0x24]",
+        // Acknowledge, or the device believes it is still asking.
+        "mov dword ptr [rbx + 0x64], 1",
+
+        "mov rax, {send}",
+        "mov rdi, {endpoint}",
+        "mov rsi, {label_raised}",
+        "mov rdx, r14",
+        "mov r10, r15",
+        "mov r8, rbp",
+        "mov r9, r13",
+        "int {gate}",
+
+        // Now some work: a factorial, with an interrupt when it is done.
+        "mov dword ptr [rbx + 0x20], 0x80",
+        "mov dword ptr [rbx + 0x08], {input}",
+        "mov rax, {recv}",
+        "mov rdi, {irq}",
+        "mov rsi, {no_slot}",
+        "mov rdx, {no_slot}",
+        "int {gate}",
+        "mov r14, rax",
+        "mov r15, rdx",
+        "mov ebp, [rbx + 0x08]",
+        "mov r13d, [rbx + 0x24]",
+        "mov dword ptr [rbx + 0x64], 1",
+
+        "mov rax, {send}",
+        "mov rdi, {endpoint}",
+        "mov rsi, {label_worked}",
+        "mov rdx, r14",
+        "mov r10, r15",
+        "mov r8, rbp",
+        "mov r9, r13",
+        "int {gate}",
+
+        // Done. There is no ring 3 runtime to return to.
+        "9:",
+        "mov rax, {yield_op}",
+        "int {gate}",
+        "jmp 9b",
+
+        config_read = const syscall::SYS_CONFIG_READ,
+        config_write = const syscall::SYS_CONFIG_WRITE,
+        map = const syscall::SYS_MAP,
+        send = const syscall::SYS_SEND,
+        recv = const syscall::SYS_RECV,
+        yield_op = const syscall::SYS_YIELD,
+        no_slot = const syscall::NO_SLOT,
+        gate = const vectors::SYSCALL,
+        endpoint = const PROBE_TASK_ENDPOINT,
+        device = const PROBE_TASK_DEVICE,
+        bar = const PROBE_TASK_BAR,
+        irq = const PROBE_TASK_IRQ,
+        bar0 = const corrode_pci::BAR0,
+        command = const corrode_pci::COMMAND,
+        decode_and_master = const corrode_pci::COMMAND_MEMORY | corrode_pci::COMMAND_BUS_MASTER,
+        probe = const EDU_PROBE,
+        input = const EDU_INPUT,
+        label_config = const LABEL_PROBE_CONFIG,
+        label_memory = const LABEL_PROBE_MEMORY,
+        label_raised = const LABEL_PROBE_RAISED,
+        label_worked = const LABEL_PROBE_WORKED,
+    )
+}
+
+fn device_check(name: &str, ok: bool) {
+    check("device", name, ok);
+}
+
+/// Hand one device to one ring 3 task and watch it drive it.
+///
+/// The device is QEMU's `edu`, which exists to be poked: a register that
+/// answers with what was written inverted, one that raises an interrupt when
+/// told to, and one that works out a factorial and interrupts when it has.
+/// On a machine without it there is nothing to check and this says so.
+fn device_checks() {
+    use cap::{CapError, Rights};
+
+    let Some((index, edu)) = pci::find(|device| {
+        device.header.vendor == EDU_VENDOR && device.header.device == EDU_DEVICE
+    }) else {
+        println!("device     : no edu test device on the bus -- nothing to drive");
+        return;
+    };
+    let Some(region) = pci::region_of(index, 0) else {
+        println!("device     : the edu device has no memory BAR");
+        return;
+    };
+    let Some(bar) = pci::region(region) else {
+        return;
+    };
+
+    // The task first: its interrupt is aimed at the CPU it is pinned to.
+    let Some(probe) = task::spawn_user("probe", user_probe) else {
+        device_check("spawned a ring 3 task to drive a device", false);
+        return;
+    };
+    let line = task::cpu_of(probe).and_then(|cpu| irq::create(index, 0, cpu));
+
+    let minted = cap::mint(
+        0,
+        PROBE_ENDPOINT,
+        cap::Object::Endpoint(ipc::Endpoint::new()),
+        Rights::ALL,
+    )
+    .is_ok()
+        && cap::mint(0, BOOT_EDU, cap::Object::PciDevice(index), Rights::ALL).is_ok()
+        && cap::mint(
+            0,
+            BOOT_EDU_BAR,
+            cap::Object::DeviceMemory(region),
+            Rights::ALL,
+        )
+        .is_ok()
+        && line.is_some_and(|line| {
+            cap::mint(0, BOOT_EDU_IRQ, cap::Object::Interrupt(line), Rights::ALL).is_ok()
+        });
+    device_check("mint a device, its memory and its interrupt", minted);
+    let Some(line) = line else {
+        println!(
+            "device     : no interrupt line for {} -- it has no MSI",
+            edu.address
+        );
+        return;
+    };
+
+    // The rules, tried from this side before anybody else holds anything.
+    device_check(
+        "a kernel task has nowhere to map device memory",
+        device::map(BOOT_EDU_BAR).err() == Some(CapError::NoSpace),
+    );
+    device_check(
+        "device memory is not an interrupt",
+        irq::wait(BOOT_EDU_BAR) == Err(CapError::WrongType),
+    );
+    device_check(
+        "an interrupt capability without READ cannot wait",
+        cap::copy(BOOT_EDU_IRQ, BOOT_EDU_IRQ_NONE, Rights::WRITE) == Ok(Rights::WRITE)
+            && irq::wait(BOOT_EDU_IRQ_NONE) == Err(CapError::InsufficientRights),
+    );
+
+    let granted = cap::grant(probe, PROBE_ENDPOINT, PROBE_TASK_ENDPOINT, Rights::WRITE).is_ok()
+        && cap::grant(probe, BOOT_EDU, PROBE_TASK_DEVICE, Rights::READ_WRITE).is_ok()
+        && cap::grant(probe, BOOT_EDU_BAR, PROBE_TASK_BAR, Rights::READ_WRITE).is_ok()
+        && cap::grant(probe, BOOT_EDU_IRQ, PROBE_TASK_IRQ, Rights::READ).is_ok();
+    device_check(
+        "grant the probe its device and somewhere to report",
+        granted && cap::slots_used(probe) == Some(4),
+    );
+    start_all(&[Some(probe)]);
+
+    for _ in 0..PROBE_MESSAGES {
+        let received = match ipc::recv(PROBE_ENDPOINT, None, None) {
+            Ok(received) => received,
+            Err(error) => {
+                println!("device     : recv failed: {:?}", error);
+                return;
+            }
+        };
+        let words = received.message.words;
+
+        match received.message.label {
+            LABEL_PROBE_CONFIG => {
+                println!(
+                    "device     : ring 3 read {:04x}:{:04x} from its configuration space",
+                    words[0] & 0xffff,
+                    words[0] >> 16
+                );
+                device_check(
+                    "ring 3 read its device's identity",
+                    words[0] == (EDU_DEVICE as u64) << 16 | EDU_VENDOR as u64,
+                );
+                device_check(
+                    "ring 3 cannot move its device's BAR",
+                    words[1] == CapError::Invalid.code(),
+                );
+                device_check(
+                    "ring 3 turned on decoding and bus mastering",
+                    words[2] == syscall::STATUS_OK
+                        && pci::config_read(BOOT_EDU, corrode_pci::COMMAND as u64, 2)
+                            .is_ok_and(|command| command & 0x6 == 0x6),
+                );
+            }
+
+            LABEL_PROBE_MEMORY => {
+                println!(
+                    "device     : {} KiB of registers at {:#x} in ring 3, identifying as {:#010x}",
+                    words[2] / 1024,
+                    words[3],
+                    words[0]
+                );
+                device_check(
+                    "the kernel chose where the registers went",
+                    words[3] == device::user_address(region) && words[2] == bar.len,
+                );
+                device_check("ring 3 read a device register", words[0] == EDU_IDENT);
+                device_check(
+                    "ring 3 wrote one, and the device answered",
+                    words[1] == !EDU_PROBE as u64,
+                );
+                let theirs = task::space_of(probe)
+                    .and_then(|space| space.translate(device::user_address(region)));
+                device_check(
+                    "that address is the BAR, by its page tables",
+                    theirs == Some(bar.physical),
+                );
+            }
+
+            LABEL_PROBE_RAISED => {
+                device_check(
+                    "an interrupt arrived in ring 3 as a message",
+                    words[0] == syscall::STATUS_OK
+                        && words[1] == 1
+                        && words[3] == syscall::FROM_HARDWARE,
+                );
+                device_check("the device agrees it was the one asking", words[2] == 1);
+            }
+
+            LABEL_PROBE_WORKED => {
+                println!(
+                    "device     : ring 3 asked for {}!, slept, and was woken with {}",
+                    EDU_INPUT, words[2]
+                );
+                device_check(
+                    "the device interrupted when its work was done",
+                    words[0] == syscall::STATUS_OK && words[1] == 1 && words[3] == 1,
+                );
+                device_check(
+                    "and the answer was there to read",
+                    words[2] == EDU_FACTORIAL,
+                );
+            }
+
+            other => println!("device     : unexpected label {other}"),
+        }
+    }
+
+    device_check(
+        "two interrupts were taken, and no more",
+        irq::total(line) == 2,
+    );
 }
 
 /// Compare the two ring 3 tasks' address spaces directly.

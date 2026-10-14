@@ -71,6 +71,8 @@ kernel/          the privileged kernel
   src/smp.rs       starting the other CPUs
   src/surface.rs   pixels a task draws and the compositor shows
   src/pci.rs       the PCI bus: what is on it, and devices as capabilities
+  src/device.rs    a device's registers, mapped into the task that holds them
+  src/irq.rs       device interrupts, as messages to whoever holds the line
   src/time.rs      monotonic nanosecond clock, off the TSC
   src/arch/x86_64/cpu.rs  which CPU is this
   build.rs         makes cargo notice linker.ld changes
@@ -195,7 +197,8 @@ task cannot read kernel memory.
 
 The PCI bus: every function found at boot, through ECAM or the legacy ports,
 and a device's configuration space and each of its BARs as capability
-objects. See "Devices" below.
+objects. A ring 3 task holding those can map the device's registers and
+block until it interrupts, and holds nothing else. See "Devices" below.
 
 Not yet: migrating a task between CPUs, reclaiming frames and stacks.
 
@@ -531,6 +534,76 @@ pci check  : the command register is the holder's to write       PASS
 pci check  : a BAR is not, whatever rights are held              PASS
 ```
 
+#### Registers in ring 3
+
+`SYS_MAP` on a `DeviceMemory` capability does what it does on a surface: the
+kernel picks the address, maps the BAR there, and returns the address and
+the length. READ gets a mapping, WRITE makes it writable, and it is uncached
+and never executable. The address is a function of which BAR it is, so
+asking twice gives the same answer. No task ever names a physical address,
+and a task with no `DeviceMemory` capability can reach no device at all --
+`in` and `out` still fault, as they always did.
+
+Two more syscalls, `SYS_CONFIG_READ` and `SYS_CONFIG_WRITE`, take a
+`PciDevice` slot, an offset, a width and a value in registers. The offset
+and width are numbers from ring 3 and are treated as that.
+
+If a device keeps its MSI-X table behind a BAR, the pages holding the table
+are left out of the mapping. The driver finds a hole there.
+
+#### An interrupt is a message nobody had to send
+
+A driver in ring 3 cannot take an interrupt. It can wait for one, and what
+it waits on is an **`Interrupt`** capability, received on with the same
+`SYS_RECV` that receives from an endpoint. The hardware is the sender, so
+the message comes from nobody (`rdi` is all ones) and carries one number:
+how many times the device has signalled since the holder last asked.
+
+Only message signalled interrupts. An MSI is the device writing a word to
+an address the local APIC listens on; the word is the vector and the address
+picks the CPU, so there is no shared line, no polarity and nothing to mask
+around the handler. The kernel writes that message into the device and a
+driver cannot, which is the point of keeping those registers back.
+
+The handler adds one to a counter and makes the waiter runnable. A message
+with nobody waiting is not lost -- the next receive returns at once -- and a
+thousand of them are one number, so a device that storms cannot spend kernel
+memory. The line is aimed at the CPU its task is pinned to, so the handler
+runs where the waiter does and switches to it on the way out instead of
+leaving it for the next tick.
+
+The proof is QEMU's `edu` device, which every run now has plugged in, and a
+ring 3 task holding four capabilities: the device, its BAR, its interrupt,
+and an endpoint to report on.
+
+```
+device     : ring 3 read 1234:11e8 from its configuration space
+device     : ring 3 cannot move its device's BAR                 PASS
+device     : ring 3 turned on decoding and bus mastering         PASS
+device     : 1024 KiB of registers at 0x10200000000 in ring 3, identifying as 0x010000ed
+device     : ring 3 wrote one, and the device answered           PASS
+device     : that address is the BAR, by its page tables         PASS
+device     : an interrupt arrived in ring 3 as a message         PASS
+device     : ring 3 asked for 10!, slept, and was woken with 3628800
+device     : the device interrupted when its work was done       PASS
+device     : two interrupts were taken, and no more              PASS
+```
+
+The second interrupt is the one that matters. The first is raised by a
+register write, synchronously. The second arrives when the device has
+finished computing, on its own time, with the task blocked in the kernel
+and nothing polling.
+
+Known gaps: no legacy INTx, so a device with neither MSI nor MSI-X has no
+interrupt here. The MSI-X path is written and has not run yet: `edu` has
+plain MSI. One line per message and they are never handed back. One waiter
+per line, and a task cannot wait for an interrupt *or* a message from a
+client in one receive -- that wants a line bound to an endpoint. A waiter
+on a different CPU from the one its line is aimed at is found at that
+core's next tick. Device memory is mapped uncached; a framebuffer wants
+write-combining, which needs the PAT set up. And a ring 3 task that faults
+still stops the machine rather than itself.
+
 Known gaps: one segment, and only the buses firmware already numbered -- a
 bridge left at bus 0 is recorded and not descended into, and nothing assigns
 BARs the firmware did not. I/O-port BARs are listed and are not objects: ring
@@ -826,7 +899,8 @@ bits rather than an observed property.
 #### The syscall boundary takes no pointers
 
 (One has since crossed it, outward: `SYS_MAP` returns the address the kernel
-chose for a surface. See "Windows". Nothing a caller says is dereferenced.)
+chose for a surface, or for a device's registers. See "Windows" and
+"Devices". Nothing a caller says is dereferenced.)
 
 A syscall that takes a user pointer must validate it: in range, mapped,
 user-accessible, and still all three when the kernel dereferences it. That
@@ -1140,7 +1214,10 @@ host tests establish against a reference: a spring starts and ends where it
 should, overshoots only when underdamped, keeps position and velocity through a
 retarget, and gives the same answer whatever order it is sampled in. Fourteen PCI checks cover the
 scan agreeing with itself through two mechanisms, and a device and a BAR as
-capabilities: what reads, what writes, what is refused and why. Three
+capabilities: what reads, what writes, what is refused and why. Seventeen
+device checks hand QEMU's test device to a ring 3 task and confirm it read its
+identity, was refused its BAR, mapped its registers where the kernel chose,
+and was woken twice by interrupts and no more. Three
 blend checks confirm a fade is exact at both ends and seamless over its own
 colour, two text checks that letters stay inside the block measured for them
 and a stroke is the thickness its weight says, and two scene checks that the

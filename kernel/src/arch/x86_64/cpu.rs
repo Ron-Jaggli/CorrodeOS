@@ -59,6 +59,14 @@ pub fn register(lapic_id: u32) -> Option<usize> {
     Some(index)
 }
 
+/// The LAPIC ID of the CPU with this index, if one has been given it.
+///
+/// The table is keyed the other way, so this looks through all of it. It is
+/// asked when an interrupt is aimed at a CPU, which is once per device.
+pub fn lapic_id_of(index: usize) -> Option<u8> {
+    (0..=255u8).find(|id| BY_LAPIC_ID[*id as usize].load(Ordering::Relaxed) == index)
+}
+
 /// Index of the CPU this is running on.
 ///
 /// Returns 0 before the LAPIC is up, which is correct rather than a fallback:

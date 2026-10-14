@@ -83,8 +83,11 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::x86_64::idt::TrapFrame;
-use crate::cap::{self, CapError, Rights};
+use crate::cap::{self, CapError, ObjectKind, Rights};
+use crate::device;
 use crate::ipc;
+use crate::irq;
+use crate::pci;
 use crate::surface;
 use crate::task;
 
@@ -111,10 +114,26 @@ pub const SYS_DELETE: u64 = 7;
 /// WRITE as well for the mapping to be writable. Returns the address in
 /// `rdx`, the width and height in pixels in `r10` and `r8`, and the bytes
 /// from one row to the next in `r9`.
+///
+/// The same call maps device memory, given a capability to that instead:
+/// the address in `rdx`, its length in bytes in `r10`, and zero in the other
+/// two. What comes back depends on what was held, as it should.
 pub const SYS_MAP: u64 = 8;
 /// Say that a rectangle of a surface has been redrawn. Needs WRITE. `rsi`
 /// and `rdx` are its left and top, `r10` and `r8` its width and height.
 pub const SYS_COMMIT: u64 = 9;
+
+/// Read a register of a PCI device's configuration space. Needs READ. `rsi`
+/// is the offset and `rdx` the width in bytes: 1, 2 or 4. The value comes
+/// back in `rdx`.
+pub const SYS_CONFIG_READ: u64 = 10;
+/// Write one. Needs WRITE, and the register has to be one a driver may
+/// write. `rsi` is the offset, `rdx` the width, `r10` the value.
+pub const SYS_CONFIG_WRITE: u64 = 11;
+
+/// The sender of a message that no task sent: a device's interrupt, received
+/// on an interrupt capability. The count of interrupts is in word 0.
+pub const FROM_HARDWARE: u64 = u64::MAX;
 
 /// Slot argument meaning "nowhere".
 ///
@@ -194,6 +213,24 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
             frame.rax = status(cap::delete(slot));
         }
 
+        // Receiving on an interrupt is the same call as receiving on an
+        // endpoint, because to the task it is the same thing: block until
+        // whoever is on the other end has something to say.
+        SYS_RECV if cap::identify(slot).is_ok_and(|(kind, _)| kind == ObjectKind::Interrupt) => {
+            match irq::wait(slot) {
+                Ok(count) => {
+                    frame.rax = STATUS_OK;
+                    frame.rdi = FROM_HARDWARE;
+                    frame.rsi = 0;
+                    frame.rdx = count;
+                    frame.r10 = 0;
+                    frame.r8 = 0;
+                    frame.r9 = 0;
+                }
+                Err(error) => frame.rax = error.code(),
+            }
+        }
+
         SYS_RECV => {
             // Read both slot arguments before anything overwrites them: rdx is
             // an argument on the way in and a message word on the way out.
@@ -234,6 +271,19 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
         // The kernel picks the address and hands it back: the first pointer
         // to cross this boundary, and it goes outward. Nothing the caller
         // says is ever dereferenced.
+        SYS_MAP if cap::identify(slot).is_ok_and(|(kind, _)| kind == ObjectKind::DeviceMemory) => {
+            match device::map(slot) {
+                Ok(mapped) => {
+                    frame.rax = STATUS_OK;
+                    frame.rdx = mapped.address;
+                    frame.r10 = mapped.len;
+                    frame.r8 = 0;
+                    frame.r9 = 0;
+                }
+                Err(error) => frame.rax = error.code(),
+            }
+        }
+
         SYS_MAP => match surface::map(slot) {
             Ok(mapped) => {
                 frame.rax = STATUS_OK;
@@ -256,6 +306,22 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
                 frame.r8 as u32,
             );
             frame.rax = status(surface::commit(slot, rect));
+        }
+
+        // The offset, the width and the value are numbers from ring 3 and
+        // are treated as that: checked against the size of configuration
+        // space and against what a driver may write before any of them is
+        // used.
+        SYS_CONFIG_READ => match pci::config_read(slot, frame.rsi, frame.rdx) {
+            Ok(value) => {
+                frame.rax = STATUS_OK;
+                frame.rdx = value as u64;
+            }
+            Err(error) => frame.rax = error.code(),
+        },
+
+        SYS_CONFIG_WRITE => {
+            frame.rax = status(pci::config_write(slot, frame.rsi, frame.rdx, frame.r10));
         }
 
         _ => frame.rax = STATUS_BAD_SYSCALL,

@@ -165,6 +165,9 @@ pub enum Object {
     /// be given a device's registers without its configuration space, or the
     /// other way about.
     DeviceMemory(usize),
+    /// A device's interrupt, by its line in [`crate::irq`]. READ means may
+    /// wait for it. There is nothing to write: the sender is the hardware.
+    Interrupt(usize),
 }
 
 impl core::fmt::Debug for Object {
@@ -178,6 +181,7 @@ impl core::fmt::Debug for Object {
             Object::Surface(index) => write!(f, "Surface({index})"),
             Object::PciDevice(index) => write!(f, "PciDevice({index})"),
             Object::DeviceMemory(index) => write!(f, "DeviceMemory({index})"),
+            Object::Interrupt(index) => write!(f, "Interrupt({index})"),
         }
     }
 }
@@ -196,6 +200,7 @@ pub enum ObjectKind {
     Surface = 6,
     PciDevice = 7,
     DeviceMemory = 8,
+    Interrupt = 9,
 }
 
 impl Object {
@@ -209,6 +214,7 @@ impl Object {
             Object::Surface(_) => ObjectKind::Surface,
             Object::PciDevice(_) => ObjectKind::PciDevice,
             Object::DeviceMemory(_) => ObjectKind::DeviceMemory,
+            Object::Interrupt(_) => ObjectKind::Interrupt,
         }
     }
 }
@@ -529,6 +535,15 @@ pub fn device_memory_of(slot: CapPtr, required: Rights) -> Result<(usize, Rights
         }
     })
     .ok_or(CapError::NoSuchTask)?
+}
+
+/// The line an Interrupt capability names. Requires `required`.
+pub fn interrupt_of(slot: CapPtr, required: Rights) -> Result<usize, CapError> {
+    let object = lookup(slot, required)?;
+    match *object {
+        Object::Interrupt(index) => Ok(index),
+        _ => Err(CapError::WrongType),
+    }
 }
 
 /// The task a Task capability names. Requires READ.

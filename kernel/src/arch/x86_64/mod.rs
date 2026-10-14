@@ -11,6 +11,11 @@ pub mod vectors {
     pub const YIELD: u8 = 0x42;
     /// Sent to every other CPU when this one has decided the machine is over.
     pub const HALT: u8 = 0x43;
+    /// Device interrupts: one vector for each line [`crate::irq`] hands out.
+    /// Sixteen vectors is one priority class, which the LAPIC does not care
+    /// about while the task priority register is zero.
+    pub const DEVICE_BASE: u8 = 0x50;
+    pub const DEVICE_END: u8 = 0x70;
     /// The system call gate, and the only IDT entry reachable from ring 3.
     ///
     /// Deliberately an ordinary trap vector rather than `syscall`/`sysret`.

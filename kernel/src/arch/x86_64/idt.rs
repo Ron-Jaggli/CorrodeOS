@@ -618,6 +618,12 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
             lapic::end_of_interrupt();
             return frame;
         }
+        vectors::DEVICE_BASE..vectors::DEVICE_END => {
+            // A device signalled. Counted, acknowledged, and whoever was
+            // waiting for it made runnable -- which is why this too hands
+            // back a frame that may be somebody else's.
+            return crate::irq::on_interrupt(vector as u8, frame);
+        }
         _ => {}
     }
 

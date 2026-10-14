@@ -9,7 +9,8 @@
 //!   reads its registers, WRITE writes the ones that are the driver's to
 //!   write. See [`corrode_pci::WritePolicy`] for which those are and why.
 //! * a **device memory** capability is one of its BARs: a run of physical
-//!   addresses where the device's registers are, and how many of them.
+//!   addresses where the device's registers are. Mapping one into a task is
+//!   [`crate::device`]'s job.
 //!
 //! There is no call that takes a bus address. A task cannot ask for "device
 //! 07:00.0"; it holds a capability to a device or it does not, and a task
@@ -186,6 +187,10 @@ pub struct Region {
     pub bar: u8,
     pub physical: u64,
     pub len: u64,
+    /// Bytes of it the kernel keeps for itself, as `(offset, len)`: the
+    /// MSI-X table, when it is behind this BAR. A driver that could write
+    /// that could aim an interrupt anywhere.
+    pub reserved: Option<(u64, u64)>,
 }
 
 struct Bus {
@@ -370,11 +375,16 @@ pub fn init(mcfg: Option<&[u8]>) -> Option<Summary> {
             let Some((physical, len)) = decoded.memory() else {
                 continue;
             };
+            let reserved = device
+                .msix
+                .filter(|msix| msix.table_bar as usize == bar)
+                .map(|msix| (msix.table_offset as u64, msix.table_len()));
             regions.push(Region {
                 device: index,
                 bar: bar as u8,
                 physical,
                 len,
+                reserved,
             });
         }
     }
@@ -406,6 +416,28 @@ pub fn ecam_pages() -> u64 {
 /// or not at all.
 pub fn device(index: usize) -> Option<Device> {
     without_interrupts(|| BUS.lock().devices.get(index).copied())
+}
+
+/// The first function matching `wanted`, and its place in the table.
+pub fn find(wanted: impl Fn(&Device) -> bool) -> Option<(usize, Device)> {
+    without_interrupts(|| {
+        let bus = BUS.lock();
+        bus.devices
+            .iter()
+            .enumerate()
+            .find(|(_, device)| wanted(device))
+            .map(|(index, device)| (index, *device))
+    })
+}
+
+/// The region behind one BAR of one device, by its place in the table.
+pub fn region_of(device: usize, bar: u8) -> Option<usize> {
+    without_interrupts(|| {
+        BUS.lock()
+            .regions
+            .iter()
+            .position(|region| region.device == device && region.bar == bar)
+    })
 }
 
 /// One region, by its place in the table.

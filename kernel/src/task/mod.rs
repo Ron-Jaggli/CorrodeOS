@@ -613,6 +613,11 @@ pub fn current_id() -> Option<usize> {
     x86_64::without_interrupts(|| Some(SCHEDULER.lock().as_ref()?.current[cpu::index()]))
 }
 
+/// The CPU a task is pinned to.
+pub fn cpu_of(id: usize) -> Option<usize> {
+    x86_64::without_interrupts(|| Some(SCHEDULER.lock().as_ref()?.tasks.get(id)?.cpu))
+}
+
 /// The address space a task runs in, if it has one of its own.
 pub fn space_of(id: usize) -> Option<crate::mm::paging::Mapper> {
     x86_64::without_interrupts(|| SCHEDULER.lock().as_ref()?.tasks.get(id)?.space)

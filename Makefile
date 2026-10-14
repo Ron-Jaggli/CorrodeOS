@@ -37,12 +37,16 @@ MACHINE ?= q35
 # Extra devices for one run, e.g. a bridge with something behind it. Emulated
 # ones only: nothing here may name a host device.
 QEMU_EXTRA ?=
+# Devices every run gets. `edu` is QEMU's teaching device: a megabyte of
+# registers and an interrupt it raises when told to, which is exactly enough
+# to check that a ring 3 task can be handed a device and nothing else.
+QEMU_DEVICES ?= -device edu
 
 QEMU_BASE := -M $(MACHINE) -m $(MEM) -smp $(CPUS) \
              -cdrom $(ISO) -boot d \
              -net none \
              -no-reboot -no-shutdown \
-             $(ACCEL) $(QEMU_EXTRA)
+             $(ACCEL) $(QEMU_DEVICES) $(QEMU_EXTRA)
 
 QEMU_COMMON := $(QEMU_BASE) -display none
 QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio

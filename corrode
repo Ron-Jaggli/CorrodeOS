@@ -42,7 +42,7 @@ VNC_PORT="${VNC_PORT:-5900}"
 
 # Build knobs the Makefile reads. Forwarded explicitly rather than by exporting
 # the whole environment, so what reaches the build is a short list you can see.
-for knob in CPUS MEM PROFILE FEATURES BOOT_TIMEOUT SHOT_DELAY MACHINE QEMU_EXTRA; do
+for knob in CPUS MEM PROFILE FEATURES BOOT_TIMEOUT SHOT_DELAY MACHINE QEMU_EXTRA QEMU_DEVICES; do
     if [ -n "${!knob:-}" ]; then
         args+=(-e "$knob=${!knob}")
     fi
