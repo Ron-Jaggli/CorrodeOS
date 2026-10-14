@@ -12,6 +12,7 @@ bench = false
 
 [dependencies]
 corrode-render = { path = "../render" }
+corrode-text = { path = "../text" }
 
 [features]
 # Deliberately take a page fault at the end of boot to exercise the trap

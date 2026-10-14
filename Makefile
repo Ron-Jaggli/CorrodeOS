@@ -42,7 +42,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 # VNC display number; :0 is TCP 5900, which is what ./corrode publishes.
 VNC_DISPLAY ?= 0
 
-.PHONY: all kernel iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot check fmt clippy clean-artifacts
+.PHONY: all kernel iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
 
@@ -55,6 +55,34 @@ check:
 
 clippy:
 	cargo clippy $(CARGO_FLAGS) -- -D warnings
+
+# The render and text crates have no kernel in them, so their tests run on the build host
+# with std and floating point -- which is the point: the integer animation
+# formulas are checked against a float reference they share no code with.
+HOST_TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
+
+test:
+	cargo test -p corrode-render -p corrode-text -p corrode-gfx --target $(HOST_TARGET)
+
+# The 3D engine's demo scene, drawn on the build host at each preset, for
+# judging by eye. Built optimised, so the times it prints mean something.
+engine-shot:
+	@mkdir -p build
+	@ENGINE_SHOT=$(CURDIR)/build cargo test -q --release -p corrode-gfx \
+	    --target $(HOST_TARGET) shot -- --ignored --nocapture
+	@for f in build/engine-*.ppm; do \
+	    pnmtopng $$f > $${f%.ppm}.png 2>/dev/null && rm -f $$f; \
+	done
+	@echo "wrote build/engine-*.png"
+
+# A sheet of the built-in typeface, for judging the glyph table by eye.
+specimen:
+	@mkdir -p build
+	@SPECIMEN=$(CURDIR)/build/specimen.pgm cargo test -q -p corrode-text \
+	    --target $(HOST_TARGET) specimen -- --ignored > /dev/null
+	@pnmtopng build/specimen.pgm > build/specimen.png 2>/dev/null
+	@rm -f build/specimen.pgm
+	@echo "wrote build/specimen.png"
 
 fmt:
 	cargo fmt --all

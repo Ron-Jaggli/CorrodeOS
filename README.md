@@ -39,6 +39,8 @@ Then:
 ./corrode wx-test     # boot and prove .text is not writable
 ./corrode user-test   # boot and prove ring 3 cannot read kernel memory
 ./corrode check       # cargo check
+./corrode test        # render and text crate unit tests, on the build host
+./corrode specimen    # draw a sheet of the typeface to build/specimen.png
 ./corrode shell       # drop into the build container
 ```
 
@@ -65,12 +67,20 @@ kernel/          the privileged kernel
   src/syscall.rs   the ring 3 boundary — capability slots in, no pointers
   src/task/user.rs user address space — aliased code pages, user stacks
   src/smp.rs       starting the other CPUs
+  src/time.rs      monotonic nanosecond clock, off the TSC
   src/arch/x86_64/cpu.rs  which CPU is this
   build.rs         makes cargo notice linker.ld changes
   linker.ld        higher-half layout at -2GB, page-aligned sections
 render/          the rendering interface
   src/lib.rs       Renderer trait, POD command lists
   src/software.rs  software rasteriser (the reference backend)
+  src/anim.rs      animation as closed-form functions of time
+  src/damage.rs    which pixels are stale
+  src/blend.rs     alpha blending, exact, two multiplies a pixel
+  src/scene.rs     layers, and the least repainting that keeps up with them
+text/            the text engine
+  src/lib.rs       strings to coverage: measuring, placing, inking
+  src/font.rs      the typeface, as pen strokes you can read and edit
 boot/limine.conf lets Limine find the kernel
 docker/          the build environment
 scripts/         check-image.sh — guards against orphan sections
@@ -92,6 +102,17 @@ primitives (`arch::x86_64::port`) and keep the layers above it safe.
 **The GPU sits behind a trait.** `Renderer` has a working software backend. A
 hardware backend is an optimisation, never a requirement — nothing may be written
 that only compiles or only boots on a machine with a particular GPU.
+
+**Nothing ticks on the frame path.** Motion is a formula sampled by whoever
+paints, not a service that steps it. A frame that changes nothing writes
+nothing, and a screen where nothing moves wakes nobody. If a feature seems to
+need a task whose job is to run every frame, that is the smell.
+
+**Storage is for loading, not for running.** The kernel and everything it
+starts are in RAM before the first instruction executes, and nothing on the
+path from input to pixels may wait on a disk. The machine this is for has a
+cheap NVMe drive whose worst-case latency is far worse than its average; the
+desktop has to be unable to notice.
 
 **Stay bootable.** Prefer increments that keep it booting over rewrites that
 leave it broken for days. Anything touching boot, paging or interrupts gets
@@ -128,8 +149,18 @@ IST1 for double faults, and a 48-vector IDT built on naked stubs that normalise
 every trap into one `TrapFrame`. PIC remapped to 0x20, PIT ticking at 100 Hz,
 interrupts live. Physical frame allocator over the Limine memory map, with the
 free list stitched through the free frames themselves. Our own four-level page
-tables, replacing Limine's. Software renderer paints the framebuffer and
-repaints on each tick.
+tables, replacing Limine's. Software renderer paints the framebuffer.
+
+A monotonic nanosecond clock off the TSC. Animations that are closed-form
+functions of that clock -- easing curves and damped springs, integer-only --
+and a painter that repaints only the pixels they made stale. Frames are composed
+in a back buffer and shown whole, colours blend, and a scene of layers works out
+what to repaint and when there is nothing to. This is the layer a compositor
+stands on; see "Motion" below.
+
+Text: a second engine, separate from the renderer, that turns strings into
+anti-aliased coverage at any size from a built-in stroke typeface. The renderer
+draws coverage through a mask atlas in any colour. See "Text" below.
 
 A kernel heap at PML4 slot 320, so `alloc` types (`Box`, `Vec`, `String`) work.
 The MADT is parsed for the interrupt controllers; the local APIC timer drives a
@@ -151,6 +182,257 @@ userspace service and gets an answer back. `./corrode user-test` proves a ring 3
 task cannot read kernel memory.
 
 Not yet: migrating a task between CPUs, reclaiming frames and stacks.
+
+### Motion
+
+Six pieces, each small, that a desktop needs before it has a single window.
+
+#### Animation is a formula
+
+An `Animation` answers one question: where is this value at time `t`. Nothing
+steps it. The usual design integrates a spring a frame at a time, which makes
+the motion depend on the frame rate -- miss a frame and it either takes one big
+step and overshoots or simply runs slow, and the machines that miss frames are
+the ones this is for. Sampling a formula has no such failure: a slow machine
+draws fewer points on exactly the same curve.
+
+The spring is the damped oscillator `x'' = -w²(x - target) - 2zwx'`, solved
+exactly in all three regimes. The equation is linear, so every motion is a sum
+of two basis responses -- released one unit away at rest, and kicked from the
+target at one unit per second:
+
+```
+z < 1   h = E (cos wd·t + (z/s) sin wd·t)     k = E sin(wd·t) / wd
+z = 1   h = E (1 + wt)                        k = E t
+z > 1   h = a e1 + b e2                       k = (e1 - e2) / (2ws)
+
+position = target + d0·h(t) + v0·k(t)
+```
+
+with `s = sqrt(|1 - z²|)`, `wd = ws`, `E = e^(-zwt)`. Keeping `h` and `k` apart
+is what lets a spring start from any position *and* any velocity, which is the
+operation a desktop performs constantly: a window sent somewhere new before it
+has finished getting to the last place. `retarget` reads position and velocity
+off the old formula and starts a new one from them, so the motion bends instead
+of jumping or stopping dead.
+
+Because the motion is known in closed form, so is when it ends. The duration of
+a spring is not a parameter; it is the first instant an upper bound on the
+distance from the target drops under half a device unit, found once when the
+animation is created. Past that instant it reports its target exactly and
+`done`, and the painter can stop.
+
+Fixed-duration curves are there too -- linear, smoothstep, cubic in/out, and
+the CSS `cubic-bezier()` -- each returning its slope along with its value, so
+an eased animation can be retargeted into a spring with the right velocity.
+
+All of it is integer arithmetic: Q16.16 at the interface, Q30 inside, with
+`e^-x`, `sin`, `cos` and `sqrt` built from shifts and multiplies. That is not
+thrift. The kernel does not save SSE state across a context switch, so a float
+in ring 0 is corrupted by the first preemption. `./corrode test` checks the
+result against a floating-point Runge-Kutta integration of the differential
+equation -- a reference that knows the physics and shares no code with the
+solution -- and position agrees to a hundredth of a pixel.
+
+An `Animation` is `Copy` and holds no pointers, for the same reason a `Command`
+does. A client can describe a motion once, send it over IPC, and never be
+scheduled again while the compositor plays it.
+
+#### The clock
+
+The scheduling tick is a 10 ms grid: fine for deciding whose turn it is, useless
+for motion. `time::now_ns` reads the TSC: one instruction, with no interrupt,
+no lock and no MMIO behind it. Its rate is measured
+at boot against PIT channel 2 over 50 ms, then *checked* over the separate
+one-second window `timer check` already spends:
+
+```
+clock      : tsc at 3395 MHz, not advertised as invariant
+clock check: 1.00s wall -> 1000074 us by the monotonic clock
+```
+
+If calibration fails it falls back to the tick -- coarse, still monotonic.
+
+Known gap: the rate is measured once. On a CPU without an invariant TSC it
+drifts when the core changes frequency, which nothing here asks it to do yet.
+
+#### Damage
+
+A `Damage` is up to eight non-overlapping rectangles of stale pixels. The
+painter replays the scene under a `Scissor` for each one, so a frame costs the
+pixels that changed rather than the screen. On a software renderer that is the
+whole performance story: at 1280x800 a full repaint is 4 MB of writes, and the
+boot screen's block moving is 10 to 20 KB.
+
+```
+paint      : 720 wakeups, 310 painted, 38530 KiB shown, 71132 KiB drawn (2880000 KiB had each one repainted)
+```
+
+Those 410 wakeups that painted nothing are the scheduling tick the kernel takes
+anyway. There is no animation task and no frame timer behind them.
+
+Known gap: frames are paced by the 100 Hz tick rather than by the display,
+because nothing here can see vblank without a GPU driver.
+
+#### The back buffer
+
+Commands draw into ordinary RAM, and `Renderer::present` copies the damaged
+rectangles to the screen. It is 4 MB at 1280x800 and it pays for itself twice.
+
+A stale region is repainted by clearing it and drawing everything in it back to
+front. Done on the screen, the display can scan out the cleared state, which is
+flicker. Done off it, only finished rows ever reach the glass.
+
+And blending reads what is underneath. Firmware maps video memory
+write-combined: fast to fill, very slow to read back. With a back buffer the
+screen is only ever written.
+
+```
+backbuffer : 4000 KiB at 0xffffa00040000000, the screen is only ever written
+```
+
+It is mapped a gigabyte above the kernel heap, in the same PML4 slot, so the
+pages appear in every address space without touching one. If the machine
+cannot spare the frames the renderer draws straight onto the screen instead --
+uglier, still correct.
+
+`present` takes the damage rather than flipping a surface, so showing a frame
+costs what changed in it, the same as drawing it did.
+
+#### Blending
+
+```
+out = (src·a + dst·(255 - a)) / 255        rounded to nearest, per channel
+```
+
+The divide is the part that goes wrong. Shifting by 8 instead is the usual
+shortcut, and it makes white over white come out 254: a fade that never quite
+arrives and a seam wherever it meets something it should match. For any `x` up
+to 65535, `round(x / 255) = (t + (t >> 8)) >> 8` with `t = x + 128`, exactly --
+two shifts and two adds.
+
+A channel's sum never exceeds `255·255 + 128`, which fits in 16 bits. So a pixel
+is split into its even and odd bytes, each pair in the two halves of one 32-bit
+word, and each pair goes through the formula in one multiply with no carry able
+to cross between channels. Whatever depends only on the colour and the opacity
+is worked out once per rectangle. That leaves two multiplies a pixel, no divide
+and no SIMD, which is what a kernel that does not save vector state can afford.
+
+`./corrode test` checks all 16.7 million combinations of source, destination
+and opacity against the formula in floating point.
+
+Known gap: blending is done on gamma-encoded values, as most compositors do by
+default. A half fade from black to white is darker than the true midpoint.
+Doing it in linear light is two table lookups per channel per pixel.
+
+#### The scene
+
+A `Layer` is a rectangle of colour whose position, size and opacity are each an
+`Animation`. A `Scene` is a stack of them, and it has one operation: `frame`
+asks every formula where it is now, compares the answers with what it last put
+on the glass, and repaints the difference.
+
+That comparison is the scheduling model. The scene does not care how long it
+has been since it was last asked, so nothing has to run at a rate. A frame in
+which nothing moved submits no commands at all. `animating_until` says when the
+last formula goes quiet, so a painter can sleep through a still screen instead
+of polling one. And a client that sets a layer moving hands over a description
+of the motion, not a stream of positions -- it need not be scheduled again.
+
+A stale rectangle is repainted bottom-up, but bottom is not always the
+background. If an opaque layer covers the whole of the stale rectangle, nothing
+under it can show, so painting starts there. Under a maximised window the
+wallpaper is never drawn again, whatever moves on top.
+
+```
+paint      : 720 wakeups, 310 painted, 38530 KiB shown, 71132 KiB drawn (2880000 KiB had each one repainted)
+```
+
+The test that matters drives a scene through 1500 random steps -- layers added,
+removed, sprung about and faded, frames arriving at irregular intervals -- and
+after every one compares the screen with a fresh scene painted from scratch at
+that instant. Damage, culling, blending and presenting all have to be right for
+those to match, and breaking any one of them fails it.
+
+Known gaps: a layer is one colour, solid or through a mask. A window needs pixels of its own, which is a
+shared `Frame` and a capability to it -- the next step, and the first one that
+crosses the ring boundary. Layers stack in the order they were added and cannot
+be restacked. And a layer that grows or moves damages its whole old and new
+rectangles, though for a flat colour only the edges changed.
+
+### Text
+
+There are two engines and they do not know about each other. The **text
+engine** (`text/`) turns a string into *coverage*: one byte per pixel saying how
+much of it the letters cover. The **renderer** takes coverage and puts a colour
+through it. What passes between them is a block of bytes, which is what a glyph
+atlas is on a GPU and what would cross an IPC boundary between a client and a
+compositor.
+
+#### Letters are distances
+
+A glyph is not an outline to fill. It is the path a pen takes, and a pixel is
+inked by how far its centre is from that path:
+
+```
+coverage = clamp(r + 1/2 - d, 0, 1)
+```
+
+`d` is the distance to the nearest stroke and `r` is half the stroke's
+thickness. Inside the stroke that is 1, outside it is 0, and over the one pixel
+at the edge it ramps -- which is the anti-aliasing, with no supersampling. Ends
+and joins are round because "within `r` of the path" is round there.
+
+Size and weight are just numbers in that formula. There are no bitmaps to scale
+and no hinting tables: 11 pixels and 300 pixels are the same path against a
+different `r`, and bold is a bigger `r`. Alongside a segment `ab` the distance
+from `p` is `|ap x ab| / |ab|` with `|ab|` found once per segment, so most
+pixels cost a multiply and a divide; only the round ends need a square root.
+
+Curves are quarter turns: the rational quadratic with weight `sqrt(1/2)` on the
+corner, which is exactly a quarter ellipse, so four make a true circle. They
+are drawn as short segments whose count grows with the square root of the size,
+which is what keeps the flats under a hundredth of a pixel.
+
+All of it is integer arithmetic in 1/64 pixel, into memory the caller supplies.
+
+#### The typeface
+
+`text/src/font.rs` is printable ASCII as text you can read:
+
+```
+g(10, "M0,17 L0,0 M0,7 A0,12 5,12 A10,12 10,7 L10,0"),     // h
+```
+
+Move, line, and arc-around-a-corner on a grid with the baseline at 0, x-height
+12 and capitals at 16. `./corrode specimen` draws the whole set to
+`build/specimen.png`, which is how a change to a letter gets judged.
+
+`./corrode test` draws strings and compares every pixel against the same
+formula in floating point, with arcs as true conics. They agree to 4% of a
+pixel's coverage, which is a sixty-fourth of a pixel in position.
+
+#### Drawing it
+
+The renderer keeps a **mask atlas**: bytes of coverage it owns. `upload_mask`
+copies a block in and `Command::Mask` draws a block in a colour at an opacity.
+The command names the block by position, so it is still plain data. A scene
+layer can be a mask instead of a solid rectangle, and then everything that
+applies to a layer applies to text -- the boot screen's name fades in and rises
+on a spring using the same formulas that move the block.
+
+```
+text check : letters are inked only inside what was measured    PASS
+text check : a stem is as thick as its weight says, to 1/10 px   PASS
+mask atlas : 1024x256, 256 KiB
+```
+
+Known gaps: printable ASCII, one line, no kerning, one typeface. A string is
+drawn whole and uploaded as one block; a desktop wants each glyph drawn once
+and cached in the atlas. Changing size means drawing again, so text cannot yet
+be zoomed smoothly as a layer. And real font files -- TrueType outlines, which
+compatibility will need -- are a second rasteriser feeding the same coverage,
+not a replacement for this one.
 
 ### W^X
 
@@ -656,7 +938,7 @@ stack; neither matters while tasks are created once at boot.
 
 ### Self-checks
 
-Five run on every boot, so a regression shows up immediately rather than three
+These run on every boot, so a regression shows up immediately rather than three
 subsystems later: an `int3` that must trap *and resume*, a frame alloc/free
 round-trip that must balance, a heap exercise that must both balance its bytes
 and collapse back to a single free block, a timer check that counts both tick
@@ -668,7 +950,16 @@ ring 3, a ring 3 task narrowing and handing over a capability under the same
 rules the kernel follows, a ring 3 server answering a call from the kernel while
 unable to send on the endpoint it serves, and two user tasks proving by
 page-table walk that one address means different memory in each of them, and
-every online CPU taking its own timer ticks.
+every online CPU taking its own timer ticks. The monotonic clock is checked
+against the PIT, and six animation checks confirm on the target itself what the
+host tests establish against a reference: a spring starts and ends where it
+should, overshoots only when underdamped, keeps position and velocity through a
+retarget, and gives the same answer whatever order it is sampled in. Three
+blend checks confirm a fade is exact at both ends and seamless over its own
+colour, two text checks that letters stay inside the block measured for them
+and a stroke is the thickness its weight says, and two scene checks that the
+first frame paints everything and a second look at the same instant paints
+nothing.
 
 That last one earns its place. Deriving "elapsed seconds" from a tick counter
 and then using it to judge that same counter is circular, and hides exactly the

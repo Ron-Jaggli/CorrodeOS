@@ -1,10 +1,8 @@
 //! Corrode kernel entry point.
 //!
-//! Current state: Limine hands us a framebuffer and a memory map, we bring up
-//! COM1, install descriptor tables, build a physical frame allocator, start the
-//! PIT, and then sit in a render loop driven by timer interrupts.
-//!
-//! No paging of our own, no tasks, no userspace yet.
+//! Brings the machine up, runs the boot self-checks, starts the demo tasks,
+//! and then becomes the painter: a loop that repaints whatever the running
+//! animations made stale and sleeps when nothing is moving.
 
 #![no_std]
 #![no_main]
@@ -22,14 +20,19 @@ mod smp;
 mod sync;
 mod syscall;
 mod task;
+mod time;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use arch::x86_64::{self, halt_forever, ioapic, lapic, pic, pit, vectors};
 use corrode_render::{
-    software::SoftwareRenderer, Color, Command, CommandList, PixelFormat, Rect, Renderer,
-    SurfaceInfo,
+    anim::{Animation, Ease, Fx, Spring, Velocity},
+    blend::{self, Blend},
+    scene::{Layer, LayerId, Painted, Scene},
+    software::SoftwareRenderer,
+    Color, PixelFormat, Rect, Renderer, SurfaceInfo,
 };
+use corrode_text::{Coverage, Style, Weight};
 
 // Section boundaries emitted by kernel/linker.ld. Only their addresses are
 // ever taken -- the values are meaningless.
@@ -48,6 +51,9 @@ const TICK_HZ: u32 = 100;
 
 const BACKGROUND: Color = Color::rgb(0x10, 0x12, 0x18);
 const RUST: Color = Color::rgb(0xb7, 0x41, 0x0e);
+const VEIL: Color = Color::rgb(0x9f, 0xc4, 0xe8);
+const TITLE: Color = Color::rgb(0xf2, 0xee, 0xe8);
+const CAPTION: Color = Color::rgb(0x8a, 0x90, 0x9c);
 
 /// Entry point. Limine jumps here with paging on, in 64-bit long mode, on a
 /// stack it provided. `kmain` never returns.
@@ -105,6 +111,21 @@ pub extern "C" fn kmain() -> ! {
         pic::unmask(pit::IRQ);
     }
 
+    // Still before interrupts: a handler inside the measurement window would
+    // skew it, and nothing can run one yet.
+    match time::init() {
+        Some(clock) => println!(
+            "clock      : tsc at {} MHz, {}",
+            clock.hz / 1_000_000,
+            if clock.invariant {
+                "invariant"
+            } else {
+                "not advertised as invariant"
+            }
+        ),
+        None => println!("clock      : no usable tsc, falling back to the {TICK_HZ} Hz tick"),
+    }
+
     // SAFETY: the IDT has a handler for all 256 vectors, and every source we
     // have unmasked -- LAPIC timer, the PIT via one I/O APIC line, and the
     // spurious vector -- is dispatched explicitly.
@@ -130,6 +151,9 @@ pub extern "C" fn kmain() -> ! {
     // still single-threaded and the output is deterministic.
     cap_bootstrap();
     cap_checks();
+    anim_checks();
+    blend_checks();
+    text_checks();
 
     // Spawn, grant, then start. Masking interrupts would not do here: a task
     // created on this CPU can be picked up by another one, and disabling
@@ -189,15 +213,7 @@ pub extern "C" fn kmain() -> ! {
     wx_test();
 
     match init_renderer() {
-        Some(mut renderer) => {
-            let info = renderer.surface_info();
-            println!(
-                "framebuffer: {}x{} pitch={} {}bpp",
-                info.width, info.height, info.pitch, info.format.bits_per_pixel
-            );
-            println!();
-            render_loop(&mut renderer)
-        }
+        Some(mut renderer) => render_loop(&mut renderer),
         None => {
             println!("framebuffer: none -- serial only");
             println!();
@@ -714,12 +730,170 @@ fn start_all(tasks: &[Option<usize>]) {
     }
 }
 
-/// Report one capability invariant.
-fn cap_check(name: &str, ok: bool) {
+/// Report one boot self-check.
+fn check(subsystem: &str, name: &str, ok: bool) {
     println!(
-        "cap check  : {:<52}{}",
+        "{:<11}: {:<52}{}",
+        subsystem,
         name,
         if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// Report one capability invariant.
+fn cap_check(name: &str, ok: bool) {
+    check("cap check", name, ok);
+}
+
+/// Exercise the animation formulas on the machine they will run on.
+///
+/// The render crate's own tests compare them against a numerical integration
+/// of the spring equation, on the build host. These are the properties a
+/// desktop relies on, checked here because this is where the arithmetic is
+/// actually executed: integer-only, in ring 0, with no FPU state to lean on.
+fn anim_checks() {
+    let (from, to) = (Fx::from_int(0), Fx::from_int(1000));
+    let bouncy = Animation::spring(0, from, to, Velocity::ZERO, Spring::BOUNCY);
+    let snappy = Animation::spring(0, from, to, Velocity::ZERO, Spring::SNAPPY);
+
+    check(
+        "anim check",
+        "a spring starts where it was released",
+        bouncy.sample(0).value == from,
+    );
+    let end = bouncy.sample(bouncy.end_ns());
+    check(
+        "anim check",
+        "a spring ends exactly on its target",
+        end.done && end.value == to,
+    );
+
+    let peak = |animation: &Animation| {
+        (0..400u64)
+            .map(|step| animation.sample(step * 5_000_000).value)
+            .max()
+            .unwrap_or(from)
+    };
+    check(
+        "anim check",
+        "an underdamped spring overshoots",
+        peak(&bouncy) > to,
+    );
+    check(
+        "anim check",
+        "a critically damped spring does not",
+        peak(&snappy) <= to,
+    );
+
+    // The operation a desktop performs constantly: something already moving
+    // is sent somewhere else. It must carry on from where it is, at the speed
+    // it is going.
+    const MID_FLIGHT: u64 = 120_000_000;
+    let before = bouncy.sample(MID_FLIGHT);
+    let turned = bouncy.retarget(MID_FLIGHT, Fx::from_int(-300), Spring::SNAPPY);
+    let after = turned.sample(MID_FLIGHT);
+    check(
+        "anim check",
+        "retargeting mid-flight keeps position and velocity",
+        before.velocity.0 > 0
+            && (before.value.0 - after.value.0).abs() <= 1
+            && (before.velocity.0 - after.velocity.0).abs() <= 4,
+    );
+
+    // No state is advanced by sampling, so order cannot matter.
+    let late = bouncy.sample(400_000_000);
+    let early = bouncy.sample(100_000_000);
+    check(
+        "anim check",
+        "sampling out of order gives the same answers",
+        late != early && bouncy.sample(400_000_000) == late && bouncy.sample(100_000_000) == early,
+    );
+
+    println!(
+        "anim       : over 1000 units, bouncy settles in {} ms and snappy in {} ms",
+        bouncy.end_ns() / 1_000_000,
+        snappy.end_ns() / 1_000_000
+    );
+}
+
+/// Exercise alpha blending on the machine it will run on.
+///
+/// The host tests compare every source, destination and opacity against the
+/// formula in floating point. These are the three properties a fade is judged
+/// by on screen: it starts as nothing, ends as the colour itself, and leaves
+/// no seam where it crosses something already that colour.
+fn blend_checks() {
+    let ends = (0..=255u8).all(|value| {
+        blend::mix(value, !value, 255) == value && blend::mix(value, !value, 0) == !value
+    });
+    check(
+        "blend check",
+        "full and zero opacity are exact, not off by one",
+        ends,
+    );
+
+    let seamless = (0..=255u8).all(|alpha| {
+        [0u8, 1, 127, 254, 255]
+            .iter()
+            .all(|v| blend::mix(*v, *v, alpha) == *v)
+    });
+    check(
+        "blend check",
+        "a colour over itself is unchanged at any opacity",
+        seamless,
+    );
+
+    // The path the rasteriser takes: all four bytes of a pixel in two
+    // multiplies. 0x33 is exactly a fifth of the way from 0 to 0xff.
+    let fifth = Blend::new(&PixelFormat::XRGB8888, Color::rgb(255, 100, 0), 51);
+    check(
+        "blend check",
+        "a whole pixel blends the same as channel by channel",
+        fifth.over(0x0000_64ff) == 0x0033_64cc,
+    );
+}
+
+/// Exercise the text engine on the machine it will run on.
+///
+/// The host tests compare whole strings against the distance formula in
+/// floating point. Here it is the two things that would go wrong first if the
+/// integer version misbehaved in ring 0: ink landing outside the block that
+/// was measured for it, and a stroke coming out the wrong thickness.
+fn text_checks() {
+    let rendered = |text: &str, style: Style| {
+        let extent = corrode_text::measure(text, style);
+        let mut coverage = alloc::vec![0u8; extent.area()];
+        corrode_text::draw(
+            text,
+            style,
+            &mut Coverage::new(&mut coverage, extent.width as usize),
+        );
+        (coverage, extent)
+    };
+
+    let (coverage, extent) = rendered("Corrode {jg}", Style::px(32).weight(Weight::Bold));
+    let (width, height) = (extent.width as usize, extent.height as usize);
+    let edge_clear = (0..width)
+        .all(|x| coverage[x] == 0 && coverage[(height - 1) * width + x] == 0)
+        && (0..height).all(|y| coverage[y * width] == 0 && coverage[y * width + width - 1] == 0);
+    check(
+        "text check",
+        "letters are inked only inside what was measured",
+        edge_clear && coverage.contains(&255),
+    );
+
+    // Coverage summed across a stem is its width in 255ths of a pixel. A
+    // regular stroke is a twelfth of the em: 8 pixels at 96.
+    let (coverage, extent) = rendered("I", Style::px(96));
+    let row = (extent.baseline as usize - 20) * extent.width as usize;
+    let stem: u32 = coverage[row..row + extent.width as usize]
+        .iter()
+        .map(|covered| *covered as u32)
+        .sum();
+    check(
+        "text check",
+        "a stem is as thick as its weight says, to 1/10 px",
+        stem.abs_diff(8 * 255) <= 25,
     );
 }
 
@@ -1751,15 +1925,26 @@ fn smp_check(online: usize) {
 fn timer_check() {
     let lapic_before = lapic::ticks();
     let pit_before = pit::ticks();
+    let clock_before = time::now_ns();
 
     pit::delay_us(1_000_000);
 
     let lapic_ticks = lapic::ticks() - lapic_before;
     let pit_ticks = pit::ticks() - pit_before;
+    let clock_us = (time::now_ns() - clock_before) / 1000;
 
     println!(
         "timer check: 1.00s wall -> lapic {} ticks, pit via ioapic {} ticks (expect ~{})",
         lapic_ticks, pit_ticks, TICK_HZ
+    );
+
+    // The monotonic clock was calibrated over 50 ms; this is a different,
+    // longer window, so it checks the calibration rather than repeating it.
+    println!("clock check: 1.00s wall -> {clock_us} us by the monotonic clock");
+    check(
+        "clock check",
+        "the monotonic clock agrees with the PIT to 1%",
+        clock_us.abs_diff(1_000_000) <= 10_000,
     );
 }
 
@@ -1800,119 +1985,439 @@ fn init_renderer() -> Option<SoftwareRenderer> {
     // `pitch * height` bytes from `address` are writable. Nothing else in the
     // kernel touches those pixels -- this is the only renderer we construct, and
     // it is never dropped -- so exclusive ownership holds for all of time.
-    match unsafe { SoftwareRenderer::new(fb.address, info) } {
-        Ok(renderer) => Some(renderer),
+    let mut renderer = match unsafe { SoftwareRenderer::new(fb.address, info) } {
+        Ok(renderer) => renderer,
         Err(err) => {
             println!("framebuffer: rejected by backend: {:?}", err);
-            None
+            return None;
+        }
+    };
+
+    println!(
+        "framebuffer: {}x{} pitch={} {}bpp",
+        info.width, info.height, info.pitch, info.format.bits_per_pixel
+    );
+
+    match map_back_buffer(&info) {
+        Some(back) => {
+            // SAFETY: `map_back_buffer` mapped `back_buffer_len` writable
+            // bytes there from frames fresh off the allocator, so they overlap
+            // nothing, the framebuffer included. The mapping is never removed
+            // and this renderer is the only thing given the address.
+            unsafe { renderer.attach_back_buffer(back) };
+            println!(
+                "backbuffer : {} KiB at {:p}, the screen is only ever written",
+                SoftwareRenderer::back_buffer_len(&info) / 1024,
+                back
+            );
+        }
+        // Still correct, just not pretty: a repaint is visible while it
+        // happens, and blending reads video memory.
+        None => println!("backbuffer : none -- drawing straight onto the screen"),
+    }
+
+    // Somewhere to keep stencils -- text, for now. Off the kernel heap, and
+    // never freed: the renderer holds it for as long as there is a screen.
+    let atlas = alloc::vec![0u8; (ATLAS_WIDTH * ATLAS_HEIGHT) as usize];
+    renderer.attach_mask_atlas(atlas.leak(), ATLAS_WIDTH);
+    println!(
+        "mask atlas : {}x{}, {} KiB",
+        ATLAS_WIDTH,
+        ATLAS_HEIGHT,
+        ATLAS_WIDTH * ATLAS_HEIGHT / 1024
+    );
+
+    Some(renderer)
+}
+
+/// The mask atlas: room for the boot screen's two lines of text.
+const ATLAS_WIDTH: u32 = 1024;
+const ATLAS_HEIGHT: u32 = 256;
+
+/// Where the back buffer is mapped: a gigabyte above the heap, in the same
+/// PML4 slot. That slot is populated before any user address space is forked,
+/// so pages added under it now appear in every space at once.
+const BACK_BUFFER_BASE: u64 = mm::heap::HEAP_START as u64 + (1 << 30);
+
+/// Largest back buffer we will map. A 4K screen needs 32 MiB.
+const BACK_BUFFER_MAX: usize = 64 << 20;
+
+/// Frames that must be left over after the back buffer has taken its share.
+/// It is a nicety; tasks and their stacks are not.
+const BACK_BUFFER_RESERVE: usize = 1024;
+
+/// Map ordinary RAM to compose frames in.
+fn map_back_buffer(info: &SurfaceInfo) -> Option<*mut u8> {
+    let bytes = SoftwareRenderer::back_buffer_len(info);
+    if bytes == 0 || bytes > BACK_BUFFER_MAX {
+        return None;
+    }
+    let pages = bytes.div_ceil(4096);
+
+    // Checked up front so that running out half way, which would strand the
+    // frames already taken, does not happen in practice. One table per 512
+    // pages, plus the two levels above.
+    let (free, _) = mm::frame::stats();
+    if free < pages + pages / 512 + 2 + BACK_BUFFER_RESERVE {
+        return None;
+    }
+
+    for i in 0..pages as u64 {
+        let frame = mm::frame::alloc()?;
+        let mapped = mm::paging::with_kernel_mapper(|mapper| {
+            mapper.map_4k(
+                BACK_BUFFER_BASE + i * 4096,
+                frame.addr(),
+                mm::paging::WRITABLE | mm::paging::NO_EXECUTE | mm::paging::GLOBAL,
+            )
+        });
+        if mapped != Some(true) {
+            return None;
+        }
+    }
+    Some(BACK_BUFFER_BASE as *mut u8)
+}
+
+/// Side of the white corner markers.
+///
+/// The markers are a deliberate diagnostic -- if pitch handling is ever wrong
+/// they land in the wrong place, which is obvious at a glance.
+const MARKER: u32 = 16;
+const BLOCK_WIDTH: u32 = 96;
+const STRIP_HEIGHT: u32 = 28;
+
+/// How solid the veil gets, out of 255.
+const VEIL_OPACITY: i32 = 150;
+/// How far below its resting place the veil starts and ends.
+const VEIL_DROP: i32 = 28;
+const VEIL_FADE_MS: u32 = 320;
+
+/// How the block gets to its next resting place.
+#[derive(Clone, Copy)]
+enum Move {
+    /// From wherever it is, at whatever speed it is doing.
+    Spring(Spring),
+    /// Over a fixed number of milliseconds.
+    Ease(u32, Ease),
+}
+
+#[derive(Clone, Copy)]
+enum Act {
+    /// Send the block to one side.
+    Block { right: bool, how: Move },
+    /// Bring the veil in, or take it away.
+    Veil { shown: bool },
+}
+
+struct Step {
+    at_ms: u64,
+    act: Act,
+}
+
+/// What the screen does, on repeat.
+///
+/// The two block steps 180 ms apart are deliberate: the block is sent back
+/// while still in flight, which is the case a stepped or restarted animation
+/// gets visibly wrong. The veil arrives and leaves while the block is moving
+/// underneath it, so every one of its frames blends over something different.
+const SCRIPT: [Step; 6] = [
+    Step {
+        at_ms: 400,
+        act: Act::Block {
+            right: true,
+            how: Move::Spring(Spring::BOUNCY),
+        },
+    },
+    Step {
+        at_ms: 1500,
+        act: Act::Veil { shown: true },
+    },
+    Step {
+        at_ms: 2200,
+        act: Act::Block {
+            right: false,
+            how: Move::Ease(600, Ease::STANDARD),
+        },
+    },
+    Step {
+        at_ms: 3600,
+        act: Act::Block {
+            right: true,
+            how: Move::Spring(Spring::SMOOTH),
+        },
+    },
+    Step {
+        at_ms: 3780,
+        act: Act::Block {
+            right: false,
+            how: Move::Spring(Spring::BOUNCY),
+        },
+    },
+    Step {
+        at_ms: 4300,
+        act: Act::Veil { shown: false },
+    },
+];
+const SCRIPT_MS: u64 = 6000;
+
+/// Draw `text` into the next free rows of the mask atlas and say where it
+/// went. `None` if it does not fit or the renderer has no atlas, in which
+/// case the screen simply goes without that line.
+fn upload_label(
+    renderer: &mut impl Renderer,
+    shelf: &mut u32,
+    text: &str,
+    style: Style,
+) -> Option<Rect> {
+    let extent = corrode_text::measure(text, style);
+    if extent.width > ATLAS_WIDTH || *shelf + extent.height > ATLAS_HEIGHT {
+        return None;
+    }
+
+    // The text engine draws into bytes it is handed and the renderer copies
+    // them into memory it owns. Neither knows the other exists.
+    let mut coverage = alloc::vec![0u8; extent.area()];
+    corrode_text::draw(
+        text,
+        style,
+        &mut Coverage::new(&mut coverage, extent.width as usize),
+    );
+
+    let at = Rect::new(0, *shelf as i32, extent.width, extent.height);
+    renderer.upload_mask(at, &coverage).ok()?;
+    *shelf += extent.height;
+    Some(at)
+}
+
+/// How far below its resting place a line of text starts.
+const TEXT_RISE: i32 = 18;
+
+/// A line of text centred on the screen with its top at `y`, which fades in
+/// and rises into place starting at `at`.
+fn label_layer(screen: Rect, src: Rect, y: i32, color: Color, at: u64) -> Layer {
+    let x = (screen.width as i32 - src.width as i32) / 2;
+    let mut layer = Layer::mask(x, y + TEXT_RISE, src, color);
+    layer.opacity = Animation::ease(at, 700, Fx::ZERO, Fx::from_int(255), Ease::Out);
+    layer.y = Animation::spring(
+        at,
+        Fx::from_int(y + TEXT_RISE),
+        Fx::from_int(y),
+        Velocity::ZERO,
+        Spring::SMOOTH,
+    );
+    layer
+}
+
+/// The boot screen: a background, the rust bar and the name above it, four
+/// corner markers, a block that crosses the screen, and a translucent veil
+/// that fades in over part of it and out again.
+///
+/// Nothing here advances per frame. Every moving quantity is a formula held by
+/// a layer in the scene, and the scene works out what went stale.
+struct Stage {
+    scene: Scene<12>,
+    block: LayerId,
+    veil: LayerId,
+    /// Where the veil rests when it is showing.
+    veil_y: i32,
+}
+
+impl Stage {
+    fn new(renderer: &mut impl Renderer, now: u64) -> Option<Self> {
+        let info = &renderer.surface_info();
+        let mut scene = Scene::new(info, BACKGROUND);
+        let (width, height) = (info.width, info.height);
+        let middle = (height / 2) as i32;
+        let full_bar = (height / 8).max(1) as i32;
+
+        // The bar opens from the middle. Its top edge and its height are two
+        // springs with the same constants, so the centre holds still: the
+        // spring equation is linear, and y = middle - height / 2 throughout.
+        let mut bar = Layer::solid(Rect::new(0, middle, width, 0), RUST);
+        let open = |from: i32, to: i32| {
+            Animation::spring(
+                now,
+                Fx::from_int(from),
+                Fx::from_int(to),
+                Velocity::ZERO,
+                Spring::BOUNCY,
+            )
+        };
+        bar.height = open(0, full_bar);
+        bar.y = open(middle, middle - full_bar / 2);
+        scene.add(bar)?;
+
+        let right = width.saturating_sub(MARKER) as i32;
+        let bottom = height.saturating_sub(MARKER) as i32;
+        for (x, y) in [(0, 0), (right, 0), (0, bottom), (right, bottom)] {
+            scene.add(Layer::solid(Rect::new(x, y, MARKER, MARKER), Color::WHITE))?;
+        }
+
+        let block_y = middle + full_bar / 2 + 48;
+        let block = scene.add(Layer::solid(
+            Rect::new(0, block_y, BLOCK_WIDTH, STRIP_HEIGHT),
+            Color::WHITE,
+        ))?;
+
+        // Over the lower half of the bar and the block's track, so it has
+        // three different things underneath it, one of them moving.
+        let veil_y = middle - full_bar / 4;
+        let veil_bottom = block_y + STRIP_HEIGHT as i32 + 24;
+        let mut veil = Layer::solid(
+            Rect::new(
+                (width / 3) as i32,
+                veil_y + VEIL_DROP,
+                width / 3,
+                (veil_bottom - veil_y).max(0) as u32,
+            ),
+            VEIL,
+        );
+        veil.opacity = Animation::rest(Fx::ZERO);
+        let veil = scene.add(veil)?;
+
+        // The name, once the bar has opened, and a caption after it. Text is
+        // a layer like any other: the same formulas move it and fade it.
+        let mut shelf = 0;
+        let screen = scene.screen();
+        let title = Style::px((height / 8).clamp(24, 144)).weight(Weight::Bold);
+        if let Some(src) = upload_label(renderer, &mut shelf, "CorrodeOS", title) {
+            let y = middle - full_bar / 2 - src.height as i32 - 24;
+            scene.add(label_layer(screen, src, y, TITLE, now + 500_000_000))?;
+        }
+        let caption = concat!("capability microkernel - v", env!("CARGO_PKG_VERSION"));
+        if let Some(src) = upload_label(renderer, &mut shelf, caption, Style::px(20)) {
+            let y = height as i32 - 96;
+            scene.add(label_layer(screen, src, y, CAPTION, now + 1_100_000_000))?;
+        }
+
+        Some(Self {
+            scene,
+            block,
+            veil,
+            veil_y,
+        })
+    }
+
+    /// Carry out one step of the script, starting at `at` -- the instant the
+    /// script called for, not whenever this loop happened to wake up and
+    /// notice.
+    fn go(&mut self, step: &Step, at: u64) {
+        match step.act {
+            Act::Block { right, how } => {
+                let travel = self.scene.screen().width.saturating_sub(BLOCK_WIDTH) as i32;
+                let to = Fx::from_int(if right { travel } else { 0 });
+                if let Some(block) = self.scene.layer_mut(self.block) {
+                    block.x = match how {
+                        Move::Spring(spring) => block.x.retarget(at, to, spring),
+                        Move::Ease(ms, ease) => {
+                            Animation::ease(at, ms, block.x.sample(at).value, to, ease)
+                        }
+                    };
+                }
+            }
+            Act::Veil { shown } => {
+                // Two formulas at once: opacity along a curve with a fixed
+                // duration, position on a spring. Neither knows about the
+                // other, and neither is told when the other finishes.
+                let (opacity, y, ease) = if shown {
+                    (VEIL_OPACITY, self.veil_y, Ease::Out)
+                } else {
+                    (0, self.veil_y + VEIL_DROP, Ease::In)
+                };
+                if let Some(veil) = self.scene.layer_mut(self.veil) {
+                    veil.opacity = Animation::ease(
+                        at,
+                        VEIL_FADE_MS,
+                        veil.opacity.sample(at).value,
+                        Fx::from_int(opacity),
+                        ease,
+                    );
+                    veil.y = veil.y.retarget(at, Fx::from_int(y), Spring::SNAPPY);
+                }
+            }
         }
     }
 }
 
-/// The static part of the frame: background, rust bar, corner markers.
+/// Paint what moved, then sleep until the next interrupt.
 ///
-/// Corner markers are a deliberate diagnostic -- if pitch handling is ever
-/// wrong they land in the wrong place, which is obvious at a glance.
-fn draw_scene(renderer: &mut impl Renderer) {
-    let info = renderer.surface_info();
-
-    let mut storage = [Command::Clear { color: BACKGROUND }; 8];
-    let mut list = CommandList::new(&mut storage);
-
-    list.push(Command::Clear { color: BACKGROUND });
-
-    let bar_height = (info.height / 8).max(1);
-    let bar_y = (info.height / 2 - bar_height / 2) as i32;
-    list.push(Command::FillRect {
-        rect: Rect::new(0, bar_y, info.width, bar_height),
-        color: RUST,
-    });
-
-    let s = 16u32;
-    for (x, y) in [
-        (0i32, 0i32),
-        ((info.width - s) as i32, 0),
-        (0, (info.height - s) as i32),
-        ((info.width - s) as i32, (info.height - s) as i32),
-    ] {
-        list.push(Command::FillRect {
-            rect: Rect::new(x, y, s, s),
-            color: Color::WHITE,
-        });
-    }
-
-    let _ = renderer.submit(&list);
-}
-
-const BLOCK_WIDTH: u32 = 96;
-const STRIP_HEIGHT: u32 = 28;
-
-/// Where the sweeping block sits for a given tick count.
-///
-/// Ping-pongs rather than wrapping, so it reads as motion instead of a jump.
-fn sweep_position(ticks: u64, travel: u32) -> u32 {
-    if travel == 0 {
-        return 0;
-    }
-    let span = travel as u64 * 2;
-    let phase = ticks.wrapping_mul(4) % span;
-    if phase <= travel as u64 {
-        phase as u32
-    } else {
-        (span - phase) as u32
-    }
-}
-
-/// Redraw the moving block, erasing the strip behind it first.
-fn draw_heartbeat(renderer: &mut impl Renderer, x: u32, strip_y: i32) {
-    let info = renderer.surface_info();
-
-    let mut storage = [Command::Clear { color: BACKGROUND }; 2];
-    let mut list = CommandList::new(&mut storage);
-
-    list.push(Command::FillRect {
-        rect: Rect::new(0, strip_y, info.width, STRIP_HEIGHT),
-        color: BACKGROUND,
-    });
-    list.push(Command::FillRect {
-        rect: Rect::new(x as i32, strip_y, BLOCK_WIDTH, STRIP_HEIGHT),
-        color: Color::WHITE,
-    });
-
-    let _ = renderer.submit(&list);
-}
-
-/// Draw once, then repaint only the moving part on each timer tick.
+/// There is no animation task behind this and no frame timer. The loop wakes
+/// on the scheduling tick the kernel already takes, asks the formulas where
+/// things are at the current nanosecond, and writes only the pixels that
+/// answer changed.
 fn render_loop(renderer: &mut impl Renderer) -> ! {
-    draw_scene(renderer);
+    let Some(mut stage) = Stage::new(renderer, time::now_ns()) else {
+        println!("scene      : no room for the boot screen's layers");
+        idle_loop()
+    };
+    let screen = stage.scene.screen().area();
 
-    let info = renderer.surface_info();
-    let bar_height = (info.height / 8).max(1);
-    let strip_y = (info.height / 2 + bar_height / 2 + 48) as i32;
-    let travel = info.width.saturating_sub(BLOCK_WIDTH);
+    // A renderer that fails paints nothing, which is what the counters below
+    // would then show.
+    let mut frame = |stage: &mut Stage, now| stage.scene.frame(renderer, now).unwrap_or_default();
+
+    let start = time::now_ns();
+    let first = frame(&mut stage, start);
+    check(
+        "scene check",
+        "the first frame paints the whole screen",
+        first.stale == screen,
+    );
+    check(
+        "scene check",
+        "asking again at the same instant paints nothing",
+        frame(&mut stage, start) == Painted::default(),
+    );
+    println!();
+
+    let mut cycle_start = start;
+    let mut next_step = 0;
 
     let hz = TICK_HZ as u64;
-    let mut last_x = u32::MAX;
     let mut next_report = 1u64;
+    let (mut wakeups, mut painted, mut stale, mut drawn) = (0u64, 0u64, 0u64, 0u64);
 
     loop {
-        let now = ticks();
+        let now = time::now_ns();
+
+        loop {
+            let due = cycle_start + SCRIPT[next_step].at_ms * 1_000_000;
+            if now < due {
+                break;
+            }
+            stage.go(&SCRIPT[next_step], due);
+            next_step += 1;
+            if next_step == SCRIPT.len() {
+                next_step = 0;
+                cycle_start += SCRIPT_MS * 1_000_000;
+            }
+        }
+
+        let result = frame(&mut stage, now);
+        wakeups += 1;
+        if result.stale > 0 {
+            painted += 1;
+            stale += result.stale;
+            drawn += result.drawn;
+        }
 
         // A few seconds of proof on serial, then stop cluttering the log.
         // Both counters are reported: the LAPIC timer is delivered by the local
         // APIC, the PIT by the I/O APIC, so if both advance then both delivery
         // paths work.
-        let seconds = now / hz;
+        let seconds = ticks() / hz;
         if seconds >= next_report && next_report <= 5 {
             report_timers(seconds);
             report_tasks();
+            println!(
+                "paint      : {} wakeups, {} painted, {} KiB shown, {} KiB drawn ({} KiB had each one repainted)",
+                wakeups,
+                painted,
+                stale * 4 / 1024,
+                drawn * 4 / 1024,
+                wakeups * screen * 4 / 1024
+            );
             next_report = seconds + 1;
-        }
-
-        let x = sweep_position(now, travel);
-        if x != last_x {
-            draw_heartbeat(renderer, x, strip_y);
-            last_x = x;
         }
 
         // Nothing to do until the next tick.

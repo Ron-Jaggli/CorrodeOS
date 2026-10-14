@@ -2,3 +2,4 @@
 /build
 /.trash
 *.iso
+.bash_history

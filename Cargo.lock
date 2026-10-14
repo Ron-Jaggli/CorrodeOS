@@ -3,12 +3,24 @@
 version = 4
 
 [[package]]
-name = "corrode-kernel"
+name = "corrode-gfx"
 version = "0.0.1"
 dependencies = [
  "corrode-render",
 ]
 
 [[package]]
+name = "corrode-kernel"
+version = "0.0.1"
+dependencies = [
+ "corrode-render",
+ "corrode-text",
+]
+
+[[package]]
 name = "corrode-render"
+version = "0.0.1"
+
+[[package]]
+name = "corrode-text"
 version = "0.0.1"
