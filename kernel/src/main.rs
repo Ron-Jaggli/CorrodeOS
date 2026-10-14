@@ -17,6 +17,7 @@ mod ipc;
 mod irq;
 mod limine;
 mod mm;
+mod modules;
 mod pci;
 mod serial;
 mod smp;
@@ -196,8 +197,13 @@ pub extern "C" fn kmain() -> ! {
         serve_user();
         let service = call_user_service();
         check_address_spaces(user, service);
-        device_checks();
     }
+
+    // Programs: ring 3 tasks that came from files rather than from the
+    // kernel image. Then a device, driven by one.
+    program_checks();
+    #[cfg(not(feature = "user-test"))]
+    device_checks();
 
     #[cfg(feature = "user-test")]
     user_fault_test();
@@ -1686,6 +1692,8 @@ extern "C" fn user_program() {
 #[unsafe(naked)]
 extern "C" fn user_service() {
     core::arch::naked_asm!(
+        // No capability rides along with anything this task sends or answers.
+        "mov r12, {no_slot}",
         "2:",
         // Receive. No slot for a transferred capability, but one for the
         // capability that lets us answer.
@@ -1705,8 +1713,9 @@ extern "C" fn user_service() {
         // Before answering, try to *send* on the endpoint we serve. We hold it
         // read-only, so this must be refused -- a server that could send on its
         // own endpoint could answer its clients' requests by impersonating one
-        // of them. r12 rather than rcx or r11 to hold the result: those two are
-        // the registers fast syscalls clobber.
+        // of them. r14 rather than rcx or r11 to hold the result: those two are
+        // the registers fast syscalls clobber, and r12 names a capability to
+        // send.
         "mov rax, {send}",
         "mov rdi, {endpoint}",
         "xor rsi, rsi",
@@ -1715,7 +1724,7 @@ extern "C" fn user_service() {
         "xor r8, r8",
         "xor r9, r9",
         "int {gate}",
-        "mov r12, rax",
+        "mov r14, rax",
 
         // Answer, carrying both the result and the status of that attempt --
         // the only way a task with no console can report on itself.
@@ -1723,7 +1732,7 @@ extern "C" fn user_service() {
         "mov rdi, {reply_slot}",
         "mov rsi, {label_result}",
         "lea rdx, [rbx + 1]",
-        "mov r10, r12",
+        "mov r10, r14",
         "xor r8, r8",
         "xor r9, r9",
         "int {gate}",
@@ -1802,7 +1811,7 @@ fn call_user_service() -> Option<usize> {
     service
 }
 
-/// Bootstrap's end of the probe's endpoint, and its capabilities to the test
+/// Bootstrap's end of the driver's endpoint, and its capabilities to the test
 /// device, one BAR of it, and its interrupt.
 const PROBE_ENDPOINT: cap::CapPtr = 19;
 const BOOT_EDU: cap::CapPtr = 20;
@@ -1810,189 +1819,216 @@ const BOOT_EDU_BAR: cap::CapPtr = 21;
 const BOOT_EDU_IRQ: cap::CapPtr = 22;
 /// A copy of the interrupt capability with nothing on it.
 const BOOT_EDU_IRQ_NONE: cap::CapPtr = 23;
+/// Bootstrap's end of the log: every right, to hand out send-only copies.
+const LOG_ENDPOINT: cap::CapPtr = 24;
 
-/// The probe's four capabilities: somewhere to report, and its device.
-const PROBE_TASK_ENDPOINT: cap::CapPtr = 0;
-const PROBE_TASK_DEVICE: cap::CapPtr = 1;
-const PROBE_TASK_BAR: cap::CapPtr = 2;
-const PROBE_TASK_IRQ: cap::CapPtr = 3;
-
-/// What the probe reports, in the order it reports it.
-const LABEL_PROBE_CONFIG: u64 = 20;
-const LABEL_PROBE_MEMORY: u64 = 21;
-const LABEL_PROBE_RAISED: u64 = 22;
-const LABEL_PROBE_WORKED: u64 = 23;
+/// Reports the `edu` driver makes before it settles.
 const PROBE_MESSAGES: usize = 4;
 
-/// QEMU's `edu` device, from its own documentation (docs/specs/edu.rst).
-const EDU_VENDOR: u16 = 0x1234;
-const EDU_DEVICE: u16 = 0x11e8;
-/// What its identification register reads: version 1.0, then "ed".
-const EDU_IDENT: u64 = 0x0100_00ed;
-/// A number to write to its liveness register, which answers with every bit
-/// turned over.
-const EDU_PROBE: u32 = 0x1234_5678;
-/// What to ask it the factorial of, and the answer.
-const EDU_INPUT: u32 = 10;
-const EDU_FACTORIAL: u64 = 3_628_800;
+/// The log server's two capabilities.
+const LOG_TASK_ENDPOINT: cap::CapPtr = 0;
+const LOG_TASK_CONSOLE: cap::CapPtr = 1;
 
-/// A **driver** in ring 3, in miniature.
+/// Most bytes of one line the log will hold for a program before printing
+/// what it has. A program cannot make the kernel remember more than this.
+const LOG_LINE_MAX: usize = 240;
+
+/// Where ring 3 programs print.
 ///
-/// It holds a device, one BAR of it, its interrupt, and an endpoint to
-/// report on, and it does what every driver does: reads its device's
-/// identity, turns on memory decoding and bus mastering, maps the registers,
-/// pokes them, and waits for the device to interrupt.
-///
-/// The second interrupt is the one that counts. The first is raised by a
-/// register write, synchronously; the second arrives when the device has
-/// finished working something out, on its own time, with this task blocked
-/// in the kernel and nothing polling.
-#[unsafe(naked)]
-extern "C" fn user_probe() {
-    core::arch::naked_asm!(
-        // No capability rides along with anything this task sends.
-        "mov r12, {no_slot}",
+/// A kernel task holding the receive half of one endpoint and a console
+/// capability. A program that was handed the send half can put a line on the
+/// console; a program that was not cannot, and nothing in the runtime changes
+/// that. Lines arrive thirty-two bytes at a time, because that is what fits
+/// in a message, and are printed whole under the name of the task that sent
+/// them -- which the kernel knows, and the sender cannot fake.
+extern "C" fn log_server() {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use corrode_abi::log;
 
-        // Who am I driving? Vendor and device in one doubleword.
-        "mov rax, {config_read}",
-        "mov rdi, {device}",
-        "xor esi, esi",
-        "mov edx, 4",
-        "int {gate}",
-        "mov rbx, rdx",
+    // One unfinished line per sender.
+    let mut partial: Vec<(usize, String)> = Vec::new();
 
-        // Try to move the device: write all ones to BAR 0. Expect a refusal.
-        "mov rax, {config_write}",
-        "mov rdi, {device}",
-        "mov esi, {bar0}",
-        "mov edx, 4",
-        "mov r10, -1",
-        "int {gate}",
-        "mov r14, rax",
+    loop {
+        let Ok(received) = ipc::recv(LOG_TASK_ENDPOINT, None, None) else {
+            return;
+        };
+        let mut buffer = [0u8; ipc::TEXT_CAPACITY];
+        let length = received.message.text_bytes(&mut buffer);
+        let text = core::str::from_utf8(&buffer[..length]).unwrap_or("?");
 
-        // The command register is ours. Memory decoding, and bus mastering:
-        // a message signalled interrupt is a write the device makes itself.
-        "mov rax, {config_read}",
-        "mov rdi, {device}",
-        "mov esi, {command}",
-        "mov edx, 2",
-        "int {gate}",
-        "or rdx, {decode_and_master}",
-        "mov r10, rdx",
-        "mov rax, {config_write}",
-        "mov rdi, {device}",
-        "mov esi, {command}",
-        "mov edx, 2",
-        "int {gate}",
-        "mov r15, rax",
+        let index = match partial.iter().position(|(from, _)| *from == received.from) {
+            Some(index) => index,
+            None => {
+                partial.push((received.from, String::new()));
+                partial.len() - 1
+            }
+        };
+        let line = &mut partial[index].1;
+        if line.len() + text.len() <= LOG_LINE_MAX {
+            line.push_str(text);
+        }
 
-        "mov rax, {send}",
-        "mov rdi, {endpoint}",
-        "mov rsi, {label_config}",
-        "mov rdx, rbx",
-        "mov r10, r14",
-        "mov r8, r15",
-        "xor r9, r9",
-        "int {gate}",
+        if received.message.label == log::LINE {
+            let name = task::name_of(received.from).unwrap_or("?");
+            let out = alloc::format!("{:<11}: {}\n", name, line);
+            let _ = cap::console_write(LOG_TASK_CONSOLE, &out);
+            partial.swap_remove(index);
+        }
+    }
+}
 
-        // Where are my registers? The kernel answers; we never tell it.
-        "mov rax, {map}",
-        "mov rdi, {bar}",
-        "int {gate}",
-        "test rax, rax",
-        "jnz 9f",
-        "mov rbx, rdx", // base
-        "mov r14, r10", // length
+/// Start the log server, and keep the endpoint to hand out.
+fn start_log() {
+    use cap::Rights;
 
-        // Identification, then liveness: it returns what was written with
-        // every bit turned over, which no stale read could produce.
-        "mov ebp, [rbx]",
-        "mov dword ptr [rbx + 4], {probe}",
-        "mov r15d, [rbx + 4]",
-
-        "mov rax, {send}",
-        "mov rdi, {endpoint}",
-        "mov rsi, {label_memory}",
-        "mov rdx, rbp",
-        "mov r10, r15",
-        "mov r8, r14",
-        "mov r9, rbx",
-        "int {gate}",
-
-        // Tell the device to interrupt, and wait for it to.
-        "mov dword ptr [rbx + 0x60], 1",
-        "mov rax, {recv}",
-        "mov rdi, {irq}",
-        "mov rsi, {no_slot}",
-        "mov rdx, {no_slot}",
-        "int {gate}",
-        "mov r14, rax", // status
-        "mov r15, rdx", // how many
-        "mov r13, rdi", // who from
-        "mov ebp, [rbx + 0x24]",
-        // Acknowledge, or the device believes it is still asking.
-        "mov dword ptr [rbx + 0x64], 1",
-
-        "mov rax, {send}",
-        "mov rdi, {endpoint}",
-        "mov rsi, {label_raised}",
-        "mov rdx, r14",
-        "mov r10, r15",
-        "mov r8, rbp",
-        "mov r9, r13",
-        "int {gate}",
-
-        // Now some work: a factorial, with an interrupt when it is done.
-        "mov dword ptr [rbx + 0x20], 0x80",
-        "mov dword ptr [rbx + 0x08], {input}",
-        "mov rax, {recv}",
-        "mov rdi, {irq}",
-        "mov rsi, {no_slot}",
-        "mov rdx, {no_slot}",
-        "int {gate}",
-        "mov r14, rax",
-        "mov r15, rdx",
-        "mov ebp, [rbx + 0x08]",
-        "mov r13d, [rbx + 0x24]",
-        "mov dword ptr [rbx + 0x64], 1",
-
-        "mov rax, {send}",
-        "mov rdi, {endpoint}",
-        "mov rsi, {label_worked}",
-        "mov rdx, r14",
-        "mov r10, r15",
-        "mov r8, rbp",
-        "mov r9, r13",
-        "int {gate}",
-
-        // Done. There is no ring 3 runtime to return to.
-        "9:",
-        "mov rax, {yield_op}",
-        "int {gate}",
-        "jmp 9b",
-
-        config_read = const syscall::SYS_CONFIG_READ,
-        config_write = const syscall::SYS_CONFIG_WRITE,
-        map = const syscall::SYS_MAP,
-        send = const syscall::SYS_SEND,
-        recv = const syscall::SYS_RECV,
-        yield_op = const syscall::SYS_YIELD,
-        no_slot = const syscall::NO_SLOT,
-        gate = const vectors::SYSCALL,
-        endpoint = const PROBE_TASK_ENDPOINT,
-        device = const PROBE_TASK_DEVICE,
-        bar = const PROBE_TASK_BAR,
-        irq = const PROBE_TASK_IRQ,
-        bar0 = const corrode_pci::BAR0,
-        command = const corrode_pci::COMMAND,
-        decode_and_master = const corrode_pci::COMMAND_MEMORY | corrode_pci::COMMAND_BUS_MASTER,
-        probe = const EDU_PROBE,
-        input = const EDU_INPUT,
-        label_config = const LABEL_PROBE_CONFIG,
-        label_memory = const LABEL_PROBE_MEMORY,
-        label_raised = const LABEL_PROBE_RAISED,
-        label_worked = const LABEL_PROBE_WORKED,
+    let minted = cap::mint(
+        0,
+        LOG_ENDPOINT,
+        cap::Object::Endpoint(ipc::Endpoint::new()),
+        Rights::ALL,
     )
+    .is_ok();
+    let server = task::spawn("log", log_server);
+    let granted = server.is_some_and(|id| {
+        cap::grant(id, LOG_ENDPOINT, LOG_TASK_ENDPOINT, Rights::READ).is_ok()
+            && cap::grant(id, 0, LOG_TASK_CONSOLE, Rights::READ_WRITE).is_ok()
+    });
+    check(
+        "program",
+        "start a log server holding the console",
+        minted && granted,
+    );
+    start_all(&[server]);
+}
+
+fn program_check(name: &str, ok: bool) {
+    check("program", name, ok);
+}
+
+/// Load a program from the bootloader's modules and make a task of it.
+///
+/// Says why not, if not: a missing module is a boot medium built without
+/// it, and a refused one is a file the loader will not run.
+fn spawn_program(name: &'static str) -> Option<usize> {
+    let Some(module) = modules::find(name) else {
+        println!("program    : no module called {name:?} was loaded");
+        return None;
+    };
+    match task::spawn_program(name, module.bytes) {
+        Ok(id) => Some(id),
+        Err(error) => {
+            println!("program    : {name:?} was not loaded: {error:?}");
+            None
+        }
+    }
+}
+
+/// What the bootloader left in RAM, and the loader's rules on the target.
+///
+/// The host tests feed the ELF reader files that lie. These are the things
+/// only a boot can show: that a real program built by the real toolchain
+/// loads, and that what ends up in its page tables is what its file asked
+/// for and no more.
+fn program_checks() {
+    use mm::paging::{NO_EXECUTE, USER, WRITABLE};
+
+    let mut count = 0;
+    for module in modules::all() {
+        println!(
+            "module     : {} -- {} KiB at {:#x}",
+            module.path,
+            module.bytes.len().div_ceil(1024),
+            module.physical
+        );
+        count += 1;
+    }
+    if count == 0 {
+        println!("module     : none -- the boot medium carries no programs");
+        return;
+    }
+
+    start_log();
+
+    // A file that is not a program, straight to the loader.
+    program_check(
+        "a file that is not a program is refused",
+        matches!(
+            task::user::load(b"not an ELF file, whatever its name says"),
+            Err(task::user::LoadError::Format(_))
+        ),
+    );
+
+    // A program that reads kernel memory. It gets nothing at all: no
+    // capability, so no way to say anything, and it does not need one.
+    let Some(module) = modules::find("fault") else {
+        return;
+    };
+    let Some(bomb) = spawn_program("fault") else {
+        program_check("load a program from a module", false);
+        return;
+    };
+    program_check(
+        "load a program from a module",
+        cap::slots_used(bomb) == Some(0),
+    );
+
+    if let (Some(space), Ok(elf)) = (
+        task::space_of(bomb),
+        corrode_elf::Elf::parse(
+            module.bytes,
+            corrode_abi::layout::IMAGE_BASE..corrode_abi::layout::IMAGE_END,
+        ),
+    ) {
+        // Every page of every segment, against the flags its file asked for.
+        let honoured = elf.segments().all(|segment| {
+            segment.pages().step_by(4096).all(|page| {
+                space.leaf_flags(page).is_some_and(|flags| {
+                    flags & USER != 0
+                        && (flags & WRITABLE != 0) == segment.writable
+                        && (flags & NO_EXECUTE == 0) == segment.executable
+                })
+            })
+        });
+        program_check(
+            "its pages carry the permissions its file asked for",
+            honoured,
+        );
+        let exclusive = elf.segments().all(|segment| {
+            segment.pages().step_by(4096).all(|page| {
+                space
+                    .leaf_flags(page)
+                    .is_some_and(|flags| flags & WRITABLE == 0 || flags & NO_EXECUTE != 0)
+            })
+        });
+        program_check("no page of it is writable and executable", exclusive);
+
+        let entry = space.translate(elf.entry());
+        let file = (module.physical..module.physical + module.bytes.len() as u64)
+            .contains(&entry.unwrap_or(0));
+        program_check(
+            "it runs from its own frames, not the file's",
+            entry.is_some() && !file,
+        );
+    }
+
+    #[cfg(not(feature = "user-test"))]
+    {
+        println!("program    : starting one that reads kernel memory (expect a task fault)");
+        start_all(&[Some(bomb)]);
+        // Wait for it to be stopped. Bounded: if the fault were somehow
+        // survivable this would otherwise sit here for good.
+        let deadline = time::now_ns() + 2_000_000_000;
+        while task::state_of(bomb) != Some(task::State::Finished) && time::now_ns() < deadline {
+            task::yield_now();
+        }
+        program_check(
+            "a program that faults is stopped",
+            task::state_of(bomb) == Some(task::State::Finished),
+        );
+        // This line being printed at all is the other half.
+        program_check("and the machine is not", true);
+    }
 }
 
 fn device_check(name: &str, ok: bool) {
@@ -2008,8 +2044,10 @@ fn device_check(name: &str, ok: bool) {
 fn device_checks() {
     use cap::{CapError, Rights};
 
-    let Some((index, edu)) = pci::find(|device| {
-        device.header.vendor == EDU_VENDOR && device.header.device == EDU_DEVICE
+    use corrode_abi::edu;
+
+    let Some((index, found)) = pci::find(|device| {
+        device.header.vendor == edu::VENDOR && device.header.device == edu::DEVICE_ID
     }) else {
         println!("device     : no edu test device on the bus -- nothing to drive");
         return;
@@ -2023,11 +2061,11 @@ fn device_checks() {
     };
 
     // The task first: its interrupt is aimed at the CPU it is pinned to.
-    let Some(probe) = task::spawn_user("probe", user_probe) else {
-        device_check("spawned a ring 3 task to drive a device", false);
+    let Some(driver) = spawn_program("edu") else {
+        device_check("load the driver from a module", false);
         return;
     };
-    let line = task::cpu_of(probe).and_then(|cpu| irq::create(index, 0, cpu));
+    let line = task::cpu_of(driver).and_then(|cpu| irq::create(index, 0, cpu));
 
     let minted = cap::mint(
         0,
@@ -2051,7 +2089,7 @@ fn device_checks() {
     let Some(line) = line else {
         println!(
             "device     : no interrupt line for {} -- it has no MSI",
-            edu.address
+            found.address
         );
         return;
     };
@@ -2071,15 +2109,16 @@ fn device_checks() {
             && irq::wait(BOOT_EDU_IRQ_NONE) == Err(CapError::InsufficientRights),
     );
 
-    let granted = cap::grant(probe, PROBE_ENDPOINT, PROBE_TASK_ENDPOINT, Rights::WRITE).is_ok()
-        && cap::grant(probe, BOOT_EDU, PROBE_TASK_DEVICE, Rights::READ_WRITE).is_ok()
-        && cap::grant(probe, BOOT_EDU_BAR, PROBE_TASK_BAR, Rights::READ_WRITE).is_ok()
-        && cap::grant(probe, BOOT_EDU_IRQ, PROBE_TASK_IRQ, Rights::READ).is_ok();
+    let granted = cap::grant(driver, PROBE_ENDPOINT, edu::REPORT, Rights::WRITE).is_ok()
+        && cap::grant(driver, BOOT_EDU, edu::DEVICE, Rights::READ_WRITE).is_ok()
+        && cap::grant(driver, BOOT_EDU_BAR, edu::BAR, Rights::READ_WRITE).is_ok()
+        && cap::grant(driver, BOOT_EDU_IRQ, edu::IRQ, Rights::READ).is_ok()
+        && cap::grant(driver, LOG_ENDPOINT, edu::LOG, Rights::WRITE).is_ok();
     device_check(
-        "grant the probe its device and somewhere to report",
-        granted && cap::slots_used(probe) == Some(4),
+        "grant the driver its device and somewhere to report",
+        granted && cap::slots_used(driver) == Some(5),
     );
-    start_all(&[Some(probe)]);
+    start_all(&[Some(driver)]);
 
     for _ in 0..PROBE_MESSAGES {
         let received = match ipc::recv(PROBE_ENDPOINT, None, None) {
@@ -2092,7 +2131,7 @@ fn device_checks() {
         let words = received.message.words;
 
         match received.message.label {
-            LABEL_PROBE_CONFIG => {
+            edu::LABEL_CONFIG => {
                 println!(
                     "device     : ring 3 read {:04x}:{:04x} from its configuration space",
                     words[0] & 0xffff,
@@ -2100,7 +2139,7 @@ fn device_checks() {
                 );
                 device_check(
                     "ring 3 read its device's identity",
-                    words[0] == (EDU_DEVICE as u64) << 16 | EDU_VENDOR as u64,
+                    words[0] == (edu::DEVICE_ID as u64) << 16 | edu::VENDOR as u64,
                 );
                 device_check(
                     "ring 3 cannot move its device's BAR",
@@ -2114,7 +2153,7 @@ fn device_checks() {
                 );
             }
 
-            LABEL_PROBE_MEMORY => {
+            edu::LABEL_MEMORY => {
                 println!(
                     "device     : {} KiB of registers at {:#x} in ring 3, identifying as {:#010x}",
                     words[2] / 1024,
@@ -2125,12 +2164,15 @@ fn device_checks() {
                     "the kernel chose where the registers went",
                     words[3] == device::user_address(region) && words[2] == bar.len,
                 );
-                device_check("ring 3 read a device register", words[0] == EDU_IDENT);
+                device_check(
+                    "ring 3 read a device register",
+                    words[0] == edu::IDENT as u64,
+                );
                 device_check(
                     "ring 3 wrote one, and the device answered",
-                    words[1] == !EDU_PROBE as u64,
+                    words[1] == !edu::PROBE as u64,
                 );
-                let theirs = task::space_of(probe)
+                let theirs = task::space_of(driver)
                     .and_then(|space| space.translate(device::user_address(region)));
                 device_check(
                     "that address is the BAR, by its page tables",
@@ -2138,7 +2180,7 @@ fn device_checks() {
                 );
             }
 
-            LABEL_PROBE_RAISED => {
+            edu::LABEL_RAISED => {
                 device_check(
                     "an interrupt arrived in ring 3 as a message",
                     words[0] == syscall::STATUS_OK
@@ -2148,10 +2190,11 @@ fn device_checks() {
                 device_check("the device agrees it was the one asking", words[2] == 1);
             }
 
-            LABEL_PROBE_WORKED => {
+            edu::LABEL_WORKED => {
                 println!(
                     "device     : ring 3 asked for {}!, slept, and was woken with {}",
-                    EDU_INPUT, words[2]
+                    edu::INPUT,
+                    words[2]
                 );
                 device_check(
                     "the device interrupted when its work was done",
@@ -2159,7 +2202,7 @@ fn device_checks() {
                 );
                 device_check(
                     "and the answer was there to read",
-                    words[2] == EDU_FACTORIAL,
+                    words[2] == edu::FACTORIAL as u64,
                 );
             }
 

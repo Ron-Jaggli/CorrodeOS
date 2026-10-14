@@ -1,6 +1,17 @@
 [workspace]
 resolver = "2"
-members = ["kernel", "render", "text", "gfx", "pci"]
+members = [
+    "kernel",
+    "render",
+    "text",
+    "gfx",
+    "pci",
+    "abi",
+    "elf",
+    "user/rt",
+    "user/edu",
+    "user/fault",
+]
 
 [workspace.package]
 version = "0.0.1"

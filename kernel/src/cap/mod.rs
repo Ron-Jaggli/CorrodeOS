@@ -36,6 +36,8 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use corrode_abi::kind;
+
 use crate::task;
 
 /// How a task names a capability: an index into its own capability space.
@@ -192,15 +194,15 @@ impl core::fmt::Debug for Object {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ObjectKind {
-    Console = 1,
-    Frame = 2,
-    Task = 3,
-    Endpoint = 4,
-    Reply = 5,
-    Surface = 6,
-    PciDevice = 7,
-    DeviceMemory = 8,
-    Interrupt = 9,
+    Console = kind::CONSOLE,
+    Frame = kind::FRAME,
+    Task = kind::TASK,
+    Endpoint = kind::ENDPOINT,
+    Reply = kind::REPLY,
+    Surface = kind::SURFACE,
+    PciDevice = kind::PCI_DEVICE,
+    DeviceMemory = kind::DEVICE_MEMORY,
+    Interrupt = kind::INTERRUPT,
 }
 
 impl Object {
@@ -285,19 +287,21 @@ impl CapError {
     /// Written out rather than derived from the enum's discriminant: a user
     /// program compiled against these numbers must not be broken by someone
     /// reordering the variants, and zero is reserved for success so a status
-    /// register reads the obvious way.
+    /// register reads the obvious way. The numbers are in `corrode-abi`,
+    /// where a ring 3 program reads the same ones.
     pub const fn code(self) -> u64 {
+        use corrode_abi::error;
         match self {
-            CapError::Empty => 1,
-            CapError::OutOfRange => 2,
-            CapError::Occupied => 3,
-            CapError::InsufficientRights => 4,
-            CapError::WrongType => 5,
-            CapError::NoSuchTask => 6,
-            CapError::Stale => 7,
-            CapError::Refused => 8,
-            CapError::NoSpace => 9,
-            CapError::Invalid => 10,
+            CapError::Empty => error::EMPTY,
+            CapError::OutOfRange => error::OUT_OF_RANGE,
+            CapError::Occupied => error::OCCUPIED,
+            CapError::InsufficientRights => error::INSUFFICIENT_RIGHTS,
+            CapError::WrongType => error::WRONG_TYPE,
+            CapError::NoSuchTask => error::NO_SUCH_TASK,
+            CapError::Stale => error::STALE,
+            CapError::Refused => error::REFUSED,
+            CapError::NoSpace => error::NO_SPACE,
+            CapError::Invalid => error::INVALID,
         }
     }
 }

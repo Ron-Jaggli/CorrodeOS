@@ -14,6 +14,8 @@ bench = false
 corrode-render = { path = "../render" }
 corrode-text = { path = "../text" }
 corrode-pci = { path = "../pci" }
+corrode-abi = { path = "../abi" }
+corrode-elf = { path = "../elf" }
 
 [features]
 # Deliberately take a page fault at the end of boot to exercise the trap

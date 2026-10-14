@@ -655,23 +655,36 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
         .copied()
         .unwrap_or("interrupt");
 
-    // Stop the other CPUs before saying anything. They are still running tasks
-    // on a machine whose state is now in question, and their output would
-    // interleave with the report line by line. This is also what makes
-    // breaking the console lock below meaningful rather than a race.
-    lapic::broadcast(vectors::HALT);
+    // An exception taken in ring 3 is that task's problem. It is reported
+    // and the task is stopped; nothing else is. The CPU wrote CS into the
+    // frame itself, so this is not a claim the faulting code could make.
+    let from_user = frame_ref.cs & 3 == 3 && vector < 32;
 
-    // This path never returns, so the console lock can be broken -- but only if
-    // this CPU is the one holding it. Without that, faulting while holding it
-    // would deadlock and we would lose the one message that explains what
-    // happened; with it, a lock held by another core is waited for instead of
-    // stolen.
-    // SAFETY: `halt_forever` at the end of this function guarantees we never
-    // resume the interrupted code, so no in-progress print can be corrupted.
-    unsafe { crate::serial::force_unlock() };
+    if from_user {
+        // No lock is broken and nobody is halted: this CPU was in ring 3, so
+        // it holds no kernel lock, and the console is taken the ordinary way.
+        crate::println!();
+        crate::println!("*** TASK FAULT ***");
+    } else {
+        // Stop the other CPUs before saying anything. They are still running
+        // tasks on a machine whose state is now in question, and their output
+        // would interleave with the report line by line. This is also what
+        // makes breaking the console lock below meaningful rather than a race.
+        lapic::broadcast(vectors::HALT);
 
-    crate::println!();
-    crate::println!("*** UNHANDLED TRAP ***");
+        // This path never returns, so the console lock can be broken -- but
+        // only if this CPU is the one holding it. Without that, faulting
+        // while holding it would deadlock and we would lose the one message
+        // that explains what happened; with it, a lock held by another core
+        // is waited for instead of stolen.
+        // SAFETY: `halt_forever` at the end of this function guarantees we
+        // never resume the interrupted code, so no in-progress print can be
+        // corrupted.
+        unsafe { crate::serial::force_unlock() };
+
+        crate::println!();
+        crate::println!("*** UNHANDLED TRAP ***");
+    }
     crate::println!("vector     : {} ({})", vector, name);
     crate::println!("error code : {:#x}", frame_ref.error_code);
     crate::println!(
@@ -729,6 +742,15 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
     crate::println!("rcx {:#018x}  rdx {:#018x}", frame_ref.rcx, frame_ref.rdx);
     crate::println!("rsi {:#018x}  rdi {:#018x}", frame_ref.rsi, frame_ref.rdi);
     crate::println!("rbp {:#018x}  r8  {:#018x}", frame_ref.rbp, frame_ref.r8);
+
+    if from_user {
+        if let Some((id, task)) = crate::task::finish_current() {
+            crate::println!("stopped    : task {id} ({task}); everything else carries on");
+        }
+        // The frame is abandoned where it lies. The scheduler hands back
+        // somebody else's, and this task is never picked again.
+        return crate::task::on_tick(frame);
+    }
 
     halt_forever();
 }

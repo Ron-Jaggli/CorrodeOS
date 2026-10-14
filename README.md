@@ -39,7 +39,7 @@ Then:
 ./corrode wx-test     # boot and prove .text is not writable
 ./corrode user-test   # boot and prove ring 3 cannot read kernel memory
 ./corrode check       # cargo check
-./corrode test        # render, text, gfx and pci crate unit tests, on the build host
+./corrode test        # render, text, gfx, pci and elf crate unit tests, on the build host
 ./corrode specimen    # draw a sheet of the typeface to build/specimen.png
 ./corrode shell       # drop into the build container
 ```
@@ -73,6 +73,7 @@ kernel/          the privileged kernel
   src/pci.rs       the PCI bus: what is on it, and devices as capabilities
   src/device.rs    a device's registers, mapped into the task that holds them
   src/irq.rs       device interrupts, as messages to whoever holds the line
+  src/modules.rs   files the bootloader left in RAM
   src/time.rs      monotonic nanosecond clock, off the TSC
   src/arch/x86_64/cpu.rs  which CPU is this
   build.rs         makes cargo notice linker.ld changes
@@ -88,6 +89,13 @@ gfx/             the 3D engine: integer-only, software, not yet on screen
 text/            the text engine
   src/lib.rs       strings to coverage: measuring, placing, inking
   src/font.rs      the typeface, as pen strokes you can read and edit
+abi/             the numbers kernel and programs agree on: syscalls, errors, slots
+elf/             reading a program file, tested on the build host against liars
+user/            ring 3 programs, each an ELF file loaded as a Limine module
+  rt/              the runtime: entry, syscalls, devices, println!, panics
+  edu/             a driver for QEMU's teaching device
+  fault/           a program that faults on purpose
+  user.ld          where a program's segments go
 pci/             PCI configuration space as arithmetic, tested on the build host
   src/lib.rs       headers, BARs, capability lists, MSI, what a driver may write
   src/mcfg.rs      the ACPI table that says where configuration space is
@@ -199,6 +207,11 @@ The PCI bus: every function found at boot, through ECAM or the legacy ports,
 and a device's configuration space and each of its BARs as capability
 objects. A ring 3 task holding those can map the device's registers and
 block until it interrupts, and holds nothing else. See "Devices" below.
+
+Programs: ring 3 tasks loaded from ELF files the bootloader put in RAM,
+written in Rust against a small runtime. A driver is one of these, and a
+program that faults is stopped without stopping anything else. See
+"Programs" below.
 
 Not yet: migrating a task between CPUs, reclaiming frames and stacks.
 
@@ -573,8 +586,9 @@ runs where the waiter does and switches to it on the way out instead of
 leaving it for the next tick.
 
 The proof is QEMU's `edu` device, which every run now has plugged in, and a
-ring 3 task holding four capabilities: the device, its BAR, its interrupt,
-and an endpoint to report on.
+driver for it -- since "Programs" below, an ordinary Rust program -- holding
+five capabilities: the device, its BAR, its interrupt, an endpoint to report
+on and one to log to.
 
 ```
 device     : ring 3 read 1234:11e8 from its configuration space
@@ -601,8 +615,7 @@ per line, and a task cannot wait for an interrupt *or* a message from a
 client in one receive -- that wants a line bound to an endpoint. A waiter
 on a different CPU from the one its line is aimed at is found at that
 core's next tick. Device memory is mapped uncached; a framebuffer wants
-write-combining, which needs the PAT set up. And a ring 3 task that faults
-still stops the machine rather than itself.
+write-combining, which needs the PAT set up.
 
 Known gaps: one segment, and only the buses firmware already numbered -- a
 bridge left at bus 0 is recorded and not descended into, and nothing assigns
@@ -613,6 +626,111 @@ so a driver that can make its device do DMA can reach all of physical
 memory.** The capability model bounds what a driver can ask the kernel for;
 it does not yet bound what the driver's hardware can do on its behalf. No
 hotplug, no AML, no power management.
+
+### Programs
+
+A driver is not part of the kernel, so it should not be built with it. A
+**program** is an ELF executable, compiled on its own against a small
+runtime, carried on the ISO as a Limine module and so in RAM before the
+kernel's first instruction. The kernel reads the file, builds an address
+space from it, and starts a task there holding nothing.
+
+```
+module     : /boot/programs/edu -- 23 KiB at 0x1fca9000
+module     : /boot/programs/fault -- 5 KiB at 0x1fca3000
+program    : its pages carry the permissions its file asked for  PASS
+program    : no page of it is writable and executable            PASS
+program    : it runs from its own frames, not the file's         PASS
+...
+edu        : 10! is 3628800, says the device (and it is right)
+```
+
+#### The loader trusts nothing it reads
+
+The ELF reader is `elf/`, a crate with no kernel in it, because it is a
+parser of untrusted input running in ring 0 and every way a file can lie
+should be a test on the build host. It accepts one shape: a 64-bit x86-64
+executable linked at fixed addresses, with no dynamic section and no
+interpreter, whose loadable segments each lie wholly inside the user image
+range, share no page with one another, and are never writable and executable
+at once. `Elf::parse` checks all of it before anything is described, so the
+kernel's loader has exactly one way to fail -- running out of memory -- and
+no file can make it map anything anywhere it should not. Offsets and lengths
+from the file are checked arithmetic throughout; the tests include a table
+offset that wraps, a segment whose end wraps, and every single-byte
+corruption of a real header, none of which may panic.
+
+Segments are copied into fresh, zeroed frames rather than mapped from the
+module. The file stays as the bootloader left it, and a program writing its
+own data writes nobody's file.
+
+#### The runtime
+
+`user/rt` is what a program has instead of a standard library: `_start`,
+the system call instruction written once, the calls as functions taking
+slots and returning `Result`, `println!`, and a panic handler. Its device
+module wraps the three capabilities a driver holds -- configuration space
+(implementing the same `ConfigSpace` trait the kernel scans with, so the
+`pci` crate's decoding runs unchanged in ring 3), registers with every access
+bounds-checked against the length the kernel reported, and an interrupt to
+wait on. There is no allocator.
+
+Every function takes a slot number, because there is nothing else to name
+things by. A program handed nothing can call all of it and every call fails
+the same way.
+
+The numbers both sides must agree on -- system calls, error codes, object
+kinds, rights bits, the slots and labels of the protocols spoken at boot --
+moved to `abi/`, which the kernel and the runtime both build against. Two
+copies of a syscall number is a bug no compiler finds.
+
+Programs are built with their own flags and their own linker script, and
+cargo applies a target's flags to every crate built for it, so the Makefile
+builds them with `RUSTFLAGS` set -- which replaces `.cargo/config.toml`'s
+outright -- into a separate target directory. The ISO's `limine.conf` is
+`boot/limine.conf` plus a `module_path` line for each program built.
+
+#### Printing is a capability, still
+
+There is no console in ring 3. A program given a send-only endpoint to the
+**log** -- a kernel task holding the receive half and a console capability
+-- can send it text, thirty-two bytes a message, and the log prints each
+line under the name of the task that sent it. The kernel knows who sent a
+message, so a program cannot print as someone else. A program not given the
+endpoint has `println!` and it does nothing.
+
+#### A fault stops the task, not the machine
+
+An exception taken in ring 3 is now that task's problem: it is reported and
+the task is finished, and the machine carries on. The test is a program
+that reads a kernel address and was given no capabilities at all:
+
+```
+*** TASK FAULT ***
+vector     : 14 (page fault)
+error code : 0x5
+rip        : 0x000000000040000a  cs : 0x23
+cr2        : 0xffffffff80000000
+cause      : protection violation on read in user mode
+stopped    : task 12 (fault); everything else carries on
+program    : a program that faults is stopped                    PASS
+program    : and the machine is not                              PASS
+```
+
+A fault in ring 0 still halts every CPU, as it should. A program can also
+end itself with `SYS_EXIT`; the runtime calls it when `main` returns.
+
+Two additions to the system call ABI came with this, both ones it had
+already pointed to: a reply can carry a capability, by `r12` and `r13` as a
+send does, and a call names in `r14` where a capability in its answer should
+land.
+
+Known gaps: nothing a finished task held is reclaimed -- frames, stack,
+capabilities -- and a task blocked on one waits for good. The older ring 3
+checks are still naked assembly in the kernel image, because they predate
+the loader and prove things about the boundary that do not need a program.
+Programs are started by boot code that knows each one's slots; there is no
+general way yet for one program to start another.
 
 ### Text
 
@@ -893,7 +1011,7 @@ ignore DPL, so keeping every other gate at DPL 0 costs nothing.
 `./corrode user-test` puts a ring 3 task in front of a kernel address and
 requires the read to fault. It reports error code 0x5 — protection violation,
 user mode — with `cs 0x23`, `ss 0x1b` and CR2 holding the kernel address it
-reached for. Without that test the ring boundary is a claim about descriptor
+reached for, and the task is stopped while the machine carries on. Without that test the ring boundary is a claim about descriptor
 bits rather than an observed property.
 
 #### The syscall boundary takes no pointers
@@ -926,7 +1044,10 @@ syscalls are an optimisation to make against a mechanism that already works.
 
 #### Where user code comes from
 
-There is no loader and no filesystem, so a user program is a function in the
+(Since "Programs" above, mostly from ELF files. What follows is how the
+first ring 3 checks still work.)
+
+Before there was a loader, a user program was a function in the
 kernel image whose frames are mapped a second time at a user address, read and
 execute, never writable. It follows that such a function must be entirely
 self-contained: a call to another kernel function, or a `&str` in `.rodata`,
@@ -1217,7 +1338,9 @@ scan agreeing with itself through two mechanisms, and a device and a BAR as
 capabilities: what reads, what writes, what is refused and why. Seventeen
 device checks hand QEMU's test device to a ring 3 task and confirm it read its
 identity, was refused its BAR, mapped its registers where the kernel chose,
-and was woken twice by interrupts and no more. Three
+and was woken twice by interrupts and no more. Eight program checks load real
+ELF files from modules, compare every page's permissions with what the file
+asked for, and stop a program that faults without stopping the machine. Three
 blend checks confirm a fade is exact at both ends and seamless over its own
 colour, two text checks that letters stay inside the block measured for them
 and a stroke is the thickness its weight says, and two scene checks that the
@@ -1229,8 +1352,8 @@ and then using it to judge that same counter is circular, and hides exactly the
 case where a timer runs at the wrong rate — which is how a broken calibration
 went unnoticed until it was measured against something independent.
 
-Four more are opt-in because they end the boot: `./corrode fault-test` takes a
-deliberate page fault to exercise trap reporting, `./corrode wx-test` is
-described above, `./corrode stack-test` overflows a task stack to prove the
-guard pages work, and `./corrode user-test` has a ring 3 task read a kernel
-address to prove it cannot.
+Four more are opt-in: `./corrode fault-test` takes a
+deliberate page fault in the kernel to exercise trap reporting, `./corrode
+wx-test` is described above, `./corrode stack-test` overflows a task stack to
+prove the guard pages work -- those three end the boot -- and `./corrode
+user-test` has a ring 3 task read a kernel address to prove it cannot.

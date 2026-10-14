@@ -1,0 +1,9 @@
+[package]
+name = "corrode-rt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+corrode-abi = { path = "../../abi" }
+corrode-pci = { path = "../../pci" }

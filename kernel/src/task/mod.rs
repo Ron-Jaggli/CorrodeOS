@@ -111,7 +111,7 @@ pub struct Task {
 }
 
 /// Slots per capability space.
-pub const CSPACE_SLOTS: usize = 32;
+pub const CSPACE_SLOTS: usize = 64;
 
 /// A copy of a task's status, for reporting without holding the lock.
 #[derive(Debug, Clone, Copy)]
@@ -322,6 +322,16 @@ pub fn spawn_user(name: &'static str, entry: extern "C" fn()) -> Option<usize> {
     spawn_inner(name, image.entry, Some(image), next_cpu())
 }
 
+/// Create a ring 3 task from a program: an ELF file already in memory.
+///
+/// This is what a driver is. Nothing about the task differs from one made by
+/// [`spawn_user`] except where its code came from -- it starts in ring 3, in
+/// an address space of its own, holding no capabilities at all.
+pub fn spawn_program(name: &'static str, file: &[u8]) -> Result<usize, user::LoadError> {
+    let image = user::load(file)?;
+    spawn_inner(name, image.entry, Some(image), next_cpu()).ok_or(user::LoadError::OutOfMemory)
+}
+
 fn spawn_inner(
     name: &'static str,
     entry_rip: u64,
@@ -470,6 +480,28 @@ extern "C" fn task_exit() -> ! {
     }
 }
 
+/// Mark the task on this CPU finished, and say which it was.
+///
+/// For a task that has asked to stop, or has faulted in ring 3 and is being
+/// stopped. The caller is in a trap handler on that task's kernel stack and
+/// must hand back somebody else's frame straight afterwards: this only
+/// changes what the scheduler will pick.
+///
+/// Nothing the task held is reclaimed -- not its frames, not its stack, not
+/// its capabilities -- and a task blocked on it stays blocked. Those are the
+/// same gaps as everywhere else, met from a new direction.
+pub fn finish_current() -> Option<(usize, &'static str)> {
+    x86_64::without_interrupts(|| {
+        let this_cpu = cpu::index();
+        let mut guard = SCHEDULER.lock();
+        let scheduler = guard.as_mut()?;
+        let current = scheduler.current[this_cpu];
+        let task = scheduler.tasks.get_mut(current)?;
+        task.state = State::Finished;
+        Some((task.id, task.name))
+    })
+}
+
 /// Give up the rest of this time slice.
 ///
 /// Implemented as a software interrupt so it goes through exactly the same path
@@ -611,6 +643,16 @@ impl Default for TaskInfo {
 /// is made from the contents of that space, never from this number.
 pub fn current_id() -> Option<usize> {
     x86_64::without_interrupts(|| Some(SCHEDULER.lock().as_ref()?.current[cpu::index()]))
+}
+
+/// Whether a task is new, runnable, blocked or finished.
+pub fn state_of(id: usize) -> Option<State> {
+    x86_64::without_interrupts(|| Some(SCHEDULER.lock().as_ref()?.tasks.get(id)?.state))
+}
+
+/// What a task is called.
+pub fn name_of(id: usize) -> Option<&'static str> {
+    x86_64::without_interrupts(|| Some(SCHEDULER.lock().as_ref()?.tasks.get(id)?.name))
 }
 
 /// The CPU a task is pinned to.

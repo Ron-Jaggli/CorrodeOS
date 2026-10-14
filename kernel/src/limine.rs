@@ -318,6 +318,76 @@ pub static RSDP: RsdpRequest = RsdpRequest {
 };
 
 // ---------------------------------------------------------------------------
+// Modules
+// ---------------------------------------------------------------------------
+
+/// A file the bootloader read into memory because the configuration named
+/// it: a user program, or a blob of firmware.
+///
+/// Only the first four fields are declared. The structure goes on to say
+/// which disk the file came from, and nothing here will ever care.
+#[repr(C)]
+pub struct File {
+    pub revision: u64,
+    /// Where the file is, 4 KiB aligned.
+    address: *mut u8,
+    pub size: u64,
+    path: *const c_char,
+}
+
+impl File {
+    /// The path the file was loaded from, as the configuration spelled it.
+    pub fn path(&self) -> &'static str {
+        // SAFETY: bootloader-provided NUL-terminated string in memory we never
+        // reclaim.
+        unsafe { cstr(self.path) }
+    }
+
+    /// The address the bootloader reported, which may be physical or through
+    /// the direct map depending on the base revision.
+    pub fn address(&self) -> u64 {
+        self.address as u64
+    }
+}
+
+#[repr(C)]
+pub struct ModuleResponse {
+    pub revision: u64,
+    pub module_count: u64,
+    modules: *mut *mut File,
+}
+
+impl ModuleResponse {
+    pub fn files(&self) -> impl Iterator<Item = &'static File> + '_ {
+        (0..self.module_count).filter_map(move |i| {
+            if self.modules.is_null() {
+                return None;
+            }
+            // SAFETY: `i < module_count`, and the bootloader guarantees
+            // `modules` points at that many valid `File` pointers.
+            Some(unsafe { &**self.modules.add(i as usize) })
+        })
+    }
+}
+
+#[repr(C)]
+pub struct ModuleRequest {
+    id: [u64; 4],
+    revision: u64,
+    pub response: ResponsePtr<ModuleResponse>,
+}
+
+/// Everything that is not the kernel arrives this way: in RAM before the
+/// first instruction runs, so nothing started at boot ever waits on a disk.
+#[used]
+#[link_section = ".requests"]
+pub static MODULES: ModuleRequest = ModuleRequest {
+    id: [MAGIC0, MAGIC1, 0x3e7e_2797_02be_32af, 0xca1c_4f3b_d128_0cee],
+    revision: 0,
+    response: ResponsePtr::null(),
+};
+
+// ---------------------------------------------------------------------------
 // Symmetric multiprocessing
 // ---------------------------------------------------------------------------
 

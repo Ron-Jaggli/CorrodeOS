@@ -54,13 +54,32 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 # VNC display number; :0 is TCP 5900, which is what ./corrode publishes.
 VNC_DISPLAY ?= 0
 
-.PHONY: all kernel iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
+.PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
 
 kernel:
-	cargo build $(CARGO_FLAGS)
+	cargo build -p corrode-kernel $(CARGO_FLAGS)
 	@scripts/check-image.sh $(KERNEL)
+
+# Ring 3 programs: drivers, and the two that exist to be boot checks. Each is
+# an ordinary ELF executable, put on the ISO as a Limine module so it is in
+# RAM before the kernel starts.
+#
+# They are built with different flags from the kernel -- their own linker
+# script, no kernel code model -- and cargo applies a target's flags to every
+# crate built for it. RUSTFLAGS in the environment replaces the ones in
+# .cargo/config.toml outright, and a separate target directory stops the two
+# sets of flags from invalidating each other's build of the crates they share.
+USER_PROGRAMS := edu fault
+USER_TARGET   := target/user
+USER_BIN      := $(USER_TARGET)/x86_64-unknown-none/release
+USER_RUSTFLAGS := -C relocation-model=static -C strip=debuginfo \
+                  -C link-arg=-T$(CURDIR)/user/user.ld
+
+user:
+	RUSTFLAGS="$(USER_RUSTFLAGS)" cargo build --release --target-dir $(USER_TARGET) \
+	    $(foreach program,$(USER_PROGRAMS),-p corrode-$(program))
 
 check:
 	cargo check $(CARGO_FLAGS)
@@ -74,7 +93,7 @@ clippy:
 HOST_TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
 
 test:
-	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci --target $(HOST_TARGET)
+	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci -p corrode-elf --target $(HOST_TARGET)
 
 # The 3D engine's demo scene, drawn on the build host at each preset, for
 # judging by eye. Built optimised, so the times it prints mean something.
@@ -101,10 +120,17 @@ fmt:
 
 $(KERNEL): kernel
 
-iso: $(KERNEL)
-	@mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/EFI/BOOT
+iso: $(KERNEL) user
+	@rm -rf $(ISO_ROOT)/boot/programs
+	@mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/boot/programs $(ISO_ROOT)/EFI/BOOT
 	cp $(KERNEL) $(ISO_ROOT)/boot/corrode
-	cp boot/limine.conf $(ISO_ROOT)/boot/limine/
+	cp $(foreach program,$(USER_PROGRAMS),$(USER_BIN)/$(program)) $(ISO_ROOT)/boot/programs/
+	@# The configuration is boot/limine.conf plus one line for each module,
+	@# so the list of what gets loaded is the list of what was built.
+	@{ cat boot/limine.conf; \
+	   for program in $(USER_PROGRAMS); do \
+	       echo "    module_path: boot():/boot/programs/$$program"; \
+	   done; } > $(ISO_ROOT)/boot/limine/limine.conf
 	cp $(LIMINE_DIR)/limine-bios.sys \
 	   $(LIMINE_DIR)/limine-bios-cd.bin \
 	   $(LIMINE_DIR)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/

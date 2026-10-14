@@ -218,6 +218,35 @@ impl Mapper {
         }
     }
 
+    /// The permission bits of the 4 KiB page mapping `va` in this space, if
+    /// there is one: everything in the leaf entry that is not the address.
+    ///
+    /// For checks that ask what a mapping *allows* rather than where it
+    /// goes. Only the leaf is reported; the walk above it is as permissive as
+    /// `descend` made it.
+    pub fn leaf_flags(&self, va: u64) -> Option<u64> {
+        // SAFETY: as `translate`.
+        unsafe {
+            let p4 = self.entry(self.root, index(va, 4)).read();
+            if p4 & PRESENT == 0 {
+                return None;
+            }
+            let p3 = self.entry(p4 & ADDR_MASK, index(va, 3)).read();
+            if p3 & PRESENT == 0 || p3 & HUGE != 0 {
+                return None;
+            }
+            let p2 = self.entry(p3 & ADDR_MASK, index(va, 2)).read();
+            if p2 & PRESENT == 0 || p2 & HUGE != 0 {
+                return None;
+            }
+            let p1 = self.entry(p2 & ADDR_MASK, index(va, 1)).read();
+            if p1 & PRESENT == 0 {
+                return None;
+            }
+            Some(p1 & !ADDR_MASK)
+        }
+    }
+
     /// Wipe a freshly allocated frame before anything else can see it.
     ///
     /// # Safety
@@ -225,6 +254,23 @@ impl Mapper {
     pub unsafe fn zero_frame(&self, pa: u64) {
         // SAFETY: forwarded from the caller's guarantee.
         unsafe { self.zero(pa) }
+    }
+
+    /// Copy bytes into a frame through the direct map.
+    ///
+    /// # Safety
+    /// `pa` must be a page-aligned frame this caller exclusively owns, and
+    /// `offset + bytes.len()` must be at most 4096.
+    pub unsafe fn write_frame(&self, pa: u64, offset: usize, bytes: &[u8]) {
+        // SAFETY: the caller owns the frame and promises the range is inside
+        // it; `bytes` is a live slice elsewhere, so the two do not overlap.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                ((pa + self.hhdm) as *mut u8).add(offset),
+                bytes.len(),
+            );
+        }
     }
 
     /// Map one 4 KiB page. `flags` should not include the address or PRESENT.

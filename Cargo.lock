@@ -3,6 +3,28 @@
 version = 4
 
 [[package]]
+name = "corrode-abi"
+version = "0.0.1"
+
+[[package]]
+name = "corrode-edu"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+]
+
+[[package]]
+name = "corrode-elf"
+version = "0.0.1"
+
+[[package]]
+name = "corrode-fault"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+]
+
+[[package]]
 name = "corrode-gfx"
 version = "0.0.1"
 dependencies = [
@@ -13,6 +35,8 @@ dependencies = [
 name = "corrode-kernel"
 version = "0.0.1"
 dependencies = [
+ "corrode-abi",
+ "corrode-elf",
  "corrode-pci",
  "corrode-render",
  "corrode-text",
@@ -25,6 +49,14 @@ version = "0.0.1"
 [[package]]
 name = "corrode-render"
 version = "0.0.1"
+
+[[package]]
+name = "corrode-rt"
+version = "0.0.1"
+dependencies = [
+ "corrode-abi",
+ "corrode-pci",
+]
 
 [[package]]
 name = "corrode-text"

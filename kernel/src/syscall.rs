@@ -46,6 +46,10 @@
 //!   r13  mask to narrow it by
 //! ```
 //!
+//! A call names one more, `r14`: the slot a capability arriving *in the
+//! answer* should land in, or `NO_SLOT`. A reply can carry one by `r12` and
+//! `r13` exactly as a send does.
+//!
 //! `r12` and `r13` rather than `rbx` or `rbp`: `rcx` and `r11` are out because
 //! fast syscalls clobber them, and of what remains these are the two least
 //! likely to be wanted by a userspace runtime for a frame or thread pointer.
@@ -93,62 +97,13 @@ use crate::task;
 
 use corrode_render::Rect;
 
-/// Give up the rest of this time slice.
-pub const SYS_YIELD: u64 = 0;
-/// Report the kind and rights of a capability slot. Needs no rights: asking
-/// what you hold is not an exercise of it.
-pub const SYS_IDENTIFY: u64 = 1;
-/// One-way send on an endpoint capability. Needs WRITE.
-pub const SYS_SEND: u64 = 2;
-/// Send and block for an answer. Needs WRITE, same as a send.
-pub const SYS_CALL: u64 = 3;
-/// Block until a message arrives on an endpoint capability. Needs READ.
-pub const SYS_RECV: u64 = 4;
-/// Answer a caller, spending the reply capability a receive produced.
-pub const SYS_REPLY: u64 = 5;
-/// Copy a capability within the caller's own space, narrowing by a mask.
-pub const SYS_COPY: u64 = 6;
-/// Drop a capability. The object goes away with its last one.
-pub const SYS_DELETE: u64 = 7;
-/// Map a surface capability into the caller's address space. Needs READ, and
-/// WRITE as well for the mapping to be writable. Returns the address in
-/// `rdx`, the width and height in pixels in `r10` and `r8`, and the bytes
-/// from one row to the next in `r9`.
-///
-/// The same call maps device memory, given a capability to that instead:
-/// the address in `rdx`, its length in bytes in `r10`, and zero in the other
-/// two. What comes back depends on what was held, as it should.
-pub const SYS_MAP: u64 = 8;
-/// Say that a rectangle of a surface has been redrawn. Needs WRITE. `rsi`
-/// and `rdx` are its left and top, `r10` and `r8` its width and height.
-pub const SYS_COMMIT: u64 = 9;
-
-/// Read a register of a PCI device's configuration space. Needs READ. `rsi`
-/// is the offset and `rdx` the width in bytes: 1, 2 or 4. The value comes
-/// back in `rdx`.
-pub const SYS_CONFIG_READ: u64 = 10;
-/// Write one. Needs WRITE, and the register has to be one a driver may
-/// write. `rsi` is the offset, `rdx` the width, `r10` the value.
-pub const SYS_CONFIG_WRITE: u64 = 11;
-
-/// The sender of a message that no task sent: a device's interrupt, received
-/// on an interrupt capability. The count of interrupts is in word 0.
-pub const FROM_HARDWARE: u64 = u64::MAX;
-
-/// Slot argument meaning "nowhere".
-///
-/// A sentinel rather than a separate flags word: every real slot is a small
-/// index, so the one value that can never be a slot is free to mean the absence
-/// of one.
-pub const NO_SLOT: u64 = u64::MAX;
-
-/// Status returned for a syscall number we do not implement.
-///
-/// Deliberately not an error a capability operation can produce, so "you asked
-/// for something that does not exist" never gets confused with "you asked for
-/// something you are not allowed to do".
-pub const STATUS_BAD_SYSCALL: u64 = 255;
-pub const STATUS_OK: u64 = 0;
+// The numbers themselves are in the `corrode-abi` crate, which ring 3
+// programs are built against too. One copy, so the two cannot disagree.
+pub use corrode_abi::{
+    FROM_HARDWARE, NO_SLOT, STATUS_BAD_SYSCALL, STATUS_OK, SYS_CALL, SYS_COMMIT, SYS_CONFIG_READ,
+    SYS_CONFIG_WRITE, SYS_COPY, SYS_DELETE, SYS_EXIT, SYS_IDENTIFY, SYS_MAP, SYS_RECV, SYS_REPLY,
+    SYS_SEND, SYS_YIELD,
+};
 
 /// Every code selector seen entering this gate, OR-ed together.
 ///
@@ -251,11 +206,13 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
             }
         }
 
+        // An answer can carry a capability, the same way a send does: this
+        // is how a server hands a client something in reply to being asked.
         SYS_REPLY => {
-            frame.rax = status(ipc::reply(slot, message, None));
+            frame.rax = status(ipc::reply(slot, message, transfer(frame)));
         }
 
-        SYS_CALL => match ipc::call(slot, message, transfer(frame), None) {
+        SYS_CALL => match ipc::call(slot, message, transfer(frame), optional_slot(frame.r14)) {
             Ok(answer) => {
                 frame.rax = STATUS_OK;
                 frame.rdi = answer.from as u64;
@@ -322,6 +279,13 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
 
         SYS_CONFIG_WRITE => {
             frame.rax = status(pci::config_write(slot, frame.rsi, frame.rdx, frame.r10));
+        }
+
+        // The task is over. Its frame is abandoned where it is and somebody
+        // else's is handed back; nothing ever resumes this one.
+        SYS_EXIT => {
+            task::finish_current();
+            return task::on_tick(frame as *mut TrapFrame);
         }
 
         _ => frame.rax = STATUS_BAD_SYSCALL,
