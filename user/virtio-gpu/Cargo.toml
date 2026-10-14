@@ -1,0 +1,16 @@
+[package]
+name = "corrode-virtio-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "virtio-gpu"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+corrode-rt = { path = "../rt" }
+corrode-render = { path = "../../render" }
+corrode-virtio = { path = "../../virtio" }

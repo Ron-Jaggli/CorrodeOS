@@ -170,6 +170,10 @@ pub enum Object {
     /// A device's interrupt, by its line in [`crate::irq`]. READ means may
     /// wait for it. There is nothing to write: the sender is the hardware.
     Interrupt(usize),
+    /// A run of frames, by its number in [`crate::memory`]. READ means may
+    /// map it, WRITE may write it -- and may ask where it physically is,
+    /// which is what a device is told.
+    Memory(usize),
 }
 
 impl core::fmt::Debug for Object {
@@ -184,6 +188,7 @@ impl core::fmt::Debug for Object {
             Object::PciDevice(index) => write!(f, "PciDevice({index})"),
             Object::DeviceMemory(index) => write!(f, "DeviceMemory({index})"),
             Object::Interrupt(index) => write!(f, "Interrupt({index})"),
+            Object::Memory(index) => write!(f, "Memory({index})"),
         }
     }
 }
@@ -203,6 +208,7 @@ pub enum ObjectKind {
     PciDevice = kind::PCI_DEVICE,
     DeviceMemory = kind::DEVICE_MEMORY,
     Interrupt = kind::INTERRUPT,
+    Memory = kind::MEMORY,
 }
 
 impl Object {
@@ -217,6 +223,7 @@ impl Object {
             Object::PciDevice(_) => ObjectKind::PciDevice,
             Object::DeviceMemory(_) => ObjectKind::DeviceMemory,
             Object::Interrupt(_) => ObjectKind::Interrupt,
+            Object::Memory(_) => ObjectKind::Memory,
         }
     }
 }
@@ -535,6 +542,23 @@ pub fn device_memory_of(slot: CapPtr, required: Rights) -> Result<(usize, Rights
         }
         match *cap.object {
             Object::DeviceMemory(index) => Ok((index, cap.rights)),
+            _ => Err(CapError::WrongType),
+        }
+    })
+    .ok_or(CapError::NoSuchTask)?
+}
+
+/// The object a Memory capability names, and the rights it is held with.
+/// Requires `required`.
+pub fn memory_of(slot: CapPtr, required: Rights) -> Result<(usize, Rights), CapError> {
+    let current = task::current_id().ok_or(CapError::NoSuchTask)?;
+    task::with_cspace(current, |cspace| {
+        let cap = cspace.get(slot)?;
+        if !cap.rights.contains(required) {
+            return Err(CapError::InsufficientRights);
+        }
+        match *cap.object {
+            Object::Memory(index) => Ok((index, cap.rights)),
             _ => Err(CapError::WrongType),
         }
     })

@@ -284,6 +284,8 @@ fn rendezvous(
             // endpoint lock is dropped.
             if let Some(token) = token {
                 block_for_reply(me, token, expect_reply.flatten());
+                // And the server is what should run next.
+                task::hand_off(receiver);
             }
             Ok(token.is_some())
         } else {
@@ -601,6 +603,8 @@ pub fn reply(
     if !delivered {
         return Err(CapError::Stale);
     }
+    // The caller has been waiting; it runs as soon as we stop.
+    task::hand_off(token.caller);
 
     // One-shot in the space as well as in the token.
     cap::delete(reply_cap)

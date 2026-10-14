@@ -16,9 +16,11 @@ mod device;
 mod ipc;
 mod irq;
 mod limine;
+mod memory;
 mod mm;
 mod modules;
 mod pci;
+mod remote;
 mod serial;
 mod smp;
 mod surface;
@@ -29,7 +31,7 @@ mod time;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use arch::x86_64::{self, halt_forever, ioapic, lapic, pic, pit, vectors};
+use arch::x86_64::{self, cpu, halt_forever, ioapic, lapic, pic, pit, vectors};
 use corrode_render::{
     anim::{Animation, Ease, Fx, Spring, Velocity},
     blend::{self, Blend},
@@ -38,6 +40,7 @@ use corrode_render::{
     Color, PixelFormat, Rect, Renderer, SurfaceInfo,
 };
 use corrode_text::{Coverage, Style, Weight};
+use sync::SpinLock;
 
 // Section boundaries emitted by kernel/linker.ld. Only their addresses are
 // ever taken -- the values are meaningless.
@@ -2583,8 +2586,271 @@ fn ticks() -> u64 {
     }
 }
 
+/// What the compositor draws through: the software renderer on the
+/// firmware's framebuffer, or a display driver in ring 3.
+///
+/// Both are a `Renderer`, and nothing that draws knows which it has. The one
+/// thing that differs is how a window's pixels are shown to them: the
+/// kernel's own renderer is handed an address, a driver a capability.
+enum Screen {
+    Software(alloc::boxed::Box<SoftwareRenderer>),
+    Remote(remote::RemoteRenderer),
+}
+
+enum ScreenError {
+    Software(corrode_render::software::Error),
+    Remote(remote::Error),
+}
+
+impl core::fmt::Debug for ScreenError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ScreenError::Software(error) => write!(f, "software renderer: {error:?}"),
+            ScreenError::Remote(error) => write!(f, "display driver: {error:?}"),
+        }
+    }
+}
+
+impl Renderer for Screen {
+    type Error = ScreenError;
+
+    fn surface_info(&self) -> SurfaceInfo {
+        match self {
+            Screen::Software(renderer) => renderer.surface_info(),
+            Screen::Remote(renderer) => renderer.surface_info(),
+        }
+    }
+
+    fn submit(&mut self, list: &corrode_render::CommandList<'_>) -> Result<(), ScreenError> {
+        match self {
+            Screen::Software(renderer) => renderer.submit(list).map_err(ScreenError::Software),
+            Screen::Remote(renderer) => renderer.submit(list).map_err(ScreenError::Remote),
+        }
+    }
+
+    fn upload_mask(&mut self, at: Rect, coverage: &[u8]) -> Result<(), ScreenError> {
+        match self {
+            Screen::Software(renderer) => renderer
+                .upload_mask(at, coverage)
+                .map_err(ScreenError::Software),
+            Screen::Remote(renderer) => renderer
+                .upload_mask(at, coverage)
+                .map_err(ScreenError::Remote),
+        }
+    }
+
+    fn present(&mut self, damage: &corrode_render::damage::Damage) -> Result<(), ScreenError> {
+        match self {
+            Screen::Software(renderer) => renderer.present(damage).map_err(ScreenError::Software),
+            Screen::Remote(renderer) => renderer.present(damage).map_err(ScreenError::Remote),
+        }
+    }
+}
+
+impl Screen {
+    /// Let `Command::Image` draw surface number `index`, whose capability
+    /// bootstrap holds in `slot`.
+    fn show_surface(&mut self, index: usize, slot: cap::CapPtr) -> bool {
+        match self {
+            Screen::Software(renderer) => {
+                let Some((base, width, height)) = surface::pixels(index) else {
+                    return false;
+                };
+                // SAFETY: `surface::create` mapped `width * height` pixels at
+                // `base` from frames fresh off the allocator, page-aligned, so
+                // they overlap nothing. The mapping is never removed.
+                unsafe { renderer.attach_surface(index as u32, base, width, height) }.is_ok()
+            }
+            Screen::Remote(renderer) => renderer.attach_surface(slot, index as u32).is_ok(),
+        }
+    }
+}
+
+/// The GPU driver's endpoint, the capabilities it is given, and the memory
+/// it draws into, as bootstrap holds them.
+const GPU_ENDPOINT: cap::CapPtr = 25;
+const GPU_DEVICE: cap::CapPtr = 26;
+const GPU_IRQ: cap::CapPtr = 27;
+const GPU_QUEUE: cap::CapPtr = 28;
+const GPU_SCREEN: cap::CapPtr = 29;
+const GPU_SHARED: cap::CapPtr = 30;
+const GPU_ATLAS: cap::CapPtr = 31;
+/// The device's BARs, at `GPU_BARS + n`.
+const GPU_BARS: cap::CapPtr = 32;
+/// A read-only copy of the screen memory, to check what that forbids.
+const GPU_SCREEN_READ: cap::CapPtr = 38;
+
+fn gpu_check(name: &str, ok: bool) {
+    check("gpu", name, ok);
+}
+
+/// What the GPU checks need after the first frame.
+struct Gpu {
+    screen: usize,
+    line: Option<usize>,
+}
+
+static GPU: SpinLock<Option<Gpu>> = SpinLock::new(None);
+
+/// Start a display driver in ring 3, if there is a device for one.
+///
+/// A virtio GPU and the program to drive it. On a machine with neither --
+/// any machine but an emulator, today -- this says so and the compositor
+/// draws on the firmware's framebuffer as it always has. The GPU is never
+/// required.
+fn start_gpu() -> Option<remote::RemoteRenderer> {
+    use cap::{CapError, Rights};
+    use corrode_abi::gpu;
+
+    let (index, found) = pci::find(|device| {
+        device.header.vendor == gpu::VIRTIO_VENDOR && device.header.device == gpu::VIRTIO_GPU
+    })?;
+    println!(
+        "gpu        : virtio GPU at {}, starting its driver in ring 3",
+        found.address
+    );
+
+    // On this CPU: the compositor calls it every frame, and a call to a
+    // task on the same core switches straight to it.
+    let driver = modules::find("virtio-gpu")
+        .and_then(|module| task::spawn_program_on("virtio-gpu", module.bytes, cpu::index()).ok());
+    let Some(driver) = driver else {
+        gpu_check("load the driver from a module", false);
+        return None;
+    };
+
+    let line = task::cpu_of(driver).and_then(|cpu| irq::create(index, 0, cpu));
+    let atlas_pages = (gpu::ATLAS_WIDTH * gpu::ATLAS_HEIGHT) as usize / 4096;
+    let queue = memory::create(gpu::QUEUE_PAGES, false);
+    let screen = memory::create(gpu::SCREEN_PAGES, true);
+    let shared = memory::create(gpu::SHARED_PAGES, true);
+    let atlas = memory::create(atlas_pages, false);
+    let (Some(queue), Some(screen), Some(shared), Some(atlas)) = (queue, screen, shared, atlas)
+    else {
+        gpu_check("make the driver's memory", false);
+        return None;
+    };
+
+    let minted = cap::mint(
+        0,
+        GPU_ENDPOINT,
+        cap::Object::Endpoint(ipc::Endpoint::new()),
+        Rights::ALL,
+    )
+    .is_ok()
+        && cap::mint(0, GPU_DEVICE, cap::Object::PciDevice(index), Rights::ALL).is_ok()
+        && cap::mint(0, GPU_QUEUE, cap::Object::Memory(queue), Rights::ALL).is_ok()
+        && cap::mint(0, GPU_SCREEN, cap::Object::Memory(screen), Rights::ALL).is_ok()
+        && cap::mint(0, GPU_SHARED, cap::Object::Memory(shared), Rights::ALL).is_ok()
+        && cap::mint(0, GPU_ATLAS, cap::Object::Memory(atlas), Rights::ALL).is_ok()
+        && line.is_none_or(|line| {
+            cap::mint(0, GPU_IRQ, cap::Object::Interrupt(line), Rights::ALL).is_ok()
+        });
+    gpu_check("mint the device, its interrupt and memory", minted);
+
+    // The rules for memory, from this side, before the driver has any.
+    gpu_check(
+        "memory gives up physical addresses only with WRITE",
+        cap::copy(GPU_SCREEN, GPU_SCREEN_READ, Rights::READ) == Ok(Rights::READ)
+            && memory::physical(GPU_SCREEN_READ, 0) == Err(CapError::InsufficientRights)
+            && memory::physical(GPU_SCREEN, 0) == Ok(memory::frame_of(screen, 0).unwrap_or(1)),
+    );
+    gpu_check(
+        "and only for pages it covers",
+        memory::physical(GPU_SCREEN, gpu::SCREEN_PAGES as u64) == Err(CapError::Invalid),
+    );
+
+    let mut granted = cap::grant(driver, GPU_ENDPOINT, gpu::SERVE, Rights::READ).is_ok()
+        && cap::grant(driver, LOG_ENDPOINT, gpu::LOG, Rights::WRITE).is_ok()
+        && cap::grant(driver, GPU_DEVICE, gpu::DEVICE, Rights::READ_WRITE).is_ok()
+        && cap::grant(driver, GPU_QUEUE, gpu::QUEUE, Rights::READ_WRITE).is_ok()
+        && cap::grant(driver, GPU_SCREEN, gpu::SCREEN, Rights::READ_WRITE).is_ok()
+        && cap::grant(driver, GPU_SHARED, gpu::SHARED, Rights::READ).is_ok()
+        && cap::grant(driver, GPU_ATLAS, gpu::ATLAS, Rights::READ_WRITE).is_ok();
+    if line.is_some() {
+        granted &= cap::grant(driver, GPU_IRQ, gpu::IRQ, Rights::READ).is_ok();
+    }
+    let mut bars = 0;
+    for bar in 0..6u8 {
+        if let Some(region) = pci::region_of(index, bar) {
+            let slot = GPU_BARS + bar as usize;
+            granted &= cap::mint(0, slot, cap::Object::DeviceMemory(region), Rights::ALL).is_ok()
+                && cap::grant(driver, slot, gpu::BARS + bar as usize, Rights::READ_WRITE).is_ok();
+            bars += 1;
+        }
+    }
+    let expected = 7 + bars + line.map_or(0, |_| 1);
+    gpu_check(
+        "the driver holds its device, its memory, and nothing else",
+        granted && cap::slots_used(driver) == Some(expected),
+    );
+    start_all(&[Some(driver)]);
+
+    match remote::RemoteRenderer::connect(GPU_ENDPOINT, shared) {
+        Ok(renderer) => {
+            let info = renderer.surface_info();
+            println!(
+                "gpu        : the driver drives {}x{}, pitch {}, on {} display(s)",
+                info.width, info.height, info.pitch, renderer.displays
+            );
+            gpu_check("the driver set the device up and reported a mode", true);
+            *GPU.lock() = Some(Gpu { screen, line });
+            Some(renderer)
+        }
+        Err(error) => {
+            println!("gpu        : the driver could not start: {error:?}");
+            gpu_check("the driver set the device up and reported a mode", false);
+            None
+        }
+    }
+}
+
+/// After the first frame: did it reach the device?
+///
+/// The kernel cannot see the host's window, so it looks at the next best
+/// thing -- the memory the driver drew into, which is what the device
+/// copies to the host -- and at whether the device ever interrupted to say
+/// it had done a copy. `./corrode screenshot GPU=virtio` shows the rest.
+fn gpu_first_frame_checks() {
+    let Some(Gpu { screen, line }) = GPU.lock().take() else {
+        return;
+    };
+    let Some((pixels, len)) = memory::in_kernel(screen) else {
+        return;
+    };
+    let read = |offset: usize| {
+        if offset + 4 > len {
+            return 0;
+        }
+        // SAFETY: inside the kernel's mapping of the screen memory, which
+        // stays for good. The driver may be drawing; a read by value is a
+        // snapshot, which is all this asks for.
+        unsafe { pixels.add(offset).cast::<u32>().read_volatile() }
+    };
+    // The top left marker is white and the background just inside it is
+    // the boot screen's dark blue-grey.
+    let white = Color::WHITE;
+    let corner = read(0) & 0x00ff_ffff;
+    gpu_check(
+        "ring 3 drew the first frame into the device's memory",
+        corner == PixelFormat::XRGB8888.pack(white),
+    );
+    gpu_check(
+        "and the device interrupted when it had copied it",
+        line.is_some_and(|line| irq::total(line) > 0),
+    );
+}
+
 /// Wrap the firmware framebuffer in the software renderer, if we got one.
-fn init_renderer() -> Option<SoftwareRenderer> {
+fn init_renderer() -> Option<Screen> {
+    if let Some(remote) = start_gpu() {
+        return Some(Screen::Remote(remote));
+    }
+    init_software_renderer().map(|renderer| Screen::Software(alloc::boxed::Box::new(renderer)))
+}
+
+/// The software renderer on the firmware's framebuffer.
+fn init_software_renderer() -> Option<SoftwareRenderer> {
     let fb = limine::FRAMEBUFFER.response.get()?.first()?;
 
     if fb.memory_model != limine::MEMORY_MODEL_RGB {
@@ -3169,20 +3435,20 @@ struct Window {
 impl Window {
     /// Make a surface, show it to the renderer, and start a task that holds
     /// a capability to it and nothing else.
-    fn open(renderer: &mut SoftwareRenderer) -> Option<Self> {
+    fn open(screen: &mut Screen) -> Option<Self> {
         use cap::{CapError, Rights};
 
         let surface = surface::create(WINDOW_WIDTH, WINDOW_HEIGHT)?;
-        let (base, width, height) = surface::pixels(surface)?;
-        // SAFETY: `surface::create` mapped `width * height` pixels at `base`
-        // from frames fresh off the allocator, page-aligned, so they overlap
-        // nothing. The mapping is never removed.
-        unsafe { renderer.attach_surface(surface as u32, base, width, height) }.ok()?;
+        let (_, width, height) = surface::pixels(surface)?;
 
         window_check(
             "mint a Surface capability into slot 14",
             cap::mint(0, BOOT_SURFACE, cap::Object::Surface(surface), Rights::ALL).is_ok(),
         );
+        if !screen.show_surface(surface, BOOT_SURFACE) {
+            println!("window     : the renderer would not take the surface");
+            return None;
+        }
 
         // The rules, tried from this side before anybody else holds it.
         let whole = Rect::new(0, 0, width, height);
@@ -3301,7 +3567,7 @@ impl Window {
 /// on the scheduling tick the kernel already takes, asks the formulas where
 /// things are at the current nanosecond, and writes only the pixels that
 /// answer changed.
-fn render_loop(renderer: &mut SoftwareRenderer) -> ! {
+fn render_loop(renderer: &mut Screen) -> ! {
     let Some(mut stage) = Stage::new(renderer, time::now_ns()) else {
         println!("scene      : no room for the boot screen's layers");
         idle_loop()
@@ -3313,8 +3579,19 @@ fn render_loop(renderer: &mut SoftwareRenderer) -> ! {
     let screen = stage.scene.screen().area();
 
     // A renderer that fails paints nothing, which is what the counters below
-    // would then show.
-    let mut frame = |stage: &mut Stage, now| stage.scene.frame(renderer, now).unwrap_or_default();
+    // would then show. The first failure is reported; a renderer that fails
+    // every frame would otherwise fill the log.
+    let mut failed = false;
+    let mut frame = |stage: &mut Stage, now| match stage.scene.frame(renderer, now) {
+        Ok(painted) => painted,
+        Err(error) => {
+            if !failed {
+                println!("paint      : the renderer failed: {error:?}");
+                failed = true;
+            }
+            Painted::default()
+        }
+    };
 
     let start = time::now_ns();
     let first = frame(&mut stage, start);
@@ -3328,6 +3605,7 @@ fn render_loop(renderer: &mut SoftwareRenderer) -> ! {
         "asking again at the same instant paints nothing",
         frame(&mut stage, start) == Painted::default(),
     );
+    gpu_first_frame_checks();
     println!();
 
     let mut cycle_start = start;

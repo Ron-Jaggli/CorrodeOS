@@ -41,12 +41,16 @@ QEMU_EXTRA ?=
 # registers and an interrupt it raises when told to, which is exactly enough
 # to check that a ring 3 task can be handed a device and nothing else.
 QEMU_DEVICES ?= -device edu
+# The display card. `std` is QEMU's plain VGA, which the kernel draws on
+# through the firmware's framebuffer. `virtio` is a virtio GPU, which a
+# driver in ring 3 takes over: the same frames, by another road.
+GPU ?= std
 
 QEMU_BASE := -M $(MACHINE) -m $(MEM) -smp $(CPUS) \
              -cdrom $(ISO) -boot d \
              -net none \
              -no-reboot -no-shutdown \
-             $(ACCEL) $(QEMU_DEVICES) $(QEMU_EXTRA)
+             -vga $(GPU) $(ACCEL) $(QEMU_DEVICES) $(QEMU_EXTRA)
 
 QEMU_COMMON := $(QEMU_BASE) -display none
 QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
@@ -71,7 +75,7 @@ kernel:
 # crate built for it. RUSTFLAGS in the environment replaces the ones in
 # .cargo/config.toml outright, and a separate target directory stops the two
 # sets of flags from invalidating each other's build of the crates they share.
-USER_PROGRAMS := edu fault
+USER_PROGRAMS := edu fault virtio-gpu
 USER_TARGET   := target/user
 USER_BIN      := $(USER_TARGET)/x86_64-unknown-none/release
 USER_RUSTFLAGS := -C relocation-model=static -C strip=debuginfo \
@@ -93,7 +97,7 @@ clippy:
 HOST_TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
 
 test:
-	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci -p corrode-elf --target $(HOST_TARGET)
+	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci -p corrode-elf -p corrode-virtio --target $(HOST_TARGET)
 
 # The 3D engine's demo scene, drawn on the build host at each preset, for
 # judging by eye. Built optimised, so the times it prints mean something.

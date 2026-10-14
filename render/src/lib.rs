@@ -26,6 +26,7 @@ pub mod blend;
 pub mod damage;
 pub mod scene;
 pub mod software;
+pub mod wire;
 
 /// How pixels are packed in a surface's memory.
 ///

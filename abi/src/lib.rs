@@ -74,6 +74,9 @@ pub const SYS_CONFIG_READ: u64 = 10;
 pub const SYS_CONFIG_WRITE: u64 = 11;
 /// Stop, for good. Takes nothing and does not return.
 pub const SYS_EXIT: u64 = 12;
+/// Where one page of a memory capability is in physical memory, for telling
+/// a device. Needs WRITE. `rsi` is the page; the address comes back in `rdx`.
+pub const SYS_PHYSICAL: u64 = 13;
 
 /// Slot argument meaning "nowhere".
 ///
@@ -133,6 +136,7 @@ pub mod kind {
     pub const PCI_DEVICE: u8 = 7;
     pub const DEVICE_MEMORY: u8 = 8;
     pub const INTERRUPT: u8 = 9;
+    pub const MEMORY: u8 = 10;
 }
 
 /// Rights, as bits: in the low byte of what `SYS_IDENTIFY` reports, and as
@@ -208,4 +212,62 @@ pub mod edu {
     /// What to ask the factorial of, and the answer.
     pub const INPUT: u32 = 10;
     pub const FACTORIAL: u32 = 3_628_800;
+}
+
+/// The conversation between the kernel's compositor and a display driver.
+///
+/// The driver is a server. The kernel calls it with commands to draw and
+/// rectangles to show, written into memory the two share; the driver draws
+/// them with the software renderer and has its device show the result. To
+/// the compositor it is a `Renderer` like any other.
+pub mod gpu {
+    /// Where the driver's capabilities are.
+    ///
+    /// The endpoint the kernel calls, receive-only.
+    pub const SERVE: usize = 0;
+    pub const LOG: usize = 1;
+    pub const DEVICE: usize = 2;
+    pub const IRQ: usize = 3;
+    /// Memory for queues and requests: [`QUEUE_PAGES`] pages.
+    pub const QUEUE: usize = 4;
+    /// Memory for the pixels the device scans out.
+    pub const SCREEN: usize = 5;
+    /// Memory the kernel writes commands into: [`SHARED_PAGES`] pages.
+    pub const SHARED: usize = 6;
+    /// Memory for the mask atlas.
+    pub const ATLAS: usize = 7;
+    /// The device's memory BARs: BAR `n` is at `BARS + n`, if it has one.
+    pub const BARS: usize = 8;
+    /// Where the capability to answer a call lands.
+    pub const REPLY: usize = 14;
+    /// Where the `n`th surface the kernel hands over lands.
+    pub const SURFACES: usize = 16;
+
+    pub const QUEUE_PAGES: usize = 16;
+    pub const SHARED_PAGES: usize = 64;
+    /// Enough for 1920 by 1080.
+    pub const SCREEN_PAGES: usize = 2048;
+    pub const ATLAS_WIDTH: u32 = 1024;
+    pub const ATLAS_HEIGHT: u32 = 256;
+
+    /// Labels of the kernel's calls. The answer's label is zero for done,
+    /// or an error code.
+    ///
+    /// Set up the device. Answered with width, height, pitch, and how many
+    /// displays the device has.
+    pub const INIT: u64 = 1;
+    /// A surface is attached to this call; word 0 is its number.
+    pub const SURFACE: u64 = 2;
+    /// Word 0 command records are in shared memory, in the format of
+    /// `corrode_render::wire`.
+    pub const SUBMIT: u64 = 3;
+    /// Coverage for the mask atlas is in shared memory; the words are the
+    /// rectangle it goes in: x, y, width, height.
+    pub const UPLOAD: u64 = 4;
+    /// Word 0 rectangles are in shared memory: show them.
+    pub const PRESENT: u64 = 5;
+
+    /// The PCI identity of a modern virtio GPU.
+    pub const VIRTIO_VENDOR: u16 = 0x1af4;
+    pub const VIRTIO_GPU: u16 = 0x1050;
 }

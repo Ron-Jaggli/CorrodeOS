@@ -91,6 +91,7 @@ use crate::cap::{self, CapError, ObjectKind, Rights};
 use crate::device;
 use crate::ipc;
 use crate::irq;
+use crate::memory;
 use crate::pci;
 use crate::surface;
 use crate::task;
@@ -101,8 +102,8 @@ use corrode_render::Rect;
 // programs are built against too. One copy, so the two cannot disagree.
 pub use corrode_abi::{
     FROM_HARDWARE, NO_SLOT, STATUS_BAD_SYSCALL, STATUS_OK, SYS_CALL, SYS_COMMIT, SYS_CONFIG_READ,
-    SYS_CONFIG_WRITE, SYS_COPY, SYS_DELETE, SYS_EXIT, SYS_IDENTIFY, SYS_MAP, SYS_RECV, SYS_REPLY,
-    SYS_SEND, SYS_YIELD,
+    SYS_CONFIG_WRITE, SYS_COPY, SYS_DELETE, SYS_EXIT, SYS_IDENTIFY, SYS_MAP, SYS_PHYSICAL,
+    SYS_RECV, SYS_REPLY, SYS_SEND, SYS_YIELD,
 };
 
 /// Every code selector seen entering this gate, OR-ed together.
@@ -228,26 +229,42 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
         // The kernel picks the address and hands it back: the first pointer
         // to cross this boundary, and it goes outward. Nothing the caller
         // says is ever dereferenced.
-        SYS_MAP if cap::identify(slot).is_ok_and(|(kind, _)| kind == ObjectKind::DeviceMemory) => {
-            match device::map(slot) {
-                Ok(mapped) => {
+        // What comes back depends on what was held: a surface has a width
+        // and a height, a run of memory has only a length. The pointer goes
+        // outward; nothing the caller says is ever dereferenced.
+        SYS_MAP => {
+            let mapped = match cap::identify(slot).map(|(kind, _)| kind) {
+                Ok(ObjectKind::DeviceMemory) => {
+                    device::map(slot).map(|mapped| (mapped.address, mapped.len, 0, 0))
+                }
+                Ok(ObjectKind::Memory) => {
+                    memory::map(slot).map(|mapped| (mapped.address, mapped.len, 0, 0))
+                }
+                _ => surface::map(slot).map(|mapped| {
+                    (
+                        mapped.address,
+                        mapped.width as u64,
+                        mapped.height as u64,
+                        mapped.pitch as u64,
+                    )
+                }),
+            };
+            match mapped {
+                Ok((address, a, b, c)) => {
                     frame.rax = STATUS_OK;
-                    frame.rdx = mapped.address;
-                    frame.r10 = mapped.len;
-                    frame.r8 = 0;
-                    frame.r9 = 0;
+                    frame.rdx = address;
+                    frame.r10 = a;
+                    frame.r8 = b;
+                    frame.r9 = c;
                 }
                 Err(error) => frame.rax = error.code(),
             }
         }
 
-        SYS_MAP => match surface::map(slot) {
-            Ok(mapped) => {
+        SYS_PHYSICAL => match memory::physical(slot, frame.rsi) {
+            Ok(address) => {
                 frame.rax = STATUS_OK;
-                frame.rdx = mapped.address;
-                frame.r10 = mapped.width as u64;
-                frame.r8 = mapped.height as u64;
-                frame.r9 = mapped.pitch as u64;
+                frame.rdx = address;
             }
             Err(error) => frame.rax = error.code(),
         },

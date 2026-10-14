@@ -39,7 +39,7 @@ Then:
 ./corrode wx-test     # boot and prove .text is not writable
 ./corrode user-test   # boot and prove ring 3 cannot read kernel memory
 ./corrode check       # cargo check
-./corrode test        # render, text, gfx, pci and elf crate unit tests, on the build host
+./corrode test        # render, text, gfx, pci, elf and virtio unit tests, on the build host
 ./corrode specimen    # draw a sheet of the typeface to build/specimen.png
 ./corrode shell       # drop into the build container
 ```
@@ -48,8 +48,9 @@ Env knobs: `CPUS=n` for guest cores (default 4; `CPUS=1` for uniprocessor),
 `ENGINE=docker`, `NO_KVM=1` to force TCG, `NET=1` to give the
 container network access (off by default — there are no crates.io dependencies,
 so the build genuinely doesn't need it), `MACHINE=pc` for QEMU's older board
-with no PCI Express, and `QEMU_EXTRA='-device …'` to plug emulated devices in
-for one run.
+with no PCI Express, `GPU=virtio` to give QEMU a virtio GPU instead of its
+plain VGA (the compositor's frames then go through a ring 3 driver), and
+`QEMU_EXTRA='-device …'` to plug emulated devices in for one run.
 
 ## Layout
 
@@ -74,6 +75,8 @@ kernel/          the privileged kernel
   src/device.rs    a device's registers, mapped into the task that holds them
   src/irq.rs       device interrupts, as messages to whoever holds the line
   src/modules.rs   files the bootloader left in RAM
+  src/memory.rs    memory a task can map and tell a device about
+  src/remote.rs    a Renderer that is a call to a driver in ring 3
   src/time.rs      monotonic nanosecond clock, off the TSC
   src/arch/x86_64/cpu.rs  which CPU is this
   build.rs         makes cargo notice linker.ld changes
@@ -85,6 +88,7 @@ render/          the rendering interface
   src/damage.rs    which pixels are stale
   src/blend.rs     alpha blending, exact, two multiplies a pixel
   src/scene.rs     layers, and the least repainting that keeps up with them
+  src/wire.rs      commands as bytes, for a renderer in another process
 gfx/             the 3D engine: integer-only, software, not yet on screen
 text/            the text engine
   src/lib.rs       strings to coverage: measuring, placing, inking
@@ -95,7 +99,9 @@ user/            ring 3 programs, each an ELF file loaded as a Limine module
   rt/              the runtime: entry, syscalls, devices, println!, panics
   edu/             a driver for QEMU's teaching device
   fault/           a program that faults on purpose
+  virtio-gpu/      a display driver: the compositor's frames, on a virtio GPU
   user.ld          where a program's segments go
+virtio/          virtqueues and virtio GPU commands, tested against a pretend device
 pci/             PCI configuration space as arithmetic, tested on the build host
   src/lib.rs       headers, BARs, capability lists, MSI, what a driver may write
   src/mcfg.rs      the ACPI table that says where configuration space is
@@ -207,6 +213,10 @@ The PCI bus: every function found at boot, through ECAM or the legacy ports,
 and a device's configuration space and each of its BARs as capability
 objects. A ring 3 task holding those can map the device's registers and
 block until it interrupts, and holds nothing else. See "Devices" below.
+
+A display driver in ring 3: with a virtio GPU present, the compositor's
+`Renderer` is a call to a program that draws the frames into memory its
+device scans out. See "A display driver in ring 3" below.
 
 Programs: ring 3 tasks loaded from ELF files the bootloader put in RAM,
 written in Rust against a small runtime. A driver is one of these, and a
@@ -609,8 +619,8 @@ finished computing, on its own time, with the task blocked in the kernel
 and nothing polling.
 
 Known gaps: no legacy INTx, so a device with neither MSI nor MSI-X has no
-interrupt here. The MSI-X path is written and has not run yet: `edu` has
-plain MSI. One line per message and they are never handed back. One waiter
+interrupt here. `edu` has plain MSI; the MSI-X path is run by the virtio GPU
+driver below. One line per message and they are never handed back. One waiter
 per line, and a task cannot wait for an interrupt *or* a message from a
 client in one receive -- that wants a line bound to an endpoint. A waiter
 on a different CPU from the one its line is aimed at is found at that
@@ -731,6 +741,115 @@ checks are still naked assembly in the kernel image, because they predate
 the loader and prove things about the boundary that do not need a program.
 Programs are started by boot code that knows each one's slots; there is no
 general way yet for one program to start another.
+
+### A display driver in ring 3
+
+`Renderer` was shaped from the start so that a GPU driver could sit behind
+it in another process: commands are plain data, own no device state, and
+can be memcpy'd. This is that, for the one GPU that can be driven entirely
+inside an emulator. `GPU=virtio ./corrode boot-test` gives QEMU a virtio GPU,
+and the boot scene -- unchanged, not told -- is drawn by a ring 3 program and
+scanned out by the device:
+
+```
+gpu        : virtio GPU at 00:01.0, starting its driver in ring 3
+gpu        : memory gives up physical addresses only with WRITE  PASS
+gpu        : the driver holds its device, its memory, and nothing else PASS
+virtio-gpu : 1280x800 on 1 display(s), woken by the device's interrupt
+gpu        : the driver set the device up and reported a mode    PASS
+gpu        : ring 3 drew the first frame into the device's memory PASS
+gpu        : and the device interrupted when it had copied it    PASS
+```
+
+`GPU=virtio ./corrode screenshot` is the rest of the proof: the kernel never
+touches the firmware's framebuffer in this mode, so a picture on the screen
+can only have come through the driver and the device.
+
+Without a virtio GPU -- on any machine that is not an emulator, today --
+nothing changes: the compositor draws on the firmware's framebuffer as it
+always has. The GPU is not required, and the code that draws does not know
+which it has.
+
+#### Memory a device can reach
+
+Everything a GPU driver needs from the system, a virtio GPU needs too:
+configuration space, registers, an interrupt -- MSI-X this time -- and
+memory the device reads and writes by DMA, along with the physical
+addresses of that memory, which nothing else in the system is ever told.
+
+That last is a new object. A **`Memory`** capability names a run of frames:
+READ maps them, WRITE makes the mapping writable and lets the holder ask,
+with `SYS_PHYSICAL`, where one of its pages physically is. The asymmetry is
+deliberate. A physical address is good for one thing, having a device write
+there, so asking needs the right to write. And it is only ever the address
+of a page the capability already covers: "where is page N of what I hold",
+never "what is at address X".
+
+The frames are not contiguous and need not be. Every structure the driver
+gives the device fits in a page or is described page by page -- the screen's
+backing goes to the device as a list of runs, adjacent pages merged.
+
+#### The frame path
+
+The kernel's side is `RemoteRenderer`, a `Renderer` whose every method is an
+IPC call to the driver, with the bulk in memory the two share: command
+records in the format of `render::wire` (a Rust enum's layout is not a
+format two separately built programs can agree on, so the format is written
+out and tested), coverage for the mask atlas, rectangles to present. The
+driver decodes the records and draws them with the same `SoftwareRenderer`
+the kernel would have used, straight into the device's backing memory --
+the host sees nothing until a transfer, so that memory already is a back
+buffer. Presenting is a batch: one `TRANSFER_TO_HOST_2D` per damaged
+rectangle and one `RESOURCE_FLUSH` over their union, a single doorbell, and
+the driver asleep on its interrupt until the device has done all of it.
+
+A window's pixels reach the driver the way they reached the kernel's
+renderer, except as a capability: the compositor hands the driver a
+read-only copy of the surface capability in the call, and the driver maps
+it.
+
+The virtio parts -- the split virtqueue, the PCI capability walk, every GPU
+command's layout -- are `virtio/`, tested on the build host against a device
+played by the test. The queue's tests run seventy thousand requests through
+a four-entry ring so every index wraps, and feed it a device that names
+descriptors it was never given.
+
+#### Calls switch straight to the callee
+
+A call from the compositor to the driver made the driver runnable and then
+waited for the scheduler's rotation to reach it. On one CPU with a task that
+never yields, that is a whole tick each way, twice a frame. Now IPC hands
+the CPU over: a call marks the server to run next on that core, a reply
+marks the client, and the rotation resumes after. The driver is started on
+the compositor's CPU so that this applies.
+
+```
+GPU=virtio CPUS=1, before:  paint : 59 wakeups, 59 painted ...
+GPU=virtio CPUS=1, after:   paint : 152 wakeups, 152 painted ...
+```
+
+#### A deadlock that was always there
+
+Two boots in twelve stopped dead while making the driver's memory. The
+scheduler asked for the kernel's page table root on every switch to a
+kernel task -- from the timer interrupt -- and that root lived behind the
+kernel mapper's lock, which boot code held with interrupts on. Mapping 8 MiB
+of screen a page at a time made the window wide enough for a tick to land in
+it, and the CPU spun on a lock it held itself. The root is now a lock-free
+atomic, and the mapper's lock, like every other lock a system call or an
+interrupt can reach, is only held with interrupts off. Twelve in twelve
+since.
+
+Known gaps: the compositor calls the driver synchronously, so a driver that
+hangs or faults freezes the screen -- the machine carries on, and nothing
+yet notices and falls back to the firmware's framebuffer. Frames are still
+paced by the tick, not by the display. The driver takes the first display
+it is told about, at the size it is told, once; a resize or hotplug is not
+listened for. Its memory is made by the kernel at boot and sized for at most
+1920 by 1080. The handoff only works within a CPU: making another core
+reschedule needs an IPI the kernel does not send yet. And the driver, like
+every driver here, can program its device to DMA anywhere: there is no
+IOMMU support.
 
 ### Text
 
@@ -1340,7 +1459,10 @@ device checks hand QEMU's test device to a ring 3 task and confirm it read its
 identity, was refused its BAR, mapped its registers where the kernel chose,
 and was woken twice by interrupts and no more. Eight program checks load real
 ELF files from modules, compare every page's permissions with what the file
-asked for, and stop a program that faults without stopping the machine. Three
+asked for, and stop a program that faults without stopping the machine. With
+a virtio GPU, eight more start its driver in ring 3 and confirm the first
+frame reached the device's memory and the device interrupted when it had
+copied it. Three
 blend checks confirm a fade is exact at both ends and seamless over its own
 colour, two text checks that letters stay inside the block measured for them
 and a stroke is the thickness its weight says, and two scene checks that the

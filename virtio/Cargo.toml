@@ -1,0 +1,8 @@
+[package]
+name = "corrode-virtio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+corrode-pci = { path = "../pci" }

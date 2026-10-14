@@ -307,6 +307,50 @@ pub fn map(slot: usize) -> Result<Mapping> {
     })
 }
 
+/// A surface the kernel mapped for us: its pixels, `0x00RRGGBB`, row by row.
+#[derive(Clone, Copy, Debug)]
+pub struct SurfaceMapping {
+    pub address: *mut u32,
+    pub width: u32,
+    pub height: u32,
+    /// Bytes from one row to the next.
+    pub pitch: u32,
+}
+
+/// Map a surface. The same call as [`map`]; a surface answers with its
+/// shape rather than a length.
+pub fn map_surface(slot: usize) -> Result<SurfaceMapping> {
+    let out = sys::call(
+        abi::SYS_MAP,
+        sys::Args {
+            rdi: slot as u64,
+            ..sys::Args::NONE
+        },
+    );
+    check(out.rax)?;
+    Ok(SurfaceMapping {
+        address: out.rdx as *mut u32,
+        width: out.r10 as u32,
+        height: out.r8 as u32,
+        pitch: out.r9 as u32,
+    })
+}
+
+/// Where page `page` of the memory in `slot` is physically: what a device
+/// is told. Needs WRITE on the memory.
+pub fn physical(slot: usize, page: usize) -> Result<u64> {
+    let out = sys::call(
+        abi::SYS_PHYSICAL,
+        sys::Args {
+            rdi: slot as u64,
+            rsi: page as u64,
+            ..sys::Args::NONE
+        },
+    );
+    check(out.rax)?;
+    Ok(out.rdx)
+}
+
 /// Name the function a program starts in.
 ///
 /// ```ignore

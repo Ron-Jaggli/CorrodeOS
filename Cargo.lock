@@ -61,3 +61,19 @@ dependencies = [
 [[package]]
 name = "corrode-text"
 version = "0.0.1"
+
+[[package]]
+name = "corrode-virtio"
+version = "0.0.1"
+dependencies = [
+ "corrode-pci",
+]
+
+[[package]]
+name = "corrode-virtio-gpu"
+version = "0.0.1"
+dependencies = [
+ "corrode-render",
+ "corrode-rt",
+ "corrode-virtio",
+]

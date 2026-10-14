@@ -147,6 +147,15 @@ struct Scheduler {
     /// that changes nothing would throw away the kernel's translations several
     /// hundred times a second for no reason.
     installed_root: [u64; MAX_CPUS],
+    /// A task this CPU should run next if it can, whoever is due by turn.
+    ///
+    /// Set when IPC makes a task runnable that the current one is about to
+    /// wait on: the server a client just called, the client a server just
+    /// answered. Round-robin would get there in the end, after every other
+    /// task on the core had its slice -- and a task that never yields takes
+    /// a whole tick. A call is a request for the other side to run now, so
+    /// it runs now.
+    handoff: [Option<usize>; MAX_CPUS],
 }
 
 static SCHEDULER: SpinLock<Option<Scheduler>> = SpinLock::new(None);
@@ -189,6 +198,7 @@ pub fn init() {
             current: [0; MAX_CPUS],
             idle: [None; MAX_CPUS],
             installed_root: [root; MAX_CPUS],
+            handoff: [None; MAX_CPUS],
         });
     });
 
@@ -328,8 +338,21 @@ pub fn spawn_user(name: &'static str, entry: extern "C" fn()) -> Option<usize> {
 /// [`spawn_user`] except where its code came from -- it starts in ring 3, in
 /// an address space of its own, holding no capabilities at all.
 pub fn spawn_program(name: &'static str, file: &[u8]) -> Result<usize, user::LoadError> {
+    spawn_program_on(name, file, next_cpu())
+}
+
+/// The same, pinned to a CPU of the caller's choosing.
+///
+/// For a server the kernel calls on its own frame path: on the caller's CPU
+/// a call switches straight to it, where on another it would wait for that
+/// core's next tick.
+pub fn spawn_program_on(
+    name: &'static str,
+    file: &[u8],
+    cpu_index: usize,
+) -> Result<usize, user::LoadError> {
     let image = user::load(file)?;
-    spawn_inner(name, image.entry, Some(image), next_cpu()).ok_or(user::LoadError::OutOfMemory)
+    spawn_inner(name, image.entry, Some(image), cpu_index).ok_or(user::LoadError::OutOfMemory)
 }
 
 fn spawn_inner(
@@ -480,6 +503,26 @@ extern "C" fn task_exit() -> ! {
     }
 }
 
+/// Ask this CPU to run `id` next, if it is one of this CPU's tasks and is
+/// runnable when the choice is made. See `Scheduler::handoff`.
+///
+/// A task on another CPU is left to that CPU's own rotation: there is no
+/// way to make another core reschedule from here yet.
+pub fn hand_off(id: usize) {
+    x86_64::without_interrupts(|| {
+        let this_cpu = cpu::index();
+        if let Some(scheduler) = SCHEDULER.lock().as_mut() {
+            if scheduler
+                .tasks
+                .get(id)
+                .is_some_and(|task| task.cpu == this_cpu)
+            {
+                scheduler.handoff[this_cpu] = Some(id);
+            }
+        }
+    });
+}
+
 /// Mark the task on this CPU finished, and say which it was.
 ///
 /// For a task that has asked to stop, or has faulted in ring 3 and is being
@@ -539,8 +582,13 @@ pub fn on_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
     // belongs to one CPU, and picking somebody else's would put two cores on
     // one kernel stack.
     let count = scheduler.tasks.len();
-    let mut chosen = None;
-    for offset in 1..=count {
+    let mut chosen = scheduler.handoff[this_cpu].take().filter(|id| {
+        scheduler
+            .tasks
+            .get(*id)
+            .is_some_and(|task| task.state == State::Ready && task.cpu == this_cpu && !task.is_idle)
+    });
+    for offset in (1..=count).take_while(|_| chosen.is_none()) {
         let candidate = (current + offset) % count;
         let task = &scheduler.tasks[candidate];
         // Idle tasks are the fallback below, not peers in the rotation.

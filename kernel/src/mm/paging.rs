@@ -433,13 +433,27 @@ pub fn kernel_phys_of(va: u64) -> Option<u64> {
     Some(physical_base + offset)
 }
 
+/// The kernel's PML4, kept apart from [`KERNEL_MAPPER`] so that reading it
+/// takes no lock.
+///
+/// The scheduler asks for it on every switch to a kernel task, from the
+/// timer interrupt. When it lived behind the mapper's lock, a tick landing
+/// while boot code held that lock -- mapping a few thousand pages of driver
+/// memory, say -- spun forever on a lock its own CPU held. Zero until set.
+static KERNEL_ROOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub fn set_kernel_mapper(mapper: Mapper) {
+    KERNEL_ROOT.store(mapper.root, core::sync::atomic::Ordering::Release);
     *KERNEL_MAPPER.lock() = Some(mapper);
 }
 
-/// Physical address of the kernel address space's PML4.
+/// Physical address of the kernel address space's PML4. Takes no lock, so
+/// it is safe from an interrupt handler.
 pub fn kernel_root() -> Option<u64> {
-    Some(KERNEL_MAPPER.lock().as_ref()?.root)
+    match KERNEL_ROOT.load(core::sync::atomic::Ordering::Acquire) {
+        0 => None,
+        root => Some(root),
+    }
 }
 
 /// Install an address space by root.
@@ -459,8 +473,12 @@ pub unsafe fn activate_root(root: u64) {
 
 /// Run `f` against the kernel address space, if it has been installed.
 ///
+/// With interrupts off, like every lock a system call can reach: a task
+/// preempted holding this would leave the next one to want it on the same
+/// CPU spinning on a holder that cannot run.
+///
 /// Note that adding a mapping does not flush the TLB; for a previously
 /// unmapped address that is fine, because there is no stale entry to evict.
 pub fn with_kernel_mapper<R>(f: impl FnOnce(&mut Mapper) -> R) -> Option<R> {
-    KERNEL_MAPPER.lock().as_mut().map(f)
+    crate::arch::x86_64::without_interrupts(|| KERNEL_MAPPER.lock().as_mut().map(f))
 }
