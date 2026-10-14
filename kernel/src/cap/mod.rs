@@ -174,6 +174,9 @@ pub enum Object {
     /// map it, WRITE may write it -- and may ask where it physically is,
     /// which is what a device is told.
     Memory(usize),
+    /// A file the bootloader loaded, by its place in [`crate::modules`].
+    /// READ means may map it and read it. Nothing means may change it.
+    Blob(usize),
 }
 
 impl core::fmt::Debug for Object {
@@ -189,6 +192,7 @@ impl core::fmt::Debug for Object {
             Object::DeviceMemory(index) => write!(f, "DeviceMemory({index})"),
             Object::Interrupt(index) => write!(f, "Interrupt({index})"),
             Object::Memory(index) => write!(f, "Memory({index})"),
+            Object::Blob(index) => write!(f, "Blob({index})"),
         }
     }
 }
@@ -209,6 +213,7 @@ pub enum ObjectKind {
     DeviceMemory = kind::DEVICE_MEMORY,
     Interrupt = kind::INTERRUPT,
     Memory = kind::MEMORY,
+    Blob = kind::BLOB,
 }
 
 impl Object {
@@ -224,6 +229,7 @@ impl Object {
             Object::DeviceMemory(_) => ObjectKind::DeviceMemory,
             Object::Interrupt(_) => ObjectKind::Interrupt,
             Object::Memory(_) => ObjectKind::Memory,
+            Object::Blob(_) => ObjectKind::Blob,
         }
     }
 }
@@ -563,6 +569,15 @@ pub fn memory_of(slot: CapPtr, required: Rights) -> Result<(usize, Rights), CapE
         }
     })
     .ok_or(CapError::NoSuchTask)?
+}
+
+/// The module a Blob capability names. Requires `required`.
+pub fn blob_of(slot: CapPtr, required: Rights) -> Result<usize, CapError> {
+    let object = lookup(slot, required)?;
+    match *object {
+        Object::Blob(index) => Ok(index),
+        _ => Err(CapError::WrongType),
+    }
 }
 
 /// The line an Interrupt capability names. Requires `required`.

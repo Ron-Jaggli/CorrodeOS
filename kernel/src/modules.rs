@@ -65,3 +65,14 @@ pub fn all() -> impl Iterator<Item = Module> {
 pub fn find(name: &str) -> Option<Module> {
     all().find(|module| module.name() == name)
 }
+
+/// The same, with its place in the list: the number a blob capability
+/// names it by.
+pub fn position(name: &str) -> Option<(usize, Module)> {
+    all().enumerate().find(|(_, module)| module.name() == name)
+}
+
+/// A module by its place in the list.
+pub fn get(index: usize) -> Option<Module> {
+    all().nth(index)
+}

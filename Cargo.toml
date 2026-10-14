@@ -13,6 +13,7 @@ members = [
     "user/edu",
     "user/fault",
     "user/virtio-gpu",
+    "user/blob-reader",
 ]
 
 [workspace.package]

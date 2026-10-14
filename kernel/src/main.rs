@@ -11,6 +11,7 @@ extern crate alloc;
 
 mod acpi;
 mod arch;
+mod blob;
 mod cap;
 mod device;
 mod ipc;
@@ -206,7 +207,10 @@ pub extern "C" fn kmain() -> ! {
     // kernel image. Then a device, driven by one.
     program_checks();
     #[cfg(not(feature = "user-test"))]
-    device_checks();
+    {
+        device_checks();
+        blob_checks();
+    }
 
     #[cfg(feature = "user-test")]
     user_fault_test();
@@ -2031,6 +2035,128 @@ fn program_checks() {
         );
         // This line being printed at all is the other half.
         program_check("and the machine is not", true);
+    }
+}
+
+/// Bootstrap's capability to the test blob, and the endpoint its reader
+/// reports on.
+const BOOT_BLOB: cap::CapPtr = 39;
+const BLOB_ENDPOINT: cap::CapPtr = 40;
+
+fn blob_check(name: &str, ok: bool) {
+    check("blob", name, ok);
+}
+
+/// FNV-1a over some bytes, from `hash`. The same few lines as the reader's,
+/// written again rather than shared.
+fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(corrode_abi::blob::FNV_PRIME);
+    }
+    hash
+}
+
+/// Hand a large file from the boot medium to one task, and check what it
+/// read is what the bootloader loaded.
+///
+/// The file is made by the build: thirty-two megabytes of numbered records,
+/// standing in for GPU firmware, which is the same shape of problem and
+/// which a QEMU boot does not need. The kernel hashes it through the direct
+/// map; the reader hashes it through its own mapping, in ring 3; the two
+/// share no code and must agree.
+fn blob_checks() {
+    use cap::{CapError, Rights};
+    use corrode_abi::blob;
+
+    let Some((index, module)) = modules::position("test.blob") else {
+        println!("blob       : no test blob on the boot medium");
+        return;
+    };
+    println!(
+        "blob       : {} MiB in RAM before the kernel started, at {:#x}",
+        module.bytes.len() >> 20,
+        module.physical
+    );
+    blob_check(
+        "the bootloader loaded all of it",
+        module.bytes.len() == blob::RECORD * blob::RECORDS,
+    );
+    let expected = fnv1a(blob::FNV_OFFSET, module.bytes);
+
+    let minted = cap::mint(0, BOOT_BLOB, cap::Object::Blob(index), Rights::READ_GRANT).is_ok()
+        && cap::mint(
+            0,
+            BLOB_ENDPOINT,
+            cap::Object::Endpoint(ipc::Endpoint::new()),
+            Rights::ALL,
+        )
+        .is_ok();
+    blob_check("mint a read-only Blob capability", minted);
+    blob_check(
+        "a kernel task has nowhere to map it",
+        crate::blob::map(BOOT_BLOB).err() == Some(CapError::NoSpace),
+    );
+
+    let Some(reader) = spawn_program("blob-reader") else {
+        blob_check("load the reader", false);
+        return;
+    };
+    let granted = cap::grant(reader, BLOB_ENDPOINT, blob::REPORT, Rights::WRITE).is_ok()
+        && cap::grant(reader, BOOT_BLOB, blob::BLOB, Rights::READ_WRITE) == Ok(Rights::READ)
+        && cap::grant(reader, LOG_ENDPOINT, blob::LOG, Rights::WRITE).is_ok();
+    blob_check(
+        "hand one task READ, though WRITE was asked for",
+        granted && cap::slots_used(reader) == Some(3),
+    );
+    start_all(&[Some(reader)]);
+
+    for _ in 0..2 {
+        let Ok(received) = ipc::recv(BLOB_ENDPOINT, None, None) else {
+            return;
+        };
+        let words = received.message.words;
+        match received.message.label {
+            blob::LABEL_READ => {
+                println!(
+                    "blob       : ring 3 read {} MiB and hashed it to {:#018x}",
+                    words[1] >> 20,
+                    words[2]
+                );
+                blob_check(
+                    "ring 3 mapped every byte of it",
+                    words[0] == syscall::STATUS_OK && words[1] == module.bytes.len() as u64,
+                );
+                blob_check("and read what the bootloader loaded", words[2] == expected);
+                blob_check("its first and last records are in place", words[3] == 1);
+                let space = task::space_of(reader);
+                let address = crate::blob::user_address(index);
+                blob_check(
+                    "the pages are the module's own, not a copy",
+                    space.and_then(|space| space.translate(address)) == Some(module.physical),
+                );
+                blob_check(
+                    "and no page of it is writable",
+                    space.is_some_and(|space| {
+                        (0..module.bytes.len() as u64).step_by(4096).all(|offset| {
+                            space
+                                .leaf_flags(address + offset)
+                                .is_some_and(|flags| flags & mm::paging::WRITABLE == 0)
+                        })
+                    }),
+                );
+            }
+            blob::LABEL_PHYSICAL => {
+                // Refused for want of WRITE, which no holder of a blob has;
+                // with it, it would be the wrong kind of object.
+                blob_check(
+                    "a blob gives up no physical address",
+                    words[0] == CapError::InsufficientRights.code()
+                        || words[0] == CapError::WrongType.code(),
+                );
+            }
+            other => println!("blob       : unexpected label {other}"),
+        }
     }
 }
 

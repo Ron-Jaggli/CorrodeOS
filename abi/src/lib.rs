@@ -137,6 +137,7 @@ pub mod kind {
     pub const DEVICE_MEMORY: u8 = 8;
     pub const INTERRUPT: u8 = 9;
     pub const MEMORY: u8 = 10;
+    pub const BLOB: u8 = 11;
 }
 
 /// Rights, as bits: in the low byte of what `SYS_IDENTIFY` reports, and as
@@ -212,6 +213,32 @@ pub mod edu {
     /// What to ask the factorial of, and the answer.
     pub const INPUT: u32 = 10;
     pub const FACTORIAL: u32 = 3_628_800;
+}
+
+/// The boot-time check that a large file reaches one task intact.
+pub mod blob {
+    /// A send-only endpoint to report on.
+    pub const REPORT: usize = 0;
+    /// The blob, read-only.
+    pub const BLOB: usize = 1;
+    pub const LOG: usize = 2;
+
+    /// Status of the mapping, its length, its FNV-1a hash, and whether its
+    /// first and last records read as they should.
+    pub const LABEL_READ: u64 = 30;
+    /// Status of trying to have its physical address.
+    pub const LABEL_PHYSICAL: u64 = 31;
+
+    /// The test file: records of sixteen bytes, each its own number in
+    /// fifteen decimal digits and a newline, `RECORDS` of them. Every page is
+    /// different from every other, so a page out of place changes the hash.
+    pub const RECORD: usize = 16;
+    pub const RECORDS: usize = 2 * 1024 * 1024;
+
+    /// FNV-1a, 64-bit: simple enough to compute the same way on both sides
+    /// of the boundary without sharing code that could be wrong twice.
+    pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    pub const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 }
 
 /// The conversation between the kernel's compositor and a display driver.

@@ -75,7 +75,7 @@ kernel:
 # crate built for it. RUSTFLAGS in the environment replaces the ones in
 # .cargo/config.toml outright, and a separate target directory stops the two
 # sets of flags from invalidating each other's build of the crates they share.
-USER_PROGRAMS := edu fault virtio-gpu
+USER_PROGRAMS := edu fault virtio-gpu blob-reader
 USER_TARGET   := target/user
 USER_BIN      := $(USER_TARGET)/x86_64-unknown-none/release
 USER_RUSTFLAGS := -C relocation-model=static -C strip=debuginfo \
@@ -124,16 +124,37 @@ fmt:
 
 $(KERNEL): kernel
 
-iso: $(KERNEL) user
-	@rm -rf $(ISO_ROOT)/boot/programs
-	@mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/boot/programs $(ISO_ROOT)/EFI/BOOT
+# A large file for the boot to carry and one task to read: 32 MiB of
+# numbered sixteen-byte records, standing in for GPU firmware. Made once; it
+# never changes.
+TEST_BLOB := build/test.blob
+$(TEST_BLOB):
+	@mkdir -p build
+	seq -f '%015.0f' 0 2097151 > $@
+
+# Firmware, if scripts/fetch-firmware.sh has put any in firmware/. Never
+# committed: it is NVIDIA's, under its own licence, and comes from
+# linux-firmware. Each file found is one more module.
+FIRMWARE := $(shell find firmware -type f -name '*.bin' 2>/dev/null | sort)
+
+iso: $(KERNEL) user $(TEST_BLOB)
+	@rm -rf $(ISO_ROOT)/boot/programs $(ISO_ROOT)/boot/firmware
+	@mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/boot/programs $(ISO_ROOT)/boot/firmware $(ISO_ROOT)/EFI/BOOT
 	cp $(KERNEL) $(ISO_ROOT)/boot/corrode
 	cp $(foreach program,$(USER_PROGRAMS),$(USER_BIN)/$(program)) $(ISO_ROOT)/boot/programs/
+	cp $(TEST_BLOB) $(ISO_ROOT)/boot/firmware/test.blob
+	@for file in $(FIRMWARE); do \
+	    mkdir -p $(ISO_ROOT)/boot/$$(dirname $$file); cp $$file $(ISO_ROOT)/boot/$$file; \
+	done
 	@# The configuration is boot/limine.conf plus one line for each module,
 	@# so the list of what gets loaded is the list of what was built.
 	@{ cat boot/limine.conf; \
 	   for program in $(USER_PROGRAMS); do \
 	       echo "    module_path: boot():/boot/programs/$$program"; \
+	   done; \
+	   echo "    module_path: boot():/boot/firmware/test.blob"; \
+	   for file in $(FIRMWARE); do \
+	       echo "    module_path: boot():/boot/$$file"; \
 	   done; } > $(ISO_ROOT)/boot/limine/limine.conf
 	cp $(LIMINE_DIR)/limine-bios.sys \
 	   $(LIMINE_DIR)/limine-bios-cd.bin \

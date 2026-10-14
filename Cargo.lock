@@ -7,6 +7,13 @@ name = "corrode-abi"
 version = "0.0.1"
 
 [[package]]
+name = "corrode-blob-reader"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+]
+
+[[package]]
 name = "corrode-edu"
 version = "0.0.1"
 dependencies = [

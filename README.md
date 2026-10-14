@@ -77,6 +77,7 @@ kernel/          the privileged kernel
   src/modules.rs   files the bootloader left in RAM
   src/memory.rs    memory a task can map and tell a device about
   src/remote.rs    a Renderer that is a call to a driver in ring 3
+  src/blob.rs      a file from the boot medium, for one task to read
   src/time.rs      monotonic nanosecond clock, off the TSC
   src/arch/x86_64/cpu.rs  which CPU is this
   build.rs         makes cargo notice linker.ld changes
@@ -100,6 +101,7 @@ user/            ring 3 programs, each an ELF file loaded as a Limine module
   edu/             a driver for QEMU's teaching device
   fault/           a program that faults on purpose
   virtio-gpu/      a display driver: the compositor's frames, on a virtio GPU
+  blob-reader/     reads 32 MiB it was handed at boot, and says what was in it
   user.ld          where a program's segments go
 virtio/          virtqueues and virtio GPU commands, tested against a pretend device
 pci/             PCI configuration space as arithmetic, tested on the build host
@@ -108,6 +110,7 @@ pci/             PCI configuration space as arithmetic, tested on the build host
 boot/limine.conf lets Limine find the kernel
 docker/          the build environment
 scripts/         check-image.sh — guards against orphan sections
+                 fetch-firmware.sh — NVIDIA GSP firmware into firmware/, never committed
 ```
 
 ## Design rules
@@ -217,6 +220,9 @@ block until it interrupts, and holds nothing else. See "Devices" below.
 A display driver in ring 3: with a virtio GPU present, the compositor's
 `Renderer` is a call to a program that draws the frames into memory its
 device scans out. See "A display driver in ring 3" below.
+
+Firmware: tens of megabytes on the boot medium, in RAM before the kernel
+starts, handed to one task as a read-only capability. See "Firmware" below.
 
 Programs: ring 3 tasks loaded from ELF files the bootloader put in RAM,
 written in Rust against a small runtime. A driver is one of these, and a
@@ -851,6 +857,63 @@ reschedule needs an IPI the kernel does not send yet. And the driver, like
 every driver here, can program its device to DMA anywhere: there is no
 IOMMU support.
 
+### Firmware
+
+A GPU of the generation this project is for will not run without tens of
+megabytes of signed NVIDIA firmware, which its driver does not interpret,
+only loads. The design rules say where that comes from: the boot medium,
+read by the bootloader before the kernel runs, because nothing on the path
+from input to pixels may wait on a disk. A Limine module is exactly that.
+
+What the kernel adds is who may see it. A **`Blob`** capability names one
+module. READ maps it into the holder read-only and never executable,
+whatever rights the capability carries -- it is the bootloader's one copy,
+shared, and nobody gets to change it under anybody else. The frames mapped
+are the module's own; tens of megabytes are not copied to be looked at.
+
+A blob gives up no physical address. A driver whose device must read
+firmware by DMA copies it into `Memory` it holds with WRITE and tells the
+device about that, so a device can never be pointed at the shared copy.
+
+The boot check carries a stand-in, because QEMU needs no NVIDIA firmware:
+32 MiB of numbered sixteen-byte records, made by the build, every page
+different from every other so a page out of place changes the hash. The
+kernel hashes it through the direct map; a ring 3 program holding nothing
+but the blob and two endpoints hashes it through its own mapping. The two
+share no code.
+
+```
+blob       : 32 MiB in RAM before the kernel started, at 0x1dc27000
+blob       : hand one task READ, though WRITE was asked for       PASS
+blob       : ring 3 read 32 MiB and hashed it to 0xd315e038c0d473a5
+blob       : and read what the bootloader loaded                 PASS
+blob       : the pages are the module's own, not a copy          PASS
+blob       : and no page of it is writable                       PASS
+blob       : a blob gives up no physical address                 PASS
+```
+
+#### The real thing
+
+`scripts/fetch-firmware.sh` puts the GSP firmware for the RTX 3060 Ti
+(GA104, release 570.144) in `firmware/`: copied from `/lib/firmware` by
+default, decompressing `.xz` or `.zst` as distributions ship it, from any
+linux-firmware tree given as an argument, or downloaded from kernel.org
+with `--download`. It only reads files and writes into this directory.
+`firmware/` is in `.gitignore`: the files are NVIDIA's, redistributed in
+linux-firmware under NVIDIA's licence, and are never committed here. Every
+`.bin` found under it becomes a module on the next ISO:
+
+```
+module     : /boot/firmware/nvidia/ga104/gsp/booter_load-570.144.bin -- 60 KiB at 0x1dc13000
+module     : /boot/firmware/nvidia/ga104/gsp/gsp-570.144.bin -- 62082 KiB at 0x19f52000
+```
+
+Known gaps: a blob is never given back, so its frames stay out of the
+allocator for good even after the one task that needed it has copied what
+it needed. 1 GiB is the most one can be. Nothing checks a firmware file's
+signature or version before a driver gets it -- that is the driver's job,
+and the GPU's, which checks the signature itself.
+
 ### Text
 
 There are two engines and they do not know about each other. The **text
@@ -1462,7 +1525,9 @@ ELF files from modules, compare every page's permissions with what the file
 asked for, and stop a program that faults without stopping the machine. With
 a virtio GPU, eight more start its driver in ring 3 and confirm the first
 frame reached the device's memory and the device interrupted when it had
-copied it. Three
+copied it. Eight blob checks hand 32 MiB from the boot medium to one ring 3
+task read-only and confirm it read what the bootloader loaded, from the
+module's own frames. Three
 blend checks confirm a fade is exact at both ends and seamless over its own
 colour, two text checks that letters stay inside the block measured for them
 and a stroke is the thickness its weight says, and two scene checks that the

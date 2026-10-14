@@ -87,6 +87,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::x86_64::idt::TrapFrame;
+use crate::blob;
 use crate::cap::{self, CapError, ObjectKind, Rights};
 use crate::device;
 use crate::ipc;
@@ -239,6 +240,9 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
                 }
                 Ok(ObjectKind::Memory) => {
                     memory::map(slot).map(|mapped| (mapped.address, mapped.len, 0, 0))
+                }
+                Ok(ObjectKind::Blob) => {
+                    blob::map(slot).map(|mapped| (mapped.address, mapped.len, 0, 0))
                 }
                 _ => surface::map(slot).map(|mapped| {
                     (
