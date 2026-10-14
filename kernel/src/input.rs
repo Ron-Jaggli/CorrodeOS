@@ -6,15 +6,17 @@
 //! The task exists because a send is a rendezvous and the painter does not
 //! block: it sleeps until the next tick, then paints whatever has happened.
 //!
-//! What the scene shows for now is a pointer that follows the mouse, kept on
-//! top of everything, and one line of typed text. Where a key should go --
-//! which window has focus -- is the window manager's question, and there is
-//! no window manager yet.
+//! The painter's half lives here too, as [`Desk`]: a pointer that follows the
+//! mouse and stays on top, and the window manager. A program's window gets a
+//! title bar; clicking a window gives it the keyboard and brings it to the
+//! front, and dragging its bar moves it. Keys go to the window with the
+//! keyboard, or, when none has it, to a line of typed text on the boot
+//! screen.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use corrode_abi::ps2;
+use corrode_abi::{ps2, window};
 use corrode_render::anim::{Animation, Ease, Fx};
 use corrode_render::scene::{Layer, LayerId, Scene};
 use corrode_render::{Color, Rect, Renderer};
@@ -32,7 +34,12 @@ pub enum Event {
     /// The driver has set the controller up and says which devices answered.
     Ready { keyboard: bool, mouse: bool },
     /// A key went down or came up, and what it types.
-    Key { pressed: bool, text: Option<char> },
+    Key {
+        key: u8,
+        pressed: bool,
+        text: Option<char>,
+        modifiers: u8,
+    },
     /// The mouse moved, or its buttons changed.
     Pointer { dx: i32, dy: i32, buttons: u8 },
 }
@@ -123,6 +130,8 @@ fn decode(message: &ipc::Message) -> Option<Event> {
             mouse: words[1] != 0,
         }),
         ps2::LABEL_KEY => Some(Event::Key {
+            key: words[0] as u8,
+            modifiers: words[3] as u8,
             pressed: words[1] != 0,
             text: u32::try_from(words[2])
                 .ok()
@@ -217,7 +226,32 @@ fn arrow(grow: i32) -> Vec<u8> {
     coverage
 }
 
-/// The keyboard and mouse, as the scene shows them.
+/// Height of a window's title bar.
+const BAR: u32 = 22;
+const BAR_FOCUSED: Color = Color::rgb(0xb7, 0x41, 0x0e);
+const BAR_IDLE: Color = Color::rgb(0x3a, 0x3d, 0x45);
+
+/// A program's window, as the painter keeps it.
+struct Managed {
+    window: usize,
+    surface: usize,
+    /// The title bar, which a docked window does not have.
+    bar: Option<LayerId>,
+    body: LayerId,
+    /// Where the window's top left is -- its bar's, if it has one.
+    at: (i32, i32),
+    docked: bool,
+}
+
+impl Managed {
+    fn body_at(&self) -> (i32, i32) {
+        let bar = if self.bar.is_some() { BAR as i32 } else { 0 };
+        (self.at.0, self.at.1 + bar)
+    }
+}
+
+/// The keyboard and mouse, as the scene shows them, and the windows they
+/// act on.
 pub struct Desk {
     /// Outline below, fill above, moving together.
     pointer: Option<[LayerId; 2]>,
@@ -228,6 +262,13 @@ pub struct Desk {
     line_height: u32,
     /// Whether the first movement has been reported.
     moved: bool,
+    windows: Vec<Managed>,
+    /// Which of `windows` has the keyboard.
+    focus: Option<usize>,
+    /// A window being dragged by its bar, and where on the bar it was held.
+    drag: Option<(usize, i32, i32)>,
+    /// Windows placed so far, for staggering the next one.
+    placed: i32,
 }
 
 impl Desk {
@@ -264,6 +305,10 @@ impl Desk {
             typed: String::new(),
             line_height,
             moved: false,
+            windows: Vec::new(),
+            focus: None,
+            drag: None,
+            placed: 0,
         };
         let src = Rect::new(0, LINE_ROW as i32, 1, line_height);
         let y = screen.height as i32 - 40 - line_height as i32;
@@ -311,12 +356,12 @@ impl Desk {
         scene: &mut Scene<N>,
         now: u64,
     ) {
-        // Anything that turned up since -- a window -- goes under the
-        // pointer, not over it.
-        if let Some([below, above]) = self.pointer {
-            if scene.top() != Some(above) {
-                scene.raise(below);
-                scene.raise(above);
+        self.restack(scene);
+
+        // What programs have drawn since the last frame.
+        for managed in &self.windows {
+            if let Some(redrawn) = crate::surface::take_redrawn(managed.surface) {
+                scene.damage(managed.body, redrawn);
             }
         }
 
@@ -331,13 +376,33 @@ impl Desk {
                     }
                 }
                 Event::Key {
-                    pressed: true,
-                    text: Some(text),
-                } => {
-                    typed |= self.key(text);
+                    key,
+                    pressed,
+                    text,
+                    modifiers,
+                } => match self.focus.and_then(|index| self.windows.get(index)) {
+                    // The window with the keyboard gets every key, up and
+                    // down, and makes of it what it likes.
+                    Some(managed) => crate::windows::push(
+                        managed.window,
+                        window::KEY,
+                        [
+                            key as u64,
+                            pressed as u64,
+                            text.map_or(0, |c| c as u64),
+                            modifiers as u64,
+                        ],
+                    ),
+                    None => {
+                        if let (true, Some(text)) = (pressed, text) {
+                            typed |= self.key(text);
+                        }
+                    }
+                },
+                Event::Pointer { dx, dy, buttons } => {
+                    self.pointer(scene, now, dx, dy, buttons);
+                    self.restack(scene);
                 }
-                Event::Key { .. } => {}
-                Event::Pointer { dx, dy, buttons } => self.pointer(scene, now, dx, dy, buttons),
             }
         }
         if typed {
@@ -359,6 +424,165 @@ impl Desk {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Give the painter a window the server has made: a place, a bar, and
+    /// the keyboard. It rises into place and fades in, like everything
+    /// else that arrives.
+    pub fn manage<const N: usize>(&mut self, window: usize, scene: &mut Scene<N>, now: u64) {
+        let Some((surface, width, height, docked)) = crate::windows::shape(window) else {
+            return;
+        };
+        let at = if docked {
+            (0, 0)
+        } else {
+            let step = self.placed % 6;
+            self.placed += 1;
+            (120 + 40 * step, 90 + 36 * step)
+        };
+        let bar = (!docked)
+            .then(|| scene.add(Layer::solid(Rect::new(at.0, at.1, width, BAR), BAR_IDLE)))
+            .flatten();
+        let mut managed_body_y = at.1;
+        if bar.is_some() {
+            managed_body_y += BAR as i32;
+        }
+        let Some(body) = scene.add(Layer::surface(
+            at.0,
+            managed_body_y,
+            surface as u32,
+            width,
+            height,
+        )) else {
+            println!("desktop    : no room in the scene for another window");
+            return;
+        };
+        if !docked {
+            for id in [bar, Some(body)].into_iter().flatten() {
+                if let Some(layer) = scene.layer_mut(id) {
+                    let rest = layer.y.sample(now).value;
+                    layer.opacity =
+                        Animation::ease(now, 250, Fx::ZERO, Fx::from_int(255), Ease::Out);
+                    layer.y = Animation::spring(
+                        now,
+                        Fx::from_int(rest.round() + 24),
+                        rest,
+                        corrode_render::anim::Velocity::ZERO,
+                        corrode_render::anim::Spring::SMOOTH,
+                    );
+                }
+            }
+        }
+        self.windows.push(Managed {
+            window,
+            surface,
+            bar,
+            body,
+            at,
+            docked,
+        });
+        if !docked {
+            self.set_focus(scene, Some(self.windows.len() - 1));
+        }
+    }
+
+    /// Give the keyboard to window `index`, or to nobody. The window that
+    /// gets it comes to the front; both are told.
+    fn set_focus<const N: usize>(&mut self, scene: &mut Scene<N>, index: Option<usize>) {
+        if self.focus == index {
+            return;
+        }
+        for (which, gained) in [(self.focus, false), (index, true)] {
+            let Some(managed) = which.and_then(|which| self.windows.get(which)) else {
+                continue;
+            };
+            crate::windows::push(managed.window, window::FOCUS, [gained as u64, 0, 0, 0]);
+            if let Some(layer) = managed.bar.and_then(|bar| scene.layer_mut(bar)) {
+                layer.color = if gained { BAR_FOCUSED } else { BAR_IDLE };
+            }
+            if gained {
+                for id in [managed.bar, Some(managed.body)].into_iter().flatten() {
+                    scene.raise(id);
+                }
+            }
+        }
+        self.focus = index;
+        self.restack(scene);
+    }
+
+    /// Docked windows above every other window, and the pointer above all.
+    fn restack<const N: usize>(&self, scene: &mut Scene<N>) {
+        let wanted = self.pointer.map(|layers| layers[1]);
+        if wanted.is_some() && scene.top() == wanted {
+            return;
+        }
+        for managed in self.windows.iter().filter(|managed| managed.docked) {
+            scene.raise(managed.body);
+        }
+        if let Some([below, above]) = self.pointer {
+            scene.raise(below);
+            scene.raise(above);
+        }
+    }
+
+    /// A button went down or up. What is under the pointer decides what it
+    /// means: a bar is picked up, a window body is given the keyboard and
+    /// told, and anything else takes the keyboard away from every window.
+    fn click<const N: usize>(&mut self, scene: &mut Scene<N>, buttons: u8, pressed: u8) {
+        // The pointer is always on top and always under itself, so it is
+        // looked past.
+        let pointer = self.pointer.unwrap_or([LayerId::NONE; 2]);
+        let under = scene
+            .layers_at(self.at.0, self.at.1)
+            .find(|id| !pointer.contains(id));
+        let hit = under.and_then(|id| {
+            self.windows
+                .iter()
+                .position(|managed| managed.body == id || managed.bar == Some(id))
+                .map(|index| (index, self.windows[index].bar == Some(id)))
+        });
+
+        if pressed & 1 != 0 {
+            println!(
+                "input      : click at ({}, {}) on {}",
+                self.at.0,
+                self.at.1,
+                match hit {
+                    Some((_, true)) => "a title bar",
+                    Some(_) => "a window",
+                    None if under.is_some() => "a layer",
+                    None => "the background",
+                }
+            );
+            match hit {
+                Some((index, on_bar)) => {
+                    if !self.windows[index].docked {
+                        self.set_focus(scene, Some(index));
+                    }
+                    if on_bar {
+                        let (x, y) = self.windows[index].at;
+                        self.drag = Some((index, self.at.0 - x, self.at.1 - y));
+                    }
+                }
+                None => self.set_focus(scene, None),
+            }
+        }
+
+        // A click on a window's body is the program's to interpret.
+        if let Some((index, false)) = hit {
+            let managed = &self.windows[index];
+            let (x, y) = managed.body_at();
+            crate::windows::push(
+                managed.window,
+                window::BUTTON,
+                [
+                    (self.at.0 - x) as u64,
+                    (self.at.1 - y) as u64,
+                    buttons as u64,
+                    0,
+                ],
+            );
         }
     }
 
@@ -405,26 +629,31 @@ impl Desk {
                 self.at.0, self.at.1
             );
         }
-        let pressed = buttons & !self.buttons;
-        if pressed & 1 != 0 {
-            // What a click lands on, by the scene's own reckoning -- the
-            // first thing a window manager will need to know.
-            // The pointer is always on top and always under itself, so it
-            // is looked past.
-            let pointer = self.pointer.unwrap_or([LayerId::NONE; 2]);
-            let under = scene
-                .layers_at(self.at.0, self.at.1)
-                .find(|id| !pointer.contains(id));
-            println!(
-                "input      : click at ({}, {}) on {}",
-                self.at.0,
-                self.at.1,
-                if under.is_some() {
-                    "a layer"
-                } else {
-                    "the background"
+        // Dragging a window by its bar: it follows the pointer, held where
+        // it was picked up.
+        if let Some((index, grab_x, grab_y)) = self.drag {
+            if buttons & 1 == 0 {
+                self.drag = None;
+            } else if let Some(managed) = self.windows.get_mut(index) {
+                managed.at = (self.at.0 - grab_x, (self.at.1 - grab_y).max(0));
+                let (x, y) = managed.at;
+                let (body_x, body_y) = managed.body_at();
+                for (id, (x, y)) in [
+                    (managed.bar, (x, y)),
+                    (Some(managed.body), (body_x, body_y)),
+                ] {
+                    if let Some(layer) = id.and_then(|id| scene.layer_mut(id)) {
+                        layer.x = Animation::rest(Fx::from_int(x));
+                        layer.y = Animation::rest(Fx::from_int(y));
+                    }
                 }
-            );
+            }
+        }
+
+        let pressed = buttons & !self.buttons;
+        let released = self.buttons & !buttons;
+        if pressed != 0 || released != 0 {
+            self.click(scene, buttons, pressed);
         }
         self.buttons = buttons;
     }

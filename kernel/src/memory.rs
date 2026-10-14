@@ -182,6 +182,30 @@ pub fn map(slot: CapPtr) -> Result<Mapped, CapError> {
     })
 }
 
+/// Make `pages` of memory out of the pool in `pool` and put a capability to
+/// it, with every right, in the caller's slot `into`. Returns its length in
+/// bytes.
+///
+/// The slot is checked before anything is spent or made, so the one way this
+/// can fail after spending -- running out of frames -- puts the pages back.
+pub fn allocate(pool: CapPtr, pages: u64, into: CapPtr) -> Result<u64, CapError> {
+    if pages == 0 || pages > SPAN / PAGE {
+        return Err(CapError::Invalid);
+    }
+    match cap::identify(into) {
+        Err(CapError::Empty) => {}
+        Ok(_) => return Err(CapError::Occupied),
+        Err(error) => return Err(error),
+    }
+    cap::pool_spend(pool, pages)?;
+    let Some(index) = create(pages as usize, false) else {
+        cap::pool_refund(pool, pages);
+        return Err(CapError::NoSpace);
+    };
+    cap::issue(into, cap::Object::Memory(index), Rights::ALL)?;
+    Ok(pages * PAGE)
+}
+
 /// Where page `page` of the memory in `slot` is physically. Requires WRITE:
 /// the only use of a physical address is to have a device write there.
 pub fn physical(slot: CapPtr, page: u64) -> Result<u64, CapError> {

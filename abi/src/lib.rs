@@ -84,6 +84,25 @@ pub const SYS_PORT_IN: u64 = 14;
 /// Write one. Needs WRITE. `rsi` is the offset, `rdx` the width, `r10` the
 /// value.
 pub const SYS_PORT_OUT: u64 = 15;
+/// The monotonic clock: nanoseconds since boot, in `rdx`. Takes nothing and
+/// needs no capability -- the timestamp counter is readable in ring 3
+/// anyway, so this hands out nothing a program could not already measure.
+pub const SYS_CLOCK: u64 = 16;
+/// Sleep until the monotonic clock reads `rdi` nanoseconds. Returns at once
+/// if it already has. A deadline rather than a duration, so a program that
+/// sleeps in a loop does not drift by however late each wake-up was.
+pub const SYS_SLEEP: u64 = 17;
+/// Make `rsi` pages of fresh, zeroed memory out of the pool capability in
+/// `rdi`, and put a capability to it in the caller's slot `rdx`. Needs WRITE
+/// on the pool. The length in bytes comes back in `rdx`; map it with
+/// `SYS_MAP`.
+pub const SYS_ALLOC: u64 = 18;
+/// Wait for the window in `rdi` to have something to say, or for the clock
+/// to read `rsi` nanoseconds, whichever is first. Needs READ. The event
+/// comes back as a message: label in `rsi`, words in `rdx`, `r10`, `r8`,
+/// `r9`. A label of zero means the deadline came first. A deadline of zero
+/// looks and returns at once; `u64::MAX` waits for ever.
+pub const SYS_WAIT: u64 = 19;
 
 /// Slot argument meaning "nowhere".
 ///
@@ -146,6 +165,61 @@ pub mod kind {
     pub const MEMORY: u8 = 10;
     pub const BLOB: u8 = 11;
     pub const IO_PORTS: u8 = 12;
+    pub const POOL: u8 = 13;
+    pub const WINDOW: u8 = 14;
+}
+
+/// What every desktop program is handed, in the same slots, and what it may
+/// put in the others.
+pub mod app {
+    /// A send-only endpoint to the window server.
+    pub const WINDOWS: usize = 0;
+    /// A pool of memory to make a heap from.
+    pub const POOL: usize = 1;
+    /// A send-only endpoint to the log.
+    pub const LOG: usize = 2;
+    /// Where the program should ask for its window to be put.
+    pub const WINDOW: usize = 3;
+    /// Where it should ask for its heap to be put.
+    pub const HEAP: usize = 4;
+    /// For the panel only: a send-only endpoint to the launcher.
+    pub const LAUNCHER: usize = 5;
+
+    /// Pages in each program's pool.
+    pub const POOL_PAGES: u64 = 256;
+}
+
+/// The window server: one call to open a window, and the events a window
+/// then receives.
+pub mod window {
+    /// A call: open a window `word 0` by `word 1` pixels. Word 2 is 1 for a
+    /// panel docked along the top of the screen -- as wide as the screen,
+    /// whatever was asked, with no title bar and never covered. The answer
+    /// carries the window's capability and says its size in words 0 and 1.
+    pub const OPEN: u64 = 60;
+    pub const OPENED: u64 = 61;
+    pub const DOCKED: u64 = 1;
+
+    /// A key, while this window has the keyboard. Words as `ps2::LABEL_KEY`.
+    pub const KEY: u64 = 62;
+    /// A mouse button went down or up inside the window. Words 0 and 1 are
+    /// where, from the window's top left corner; word 2 the buttons held.
+    pub const BUTTON: u64 = 63;
+    /// The window gained the keyboard (word 0 is 1) or lost it (0).
+    pub const FOCUS: u64 = 64;
+
+    /// Most a window may be, either way.
+    pub const MAX_WIDTH: u32 = 1024;
+    pub const MAX_HEIGHT: u32 = 768;
+}
+
+/// The launcher: start one of the programs the system was booted with.
+pub mod launcher {
+    /// Start program number word 0. The answer's word 0 is zero for
+    /// started, or the status of why not.
+    pub const LAUNCH: u64 = 70;
+    pub const LAUNCHED: u64 = 71;
+    pub const TERMINAL: u64 = 1;
 }
 
 /// Rights, as bits: in the low byte of what `SYS_IDENTIFY` reports, and as

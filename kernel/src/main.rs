@@ -31,6 +31,7 @@ mod sync;
 mod syscall;
 mod task;
 mod time;
+mod windows;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -214,6 +215,7 @@ pub extern "C" fn kmain() -> ! {
         blob_checks();
         nvidia_checks();
         start_input();
+        start_desktop();
     }
 
     #[cfg(feature = "user-test")]
@@ -2012,6 +2014,218 @@ fn start_input() {
     start_all(&[receiver, Some(driver)]);
 }
 
+/// Bootstrap's ends of the window server's and the launcher's endpoints,
+/// with every right, to hand out send-only copies.
+const WINDOWS_ENDPOINT: cap::CapPtr = 64;
+const LAUNCHER_ENDPOINT: cap::CapPtr = 65;
+/// Where bootstrap is given each window's surface -- at this slot plus the
+/// surface's number -- so the renderer can be shown it.
+const WINDOW_SURFACES: cap::CapPtr = 96;
+
+/// A service's capabilities: the receive half of its endpoint, where the
+/// answer to a call lands, and a slot for what it is about to hand over.
+const SERVICE_ENDPOINT_SLOT: cap::CapPtr = 0;
+const SERVICE_REPLY_SLOT: cap::CapPtr = 1;
+const SERVICE_SPARE_SLOT: cap::CapPtr = 2;
+/// The launcher also holds what it gives the programs it starts.
+const LAUNCHER_WINDOWS_SLOT: cap::CapPtr = 3;
+const LAUNCHER_LOG_SLOT: cap::CapPtr = 4;
+
+fn desktop_check(name: &str, ok: bool) {
+    check("desktop", name, ok);
+}
+
+/// The window server: open a window for whoever calls, and answer with the
+/// one capability to it.
+///
+/// The window's surface goes to bootstrap as well, where the painter can
+/// show it to the renderer. Placing the window, and everything after, is the
+/// painter's: this task only makes them.
+extern "C" fn window_server() {
+    use corrode_abi::window;
+
+    loop {
+        let Ok(received) = ipc::recv(SERVICE_ENDPOINT_SLOT, None, Some(SERVICE_REPLY_SLOT)) else {
+            return;
+        };
+        let words = received.message.words;
+        let size = |word: u64| word.min(u32::MAX as u64) as u32;
+        let opened = (received.message.label == window::OPEN)
+            .then(|| windows::open(size(words[0]), size(words[1]), words[2] == window::DOCKED))
+            .flatten();
+
+        let Some(index) = opened else {
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: window::OPENED,
+                    words: [0; 4],
+                },
+                None,
+            );
+            continue;
+        };
+        let Some((surface, width, height, _)) = windows::shape(index) else {
+            continue;
+        };
+        let issued = cap::issue_to(
+            0,
+            WINDOW_SURFACES + surface,
+            cap::Object::Surface(surface),
+            cap::Rights::ALL,
+        )
+        .is_ok()
+            && cap::issue(
+                SERVICE_SPARE_SLOT,
+                cap::Object::Window(index),
+                cap::Rights::ALL,
+            )
+            .is_ok();
+        let answer = ipc::Message {
+            label: window::OPENED,
+            words: [width as u64, height as u64, 0, 0],
+        };
+        // Handed over without GRANT: a window is its program's to draw in,
+        // not to give away.
+        let transfer = issued.then_some((SERVICE_SPARE_SLOT, cap::Rights::READ_WRITE));
+        let _ = ipc::reply(SERVICE_REPLY_SLOT, answer, transfer);
+        let _ = cap::delete(SERVICE_SPARE_SLOT);
+    }
+}
+
+/// The launcher: start one of the programs the system was booted with, on
+/// request. Only the panel holds an endpoint to it.
+extern "C" fn launcher() {
+    use corrode_abi::launcher;
+
+    loop {
+        let Ok(received) = ipc::recv(SERVICE_ENDPOINT_SLOT, None, Some(SERVICE_REPLY_SLOT)) else {
+            return;
+        };
+        let words = received.message.words;
+        let status = match (received.message.label, words[0]) {
+            (launcher::LAUNCH, launcher::TERMINAL) => {
+                match start_app("terminal", LAUNCHER_WINDOWS_SLOT, LAUNCHER_LOG_SLOT, None) {
+                    Ok(_) => 0,
+                    Err(error) => error.code(),
+                }
+            }
+            _ => cap::CapError::Invalid.code(),
+        };
+        let _ = ipc::reply(
+            SERVICE_REPLY_SLOT,
+            ipc::Message {
+                label: launcher::LAUNCHED,
+                words: [status, 0, 0, 0],
+            },
+            None,
+        );
+    }
+}
+
+/// Start the program called `name` as a desktop program: an endpoint to the
+/// window server, a pool of memory of its own, the log -- and, for the
+/// panel, the launcher. The capabilities are derived from the caller's
+/// slots, so whoever starts a program can give it only what it holds.
+fn start_app(
+    name: &'static str,
+    windows_slot: cap::CapPtr,
+    log_slot: cap::CapPtr,
+    launcher_slot: Option<cap::CapPtr>,
+) -> Result<usize, cap::CapError> {
+    use cap::{CapError, Object, Rights};
+    use corrode_abi::app;
+
+    let id = spawn_program(name).ok_or(CapError::NoSpace)?;
+    cap::grant(id, windows_slot, app::WINDOWS, Rights::WRITE)?;
+    cap::grant(id, log_slot, app::LOG, Rights::WRITE)?;
+    if let Some(slot) = launcher_slot {
+        cap::grant(id, slot, app::LAUNCHER, Rights::WRITE)?;
+    }
+    cap::issue_to(
+        id,
+        app::POOL,
+        Object::Pool(core::sync::atomic::AtomicU64::new(app::POOL_PAGES)),
+        Rights::READ_WRITE,
+    )?;
+    task::start(id);
+    Ok(id)
+}
+
+/// The desktop's services, and the panel.
+fn start_desktop() {
+    use cap::{CapError, Object, Rights};
+
+    let minted = cap::mint(
+        0,
+        WINDOWS_ENDPOINT,
+        Object::Endpoint(ipc::Endpoint::new()),
+        Rights::ALL,
+    )
+    .is_ok()
+        && cap::mint(
+            0,
+            LAUNCHER_ENDPOINT,
+            Object::Endpoint(ipc::Endpoint::new()),
+            Rights::ALL,
+        )
+        .is_ok();
+    desktop_check("mint the window server's and launcher's endpoints", minted);
+
+
+    // The pool's rules, from this side, on a pool of four pages.
+    let pool_rules = cap::issue(
+        BOOT_POOL,
+        Object::Pool(core::sync::atomic::AtomicU64::new(4)),
+        Rights::ALL,
+    )
+    .is_ok()
+        && memory::allocate(BOOT_POOL, 8, BOOT_POOL_MEMORY) == Err(CapError::NoSpace)
+        && memory::allocate(BOOT_POOL, 0, BOOT_POOL_MEMORY) == Err(CapError::Invalid)
+        && memory::allocate(BOOT_POOL, 3, BOOT_POOL_MEMORY) == Ok(3 * 4096)
+        && memory::allocate(BOOT_POOL, 1, BOOT_POOL_MEMORY) == Err(CapError::Occupied)
+        && memory::allocate(BOOT_POOL, 2, BOOT_POOL_SPARE) == Err(CapError::NoSpace)
+        && memory::allocate(BOOT_POOL, 1, BOOT_POOL_SPARE) == Ok(4096)
+        && memory::allocate(WINDOWS_ENDPOINT, 1, BOOT_POOL_SPARE + 1) == Err(CapError::WrongType);
+    desktop_check("a pool gives what it has and no more", pool_rules);
+
+    let server = task::spawn("windows", window_server);
+    let launcher_task = task::spawn("launcher", launcher);
+    let granted = server.is_some_and(|id| {
+        cap::grant(id, WINDOWS_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
+    }) && launcher_task.is_some_and(|id| {
+        cap::grant(id, LAUNCHER_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
+            && cap::grant(id, WINDOWS_ENDPOINT, LAUNCHER_WINDOWS_SLOT, Rights::ALL).is_ok()
+            && cap::grant(id, LOG_ENDPOINT, LAUNCHER_LOG_SLOT, Rights::ALL).is_ok()
+    });
+    desktop_check("start the window server and the launcher", granted);
+    start_all(&[server, launcher_task]);
+}
+
+/// Start the panel. Done by the painter once it knows the screen's size --
+/// which, with a GPU driver, is whatever mode the driver set -- because the
+/// panel asks for a window as wide as the screen.
+fn start_panel() {
+    if cap::identify(WINDOWS_ENDPOINT).is_err() {
+        return;
+    }
+    let panel = start_app(
+        "panel",
+        WINDOWS_ENDPOINT,
+        LOG_ENDPOINT,
+        Some(LAUNCHER_ENDPOINT),
+    );
+    desktop_check(
+        "start the panel with four capabilities",
+        panel.is_ok_and(|id| cap::slots_used(id) == Some(4)),
+    );
+}
+
+/// Bootstrap's pool, for the checks, and where its memory goes.
+const BOOT_POOL: cap::CapPtr = 66;
+const BOOT_POOL_MEMORY: cap::CapPtr = 67;
+const BOOT_POOL_SPARE: cap::CapPtr = 68;
+
 /// Load a program from the bootloader's modules and make a task of it.
 ///
 /// Says why not, if not: a missing module is a boot medium built without
@@ -3460,7 +3674,7 @@ fn label_layer(screen: Rect, src: Rect, y: i32, color: Color, at: u64) -> Layer 
 /// Nothing here advances per frame. Every moving quantity is a formula held by
 /// a layer in the scene, and the scene works out what went stale.
 struct Stage {
-    scene: Scene<16>,
+    scene: Scene<48>,
     block: LayerId,
     veil: LayerId,
     /// Where the veil rests when it is showing.
@@ -3930,6 +4144,11 @@ fn render_loop(renderer: &mut Screen) -> ! {
         println!("window     : none -- no memory for a surface or its task");
     }
     let mut desk = input::Desk::new(renderer, &mut stage.scene);
+    {
+        let screen = stage.scene.screen();
+        windows::set_screen(screen.width, screen.height);
+    }
+    start_panel();
     let screen = stage.scene.screen().area();
 
     // A renderer that fails paints nothing, which is what the counters below
@@ -3990,6 +4209,19 @@ fn render_loop(renderer: &mut Screen) -> ! {
         // the client itself is not asked and need not be running.
         if let Some(window) = window.as_mut() {
             window.poll(&mut stage.scene, now);
+        }
+
+        // Windows programs have asked for since the last look: shown to the
+        // renderer, then given a place.
+        for index in windows::take_new() {
+            let Some((surface, ..)) = windows::shape(index) else {
+                continue;
+            };
+            if renderer.show_surface(surface, WINDOW_SURFACES + surface) {
+                desk.manage(index, &mut stage.scene, now);
+            } else {
+                println!("desktop    : the renderer cannot show window {index}");
+            }
         }
 
         // What the keyboard and mouse have done since the last look.

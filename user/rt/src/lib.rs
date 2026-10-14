@@ -29,6 +29,7 @@ pub use corrode_abi as abi;
 pub use corrode_pci as pci;
 
 pub mod device;
+pub mod heap;
 pub mod log;
 pub mod sys;
 
@@ -155,6 +156,63 @@ impl Received {
 
 fn slot_or_none(slot: Option<usize>) -> u64 {
     slot.map_or(abi::NO_SLOT, |slot| slot as u64)
+}
+
+/// Say that a rectangle of a surface or a window has been redrawn.
+pub fn commit(slot: usize, x: i32, y: i32, width: u32, height: u32) -> Result<()> {
+    let out = sys::call(
+        abi::SYS_COMMIT,
+        sys::Args {
+            rdi: slot as u64,
+            rsi: x as i64 as u64,
+            rdx: y as i64 as u64,
+            r10: width as u64,
+            r8: height as u64,
+            ..sys::Args::NONE
+        },
+    );
+    check(out.rax)
+}
+
+/// Wait for the window in `slot` to have an event, or for the clock to read
+/// `deadline`. `None` means the deadline came first.
+pub fn wait(slot: usize, deadline: u64) -> Result<Option<Message>> {
+    let out = sys::call(
+        abi::SYS_WAIT,
+        sys::Args {
+            rdi: slot as u64,
+            rsi: deadline,
+            ..sys::Args::NONE
+        },
+    );
+    check(out.rax)?;
+    Ok((out.rsi != 0).then_some(Message {
+        label: out.rsi,
+        words: [out.rdx, out.r10, out.r8, out.r9],
+    }))
+}
+
+/// Nanoseconds since boot, by the monotonic clock.
+pub fn now_ns() -> u64 {
+    sys::call(abi::SYS_CLOCK, sys::Args::NONE).rdx
+}
+
+/// Sleep until the clock reads `deadline` nanoseconds. Returns at once if
+/// it already has. Wakes within a scheduling tick -- ten milliseconds -- of
+/// the deadline.
+pub fn sleep_until(deadline: u64) {
+    sys::call(
+        abi::SYS_SLEEP,
+        sys::Args {
+            rdi: deadline,
+            ..sys::Args::NONE
+        },
+    );
+}
+
+/// Sleep for `ns` nanoseconds from now.
+pub fn sleep_ns(ns: u64) {
+    sleep_until(now_ns().saturating_add(ns));
 }
 
 /// Give up the rest of this time slice.

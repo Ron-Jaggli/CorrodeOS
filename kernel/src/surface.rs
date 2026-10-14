@@ -197,6 +197,13 @@ pub struct Mapped {
 /// allows to match.
 pub fn map(slot: CapPtr) -> Result<Mapped, CapError> {
     let (index, rights) = cap::surface_of(slot, Rights::READ)?;
+    map_index(index, rights)
+}
+
+/// Map surface `index` into the calling task, as a capability carrying
+/// `rights` allows: writable only with WRITE. For whoever has already
+/// checked a capability that names it -- a window's, say.
+pub fn map_index(index: usize, rights: Rights) -> Result<Mapped, CapError> {
     let current = task::current_id().ok_or(CapError::NoSuchTask)?;
     // A kernel task has no lower half to put it in.
     let mut space = task::space_of(current).ok_or(CapError::NoSpace)?;
@@ -236,6 +243,12 @@ pub fn map(slot: CapPtr) -> Result<Mapped, CapError> {
 /// out when it next paints.
 pub fn commit(slot: CapPtr, rect: Rect) -> Result<(), CapError> {
     let (index, _) = cap::surface_of(slot, Rights::WRITE)?;
+    commit_index(index, rect)
+}
+
+/// Record a commit to surface `index`, for whoever has already checked a
+/// capability with WRITE that names it.
+pub fn commit_index(index: usize, rect: Rect) -> Result<(), CapError> {
     with(index, |surface| {
         let bounds = Rect::new(0, 0, surface.width, surface.height);
         if let Some(inside) = rect.intersect(&bounds) {

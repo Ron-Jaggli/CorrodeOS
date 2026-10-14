@@ -99,7 +99,8 @@ kernel/          the privileged kernel
   src/device.rs    a device's registers, mapped into the task that holds them
   src/irq.rs       device interrupts, as messages to whoever holds the line
   src/ports.rs     I/O ports, read and written for whoever holds a range
-  src/input.rs     keyboard and mouse events, from the driver to the scene
+  src/input.rs     keyboard and mouse events, and the window manager
+  src/windows.rs   windows: a surface to draw in and a queue of events
   src/modules.rs   files the bootloader left in RAM
   src/memory.rs    memory a task can map and tell a device about
   src/remote.rs    a Renderer that is a call to a driver in ring 3
@@ -126,6 +127,9 @@ user/            ring 3 programs, each an ELF file loaded as a Limine module
   rt/              the runtime: entry, syscalls, devices, println!, panics
   edu/             a driver for QEMU's teaching device
   ps2/             the keyboard and mouse driver
+  ui/              a window to draw rectangles and text in, and its events
+  terminal/        a terminal with a few built-in commands
+  panel/           the bar along the top: a launcher button and a clock
   fault/           a program that faults on purpose
   virtio-gpu/      a display driver: the compositor's frames, on a virtio GPU
   blob-reader/     reads 32 MiB it was handed at boot, and says what was in it
@@ -135,6 +139,7 @@ virtio/          virtqueues and virtio GPU commands, tested against a pretend de
 nv/              NVIDIA chips, VBIOS and firmware files as data, tested on the build host
 pci/             PCI configuration space as arithmetic, tested on the build host
 input/           scancodes and mouse packets to key presses and movements
+heap/            the allocator: the kernel's heap and every program's
   src/lib.rs       headers, BARs, capability lists, MSI, what a driver may write
   src/mcfg.rs      the ACPI table that says where configuration space is
 boot/limine.conf lets Limine find the kernel
@@ -264,6 +269,11 @@ Programs: ring 3 tasks loaded from ELF files the bootloader put in RAM,
 written in Rust against a small runtime. A driver is one of these, and a
 program that faults is stopped without stopping anything else. See
 "Programs" below.
+
+A desktop: a PS/2 keyboard and mouse driver in ring 3, a pointer, a window
+manager that focuses, raises and drags windows, and two programs -- a panel
+with a launcher button and a clock, and a terminal -- that ask for their own
+windows and memory. See "The desktop" below.
 
 Not yet: migrating a task between CPUs, reclaiming frames and stacks.
 
@@ -527,6 +537,82 @@ cure is two buffers and a swap on commit. A surface has no transparency of
 its own. A commit is found at the next scheduling tick rather than waking the
 painter, which is the same gap as pacing by the tick. And the 3D engine in
 `gfx/` produces exactly these pixels but nothing connects the two yet.
+
+### The desktop
+
+```
+desktop    : start the panel with four capabilities              PASS
+panel      : up, 1280 pixels wide
+input      : click at (180, 20) on a window
+panel      : started a terminal
+terminal   : open, 600x340
+terminal   : $ help
+input      : click at (380, 90) on a title bar
+```
+
+`./corrode input-test` does all of that from QEMU's monitor: it clicks the
+panel's Terminal button, types `help`, `echo window` and `mem` into the
+terminal that opens, and drags it by its title bar. `build/input.png` is the
+result.
+
+#### What a program is given
+
+A desktop program starts holding four capabilities, in the slots
+`corrode_abi::app` names: a send-only endpoint to the **window server**, a
+**pool** of memory, the **log**, and -- for the panel alone -- an endpoint to
+the **launcher**. Everything else it has, it made from those.
+
+- **Memory.** A `Pool` is a budget of pages shared by every copy of the
+  capability. `SYS_ALLOC` spends some of it on fresh, zeroed memory and puts
+  a `Memory` capability to it in a slot the caller names; nothing can add
+  pages to a pool. The runtime's `heap::init` buys pages this way and hands
+  them to `corrode-heap` -- the allocator the kernel's own heap uses, moved
+  into a crate of its own and tested on the build host with twenty thousand
+  random allocations checked byte by byte against a model.
+- **A window.** One call to the window server; the answer carries a `Window`
+  capability. WRITE maps the window's pixels and commits them, as for a
+  surface. READ waits on it.
+- **Time.** `SYS_CLOCK` reads the monotonic clock and `SYS_SLEEP` sleeps to a
+  deadline. Neither takes a capability: ring 3 can read the timestamp counter
+  anyway, so a clock hands out nothing a program could not measure. A sleeper
+  is woken on the first scheduling tick past its deadline.
+
+#### Waiting on a window
+
+`SYS_WAIT` waits for a window's next event -- a key while it has the
+keyboard, a click on it, gaining or losing the keyboard -- *or* for a
+deadline, whichever is first. That one call is all the waiting a simple
+program needs. The terminal waits for ever. The panel waits for a click or
+the next whole second, redraws its clock, and is not scheduled in between.
+
+The painter pushes events and never waits for a program to take them. A
+window holds sixty-four; past that they are dropped, so a program that stops
+listening costs nobody but itself.
+
+#### The window manager
+
+The painter places a new window -- staggered, rising into place on a spring
+as it fades in -- with a title bar the program does not draw. Clicking a
+window gives it the keyboard and brings it to the front; its bar turns rust.
+Dragging the bar moves it. Clicking anything else takes the keyboard away,
+and keys go back to the boot screen's typed line. A docked window -- the
+panel -- has no bar, is as wide as the screen, and is kept above every other
+window. What is under the pointer is `Scene::layers_at`, and the pointer is
+kept on top with `Scene::raise`.
+
+#### Starting programs
+
+The launcher is a kernel task holding an endpoint only the panel was given.
+Asked for a terminal, it loads the program and gives it the standard four
+capabilities, derived from its own -- so it can hand out only what it holds,
+and a program can start nothing it was not given a way to ask for.
+
+Known gaps: windows cannot be closed, resized or minimised, and a program
+cannot exit cleanly and give its window back. Eight surfaces in all, one of
+them the boot screen's painter. No window titles: the bar is a handle, not a
+label. Keys reach the focused window as key codes and characters, US layout.
+The terminal's commands are built in, because there is no filesystem to find
+others on. A pool is fixed at start; nothing yet takes memory back.
 
 ### Input
 

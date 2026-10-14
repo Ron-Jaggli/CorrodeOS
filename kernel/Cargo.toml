@@ -12,6 +12,7 @@ bench = false
 
 [dependencies]
 corrode-render = { path = "../render" }
+corrode-heap = { path = "../heap" }
 corrode-text = { path = "../text" }
 corrode-pci = { path = "../pci" }
 corrode-abi = { path = "../abi" }

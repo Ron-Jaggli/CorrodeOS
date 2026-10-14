@@ -97,15 +97,17 @@ use crate::pci;
 use crate::ports;
 use crate::surface;
 use crate::task;
+use crate::windows;
 
 use corrode_render::Rect;
 
 // The numbers themselves are in the `corrode-abi` crate, which ring 3
 // programs are built against too. One copy, so the two cannot disagree.
 pub use corrode_abi::{
-    FROM_HARDWARE, NO_SLOT, STATUS_BAD_SYSCALL, STATUS_OK, SYS_CALL, SYS_COMMIT, SYS_CONFIG_READ,
-    SYS_CONFIG_WRITE, SYS_COPY, SYS_DELETE, SYS_EXIT, SYS_IDENTIFY, SYS_MAP, SYS_PHYSICAL,
-    SYS_PORT_IN, SYS_PORT_OUT, SYS_RECV, SYS_REPLY, SYS_SEND, SYS_YIELD,
+    FROM_HARDWARE, NO_SLOT, STATUS_BAD_SYSCALL, STATUS_OK, SYS_ALLOC, SYS_CALL, SYS_CLOCK,
+    SYS_COMMIT, SYS_CONFIG_READ, SYS_CONFIG_WRITE, SYS_COPY, SYS_DELETE, SYS_EXIT, SYS_IDENTIFY,
+    SYS_MAP, SYS_PHYSICAL, SYS_PORT_IN, SYS_PORT_OUT, SYS_RECV, SYS_REPLY, SYS_SEND, SYS_SLEEP,
+    SYS_WAIT, SYS_YIELD,
 };
 
 /// Every code selector seen entering this gate, OR-ed together.
@@ -245,6 +247,14 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
                 Ok(ObjectKind::Blob) => {
                     blob::map(slot).map(|mapped| (mapped.address, mapped.len, 0, 0))
                 }
+                Ok(ObjectKind::Window) => windows::map(slot).map(|mapped| {
+                    (
+                        mapped.address,
+                        mapped.width as u64,
+                        mapped.height as u64,
+                        mapped.pitch as u64,
+                    )
+                }),
                 _ => surface::map(slot).map(|mapped| {
                     (
                         mapped.address,
@@ -296,8 +306,27 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
                 frame.r10 as u32,
                 frame.r8 as u32,
             );
-            frame.rax = status(surface::commit(slot, rect));
+            let committed = match cap::identify(slot).map(|(kind, _)| kind) {
+                Ok(ObjectKind::Window) => windows::commit(slot, rect),
+                _ => surface::commit(slot, rect),
+            };
+            frame.rax = status(committed);
         }
+
+        // Rescheduling happens inside the wait, so the answer is written
+        // into this frame after the task has been woken.
+        SYS_WAIT => match windows::wait(slot, frame.rsi) {
+            Ok(event) => {
+                let (label, words) = event.unwrap_or((0, [0; 4]));
+                frame.rax = STATUS_OK;
+                frame.rsi = label;
+                frame.rdx = words[0];
+                frame.r10 = words[1];
+                frame.r8 = words[2];
+                frame.r9 = words[3];
+            }
+            Err(error) => frame.rax = error.code(),
+        },
 
         // The offset, the width and the value are numbers from ring 3 and
         // are treated as that: checked against the size of configuration
@@ -317,6 +346,26 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
 
         // The task is over. Its frame is abandoned where it is and somebody
         // else's is handed back; nothing ever resumes this one.
+        SYS_ALLOC => match memory::allocate(slot, frame.rsi, frame.rdx as usize) {
+            Ok(bytes) => {
+                frame.rax = STATUS_OK;
+                frame.rdx = bytes;
+            }
+            Err(error) => frame.rax = error.code(),
+        },
+
+        SYS_CLOCK => {
+            frame.rax = STATUS_OK;
+            frame.rdx = crate::time::now_ns();
+        }
+
+        SYS_SLEEP => {
+            frame.rax = STATUS_OK;
+            if task::sleep_until(frame.rdi) {
+                return task::on_tick(frame as *mut TrapFrame);
+            }
+        }
+
         SYS_EXIT => {
             task::finish_current();
             return task::on_tick(frame as *mut TrapFrame);

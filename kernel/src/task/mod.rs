@@ -102,6 +102,10 @@ pub struct Task {
     pub cpu: usize,
     /// Whether this is a CPU's idle task, which the rotation skips.
     pub is_idle: bool,
+    /// When a sleeping task is due to wake, by the monotonic clock, or `None`
+    /// if it is not asleep. A task blocked for any other reason has none, so
+    /// only the clock can wake a sleeper and the clock wakes nothing else.
+    pub wake_at: Option<u64>,
     /// This task's address space, or `None` to run in the kernel's.
     ///
     /// Only user tasks have one. Kernel tasks share the kernel address space
@@ -111,7 +115,7 @@ pub struct Task {
 }
 
 /// Slots per capability space.
-pub const CSPACE_SLOTS: usize = 64;
+pub const CSPACE_SLOTS: usize = 128;
 
 /// A copy of a task's status, for reporting without holding the lock.
 #[derive(Debug, Clone, Copy)]
@@ -185,6 +189,7 @@ pub fn init() {
             recv_slot: None,
             reply_slot: None,
             awaiting_reply: None,
+            wake_at: None,
             call_seq: 0,
             // Task 0 runs on the stack Limine gave us, which it neither
             // allocated nor knows the extent of.
@@ -250,6 +255,7 @@ pub fn adopt_as_idle(cpu_index: usize, stack_top: u64) {
             recv_slot: None,
             reply_slot: None,
             awaiting_reply: None,
+            wake_at: None,
             call_seq: 0,
             kernel_stack_top: stack_top,
             user: false,
@@ -449,6 +455,7 @@ fn spawn_inner(
             recv_slot: None,
             reply_slot: None,
             awaiting_reply: None,
+            wake_at: None,
             call_seq: 0,
             kernel_stack_top: stack.top,
             user,
@@ -556,6 +563,25 @@ pub fn yield_now() {
     }
 }
 
+/// Put the current task to sleep until the monotonic clock reads `deadline`
+/// nanoseconds. Returns whether it is now asleep: false if the deadline has
+/// already passed, in which case there is nothing to wait for.
+///
+/// The caller then reschedules, as a system call does on its way out.
+pub fn sleep_until(deadline: u64) -> bool {
+    if deadline <= crate::time::now_ns() {
+        return false;
+    }
+    let Some(me) = current_id() else {
+        return false;
+    };
+    with_task(me, |task| {
+        task.wake_at = Some(deadline);
+        task.state = State::Blocked;
+    })
+    .is_some()
+}
+
 /// Pick the next task to run.
 ///
 /// Called from interrupt context with interrupts already disabled by the gate.
@@ -573,6 +599,21 @@ pub fn on_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
     scheduler.tasks[current].saved_rsp = frame as u64;
     if scheduler.tasks[current].state == State::Running {
         scheduler.tasks[current].state = State::Ready;
+    }
+
+    // Wake this CPU's sleepers whose time has come. Checked on every pass
+    // through here, which is at least every tick, so a sleep ends within one
+    // tick of its deadline.
+    let now = crate::time::now_ns();
+    for task in scheduler.tasks.iter_mut() {
+        if task.cpu == this_cpu && task.state == State::Blocked {
+            if let Some(due) = task.wake_at {
+                if due <= now {
+                    task.wake_at = None;
+                    task.state = State::Ready;
+                }
+            }
+        }
     }
 
     // Round-robin over this CPU's own tasks. `current` is considered too, at
