@@ -168,6 +168,45 @@ impl Mmio {
     }
 }
 
+/// A run of I/O ports, through the capability in a slot.
+///
+/// Every access is a system call: ring 3 has no port instructions, so the
+/// kernel does it, after checking the port is inside the range held.
+#[derive(Clone, Copy)]
+pub struct Ports(pub usize);
+
+impl Ports {
+    /// Read the byte at `offset` into the range.
+    pub fn try_read8(&self, offset: u16) -> Result<u8> {
+        let out = sys::call(
+            abi::SYS_PORT_IN,
+            sys::Args {
+                rdi: self.0 as u64,
+                rsi: offset as u64,
+                rdx: 1,
+                ..sys::Args::NONE
+            },
+        );
+        check(out.rax)?;
+        Ok(out.rdx as u8)
+    }
+
+    /// Write a byte at `offset` into the range.
+    pub fn try_write8(&self, offset: u16, value: u8) -> Result<()> {
+        let out = sys::call(
+            abi::SYS_PORT_OUT,
+            sys::Args {
+                rdi: self.0 as u64,
+                rsi: offset as u64,
+                rdx: 1,
+                r10: value as u64,
+                ..sys::Args::NONE
+            },
+        );
+        check(out.rax)
+    }
+}
+
 /// A device's interrupt.
 #[derive(Clone, Copy)]
 pub struct Interrupt(pub usize);

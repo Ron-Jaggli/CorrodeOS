@@ -14,6 +14,9 @@ mod arch;
 mod blob;
 mod cap;
 mod device;
+#[cfg(feature = "efi-log")]
+mod efi_log;
+mod input;
 mod ipc;
 mod irq;
 mod limine;
@@ -21,7 +24,11 @@ mod memory;
 mod mm;
 mod modules;
 mod pci;
+mod ports;
 mod remote;
+#[cfg(feature = "hw-log")]
+mod screen_log;
+mod secure_core;
 mod serial;
 mod smp;
 mod surface;
@@ -29,6 +36,7 @@ mod sync;
 mod syscall;
 mod task;
 mod time;
+mod windows;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -88,6 +96,8 @@ pub extern "C" fn kmain() -> ! {
         }
     );
 
+    report_boot_framebuffer();
+
     // Descriptor tables before anything else: the IDT names a code selector
     // from our GDT, and until both are in place any fault is a silent reboot.
     x86_64::gdt::init();
@@ -104,6 +114,10 @@ pub extern "C" fn kmain() -> ! {
     init_heap();
 
     heap_test();
+
+    // The first point a firmware call can be made from: it needs frames and
+    // the kernel's page tables. A machine that dies later still leaves this.
+    efi_checkpoint("early");
 
     // Interrupts last: everything they can reach has to exist first.
     //
@@ -157,6 +171,8 @@ pub extern "C" fn kmain() -> ! {
         online, reported, TICK_HZ
     );
     smp_check(online);
+    secure_core_check(online);
+    efi_checkpoint("smp");
 
     // Seed the capability system, then check its invariants while execution is
     // still single-threaded and the output is deterministic.
@@ -211,6 +227,11 @@ pub extern "C" fn kmain() -> ! {
         device_checks();
         blob_checks();
         nvidia_checks();
+        if cfg!(feature = "hw-log") {
+            hw_log_stop();
+        }
+        start_input();
+        start_desktop();
     }
 
     #[cfg(feature = "user-test")]
@@ -659,6 +680,13 @@ fn init_apic() -> bool {
             },
         );
     }
+
+    // Kept, so that a driver can later be given an ISA line -- the PS/2
+    // keyboard and mouse have no other kind.
+    irq::keep_isa(
+        io,
+        core::array::from_fn(|line| madt.gsi_for_irq(line as u8)),
+    );
     true
 }
 
@@ -1914,6 +1942,335 @@ fn program_check(name: &str, ok: bool) {
     check("program", name, ok);
 }
 
+/// Bootstrap's capabilities for the PS/2 driver: its two ports, its
+/// interrupt, and every right on the endpoint it reports to.
+const PS2_DATA: cap::CapPtr = 56;
+const PS2_COMMAND: cap::CapPtr = 57;
+const PS2_IRQ: cap::CapPtr = 58;
+const INPUT_ENDPOINT: cap::CapPtr = 59;
+/// A read-only copy of the data port, to check what that forbids.
+const PS2_DATA_READ: cap::CapPtr = 60;
+
+/// The controller's ports, and the ISA interrupts of its two devices.
+const PS2_DATA_PORT: u16 = 0x60;
+const PS2_COMMAND_PORT: u16 = 0x64;
+const PS2_KEYBOARD_IRQ: u8 = 1;
+const PS2_MOUSE_IRQ: u8 = 12;
+
+fn input_check(name: &str, ok: bool) {
+    check("input", name, ok);
+}
+
+/// Start the keyboard and mouse driver, and the task that passes what it
+/// says on to the painter.
+///
+/// The driver gets each of the controller's two ports as a range of one,
+/// so the three ports between them -- one of which gates the speaker and
+/// reports memory errors -- are out of its reach.
+fn start_input() {
+    use cap::{CapError, Object, Rights};
+    use corrode_abi::ps2;
+
+    let Some(driver) = spawn_program("ps2") else {
+        input_check("load the keyboard and mouse driver", false);
+        return;
+    };
+    let line = task::cpu_of(driver)
+        .and_then(|cpu| irq::create_isa(&[PS2_KEYBOARD_IRQ, PS2_MOUSE_IRQ], cpu));
+    input_check(
+        "route the keyboard and the mouse to one line",
+        line.is_some(),
+    );
+    let Some(line) = line else { return };
+
+    let ports = |base| Object::IoPorts { base, count: 1 };
+    let minted = cap::mint(0, PS2_DATA, ports(PS2_DATA_PORT), Rights::ALL).is_ok()
+        && cap::mint(0, PS2_COMMAND, ports(PS2_COMMAND_PORT), Rights::ALL).is_ok()
+        && cap::mint(0, PS2_IRQ, Object::Interrupt(line), Rights::ALL).is_ok()
+        && cap::mint(
+            0,
+            INPUT_ENDPOINT,
+            Object::Endpoint(ipc::Endpoint::new()),
+            Rights::ALL,
+        )
+        .is_ok();
+    input_check("mint two ports, an interrupt and an endpoint", minted);
+
+    // The rules, from this side. Only reads and refused writes: a write
+    // that went through would reach the controller.
+    input_check(
+        "a port range reaches only the ports in it",
+        ports::read(PS2_DATA, 1, 1) == Err(CapError::Invalid)
+            && ports::read(PS2_DATA, 0, 2) == Err(CapError::Invalid)
+            && ports::read(PS2_DATA, u64::MAX, 1) == Err(CapError::Invalid)
+            && ports::read(PS2_DATA, 0, 3) == Err(CapError::Invalid),
+    );
+    input_check(
+        "a read-only port range cannot write",
+        cap::copy(PS2_DATA, PS2_DATA_READ, Rights::READ) == Ok(Rights::READ)
+            && ports::write(PS2_DATA_READ, 0, 1, 0xff) == Err(CapError::InsufficientRights),
+    );
+    input_check(
+        "an endpoint is not a port",
+        ports::read(INPUT_ENDPOINT, 0, 1) == Err(CapError::WrongType),
+    );
+
+    let receiver = task::spawn("input", input::receiver);
+    let granted = receiver.is_some_and(|id| {
+        cap::grant(id, INPUT_ENDPOINT, input::TASK_ENDPOINT, Rights::READ).is_ok()
+    }) && cap::grant(driver, PS2_DATA, ps2::DATA, Rights::READ_WRITE).is_ok()
+        && cap::grant(driver, PS2_COMMAND, ps2::COMMAND, Rights::READ_WRITE).is_ok()
+        && cap::grant(driver, PS2_IRQ, ps2::IRQ, Rights::READ).is_ok()
+        && cap::grant(driver, INPUT_ENDPOINT, ps2::EVENTS, Rights::WRITE).is_ok()
+        && cap::grant(driver, LOG_ENDPOINT, ps2::LOG, Rights::WRITE).is_ok();
+    input_check(
+        "grant the driver two ports, a line and an endpoint",
+        granted && cap::slots_used(driver) == Some(5),
+    );
+    start_all(&[receiver, Some(driver)]);
+}
+
+/// Bootstrap's ends of the window server's and the launcher's endpoints,
+/// with every right, to hand out send-only copies.
+const WINDOWS_ENDPOINT: cap::CapPtr = 64;
+const LAUNCHER_ENDPOINT: cap::CapPtr = 65;
+/// Where bootstrap is given each window's surface -- at this slot plus the
+/// surface's number -- so the renderer can be shown it.
+const WINDOW_SURFACES: cap::CapPtr = 96;
+
+/// A service's capabilities: the receive half of its endpoint, where the
+/// answer to a call lands, and a slot for what it is about to hand over.
+const SERVICE_ENDPOINT_SLOT: cap::CapPtr = 0;
+const SERVICE_REPLY_SLOT: cap::CapPtr = 1;
+const SERVICE_SPARE_SLOT: cap::CapPtr = 2;
+/// The launcher also holds what it gives the programs it starts.
+const LAUNCHER_WINDOWS_SLOT: cap::CapPtr = 3;
+const LAUNCHER_LOG_SLOT: cap::CapPtr = 4;
+/// The files from `root/`, for the terminal, if the boot medium has them.
+const LAUNCHER_FILES_SLOT: cap::CapPtr = 5;
+
+fn desktop_check(name: &str, ok: bool) {
+    check("desktop", name, ok);
+}
+
+/// The window server: open a window for whoever calls, and answer with the
+/// one capability to it.
+///
+/// The window's surface goes to bootstrap as well, where the painter can
+/// show it to the renderer. Placing the window, and everything after, is the
+/// painter's: this task only makes them.
+extern "C" fn window_server() {
+    use corrode_abi::window;
+
+    loop {
+        let Ok(received) = ipc::recv(SERVICE_ENDPOINT_SLOT, None, Some(SERVICE_REPLY_SLOT)) else {
+            return;
+        };
+        let words = received.message.words;
+        let size = |word: u64| word.min(u32::MAX as u64) as u32;
+        let opened = (received.message.label == window::OPEN)
+            .then(|| windows::open(size(words[0]), size(words[1]), words[2] == window::DOCKED))
+            .flatten();
+
+        let Some(index) = opened else {
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: window::OPENED,
+                    words: [0; 4],
+                },
+                None,
+            );
+            continue;
+        };
+        let Some((surface, width, height, _)) = windows::shape(index) else {
+            continue;
+        };
+        let issued = cap::issue_to(
+            0,
+            WINDOW_SURFACES + surface,
+            cap::Object::Surface(surface),
+            cap::Rights::ALL,
+        )
+        .is_ok()
+            && cap::issue(
+                SERVICE_SPARE_SLOT,
+                cap::Object::Window(index),
+                cap::Rights::ALL,
+            )
+            .is_ok();
+        let answer = ipc::Message {
+            label: window::OPENED,
+            words: [width as u64, height as u64, 0, 0],
+        };
+        // Handed over without GRANT: a window is its program's to draw in,
+        // not to give away.
+        let transfer = issued.then_some((SERVICE_SPARE_SLOT, cap::Rights::READ_WRITE));
+        let _ = ipc::reply(SERVICE_REPLY_SLOT, answer, transfer);
+        let _ = cap::delete(SERVICE_SPARE_SLOT);
+    }
+}
+
+/// The launcher: start one of the programs the system was booted with, on
+/// request. Only the panel holds an endpoint to it.
+extern "C" fn launcher() {
+    use corrode_abi::launcher;
+
+    loop {
+        let Ok(received) = ipc::recv(SERVICE_ENDPOINT_SLOT, None, Some(SERVICE_REPLY_SLOT)) else {
+            return;
+        };
+        let words = received.message.words;
+        let status = match (received.message.label, words[0]) {
+            (launcher::LAUNCH, launcher::TERMINAL) => {
+                let files = cap::identify(LAUNCHER_FILES_SLOT)
+                    .is_ok()
+                    .then_some(LAUNCHER_FILES_SLOT);
+                match start_app(
+                    "terminal",
+                    LAUNCHER_WINDOWS_SLOT,
+                    LAUNCHER_LOG_SLOT,
+                    None,
+                    files,
+                ) {
+                    Ok(_) => 0,
+                    Err(error) => error.code(),
+                }
+            }
+            _ => cap::CapError::Invalid.code(),
+        };
+        let _ = ipc::reply(
+            SERVICE_REPLY_SLOT,
+            ipc::Message {
+                label: launcher::LAUNCHED,
+                words: [status, 0, 0, 0],
+            },
+            None,
+        );
+    }
+}
+
+/// Start the program called `name` as a desktop program: an endpoint to the
+/// window server, a pool of memory of its own, the log -- and, for the
+/// panel, the launcher, and for the terminal, the files. The capabilities are derived from the caller's
+/// slots, so whoever starts a program can give it only what it holds.
+fn start_app(
+    name: &'static str,
+    windows_slot: cap::CapPtr,
+    log_slot: cap::CapPtr,
+    launcher_slot: Option<cap::CapPtr>,
+    files_slot: Option<cap::CapPtr>,
+) -> Result<usize, cap::CapError> {
+    use cap::{CapError, Object, Rights};
+    use corrode_abi::app;
+
+    let id = spawn_program(name).ok_or(CapError::NoSpace)?;
+    cap::grant(id, windows_slot, app::WINDOWS, Rights::WRITE)?;
+    cap::grant(id, log_slot, app::LOG, Rights::WRITE)?;
+    if let Some(slot) = launcher_slot {
+        cap::grant(id, slot, app::LAUNCHER, Rights::WRITE)?;
+    }
+    if let Some(slot) = files_slot {
+        cap::grant(id, slot, app::FILES, Rights::READ)?;
+    }
+    cap::issue_to(
+        id,
+        app::POOL,
+        Object::Pool(core::sync::atomic::AtomicU64::new(app::POOL_PAGES)),
+        Rights::READ_WRITE,
+    )?;
+    task::start(id);
+    Ok(id)
+}
+
+/// The desktop's services, and the panel.
+fn start_desktop() {
+    use cap::{CapError, Object, Rights};
+
+    let minted = cap::mint(
+        0,
+        WINDOWS_ENDPOINT,
+        Object::Endpoint(ipc::Endpoint::new()),
+        Rights::ALL,
+    )
+    .is_ok()
+        && cap::mint(
+            0,
+            LAUNCHER_ENDPOINT,
+            Object::Endpoint(ipc::Endpoint::new()),
+            Rights::ALL,
+        )
+        .is_ok();
+    desktop_check("mint the window server's and launcher's endpoints", minted);
+
+    // The pool's rules, from this side, on a pool of four pages.
+    let pool_rules = cap::issue(
+        BOOT_POOL,
+        Object::Pool(core::sync::atomic::AtomicU64::new(4)),
+        Rights::ALL,
+    )
+    .is_ok()
+        && memory::allocate(BOOT_POOL, 8, BOOT_POOL_MEMORY) == Err(CapError::NoSpace)
+        && memory::allocate(BOOT_POOL, 0, BOOT_POOL_MEMORY) == Err(CapError::Invalid)
+        && memory::allocate(BOOT_POOL, 3, BOOT_POOL_MEMORY) == Ok(3 * 4096)
+        && memory::allocate(BOOT_POOL, 1, BOOT_POOL_MEMORY) == Err(CapError::Occupied)
+        && memory::allocate(BOOT_POOL, 2, BOOT_POOL_SPARE) == Err(CapError::NoSpace)
+        && memory::allocate(BOOT_POOL, 1, BOOT_POOL_SPARE) == Ok(4096)
+        && memory::allocate(WINDOWS_ENDPOINT, 1, BOOT_POOL_SPARE + 1) == Err(CapError::WrongType);
+    desktop_check("a pool gives what it has and no more", pool_rules);
+
+    let server = task::spawn("windows", window_server);
+    let launcher_task = task::spawn("launcher", launcher);
+    let granted = server.is_some_and(|id| {
+        cap::grant(id, WINDOWS_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
+    }) && launcher_task.is_some_and(|id| {
+        cap::grant(id, LAUNCHER_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
+            && cap::grant(id, WINDOWS_ENDPOINT, LAUNCHER_WINDOWS_SLOT, Rights::ALL).is_ok()
+            && cap::grant(id, LOG_ENDPOINT, LAUNCHER_LOG_SLOT, Rights::ALL).is_ok()
+    });
+    desktop_check("start the window server and the launcher", granted);
+
+    // The terminal's files. A boot medium without them still gets a
+    // terminal, with nothing to read.
+    if let (Some(id), Some((index, module))) = (launcher_task, modules::position("root.tar")) {
+        let given = cap::issue_to(
+            id,
+            LAUNCHER_FILES_SLOT,
+            Object::Blob(index),
+            Rights::READ_GRANT,
+        )
+        .is_ok();
+        desktop_check("give the launcher the terminal's files", given);
+        println!("files      : root.tar, {} KiB", module.bytes.len() / 1024);
+    }
+    start_all(&[server, launcher_task]);
+}
+
+/// Start the panel. Done by the painter once it knows the screen's size --
+/// which, with a GPU driver, is whatever mode the driver set -- because the
+/// panel asks for a window as wide as the screen.
+fn start_panel() {
+    if cap::identify(WINDOWS_ENDPOINT).is_err() {
+        return;
+    }
+    let panel = start_app(
+        "panel",
+        WINDOWS_ENDPOINT,
+        LOG_ENDPOINT,
+        Some(LAUNCHER_ENDPOINT),
+        None,
+    );
+    desktop_check(
+        "start the panel with four capabilities",
+        panel.is_ok_and(|id| cap::slots_used(id) == Some(4)),
+    );
+}
+
+/// Bootstrap's pool, for the checks, and where its memory goes.
+const BOOT_POOL: cap::CapPtr = 66;
+const BOOT_POOL_MEMORY: cap::CapPtr = 67;
+const BOOT_POOL_SPARE: cap::CapPtr = 68;
+
 /// Load a program from the bootloader's modules and make a task of it.
 ///
 /// Says why not, if not: a missing module is a boot medium built without
@@ -2799,6 +3156,116 @@ fn smp_check(online: usize) {
     );
 }
 
+/// Say which core was set aside, and check it stayed out of the scheduler.
+///
+/// Run after [`smp_check`], so the general CPUs have already been ticking for
+/// a measured window: a secure CPU with a timer running would have counted
+/// some of those ticks too.
+fn secure_core_check(online: usize) {
+    let status = secure_core::status();
+    let Some(secure) = status.secure else {
+        println!("secure     : no core reserved -- the machine has one physical core");
+        return;
+    };
+
+    println!(
+        "secure     : cpu{} reserved, {} sibling(s) parked, {} general cpu(s) left",
+        secure, status.parked, online
+    );
+    check(
+        "secure",
+        "the secure cpu is numbered outside the scheduler's",
+        secure >= online,
+    );
+    check(
+        "secure",
+        "the secure cpu has taken no timer ticks",
+        lapic::ticks_on(secure) == 0,
+    );
+    check(
+        "secure",
+        "the secure core answers its mailbox",
+        secure_core::ping().is_ok(),
+    );
+
+    if !status.aes {
+        println!("secure     : no AES-NI/RDRAND on this cpu -- no key, so nothing to encrypt with");
+        return;
+    }
+    check(
+        "secure",
+        "AES-128 gives the FIPS-197 answer on the secure core",
+        status.self_test,
+    );
+    check(
+        "secure",
+        "a per-boot key was made in a register, not in RAM",
+        status.key,
+    );
+
+    // Round trip through the mailbox. The kernel sees plaintext and
+    // ciphertext; the key that relates them stays in the secure core.
+    let original = *b"the secure core shows what it did, never the key";
+    let mut data = original;
+    let first = secure_core::crypt(&[7; 12], &mut data);
+    let sealed = data;
+    check(
+        "secure",
+        "encrypting through the mailbox changes the data",
+        first.is_ok() && sealed != original,
+    );
+    let second = secure_core::crypt(&[7; 12], &mut data);
+    check(
+        "secure",
+        "the same call again gives the data back",
+        second.is_ok() && data == original,
+    );
+    let mut other = original;
+    let third = secure_core::crypt(&[8; 12], &mut other);
+    check(
+        "secure",
+        "a different nonce gives different ciphertext",
+        third.is_ok() && other != sealed,
+    );
+    // The edges of counter mode: nothing at all, a last block cut short, and
+    // a mailbox filled to the byte.
+    check(
+        "secure",
+        "an empty request is answered",
+        secure_core::crypt(&[9; 12], &mut []).is_ok(),
+    );
+    let mut ragged = [0x5au8; 33];
+    let ragged_out = secure_core::crypt(&[10; 12], &mut ragged);
+    let ragged_sealed = ragged;
+    let ragged_back = secure_core::crypt(&[10; 12], &mut ragged);
+    check(
+        "secure",
+        "a length that is not a whole number of blocks round-trips",
+        ragged_out.is_ok()
+            && ragged_back.is_ok()
+            && ragged_sealed != [0x5a; 33]
+            && ragged == [0x5a; 33],
+    );
+    let mut full = alloc::vec![0xa5u8; secure_core::PAYLOAD];
+    let full_out = secure_core::crypt(&[11; 12], &mut full);
+    // Every block of the keystream is different, so no two blocks of the
+    // same plaintext may come out alike.
+    let blocks_differ =
+        full[..16] != full[16..32] && full[..16] != full[secure_core::PAYLOAD - 16..];
+    let full_back = secure_core::crypt(&[11; 12], &mut full);
+    check(
+        "secure",
+        "a full mailbox round-trips, each block under its own counter",
+        full_out.is_ok() && full_back.is_ok() && blocks_differ && full.iter().all(|b| *b == 0xa5),
+    );
+    let mut too_long = [0u8; secure_core::PAYLOAD + 1];
+    check(
+        "secure",
+        "a request bigger than the mailbox is refused",
+        secure_core::crypt(&[9; 12], &mut too_long) == Err(secure_core::CallError::TooLong),
+    );
+}
+
 /// Measure both timers against a known second of wall time.
 ///
 /// The tick counters cannot check each other -- deriving "elapsed seconds" from
@@ -3179,7 +3646,7 @@ fn init_software_renderer() -> Option<SoftwareRenderer> {
 
 /// The mask atlas: room for the boot screen's two lines of text.
 const ATLAS_WIDTH: u32 = 1024;
-const ATLAS_HEIGHT: u32 = 256;
+const ATLAS_HEIGHT: u32 = 512;
 
 /// Where the back buffer is mapped: a gigabyte above the heap, in the same
 /// PML4 slot. That slot is populated before any user address space is forked,
@@ -3362,7 +3829,7 @@ fn label_layer(screen: Rect, src: Rect, y: i32, color: Color, at: u64) -> Layer 
 /// Nothing here advances per frame. Every moving quantity is a formula held by
 /// a layer in the scene, and the scene works out what went stale.
 struct Stage {
-    scene: Scene<12>,
+    scene: Scene<48>,
     block: LayerId,
     veil: LayerId,
     /// Where the veil rests when it is showing.
@@ -3831,25 +4298,32 @@ fn render_loop(renderer: &mut Screen) -> ! {
     if window.is_none() {
         println!("window     : none -- no memory for a surface or its task");
     }
+    let mut desk = input::Desk::new(renderer, &mut stage.scene);
+    {
+        let screen = stage.scene.screen();
+        windows::set_screen(screen.width, screen.height);
+    }
+    start_panel();
     let screen = stage.scene.screen().area();
 
     // A renderer that fails paints nothing, which is what the counters below
     // would then show. The first failure is reported; a renderer that fails
     // every frame would otherwise fill the log.
     let mut failed = false;
-    let mut frame = |stage: &mut Stage, now| match stage.scene.frame(renderer, now) {
-        Ok(painted) => painted,
-        Err(error) => {
-            if !failed {
-                println!("paint      : the renderer failed: {error:?}");
-                failed = true;
+    let mut frame =
+        |stage: &mut Stage, renderer: &mut Screen, now| match stage.scene.frame(renderer, now) {
+            Ok(painted) => painted,
+            Err(error) => {
+                if !failed {
+                    println!("paint      : the renderer failed: {error:?}");
+                    failed = true;
+                }
+                Painted::default()
             }
-            Painted::default()
-        }
-    };
+        };
 
     let start = time::now_ns();
-    let first = frame(&mut stage, start);
+    let first = frame(&mut stage, renderer, start);
     check(
         "scene check",
         "the first frame paints the whole screen",
@@ -3858,7 +4332,7 @@ fn render_loop(renderer: &mut Screen) -> ! {
     check(
         "scene check",
         "asking again at the same instant paints nothing",
-        frame(&mut stage, start) == Painted::default(),
+        frame(&mut stage, renderer, start) == Painted::default(),
     );
     gpu_first_frame_checks();
     println!();
@@ -3892,7 +4366,23 @@ fn render_loop(renderer: &mut Screen) -> ! {
             window.poll(&mut stage.scene, now);
         }
 
-        let result = frame(&mut stage, now);
+        // Windows programs have asked for since the last look: shown to the
+        // renderer, then given a place.
+        for index in windows::take_new() {
+            let Some((surface, ..)) = windows::shape(index) else {
+                continue;
+            };
+            if renderer.show_surface(surface, WINDOW_SURFACES + surface) {
+                desk.manage(index, &mut stage.scene, now);
+            } else {
+                println!("desktop    : the renderer cannot show window {index}");
+            }
+        }
+
+        // What the keyboard and mouse have done since the last look.
+        desk.poll(renderer, &mut stage.scene, now);
+
+        let result = frame(&mut stage, renderer, now);
         wakeups += 1;
         if result.stale > 0 {
             painted += 1;
@@ -3999,8 +4489,65 @@ fn wx_test() {
     println!("wx test    : FAILED -- .text was writable");
 }
 
+/// What the firmware left lit, if anything, as the bootloader describes it.
+///
+/// Printed first thing, so a machine whose screen stays dark still says why
+/// in a log read some other way: no framebuffer at all, or one in a format
+/// the screen log declines to draw on.
+fn report_boot_framebuffer() {
+    let Some(response) = limine::FRAMEBUFFER.response.get() else {
+        println!("boot fb    : the bootloader gave no framebuffer");
+        return;
+    };
+    let Some(fb) = response.first() else {
+        println!(
+            "boot fb    : {} framebuffer(s) reported, none usable",
+            response.framebuffer_count
+        );
+        return;
+    };
+    println!(
+        "boot fb    : {}x{} pitch {} {}bpp model {}, r {}@{} g {}@{} b {}@{}, at {:p}, {} reported",
+        fb.width,
+        fb.height,
+        fb.pitch,
+        fb.bpp,
+        fb.memory_model,
+        fb.red_mask_size,
+        fb.red_mask_shift,
+        fb.green_mask_size,
+        fb.green_mask_shift,
+        fb.blue_mask_size,
+        fb.blue_mask_shift,
+        fb.address,
+        response.framebuffer_count
+    );
+}
+
+/// Under `efi-log`, save the boot log so far into UEFI variables. Nothing
+/// otherwise, so call sites need no `cfg` of their own.
+fn efi_checkpoint(stage: &str) {
+    #[cfg(feature = "efi-log")]
+    efi_log::checkpoint(stage);
+    #[cfg(not(feature = "efi-log"))]
+    let _ = stage;
+}
+
+/// The end of a `hw-log` boot: the NVIDIA stage has reported, so put its
+/// lines on screen in order and stop before the desktop paints over them.
+fn hw_log_stop() -> ! {
+    println!("hw-log     : boot stops here so the log stays on screen; power off to exit");
+    efi_checkpoint("end");
+    #[cfg(feature = "hw-log")]
+    serial::settle_screen();
+    halt_forever();
+}
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    // If this is the secure CPU, its key goes before anything else runs.
+    secure_core::on_fatal();
+
     // Stop the other CPUs first, for the same reasons as an unhandled trap.
     lapic::broadcast(vectors::HALT);
 
@@ -4012,5 +4559,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     println!();
     println!("*** KERNEL PANIC ***");
     println!("{}", info);
+    efi_checkpoint("panic");
+    #[cfg(feature = "hw-log")]
+    serial::settle_screen();
     halt_forever();
 }

@@ -177,6 +177,24 @@ pub enum Object {
     /// A file the bootloader loaded, by its place in [`crate::modules`].
     /// READ means may map it and read it. Nothing means may change it.
     Blob(usize),
+    /// A run of I/O ports, `count` of them from `base`. READ means may read
+    /// them, WRITE may write them.
+    ///
+    /// Ring 3 still has no port instructions of its own: IOPL stays 0 and
+    /// there is no I/O permission bitmap. The kernel does the access on the
+    /// holder's behalf, after checking the port is inside the range, so the
+    /// range is exactly the authority and a driver handed the keyboard's two
+    /// ports cannot reach the third one between them.
+    IoPorts { base: u16, count: u16 },
+    /// A budget of pages of memory, shared by every copy of the capability.
+    /// WRITE means may spend it on new memory, which arrives as a `Memory`
+    /// capability of its own. Spending is the only thing that changes it:
+    /// there is no call that adds pages to a pool.
+    Pool(core::sync::atomic::AtomicU64),
+    /// A window, by its number in [`crate::windows`]. WRITE means may draw
+    /// in it -- map its pixels writable and commit them -- and READ means may
+    /// wait for what happens to it: keys while it has focus, clicks on it.
+    Window(usize),
 }
 
 impl core::fmt::Debug for Object {
@@ -193,6 +211,13 @@ impl core::fmt::Debug for Object {
             Object::Interrupt(index) => write!(f, "Interrupt({index})"),
             Object::Memory(index) => write!(f, "Memory({index})"),
             Object::Blob(index) => write!(f, "Blob({index})"),
+            Object::IoPorts { base, count } => write!(f, "IoPorts({base:#x}, {count})"),
+            Object::Window(index) => write!(f, "Window({index})"),
+            Object::Pool(left) => write!(
+                f,
+                "Pool({} pages)",
+                left.load(core::sync::atomic::Ordering::Relaxed)
+            ),
         }
     }
 }
@@ -214,6 +239,9 @@ pub enum ObjectKind {
     Interrupt = kind::INTERRUPT,
     Memory = kind::MEMORY,
     Blob = kind::BLOB,
+    IoPorts = kind::IO_PORTS,
+    Pool = kind::POOL,
+    Window = kind::WINDOW,
 }
 
 impl Object {
@@ -230,6 +258,9 @@ impl Object {
             Object::Interrupt(_) => ObjectKind::Interrupt,
             Object::Memory(_) => ObjectKind::Memory,
             Object::Blob(_) => ObjectKind::Blob,
+            Object::IoPorts { .. } => ObjectKind::IoPorts,
+            Object::Pool(_) => ObjectKind::Pool,
+            Object::Window(_) => ObjectKind::Window,
         }
     }
 }
@@ -578,6 +609,88 @@ pub fn blob_of(slot: CapPtr, required: Rights) -> Result<usize, CapError> {
         Object::Blob(index) => Ok(index),
         _ => Err(CapError::WrongType),
     }
+}
+
+/// The ports an IoPorts capability names, as `(base, count)`. Requires
+/// `required`.
+pub fn ports_of(slot: CapPtr, required: Rights) -> Result<(u16, u16), CapError> {
+    let object = lookup(slot, required)?;
+    match *object {
+        Object::IoPorts { base, count } => Ok((base, count)),
+        _ => Err(CapError::WrongType),
+    }
+}
+
+/// Spend `pages` of the pool in `slot`. Requires WRITE. `NoSpace` if it
+/// has fewer left; nothing is spent then.
+pub fn pool_spend(slot: CapPtr, pages: u64) -> Result<(), CapError> {
+    use core::sync::atomic::Ordering;
+    let object = lookup(slot, Rights::WRITE)?;
+    let Object::Pool(left) = &*object else {
+        return Err(CapError::WrongType);
+    };
+    left.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+        left.checked_sub(pages)
+    })
+    .map(|_| ())
+    .map_err(|_| CapError::NoSpace)
+}
+
+/// Put back pages spent on memory that could not be made after all.
+pub fn pool_refund(slot: CapPtr, pages: u64) {
+    if let Ok(object) = lookup(slot, Rights::WRITE) {
+        if let Object::Pool(left) = &*object {
+            left.fetch_add(pages, core::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
+/// Place a capability to an object the caller has just had made for it, in
+/// the caller's own slot `slot`.
+///
+/// # Why this is not a second [`mint`]
+/// `mint` conjures authority over an object that already exists. This is
+/// only ever handed an object created a moment ago, at the caller's request
+/// and paid for out of a capability it already held -- memory bought from a
+/// pool. Nobody else can hold a capability to it yet, so nothing anyone held
+/// before is reachable through it.
+pub fn issue(slot: CapPtr, object: Object, rights: Rights) -> Result<(), CapError> {
+    let current = task::current_id().ok_or(CapError::NoSuchTask)?;
+    issue_to(current, slot, object, rights)
+}
+
+/// [`issue`], into another task's space: for a kernel service handing the
+/// painter, or a program it is starting, the one capability to something it
+/// has just made. The same argument holds -- the object is new, so nothing
+/// that existed before becomes reachable.
+pub fn issue_to(
+    task_id: usize,
+    slot: CapPtr,
+    object: Object,
+    rights: Rights,
+) -> Result<(), CapError> {
+    let cap = Capability {
+        object: Arc::new(object),
+        rights,
+    };
+    task::with_cspace(task_id, |cspace| cspace.put(slot, cap)).ok_or(CapError::NoSuchTask)?
+}
+
+/// The window a Window capability names, and the rights it is held with.
+/// Requires `required`.
+pub fn window_of(slot: CapPtr, required: Rights) -> Result<(usize, Rights), CapError> {
+    let current = task::current_id().ok_or(CapError::NoSuchTask)?;
+    task::with_cspace(current, |cspace| {
+        let cap = cspace.get(slot)?;
+        if !cap.rights.contains(required) {
+            return Err(CapError::InsufficientRights);
+        }
+        match *cap.object {
+            Object::Window(index) => Ok((index, cap.rights)),
+            _ => Err(CapError::WrongType),
+        }
+    })
+    .ok_or(CapError::NoSuchTask)?
 }
 
 /// The line an Interrupt capability names. Requires `required`.

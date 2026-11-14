@@ -318,6 +318,62 @@ pub static RSDP: RsdpRequest = RsdpRequest {
 };
 
 // ---------------------------------------------------------------------------
+// UEFI
+// ---------------------------------------------------------------------------
+
+/// The firmware's system table, if this was a UEFI boot. Absent on BIOS.
+#[repr(C)]
+pub struct EfiSystemTableResponse {
+    pub revision: u64,
+    /// Physical or HHDM-virtual depending on the base revision, like the RSDP.
+    pub address: u64,
+}
+
+#[repr(C)]
+pub struct EfiSystemTableRequest {
+    id: [u64; 4],
+    revision: u64,
+    pub response: ResponsePtr<EfiSystemTableResponse>,
+}
+
+#[used]
+#[link_section = ".requests"]
+pub static EFI_SYSTEM_TABLE: EfiSystemTableRequest = EfiSystemTableRequest {
+    id: [MAGIC0, MAGIC1, 0x5ceb_a516_3eaa_f6d6, 0x0a69_8161_0cf6_5fcc],
+    revision: 0,
+    response: ResponsePtr::null(),
+};
+
+/// The firmware's own memory map, as it stood at ExitBootServices. Unlike the
+/// Limine map it still says which regions the runtime services live in.
+#[repr(C)]
+pub struct EfiMemmapResponse {
+    pub revision: u64,
+    /// Where the descriptors are; physical or HHDM-virtual, as above.
+    pub memmap: u64,
+    pub memmap_size: u64,
+    /// Stride between descriptors. Not `size_of` any struct: firmware may
+    /// append fields, and this is the only correct step.
+    pub desc_size: u64,
+    pub desc_version: u64,
+}
+
+#[repr(C)]
+pub struct EfiMemmapRequest {
+    id: [u64; 4],
+    revision: u64,
+    pub response: ResponsePtr<EfiMemmapResponse>,
+}
+
+#[used]
+#[link_section = ".requests"]
+pub static EFI_MEMMAP: EfiMemmapRequest = EfiMemmapRequest {
+    id: [MAGIC0, MAGIC1, 0x7df6_2a43_1d68_72d5, 0xa4fc_dfb3_e573_06c8],
+    revision: 0,
+    response: ResponsePtr::null(),
+};
+
+// ---------------------------------------------------------------------------
 // Modules
 // ---------------------------------------------------------------------------
 

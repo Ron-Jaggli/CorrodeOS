@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 corrode-abi = { path = "../../abi" }
 corrode-pci = { path = "../../pci" }
+corrode-heap = { path = "../../heap" }

@@ -39,14 +39,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "corrode-heap"
+version = "0.0.1"
+
+[[package]]
+name = "corrode-input"
+version = "0.0.1"
+
+[[package]]
 name = "corrode-kernel"
 version = "0.0.1"
 dependencies = [
  "corrode-abi",
  "corrode-elf",
+ "corrode-heap",
  "corrode-pci",
  "corrode-render",
  "corrode-text",
+]
+
+[[package]]
+name = "corrode-line"
+version = "0.0.1"
+dependencies = [
+ "corrode-input",
 ]
 
 [[package]]
@@ -62,8 +78,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "corrode-panel"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+ "corrode-ui",
+]
+
+[[package]]
 name = "corrode-pci"
 version = "0.0.1"
+
+[[package]]
+name = "corrode-ps2"
+version = "0.0.1"
+dependencies = [
+ "corrode-input",
+ "corrode-rt",
+]
 
 [[package]]
 name = "corrode-render"
@@ -74,12 +106,36 @@ name = "corrode-rt"
 version = "0.0.1"
 dependencies = [
  "corrode-abi",
+ "corrode-heap",
  "corrode-pci",
+]
+
+[[package]]
+name = "corrode-shell"
+version = "0.0.1"
+
+[[package]]
+name = "corrode-terminal"
+version = "0.0.1"
+dependencies = [
+ "corrode-input",
+ "corrode-line",
+ "corrode-rt",
+ "corrode-shell",
+ "corrode-ui",
 ]
 
 [[package]]
 name = "corrode-text"
 version = "0.0.1"
+
+[[package]]
+name = "corrode-ui"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+ "corrode-text",
+]
 
 [[package]]
 name = "corrode-virtio"

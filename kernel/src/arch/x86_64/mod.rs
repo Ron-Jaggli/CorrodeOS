@@ -25,6 +25,10 @@ pub mod vectors {
     /// second entry path to keep in sync. Fast syscalls are an optimisation to
     /// make later, against a mechanism that already works.
     pub const SYSCALL: u8 = 0x80;
+    /// Wakes the secure core: a request is waiting in its mailbox. The top
+    /// priority class, so the secure core can set its task priority to refuse
+    /// every other vector and still take this one.
+    pub const SECURE_MAILBOX: u8 = 0xf0;
     /// Raised by the LAPIC when an interrupt is withdrawn before delivery.
     /// Must never be acknowledged.
     pub const SPURIOUS: u8 = 0xff;
@@ -38,6 +42,7 @@ pub mod lapic;
 pub mod pic;
 pub mod pit;
 pub mod port;
+pub mod topology;
 
 /// Unmask interrupts on this CPU.
 ///
@@ -171,6 +176,40 @@ pub unsafe fn enable_memory_protections() {
         let cr0: u64;
         core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
         core::arch::asm!("mov cr0, {}", in(reg) cr0 | CR0_WP, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Let SSE instructions execute on this CPU.
+///
+/// The kernel is built soft-float and never emits them itself. Two things do
+/// need them: UEFI firmware, which the specification promises SSE, and the
+/// secure core, whose key lives in an XMM register precisely because nothing
+/// else on that core touches those registers.
+///
+/// # Safety
+/// Ring 0. Changes only the FPU/SSE control bits of CR0 and CR4.
+pub unsafe fn enable_sse() {
+    const CR0_MP: u64 = 1 << 1;
+    const CR0_EM: u64 = 1 << 2;
+    const CR0_TS: u64 = 1 << 3;
+    const CR4_OSFXSR: u64 = 1 << 9;
+    const CR4_OSXMMEXCPT: u64 = 1 << 10;
+    // SAFETY: forwarded from the caller.
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp}, cr0",
+            "and {tmp}, {clear0}",
+            "or {tmp}, {set0}",
+            "mov cr0, {tmp}",
+            "mov {tmp}, cr4",
+            "or {tmp}, {set4}",
+            "mov cr4, {tmp}",
+            tmp = out(reg) _,
+            clear0 = in(reg) !(CR0_EM | CR0_TS),
+            set0 = in(reg) CR0_MP,
+            set4 = in(reg) CR4_OSFXSR | CR4_OSXMMEXCPT,
+            options(nomem, nostack),
+        );
     }
 }
 

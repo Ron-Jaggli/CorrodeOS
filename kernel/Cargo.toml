@@ -12,6 +12,7 @@ bench = false
 
 [dependencies]
 corrode-render = { path = "../render" }
+corrode-heap = { path = "../heap" }
 corrode-text = { path = "../text" }
 corrode-pci = { path = "../pci" }
 corrode-abi = { path = "../abi" }
@@ -32,3 +33,13 @@ stack-test = []
 # Put a ring 3 task in front of a kernel address; the missing USER bit must
 # turn the read into a page fault.
 user-test = []
+
+# For booting on a real machine with no serial cable: mirror the boot log onto
+# the firmware's framebuffer, and stop after the NVIDIA stage so nothing paints
+# over it. See `screen_log` and `scripts/flash-usb.sh`. Implies `efi-log`, for a
+# machine whose screen stays dark.
+hw-log = ["efi-log"]
+
+# Keep the boot log in UEFI variables, readable from Linux after a reboot under
+# /sys/firmware/efi/efivars/CorrodeLog*. See `efi_log`.
+efi-log = []

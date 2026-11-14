@@ -62,8 +62,10 @@ Then:
 ./corrode fault-test  # boot into a deliberate page fault
 ./corrode wx-test     # boot and prove .text is not writable
 ./corrode user-test   # boot and prove ring 3 cannot read kernel memory
+./corrode input-test  # boot, type and move the mouse through QEMU, check what arrived
+./corrode terminal-test # boot, open the terminal, edit and recall lines, read a file, to build/terminal.png
 ./corrode check       # cargo check
-./corrode test        # render, text, gfx, pci, elf, virtio and nv unit tests, on the build host
+./corrode test        # render, text, gfx, pci, elf, virtio, nv, input, heap, line and shell unit tests, on the build host
 ./corrode specimen    # draw a sheet of the typeface to build/specimen.png
 ./corrode shell       # drop into the build container
 ```
@@ -93,17 +95,24 @@ kernel/          the privileged kernel
   src/ipc.rs       synchronous IPC — endpoints, call/reply, reply capabilities
   src/syscall.rs   the ring 3 boundary — capability slots in, no pointers
   src/task/user.rs user address space — aliased code pages, user stacks
-  src/smp.rs       starting the other CPUs
+  src/smp.rs       starting the other CPUs, and setting one core aside
+  src/secure_core.rs  that core: a key in a register, reached through a mailbox
+  src/screen_log.rs   under hw-log, the boot log on the firmware's framebuffer
+  src/efi_log.rs      under efi-log, the boot log kept in UEFI variables
   src/surface.rs   pixels a task draws and the compositor shows
   src/pci.rs       the PCI bus: what is on it, and devices as capabilities
   src/device.rs    a device's registers, mapped into the task that holds them
   src/irq.rs       device interrupts, as messages to whoever holds the line
+  src/ports.rs     I/O ports, read and written for whoever holds a range
+  src/input.rs     keyboard and mouse events, and the window manager
+  src/windows.rs   windows: a surface to draw in and a queue of events
   src/modules.rs   files the bootloader left in RAM
   src/memory.rs    memory a task can map and tell a device about
   src/remote.rs    a Renderer that is a call to a driver in ring 3
   src/blob.rs      a file from the boot medium, for one task to read
   src/time.rs      monotonic nanosecond clock, off the TSC
   src/arch/x86_64/cpu.rs  which CPU is this
+  src/arch/x86_64/topology.rs  which CPUs share a core
   build.rs         makes cargo notice linker.ld changes
   linker.ld        higher-half layout at -2GB, page-aligned sections
 render/          the rendering interface
@@ -123,6 +132,10 @@ elf/             reading a program file, tested on the build host against liars
 user/            ring 3 programs, each an ELF file loaded as a Limine module
   rt/              the runtime: entry, syscalls, devices, println!, panics
   edu/             a driver for QEMU's teaching device
+  ps2/             the keyboard and mouse driver
+  ui/              a window to draw rectangles and text in, and its events
+  terminal/        a terminal: corrode-shell, a few commands of its own, line editing, history
+  panel/           the bar along the top: a launcher button and a clock
   fault/           a program that faults on purpose
   virtio-gpu/      a display driver: the compositor's frames, on a virtio GPU
   blob-reader/     reads 32 MiB it was handed at boot, and says what was in it
@@ -131,11 +144,17 @@ user/            ring 3 programs, each an ELF file loaded as a Limine module
 virtio/          virtqueues and virtio GPU commands, tested against a pretend device
 nv/              NVIDIA chips, VBIOS and firmware files as data, tested on the build host
 pci/             PCI configuration space as arithmetic, tested on the build host
+input/           scancodes and mouse packets to key presses and movements
+line/            a prompt's line: cursor, history, Ctrl chords, Tab completion
+shell/           a shell: pipes, lists, variables, globs, and ls/cat/grep/sort and kin
+root/            the files the terminal can read, packed into a tar at build time
+heap/            the allocator: the kernel's heap and every program's
   src/lib.rs       headers, BARs, capability lists, MSI, what a driver may write
   src/mcfg.rs      the ACPI table that says where configuration space is
 boot/limine.conf lets Limine find the kernel
 docker/          the build environment
 scripts/         check-image.sh — guards against orphan sections
+                 flash-usb.sh — write a FEATURES=hw-log ISO to a USB stick, checking hard first
                  fetch-firmware.sh — NVIDIA GSP firmware into firmware/, never committed
 ```
 
@@ -260,6 +279,11 @@ Programs: ring 3 tasks loaded from ELF files the bootloader put in RAM,
 written in Rust against a small runtime. A driver is one of these, and a
 program that faults is stopped without stopping anything else. See
 "Programs" below.
+
+A desktop: a PS/2 keyboard and mouse driver in ring 3, a pointer, a window
+manager that focuses, raises and drags windows, and two programs -- a panel
+with a launcher button and a clock, and a terminal -- that ask for their own
+windows and memory. See "The desktop" below.
 
 Not yet: migrating a task between CPUs, reclaiming frames and stacks.
 
@@ -434,8 +458,17 @@ after every one compares the screen with a fresh scene painted from scratch at
 that instant. Damage, culling, blending and presenting all have to be right for
 those to match, and breaking any one of them fails it.
 
-Known gaps: layers stack in the order they were added and cannot be
-restacked. And a layer that grows or moves damages its whole old and new
+`Scene::raise` puts a layer back on top, and `Scene::layers_at` says what is
+under a pixel, top first -- the two questions a window manager asks of a
+click. An id is a slot that never changes; what restacking rearranges is a
+separate order, and a raised layer is repainted whole.
+
+The randomised test above had a weakness until restacking was added to it: a
+removed layer's slot is never reused, so its twelve-slot scene filled after
+twelve additions and the rest of the run was spent on an empty one. It now
+has room for every layer it adds, and raises them as it goes.
+
+Known gaps: a layer that grows or moves damages its whole old and new
 rectangles, though for a flat colour only the edges changed.
 
 ### Windows
@@ -514,6 +547,147 @@ cure is two buffers and a swap on commit. A surface has no transparency of
 its own. A commit is found at the next scheduling tick rather than waking the
 painter, which is the same gap as pacing by the tick. And the 3D engine in
 `gfx/` produces exactly these pixels but nothing connects the two yet.
+
+### The desktop
+
+```
+desktop    : start the panel with four capabilities              PASS
+panel      : up, 1280 pixels wide
+input      : click at (180, 20) on a window
+panel      : started a terminal
+terminal   : open, 600x340
+terminal   : $ help
+input      : click at (380, 90) on a title bar
+```
+
+`./corrode input-test` does all of that from QEMU's monitor: it clicks the
+panel's Terminal button, types `help`, `echo window` and `mem` into the
+terminal that opens, and drags it by its title bar. `build/input.png` is the
+result.
+
+#### What a program is given
+
+A desktop program starts holding four capabilities, in the slots
+`corrode_abi::app` names: a send-only endpoint to the **window server**, a
+**pool** of memory, the **log**, and -- for the panel alone -- an endpoint to
+the **launcher**. Everything else it has, it made from those.
+
+- **Memory.** A `Pool` is a budget of pages shared by every copy of the
+  capability. `SYS_ALLOC` spends some of it on fresh, zeroed memory and puts
+  a `Memory` capability to it in a slot the caller names; nothing can add
+  pages to a pool. The runtime's `heap::init` buys pages this way and hands
+  them to `corrode-heap` -- the allocator the kernel's own heap uses, moved
+  into a crate of its own and tested on the build host with twenty thousand
+  random allocations checked byte by byte against a model.
+- **A window.** One call to the window server; the answer carries a `Window`
+  capability. WRITE maps the window's pixels and commits them, as for a
+  surface. READ waits on it.
+- **Time.** `SYS_CLOCK` reads the monotonic clock and `SYS_SLEEP` sleeps to a
+  deadline. Neither takes a capability: ring 3 can read the timestamp counter
+  anyway, so a clock hands out nothing a program could not measure. A sleeper
+  is woken on the first scheduling tick past its deadline.
+
+#### Waiting on a window
+
+`SYS_WAIT` waits for a window's next event -- a key while it has the
+keyboard, a click on it, gaining or losing the keyboard -- *or* for a
+deadline, whichever is first. That one call is all the waiting a simple
+program needs. The terminal waits for ever. The panel waits for a click or
+the next whole second, redraws its clock, and is not scheduled in between.
+
+The painter pushes events and never waits for a program to take them. A
+window holds sixty-four; past that they are dropped, so a program that stops
+listening costs nobody but itself.
+
+#### The window manager
+
+The painter places a new window -- staggered, rising into place on a spring
+as it fades in -- with a title bar the program does not draw. Clicking a
+window gives it the keyboard and brings it to the front; its bar turns rust.
+Dragging the bar moves it. Clicking anything else takes the keyboard away,
+and keys go back to the boot screen's typed line. A docked window -- the
+panel -- has no bar, is as wide as the screen, and is kept above every other
+window. What is under the pointer is `Scene::layers_at`, and the pointer is
+kept on top with `Scene::raise`.
+
+#### Starting programs
+
+The launcher is a kernel task holding an endpoint only the panel was given.
+Asked for a terminal, it loads the program and gives it the standard four
+capabilities, derived from its own -- so it can hand out only what it holds,
+and a program can start nothing it was not given a way to ask for.
+
+Known gaps: windows cannot be closed, resized or minimised, and a program
+cannot exit cleanly and give its window back. Eight surfaces in all, one of
+them the boot screen's painter. No window titles: the bar is a handle, not a
+label. Keys reach the focused window as key codes and characters, US layout.
+The terminal's commands are built in, because there is no filesystem to find
+others on. A pool is fixed at start; nothing yet takes memory back.
+
+### Input
+
+The keyboard and mouse are a ring 3 driver like any other, holding five
+capabilities: the PS/2 controller's data port, its command port, one
+interrupt line, an endpoint to the compositor and one to the log.
+
+```
+ps2        : keyboard up, mouse up
+input      : the driver found a keyboard                         PASS
+input      : line "Hi there"
+input      : the pointer moved to (760, 320)
+input      : click at (760, 320) on a layer
+```
+
+`./corrode input-test` produces those last lines: QEMU's monitor types
+`shift-h i spc t h e r e ret`, moves the mouse and clicks, and the serial log
+says what reached the scene. It drives QEMU's emulated controller, never the
+host's devices.
+
+#### Ports are a capability too
+
+The controller is reached through I/O ports, and ring 3 has none: IOPL is 0
+and there is no permission bitmap. An **`IoPorts`** capability names a range,
+and `SYS_PORT_IN` and `SYS_PORT_OUT` do the access in the kernel after
+checking it falls inside. The driver gets port 0x60 and port 0x64 as two
+ranges of one, so the ports between them -- 0x61 gates the speaker and
+reports memory parity errors -- are out of its reach. A system call per byte
+is slow and does not matter at the rate keys move.
+
+#### Two devices, one line
+
+The keyboard is ISA interrupt 1 and the mouse ISA interrupt 12. Both mean
+"read port 0x60", and the status register says which device the byte is
+from, so `irq::create_isa` routes both through the I/O APIC to the same
+line: one wait covers both, where two lines would mean waiting on one while
+the other went unheard. The I/O APIC is now kept after boot for this, behind
+a lock, and only edge-triggered lines are accepted -- a level-triggered one
+acknowledged before the driver has read the device would fire for ever.
+
+#### Decoding is a crate
+
+`input/` turns bytes into meaning with no machine in sight: scancode set 1
+with `0xE0` extended keys, the fake shifts keyboards wrap around some of
+them, Pause's six bytes swallowed whole, per-side modifiers, Caps Lock
+turning over once per press however long it auto-repeats; and three-byte
+mouse packets with nine-bit signed motion and overflow, resynchronised on
+the bit that marks a packet's first byte. The tests feed it random bytes and
+require it to recover.
+
+#### Into the scene
+
+A kernel task holds the receive half of the driver's endpoint and queues what
+arrives; the painter takes the queue when it wakes. Mouse movements with the
+same buttons held are added together in the queue, so a fast mouse cannot
+crowd out a key press. The scene gets a pointer -- a white arrow over a dark
+outline, two mask layers moving together, raised above anything added after
+it -- and one line of typed text drawn into the atlas, which grew to 512 rows
+to hold them.
+
+Known gaps: keys go to the one typed line, because which window should get
+them is a window manager's decision and there is none yet. US layout only.
+No USB, so on most real laptops and desktops this is the firmware's PS/2
+emulation or nothing. The pointer has no acceleration, and the cursor and
+line only exist on the boot screen.
 
 ### Devices
 

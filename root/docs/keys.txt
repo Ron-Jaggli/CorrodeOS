@@ -1,0 +1,11 @@
+Keys
+====
+
+Left, Right      move along the line
+Home, End        to the start or end of it (Ctrl+A, Ctrl+E too)
+Up, Down         earlier lines, and back
+Tab              finish a command's name
+Ctrl+U, Ctrl+K   cut to the start, or to the end
+Ctrl+W           cut the word before the cursor
+Ctrl+C           abandon the line, or stop a sleep
+Ctrl+L           clear the screen

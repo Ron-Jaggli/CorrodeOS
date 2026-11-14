@@ -1,0 +1,174 @@
+//! Windows: a surface to draw in, and a queue of what happened to it.
+//!
+//! A program asks the window server for a window and gets one capability
+//! back. With WRITE it maps the window's pixels and commits them, exactly as
+//! with a bare surface. With READ it waits on the window for events -- a key
+//! while it has the keyboard, a click on it -- or for a deadline, whichever
+//! comes first, which is all the waiting a simple program needs: one call
+//! that covers "the user did something" and "it is time to redraw the
+//! clock".
+//!
+//! The painter decides everything else: where a window goes, which one is
+//! on top, which one has the keyboard. It pushes events in; it never waits
+//! for a program to take them. A queue that fills drops what does not fit,
+//! so a program that stops listening costs the system nothing but its own
+//! missed keys.
+
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use corrode_abi::window;
+use corrode_render::Rect;
+
+use crate::arch::x86_64::without_interrupts;
+use crate::cap::{self, CapError, CapPtr, Rights};
+use crate::surface;
+use crate::sync::SpinLock;
+use crate::task::{self, State};
+
+/// Events a window holds before it starts dropping them.
+const QUEUE: usize = 64;
+
+/// Nobody is waiting.
+const NOBODY: usize = usize::MAX;
+
+pub struct Window {
+    pub surface: usize,
+    pub width: u32,
+    pub height: u32,
+    pub docked: bool,
+    events: VecDeque<(u64, [u64; 4])>,
+    waiter: usize,
+}
+
+static TABLE: SpinLock<Vec<Window>> = SpinLock::new(Vec::new());
+
+/// Windows made but not yet given a place by the painter.
+static NEW: SpinLock<Vec<usize>> = SpinLock::new(Vec::new());
+
+/// The screen's size, so a docked window can be made as wide as it.
+static SCREEN: [AtomicU32; 2] = [AtomicU32::new(1024), AtomicU32::new(768)];
+
+pub fn set_screen(width: u32, height: u32) {
+    SCREEN[0].store(width, Ordering::Relaxed);
+    SCREEN[1].store(height, Ordering::Relaxed);
+}
+
+/// Make a window and say its number. `None` if there is no surface left.
+pub fn open(width: u32, height: u32, docked: bool) -> Option<usize> {
+    let (width, height) = if docked {
+        (SCREEN[0].load(Ordering::Relaxed), height.clamp(16, 64))
+    } else {
+        (
+            width.clamp(64, window::MAX_WIDTH),
+            height.clamp(32, window::MAX_HEIGHT),
+        )
+    };
+    let surface = surface::create(width, height)?;
+    let index = without_interrupts(|| {
+        let mut table = TABLE.lock();
+        table.push(Window {
+            surface,
+            width,
+            height,
+            docked,
+            events: VecDeque::new(),
+            waiter: NOBODY,
+        });
+        table.len() - 1
+    });
+    without_interrupts(|| NEW.lock().push(index));
+    Some(index)
+}
+
+/// Windows the painter has not placed yet.
+pub fn take_new() -> Vec<usize> {
+    without_interrupts(|| core::mem::take(&mut *NEW.lock()))
+}
+
+/// A window's surface, size, and whether it is docked.
+pub fn shape(index: usize) -> Option<(usize, u32, u32, bool)> {
+    without_interrupts(|| {
+        let table = TABLE.lock();
+        let window = table.get(index)?;
+        Some((window.surface, window.width, window.height, window.docked))
+    })
+}
+
+/// Give a window an event, and wake its program if it is waiting.
+pub fn push(index: usize, label: u64, words: [u64; 4]) {
+    let waiter = without_interrupts(|| {
+        let mut table = TABLE.lock();
+        let window = table.get_mut(index)?;
+        if window.events.len() < QUEUE {
+            window.events.push_back((label, words));
+        }
+        Some(window.waiter)
+    });
+    if let Some(waiter) = waiter.filter(|waiter| *waiter != NOBODY) {
+        task::with_task(waiter, |task| {
+            if task.state == State::Blocked {
+                task.wake_at = None;
+                task.state = State::Ready;
+            }
+        });
+    }
+}
+
+/// Map the window in `slot` into the calling task: its pixels, as a surface.
+pub fn map(slot: CapPtr) -> Result<surface::Mapped, CapError> {
+    let (index, rights) = cap::window_of(slot, Rights::READ)?;
+    let (surface, ..) = shape(index).ok_or(CapError::Stale)?;
+    surface::map_index(surface, rights)
+}
+
+/// Say a rectangle of the window in `slot` has been redrawn. Needs WRITE.
+pub fn commit(slot: CapPtr, rect: Rect) -> Result<(), CapError> {
+    let (index, _) = cap::window_of(slot, Rights::WRITE)?;
+    let (surface, ..) = shape(index).ok_or(CapError::Stale)?;
+    surface::commit_index(surface, rect)
+}
+
+/// Wait for an event on the window in `slot`, or for the clock to read
+/// `deadline`. Needs READ. `None` means the deadline came first.
+///
+/// One waiter at a time, as for an interrupt.
+pub fn wait(slot: CapPtr, deadline: u64) -> Result<Option<(u64, [u64; 4])>, CapError> {
+    let (index, _) = cap::window_of(slot, Rights::READ)?;
+    let me = task::current_id().ok_or(CapError::NoSuchTask)?;
+    loop {
+        let taken = without_interrupts(|| {
+            let mut table = TABLE.lock();
+            let window = table.get_mut(index).ok_or(CapError::Stale)?;
+            if let Some(event) = window.events.pop_front() {
+                if window.waiter == me {
+                    window.waiter = NOBODY;
+                }
+                return Ok(Some(Some(event)));
+            }
+            if deadline <= crate::time::now_ns() {
+                if window.waiter == me {
+                    window.waiter = NOBODY;
+                }
+                return Ok(Some(None));
+            }
+            if window.waiter != NOBODY && window.waiter != me {
+                return Err(CapError::Refused);
+            }
+            window.waiter = me;
+            // Asleep until an event or the deadline, whichever wakes it.
+            // Done under the window's lock, so a `push` cannot land between
+            // looking at the queue and going to sleep.
+            task::with_task(me, |task| {
+                task.wake_at = (deadline != u64::MAX).then_some(deadline);
+                task.state = State::Blocked;
+            });
+            Ok(None)
+        })?;
+        match taken {
+            Some(result) => return Ok(result),
+            None => task::yield_now(),
+        }
+    }
+}

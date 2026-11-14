@@ -1,0 +1,18 @@
+[package]
+name = "corrode-terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "terminal"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+corrode-rt = { path = "../rt" }
+corrode-ui = { path = "../ui" }
+corrode-input = { path = "../../input" }
+corrode-line = { path = "../../line" }
+corrode-shell = { path = "../../shell" }

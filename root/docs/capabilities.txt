@@ -1,0 +1,24 @@
+Capabilities
+============
+
+On Linux a program may try to do anything, and the kernel checks who it
+is running as. Root may do everything; everyone else may do what the
+permission bits allow.
+
+Corrode has no users and no root. A program can do exactly what it holds a
+capability for, and nothing else. A capability names one thing -- a window,
+a pool of memory, the list of running tasks -- and says what the holder may
+do with it: read it, write it, or hand it on.
+
+caps            lists what this terminal holds, slot by slot.
+
+grant COMMAND   asks for what COMMAND needs and then runs it. The kernel
+                shows a prompt that no program can draw or answer: only a
+                click on Allow, by you, hands the capability over. The
+                terminal gets exactly that one thing, without the right to
+                pass it on.
+
+revoke [WHAT]   drops what grant gave, and the terminal is back to what it
+                started with.
+
+grant is to sudo what a key to one door is to a master key.

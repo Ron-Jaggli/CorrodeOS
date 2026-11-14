@@ -596,6 +596,13 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
             lapic::end_of_interrupt();
             return crate::task::on_tick(frame);
         }
+        vectors::SECURE_MAILBOX => {
+            // Only ever taken by the secure core, halted in its idle loop with
+            // nothing secret in the registers saved here. The point of the
+            // interrupt is to end the `hlt`; the mailbox is read after return.
+            lapic::end_of_interrupt();
+            return frame;
+        }
         vectors::YIELD => {
             // Software interrupt, so there is nothing to acknowledge.
             return crate::task::on_tick(frame);
@@ -666,6 +673,9 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
         crate::println!();
         crate::println!("*** TASK FAULT ***");
     } else {
+        // If this is the secure CPU, its key goes before anything else runs.
+        crate::secure_core::on_fatal();
+
         // Stop the other CPUs before saying anything. They are still running
         // tasks on a machine whose state is now in question, and their output
         // would interleave with the report line by line. This is also what
@@ -752,5 +762,6 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
         return crate::task::on_tick(frame);
     }
 
+    crate::efi_checkpoint("trap");
     halt_forever();
 }
