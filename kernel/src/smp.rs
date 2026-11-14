@@ -29,10 +29,24 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::arch::x86_64::topology::{self, Topology};
 use crate::arch::x86_64::{self, cpu, gdt, idt, lapic, vectors};
 use crate::limine;
 use crate::mm::paging;
+use crate::secure_core;
 use crate::task;
+
+/// What a CPU is started to do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+enum Role {
+    /// Schedule tasks, like the bootstrap processor.
+    General,
+    /// Become the secure CPU. See [`secure_core`].
+    Secure,
+    /// Share a core with the secure CPU, and so do nothing at all.
+    Parked,
+}
 
 /// What an AP needs before it can run kernel code, reachable from both address
 /// spaces because it lives in the kernel image.
@@ -44,12 +58,16 @@ struct ApStart {
     stack_top: u64,
     /// Dense CPU index, passed to [`ap_main`].
     cpu: u64,
+    /// Read by [`ap_main`], not the trampoline, so it goes after the fields
+    /// the trampoline reads by offset.
+    role: Role,
 }
 
 const NO_START: ApStart = ApStart {
     cr3: 0,
     stack_top: 0,
     cpu: 0,
+    role: Role::General,
 };
 
 static mut AP_START: [ApStart; cpu::MAX_CPUS] = [NO_START; cpu::MAX_CPUS];
@@ -104,12 +122,20 @@ extern "C" fn ap_main(cpu: usize) -> ! {
 
     gdt::load(cpu);
     idt::load();
-    lapic::enable_local();
 
     // SAFETY: only this CPU reads or writes its own entry, and it does so
     // before any other CPU could look at it.
     let starts = &raw const AP_START;
-    let stack_top = unsafe { (*starts)[cpu].stack_top };
+    let (stack_top, role) = unsafe { ((*starts)[cpu].stack_top, (*starts)[cpu].role) };
+
+    // The reserved core leaves here: everything below makes a CPU schedulable.
+    match role {
+        Role::Secure => secure_core::run(cpu),
+        Role::Parked => secure_core::park(cpu),
+        Role::General => {}
+    }
+
+    lapic::enable_local();
 
     // Become a task, so there is something for the scheduler to switch away
     // from when the first tick lands. This context is a halt loop, which is
@@ -131,7 +157,12 @@ extern "C" fn ap_main(cpu: usize) -> ! {
 
 /// Start every application processor the firmware reported.
 ///
-/// Returns `(online, reported)`.
+/// General CPUs first, then the reserved core. The order is load-bearing: dense
+/// indices are handed out as CPUs are registered, and the scheduler spreads
+/// tasks over `0..online`, so the reserved core has to be numbered after every
+/// CPU that schedules.
+///
+/// Returns `(online, reported)`, where `online` counts only general CPUs.
 pub fn start_aps() -> (usize, usize) {
     let Some(response) = limine::SMP.response.get() else {
         crate::println!("smp        : no response -- single processor");
@@ -143,62 +174,155 @@ pub fn start_aps() -> (usize, usize) {
     cpu::register(response.bsp_lapic_id);
 
     let reported = response.cpu_count as usize;
+    let Some(cr3) = paging::kernel_root() else {
+        return (1, reported);
+    };
+
+    let topology = topology::detect();
+    let reserved = choose_reserved(response, &topology);
+    let reserved_threads = response
+        .cpus()
+        .filter(|info| Some(topology.core_of(info.lapic_id)) == reserved)
+        .count();
+    let cores = distinct_cores(response, &topology);
+    crate::println!(
+        "topology   : {} cpu(s) on {} core(s), up to {} thread(s) per core ({})",
+        reported,
+        cores,
+        topology.max_threads_per_core(),
+        topology.source.name()
+    );
+
+    // Index slots the general CPUs may take, leaving room for the reserved core
+    // when there are more CPUs than `MAX_CPUS`.
+    // Saturating: a topology that puts `MAX_CPUS` threads or more on the
+    // reserved core must not wrap this round to "no limit".
+    let general_slots = cpu::MAX_CPUS.saturating_sub(reserved_threads).max(1);
+    let mut general = 1;
     let mut launched = 0;
 
     for info in response.cpus() {
-        if info.lapic_id == response.bsp_lapic_id {
+        if info.lapic_id == response.bsp_lapic_id
+            || Some(topology.core_of(info.lapic_id)) == reserved
+        {
             continue;
         }
-
-        let Some(index) = cpu::register(info.lapic_id) else {
+        if general >= general_slots {
             crate::println!(
                 "smp        : lapic {} left parked (over the {} CPU limit)",
                 info.lapic_id,
                 cpu::MAX_CPUS
             );
             continue;
-        };
-
-        let Some(stack) = task::stack::allocate() else {
-            crate::println!(
-                "smp        : lapic {} left parked (no stack)",
-                info.lapic_id
-            );
-            continue;
-        };
-
-        let Some(cr3) = paging::kernel_root() else {
-            return (1, reported);
-        };
-
-        // SAFETY: this CPU has not been started yet, so nothing else reads or
-        // writes its slot. The write must be complete before `goto_address` is
-        // set, which the release store below orders.
-        unsafe {
-            let starts = &raw mut AP_START;
-            (*starts)[index] = ApStart {
-                cr3,
-                stack_top: stack.top,
-                cpu: index as u64,
-            };
         }
-
-        // SAFETY: taking the address of one element of a static. The pointer
-        // is handed to a CPU that has not started yet, and only that CPU reads
-        // it, so there is no aliasing to claim.
-        let slot = unsafe { (&raw const AP_START).cast::<ApStart>().add(index) };
-        info.extra_argument.store(slot as u64, Ordering::Relaxed);
-
-        // The release store is what starts the CPU. Everything above has to be
-        // visible to it first, which is exactly what release ordering buys.
-        info.goto_address
-            .store(ap_trampoline as *const () as u64, Ordering::Release);
-
-        launched += 1;
+        general += 1;
+        if launch(info, Role::General, cr3) {
+            launched += 1;
+        }
     }
 
     wait_for(launched + 1);
+
+    if let Some(core) = reserved {
+        // The first thread that actually starts is the secure CPU; one that
+        // could not be started does not use the role up.
+        let mut secure = false;
+        let mut parked = 0;
+        for info in response.cpus() {
+            if topology.core_of(info.lapic_id) != core {
+                continue;
+            }
+            let role = if secure { Role::Parked } else { Role::Secure };
+            if launch(info, role, cr3) {
+                match role {
+                    Role::Secure => secure = true,
+                    _ => parked += 1,
+                }
+            }
+        }
+        secure_core::wait_for(secure, parked);
+    }
+
     (online(), reported)
+}
+
+/// The physical core to set aside, if the machine has one to spare.
+///
+/// Never the bootstrap processor's: it is running this code, and everything
+/// from here on assumes it schedules. Of the rest, the highest-numbered, which
+/// on parts with mixed core types is usually an ordinary one rather than the
+/// fastest. At least one core always stays general.
+fn choose_reserved(response: &limine::SmpResponse, topology: &Topology) -> Option<u32> {
+    let bsp_core = topology.core_of(response.bsp_lapic_id);
+    response
+        .cpus()
+        .map(|info| topology.core_of(info.lapic_id))
+        .filter(|core| *core != bsp_core)
+        .max()
+}
+
+/// How many physical cores the firmware's CPU list covers.
+fn distinct_cores(response: &limine::SmpResponse, topology: &Topology) -> usize {
+    let mut cores = 0;
+    for (i, info) in response.cpus().enumerate() {
+        let core = topology.core_of(info.lapic_id);
+        if !response
+            .cpus()
+            .take(i)
+            .any(|earlier| topology.core_of(earlier.lapic_id) == core)
+        {
+            cores += 1;
+        }
+    }
+    cores
+}
+
+/// Give one AP an index and a stack, and start it in `role`. Returns whether it
+/// was started; one that was not is reported and stays parked in the
+/// bootloader.
+fn launch(info: &limine::SmpInfo, role: Role, cr3: u64) -> bool {
+    let Some(index) = cpu::register(info.lapic_id) else {
+        crate::println!(
+            "smp        : lapic {} left parked (over the {} CPU limit)",
+            info.lapic_id,
+            cpu::MAX_CPUS
+        );
+        return false;
+    };
+
+    let Some(stack) = task::stack::allocate() else {
+        crate::println!(
+            "smp        : lapic {} left parked (no stack)",
+            info.lapic_id
+        );
+        return false;
+    };
+
+    // SAFETY: this CPU has not been started yet, so nothing else reads or
+    // writes its slot. The write must be complete before `goto_address` is
+    // set, which the release store below orders.
+    unsafe {
+        let starts = &raw mut AP_START;
+        (*starts)[index] = ApStart {
+            cr3,
+            stack_top: stack.top,
+            cpu: index as u64,
+            role,
+        };
+    }
+
+    // SAFETY: taking the address of one element of a static. The pointer
+    // is handed to a CPU that has not started yet, and only that CPU reads
+    // it, so there is no aliasing to claim.
+    let slot = unsafe { (&raw const AP_START).cast::<ApStart>().add(index) };
+    info.extra_argument.store(slot as u64, Ordering::Relaxed);
+
+    // The release store is what starts the CPU. Everything above has to be
+    // visible to it first, which is exactly what release ordering buys.
+    info.goto_address
+        .store(ap_trampoline as *const () as u64, Ordering::Release);
+
+    true
 }
 
 /// Spin until every launched CPU has checked in, or give up.

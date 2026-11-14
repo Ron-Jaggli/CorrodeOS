@@ -59,6 +59,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "corrode-line"
+version = "0.0.1"
+dependencies = [
+ "corrode-input",
+]
+
+[[package]]
 name = "corrode-nv"
 version = "0.0.1"
 
@@ -104,10 +111,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "corrode-shell"
+version = "0.0.1"
+
+[[package]]
 name = "corrode-terminal"
 version = "0.0.1"
 dependencies = [
+ "corrode-input",
+ "corrode-line",
  "corrode-rt",
+ "corrode-shell",
  "corrode-ui",
 ]
 

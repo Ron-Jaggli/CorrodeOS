@@ -1,0 +1,14 @@
+CorrodeOS
+=========
+
+A capability-based microkernel for x86_64, written from scratch in Rust.
+
+These files came from the boot medium, packed when the system was built.
+They are read-only: nothing on this machine can change them, because no
+program holds a capability that would.
+
+Try:
+    ls /docs
+    cat /docs/capabilities.txt
+    grep -n grant /docs/*.txt
+    caps

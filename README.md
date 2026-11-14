@@ -62,8 +62,9 @@ Then:
 ./corrode wx-test     # boot and prove .text is not writable
 ./corrode user-test   # boot and prove ring 3 cannot read kernel memory
 ./corrode input-test  # boot, type and move the mouse through QEMU, check what arrived
+./corrode terminal-test # boot, open the terminal, edit and recall lines, read a file, to build/terminal.png
 ./corrode check       # cargo check
-./corrode test        # render, text, gfx, pci, elf, virtio and nv unit tests, on the build host
+./corrode test        # render, text, gfx, pci, elf, virtio, nv, input, heap, line and shell unit tests, on the build host
 ./corrode specimen    # draw a sheet of the typeface to build/specimen.png
 ./corrode shell       # drop into the build container
 ```
@@ -93,7 +94,10 @@ kernel/          the privileged kernel
   src/ipc.rs       synchronous IPC — endpoints, call/reply, reply capabilities
   src/syscall.rs   the ring 3 boundary — capability slots in, no pointers
   src/task/user.rs user address space — aliased code pages, user stacks
-  src/smp.rs       starting the other CPUs
+  src/smp.rs       starting the other CPUs, and setting one core aside
+  src/secure_core.rs  that core: a key in a register, reached through a mailbox
+  src/screen_log.rs   under hw-log, the boot log on the firmware's framebuffer
+  src/efi_log.rs      under efi-log, the boot log kept in UEFI variables
   src/surface.rs   pixels a task draws and the compositor shows
   src/pci.rs       the PCI bus: what is on it, and devices as capabilities
   src/device.rs    a device's registers, mapped into the task that holds them
@@ -107,6 +111,7 @@ kernel/          the privileged kernel
   src/blob.rs      a file from the boot medium, for one task to read
   src/time.rs      monotonic nanosecond clock, off the TSC
   src/arch/x86_64/cpu.rs  which CPU is this
+  src/arch/x86_64/topology.rs  which CPUs share a core
   build.rs         makes cargo notice linker.ld changes
   linker.ld        higher-half layout at -2GB, page-aligned sections
 render/          the rendering interface
@@ -128,7 +133,7 @@ user/            ring 3 programs, each an ELF file loaded as a Limine module
   edu/             a driver for QEMU's teaching device
   ps2/             the keyboard and mouse driver
   ui/              a window to draw rectangles and text in, and its events
-  terminal/        a terminal with a few built-in commands
+  terminal/        a terminal: corrode-shell, a few commands of its own, line editing, history
   panel/           the bar along the top: a launcher button and a clock
   fault/           a program that faults on purpose
   virtio-gpu/      a display driver: the compositor's frames, on a virtio GPU
@@ -139,12 +144,16 @@ virtio/          virtqueues and virtio GPU commands, tested against a pretend de
 nv/              NVIDIA chips, VBIOS and firmware files as data, tested on the build host
 pci/             PCI configuration space as arithmetic, tested on the build host
 input/           scancodes and mouse packets to key presses and movements
+line/            a prompt's line: cursor, history, Ctrl chords, Tab completion
+shell/           a shell: pipes, lists, variables, globs, and ls/cat/grep/sort and kin
+root/            the files the terminal can read, packed into a tar at build time
 heap/            the allocator: the kernel's heap and every program's
   src/lib.rs       headers, BARs, capability lists, MSI, what a driver may write
   src/mcfg.rs      the ACPI table that says where configuration space is
 boot/limine.conf lets Limine find the kernel
 docker/          the build environment
 scripts/         check-image.sh — guards against orphan sections
+                 flash-usb.sh — write a FEATURES=hw-log ISO to a USB stick, checking hard first
                  fetch-firmware.sh — NVIDIA GSP firmware into firmware/, never committed
 ```
 

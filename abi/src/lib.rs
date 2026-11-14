@@ -184,6 +184,9 @@ pub mod app {
     pub const HEAP: usize = 4;
     /// For the panel only: a send-only endpoint to the launcher.
     pub const LAUNCHER: usize = 5;
+    /// For the terminal only: the files packed from `root/` at build time,
+    /// a ustar archive, as a read-only blob.
+    pub const FILES: usize = 6;
 
     /// Pages in each program's pool.
     pub const POOL_PAGES: u64 = 256;

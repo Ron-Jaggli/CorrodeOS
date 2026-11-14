@@ -12,6 +12,8 @@ members = [
     "nv",
     "input",
     "heap",
+    "line",
+    "shell",
     "user/rt",
     "user/edu",
     "user/fault",

@@ -14,6 +14,8 @@ mod arch;
 mod blob;
 mod cap;
 mod device;
+#[cfg(feature = "efi-log")]
+mod efi_log;
 mod input;
 mod ipc;
 mod irq;
@@ -24,6 +26,9 @@ mod modules;
 mod pci;
 mod ports;
 mod remote;
+#[cfg(feature = "hw-log")]
+mod screen_log;
+mod secure_core;
 mod serial;
 mod smp;
 mod surface;
@@ -91,6 +96,8 @@ pub extern "C" fn kmain() -> ! {
         }
     );
 
+    report_boot_framebuffer();
+
     // Descriptor tables before anything else: the IDT names a code selector
     // from our GDT, and until both are in place any fault is a silent reboot.
     x86_64::gdt::init();
@@ -107,6 +114,10 @@ pub extern "C" fn kmain() -> ! {
     init_heap();
 
     heap_test();
+
+    // The first point a firmware call can be made from: it needs frames and
+    // the kernel's page tables. A machine that dies later still leaves this.
+    efi_checkpoint("early");
 
     // Interrupts last: everything they can reach has to exist first.
     //
@@ -160,6 +171,8 @@ pub extern "C" fn kmain() -> ! {
         online, reported, TICK_HZ
     );
     smp_check(online);
+    secure_core_check(online);
+    efi_checkpoint("smp");
 
     // Seed the capability system, then check its invariants while execution is
     // still single-threaded and the output is deterministic.
@@ -214,6 +227,9 @@ pub extern "C" fn kmain() -> ! {
         device_checks();
         blob_checks();
         nvidia_checks();
+        if cfg!(feature = "hw-log") {
+            hw_log_stop();
+        }
         start_input();
         start_desktop();
     }
@@ -2030,6 +2046,8 @@ const SERVICE_SPARE_SLOT: cap::CapPtr = 2;
 /// The launcher also holds what it gives the programs it starts.
 const LAUNCHER_WINDOWS_SLOT: cap::CapPtr = 3;
 const LAUNCHER_LOG_SLOT: cap::CapPtr = 4;
+/// The files from `root/`, for the terminal, if the boot medium has them.
+const LAUNCHER_FILES_SLOT: cap::CapPtr = 5;
 
 fn desktop_check(name: &str, ok: bool) {
     check("desktop", name, ok);
@@ -2105,7 +2123,16 @@ extern "C" fn launcher() {
         let words = received.message.words;
         let status = match (received.message.label, words[0]) {
             (launcher::LAUNCH, launcher::TERMINAL) => {
-                match start_app("terminal", LAUNCHER_WINDOWS_SLOT, LAUNCHER_LOG_SLOT, None) {
+                let files = cap::identify(LAUNCHER_FILES_SLOT)
+                    .is_ok()
+                    .then_some(LAUNCHER_FILES_SLOT);
+                match start_app(
+                    "terminal",
+                    LAUNCHER_WINDOWS_SLOT,
+                    LAUNCHER_LOG_SLOT,
+                    None,
+                    files,
+                ) {
                     Ok(_) => 0,
                     Err(error) => error.code(),
                 }
@@ -2125,13 +2152,14 @@ extern "C" fn launcher() {
 
 /// Start the program called `name` as a desktop program: an endpoint to the
 /// window server, a pool of memory of its own, the log -- and, for the
-/// panel, the launcher. The capabilities are derived from the caller's
+/// panel, the launcher, and for the terminal, the files. The capabilities are derived from the caller's
 /// slots, so whoever starts a program can give it only what it holds.
 fn start_app(
     name: &'static str,
     windows_slot: cap::CapPtr,
     log_slot: cap::CapPtr,
     launcher_slot: Option<cap::CapPtr>,
+    files_slot: Option<cap::CapPtr>,
 ) -> Result<usize, cap::CapError> {
     use cap::{CapError, Object, Rights};
     use corrode_abi::app;
@@ -2141,6 +2169,9 @@ fn start_app(
     cap::grant(id, log_slot, app::LOG, Rights::WRITE)?;
     if let Some(slot) = launcher_slot {
         cap::grant(id, slot, app::LAUNCHER, Rights::WRITE)?;
+    }
+    if let Some(slot) = files_slot {
+        cap::grant(id, slot, app::FILES, Rights::READ)?;
     }
     cap::issue_to(
         id,
@@ -2172,7 +2203,6 @@ fn start_desktop() {
         .is_ok();
     desktop_check("mint the window server's and launcher's endpoints", minted);
 
-
     // The pool's rules, from this side, on a pool of four pages.
     let pool_rules = cap::issue(
         BOOT_POOL,
@@ -2199,6 +2229,20 @@ fn start_desktop() {
             && cap::grant(id, LOG_ENDPOINT, LAUNCHER_LOG_SLOT, Rights::ALL).is_ok()
     });
     desktop_check("start the window server and the launcher", granted);
+
+    // The terminal's files. A boot medium without them still gets a
+    // terminal, with nothing to read.
+    if let (Some(id), Some((index, module))) = (launcher_task, modules::position("root.tar")) {
+        let given = cap::issue_to(
+            id,
+            LAUNCHER_FILES_SLOT,
+            Object::Blob(index),
+            Rights::READ_GRANT,
+        )
+        .is_ok();
+        desktop_check("give the launcher the terminal's files", given);
+        println!("files      : root.tar, {} KiB", module.bytes.len() / 1024);
+    }
     start_all(&[server, launcher_task]);
 }
 
@@ -2214,6 +2258,7 @@ fn start_panel() {
         WINDOWS_ENDPOINT,
         LOG_ENDPOINT,
         Some(LAUNCHER_ENDPOINT),
+        None,
     );
     desktop_check(
         "start the panel with four capabilities",
@@ -3108,6 +3153,116 @@ fn smp_check(online: usize) {
     cap_check(
         "every online cpu is taking its own timer ticks",
         all_ticking,
+    );
+}
+
+/// Say which core was set aside, and check it stayed out of the scheduler.
+///
+/// Run after [`smp_check`], so the general CPUs have already been ticking for
+/// a measured window: a secure CPU with a timer running would have counted
+/// some of those ticks too.
+fn secure_core_check(online: usize) {
+    let status = secure_core::status();
+    let Some(secure) = status.secure else {
+        println!("secure     : no core reserved -- the machine has one physical core");
+        return;
+    };
+
+    println!(
+        "secure     : cpu{} reserved, {} sibling(s) parked, {} general cpu(s) left",
+        secure, status.parked, online
+    );
+    check(
+        "secure",
+        "the secure cpu is numbered outside the scheduler's",
+        secure >= online,
+    );
+    check(
+        "secure",
+        "the secure cpu has taken no timer ticks",
+        lapic::ticks_on(secure) == 0,
+    );
+    check(
+        "secure",
+        "the secure core answers its mailbox",
+        secure_core::ping().is_ok(),
+    );
+
+    if !status.aes {
+        println!("secure     : no AES-NI/RDRAND on this cpu -- no key, so nothing to encrypt with");
+        return;
+    }
+    check(
+        "secure",
+        "AES-128 gives the FIPS-197 answer on the secure core",
+        status.self_test,
+    );
+    check(
+        "secure",
+        "a per-boot key was made in a register, not in RAM",
+        status.key,
+    );
+
+    // Round trip through the mailbox. The kernel sees plaintext and
+    // ciphertext; the key that relates them stays in the secure core.
+    let original = *b"the secure core shows what it did, never the key";
+    let mut data = original;
+    let first = secure_core::crypt(&[7; 12], &mut data);
+    let sealed = data;
+    check(
+        "secure",
+        "encrypting through the mailbox changes the data",
+        first.is_ok() && sealed != original,
+    );
+    let second = secure_core::crypt(&[7; 12], &mut data);
+    check(
+        "secure",
+        "the same call again gives the data back",
+        second.is_ok() && data == original,
+    );
+    let mut other = original;
+    let third = secure_core::crypt(&[8; 12], &mut other);
+    check(
+        "secure",
+        "a different nonce gives different ciphertext",
+        third.is_ok() && other != sealed,
+    );
+    // The edges of counter mode: nothing at all, a last block cut short, and
+    // a mailbox filled to the byte.
+    check(
+        "secure",
+        "an empty request is answered",
+        secure_core::crypt(&[9; 12], &mut []).is_ok(),
+    );
+    let mut ragged = [0x5au8; 33];
+    let ragged_out = secure_core::crypt(&[10; 12], &mut ragged);
+    let ragged_sealed = ragged;
+    let ragged_back = secure_core::crypt(&[10; 12], &mut ragged);
+    check(
+        "secure",
+        "a length that is not a whole number of blocks round-trips",
+        ragged_out.is_ok()
+            && ragged_back.is_ok()
+            && ragged_sealed != [0x5a; 33]
+            && ragged == [0x5a; 33],
+    );
+    let mut full = alloc::vec![0xa5u8; secure_core::PAYLOAD];
+    let full_out = secure_core::crypt(&[11; 12], &mut full);
+    // Every block of the keystream is different, so no two blocks of the
+    // same plaintext may come out alike.
+    let blocks_differ =
+        full[..16] != full[16..32] && full[..16] != full[secure_core::PAYLOAD - 16..];
+    let full_back = secure_core::crypt(&[11; 12], &mut full);
+    check(
+        "secure",
+        "a full mailbox round-trips, each block under its own counter",
+        full_out.is_ok() && full_back.is_ok() && blocks_differ && full.iter().all(|b| *b == 0xa5),
+    );
+    let mut too_long = [0u8; secure_core::PAYLOAD + 1];
+    check(
+        "secure",
+        "a request bigger than the mailbox is refused",
+        secure_core::crypt(&[9; 12], &mut too_long) == Err(secure_core::CallError::TooLong),
     );
 }
 
@@ -4334,8 +4489,65 @@ fn wx_test() {
     println!("wx test    : FAILED -- .text was writable");
 }
 
+/// What the firmware left lit, if anything, as the bootloader describes it.
+///
+/// Printed first thing, so a machine whose screen stays dark still says why
+/// in a log read some other way: no framebuffer at all, or one in a format
+/// the screen log declines to draw on.
+fn report_boot_framebuffer() {
+    let Some(response) = limine::FRAMEBUFFER.response.get() else {
+        println!("boot fb    : the bootloader gave no framebuffer");
+        return;
+    };
+    let Some(fb) = response.first() else {
+        println!(
+            "boot fb    : {} framebuffer(s) reported, none usable",
+            response.framebuffer_count
+        );
+        return;
+    };
+    println!(
+        "boot fb    : {}x{} pitch {} {}bpp model {}, r {}@{} g {}@{} b {}@{}, at {:p}, {} reported",
+        fb.width,
+        fb.height,
+        fb.pitch,
+        fb.bpp,
+        fb.memory_model,
+        fb.red_mask_size,
+        fb.red_mask_shift,
+        fb.green_mask_size,
+        fb.green_mask_shift,
+        fb.blue_mask_size,
+        fb.blue_mask_shift,
+        fb.address,
+        response.framebuffer_count
+    );
+}
+
+/// Under `efi-log`, save the boot log so far into UEFI variables. Nothing
+/// otherwise, so call sites need no `cfg` of their own.
+fn efi_checkpoint(stage: &str) {
+    #[cfg(feature = "efi-log")]
+    efi_log::checkpoint(stage);
+    #[cfg(not(feature = "efi-log"))]
+    let _ = stage;
+}
+
+/// The end of a `hw-log` boot: the NVIDIA stage has reported, so put its
+/// lines on screen in order and stop before the desktop paints over them.
+fn hw_log_stop() -> ! {
+    println!("hw-log     : boot stops here so the log stays on screen; power off to exit");
+    efi_checkpoint("end");
+    #[cfg(feature = "hw-log")]
+    serial::settle_screen();
+    halt_forever();
+}
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    // If this is the secure CPU, its key goes before anything else runs.
+    secure_core::on_fatal();
+
     // Stop the other CPUs first, for the same reasons as an unhandled trap.
     lapic::broadcast(vectors::HALT);
 
@@ -4347,5 +4559,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     println!();
     println!("*** KERNEL PANIC ***");
     println!("{}", info);
+    efi_checkpoint("panic");
+    #[cfg(feature = "hw-log")]
+    serial::settle_screen();
     halt_forever();
 }

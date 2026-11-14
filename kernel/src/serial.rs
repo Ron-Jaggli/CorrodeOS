@@ -137,10 +137,82 @@ pub fn _print(args: fmt::Arguments) {
         unsafe {
             let port = &mut *core::ptr::addr_of_mut!(PORT);
             if let Some(port) = port.as_mut() {
-                let _ = port.write_fmt(args);
+                let _ = Tee(port).write_fmt(args);
             }
         }
 
+        LOCK.owner.store(NO_OWNER, Ordering::Relaxed);
+        LOCK.locked.store(false, Ordering::Release);
+    });
+}
+
+/// COM1, and under `hw-log` the screen as well.
+struct Tee<'a>(&'a mut SerialPort);
+
+impl Write for Tee<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.0.write_str(s)?;
+        // SAFETY: only constructed inside `_print`, with the console lock held.
+        #[cfg(feature = "hw-log")]
+        unsafe {
+            crate::screen_log::write(s)
+        };
+        // SAFETY: as above.
+        #[cfg(feature = "efi-log")]
+        unsafe {
+            crate::efi_log::write(s)
+        };
+        Ok(())
+    }
+}
+
+/// Run `f` holding the console lock, so no line is printed halfway through it.
+///
+/// Waits a bounded time and then runs `f` regardless. Its callers include the
+/// panic path, where the holder may be a CPU that has been halted mid-print;
+/// a torn last line is a better outcome than never running `f`.
+#[cfg(feature = "efi-log")]
+pub fn with_console_lock<R>(f: impl FnOnce() -> R) -> R {
+    x86_64::without_interrupts(|| {
+        let mut held = false;
+        for _ in 0..50_000_000u32 {
+            if LOCK
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                held = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if held {
+            LOCK.owner.store(x86_64::cpu::index(), Ordering::Relaxed);
+        }
+        let result = f();
+        if held {
+            LOCK.owner.store(NO_OWNER, Ordering::Relaxed);
+            LOCK.locked.store(false, Ordering::Release);
+        }
+        result
+    })
+}
+
+/// Redraw the on-screen log with the newest lines in order. Takes the console
+/// lock the way `_print` does, so it never lands in the middle of a line.
+#[cfg(feature = "hw-log")]
+pub fn settle_screen() {
+    x86_64::without_interrupts(|| {
+        while LOCK
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        LOCK.owner.store(x86_64::cpu::index(), Ordering::Relaxed);
+        // SAFETY: the console lock is held.
+        unsafe { crate::screen_log::settle() };
         LOCK.owner.store(NO_OWNER, Ordering::Relaxed);
         LOCK.locked.store(false, Ordering::Release);
     });

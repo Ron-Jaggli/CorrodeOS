@@ -1,0 +1,25 @@
+Commands
+========
+
+Files (read-only, from the boot medium):
+    ls cd pwd cat head tail wc find tree stat file basename dirname
+
+Text, usually in a pipe:
+    grep sort uniq cut tr rev tac nl seq echo
+
+The shell:
+    env export unset which true false history clear help
+
+The system:
+    uname uptime free caps whoami about sleep exit
+
+Things that need permission first (see capabilities.txt):
+    ps       the running tasks             grant ps
+    kill ID  stop a task                   grant kill ID
+    lspci    devices on the PCI bus        grant lspci
+    dmesg    the kernel's log              grant dmesg
+
+Pipes and lists work as in any shell:
+    cat /docs/commands.txt | grep grant | wc -l
+    grep -q x file && echo yes || echo no
+    X=hello; echo "$X, world"

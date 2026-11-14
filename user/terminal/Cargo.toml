@@ -13,3 +13,6 @@ bench = false
 [dependencies]
 corrode-rt = { path = "../rt" }
 corrode-ui = { path = "../ui" }
+corrode-input = { path = "../../input" }
+corrode-line = { path = "../../line" }
+corrode-shell = { path = "../../shell" }

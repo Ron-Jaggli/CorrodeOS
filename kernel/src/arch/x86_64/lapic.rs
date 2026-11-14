@@ -22,6 +22,7 @@ const REG_TPR: usize = 0x080;
 const REG_EOI: usize = 0x0b0;
 const REG_SPURIOUS: usize = 0x0f0;
 const REG_ICR_LOW: usize = 0x300;
+const REG_ICR_HIGH: usize = 0x310;
 const REG_LVT_TIMER: usize = 0x320;
 const REG_TIMER_INITIAL: usize = 0x380;
 const REG_TIMER_CURRENT: usize = 0x390;
@@ -132,6 +133,16 @@ pub fn enable_local() {
     }
 }
 
+/// Software-disable *this* CPU's local APIC.
+///
+/// A disabled LAPIC accepts no fixed interrupt at all, from an IPI, the I/O
+/// APIC or its own timer; only NMI, SMI, INIT and start-up still get through.
+/// The spurious vector is kept, as the register requires one.
+pub fn disable_local() {
+    // SAFETY: the registers are mapped, as for `enable_local`.
+    unsafe { write(REG_SPURIOUS, super::vectors::SPURIOUS as u32) };
+}
+
 pub fn id() -> u32 {
     // SAFETY: only called after a successful `init`.
     unsafe { read(REG_ID) >> 24 }
@@ -220,6 +231,42 @@ pub fn broadcast(vector: u8) {
             spins += 1;
         }
     }
+}
+
+/// Send `vector` to the one CPU whose LAPIC ID is `apic_id`.
+///
+/// Fixed delivery, physical destination, no shorthand. Interrupts are off
+/// across the two register writes: an IPI sent from a handler in between would
+/// rewrite the destination under this one.
+pub fn send(apic_id: u8, vector: u8) {
+    if !is_mapped() {
+        return;
+    }
+    super::without_interrupts(|| {
+        // SAFETY: the LAPIC is mapped. ICR high holds the destination in bits
+        // 24-31; writing ICR low is what sends. The spin waits for the LAPIC
+        // to accept it, as in `broadcast`.
+        unsafe {
+            write(REG_ICR_HIGH, (apic_id as u32) << 24);
+            write(REG_ICR_LOW, vector as u32 | ICR_ASSERT);
+            let mut spins = 0u32;
+            while read(REG_ICR_LOW) & ICR_SEND_PENDING != 0 && spins < 1_000_000 {
+                core::hint::spin_loop();
+                spins += 1;
+            }
+        }
+    });
+}
+
+/// Refuse every interrupt on this CPU below `vector`'s priority class.
+///
+/// The LAPIC delivers a vector only if its class (the top four bits) is above
+/// the task priority's, so this sets the task priority one class below.
+/// Interrupts refused this way are not lost, only left pending.
+pub fn accept_only_from(vector: u8) {
+    let class = (vector & 0xf0).saturating_sub(0x10);
+    // SAFETY: the LAPIC is mapped, and every value is a legal task priority.
+    unsafe { write(REG_TPR, class as u32) };
 }
 
 /// Signal end-of-interrupt.
