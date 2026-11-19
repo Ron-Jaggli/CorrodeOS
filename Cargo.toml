@@ -19,6 +19,7 @@ members = [
     "user/edu",
     "user/fault",
     "user/virtio-gpu",
+    "user/virtio-blk",
     "user/blob-reader",
     "user/nvidia",
     "user/ps2",

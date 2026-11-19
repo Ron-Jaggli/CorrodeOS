@@ -454,6 +454,38 @@ pub mod blob {
 /// rectangles to show, written into memory the two share; the driver draws
 /// them with the software renderer and has its device show the result. To
 /// the compositor it is a `Renderer` like any other.
+/// The settings store: a driver for a virtio block device, which keeps the
+/// desktop's theme in the disk's first sector. The desktop is its only
+/// client.
+pub mod store {
+    /// Where the driver's capabilities are.
+    ///
+    /// The endpoint the desktop calls, receive-only.
+    pub const SERVE: usize = 0;
+    pub const LOG: usize = 1;
+    pub const DEVICE: usize = 2;
+    /// Memory for the queue, its requests and one sector:
+    /// [`QUEUE_PAGES`] pages.
+    pub const QUEUE: usize = 3;
+    /// The device's memory BARs: BAR `n` is at `BARS + n`, if it has one.
+    pub const BARS: usize = 4;
+    /// Where the capability to answer a call lands.
+    pub const REPLY: usize = 10;
+    pub const QUEUE_PAGES: usize = 3;
+
+    /// The modern (virtio 1) block device's id, which QEMU gives with
+    /// `disable-legacy=on`, and the transitional one it gives by default.
+    pub const VIRTIO_BLK: u16 = 0x1042;
+    pub const VIRTIO_BLK_TRANSITIONAL: u16 = 0x1001;
+
+    /// Read the kept theme. The answer's words are its four words, and its
+    /// label [`crate::STATUS_OK`]; or a status of `Empty` if the disk has
+    /// none, or of why it could not be read.
+    pub const LOAD: u64 = 90;
+    /// Keep the theme in words 0..4. The answer's label is the status.
+    pub const SAVE: u64 = 91;
+}
+
 pub mod gpu {
     /// Where the driver's capabilities are.
     ///

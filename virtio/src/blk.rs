@@ -20,11 +20,6 @@ pub const S_UNSUPP: u8 = 2;
 pub const SECTOR: usize = 512;
 pub const HEADER_LEN: usize = 16;
 
-/// The modern (virtio 1) device id; QEMU gives it with `disable-legacy=on`.
-pub const DEVICE_ID: u16 = 0x1042;
-/// The transitional id, which QEMU gives by default.
-pub const TRANSITIONAL_ID: u16 = 0x1001;
-
 /// Write the header of a request of type `kind` at sector `sector`, and
 /// say how long it is.
 pub fn header(out: &mut [u8], kind: u32, sector: u64) -> usize {

@@ -85,9 +85,12 @@ easiest first.
 
 **1. Settings, while it runs.** Click the cog in the dock. Every row applies
 at once to the whole desktop: wallpaper, glass, every window's frame and
-buttons, the dock, and the colours inside every open program. Nothing is
-saved yet: the root filesystem is a read-only tar on the ISO, so a reboot
-goes back to the file below.
+buttons, the dock, and the colours inside every open program. With a disk
+it is kept: `./corrode run` and `run-gui` attach `build/settings.img`, and
+whatever was last picked comes back next boot, over the file below (delete
+the image to go back to the file). Any other target boots without a disk,
+or give one with `STORE=path/to/image`; without one, a reboot goes back to
+the file, since the root filesystem is a read-only tar on the ISO.
 
 **2. `root/etc/desktop.conf`, for the look it boots with.** One `key =
 value` a line, `#` for comments. Edit it, then `./corrode iso` (or `./corrode
@@ -270,6 +273,7 @@ user/            ring 3 programs, each an ELF file loaded as a Limine module
   menu/            the right-click menus, for the desktop and dock icons
   fault/           a program that faults on purpose
   virtio-gpu/      a display driver: the compositor's frames, on a virtio GPU
+  virtio-blk/      the settings store: the theme, kept in a virtio disk's first sector
   blob-reader/     reads 32 MiB it was handed at boot, and says what was in it
   nvidia/          NVIDIA stage one: identify the card, read its VBIOS, change nothing
   user.ld          where a program's segments go

@@ -45,12 +45,20 @@ QEMU_DEVICES ?= -device edu
 # through the firmware's framebuffer. `virtio` is a virtio GPU, which a
 # driver in ring 3 takes over: the same frames, by another road.
 GPU ?= std
+# A raw disk image to keep settings on between boots, attached as a virtio
+# disk; none by default, so no test's theme leaks into the next one's.
+# `run` and `run-gui` keep theirs in build/settings.img.
+STORE ?=
+SETTINGS_IMG := build/settings.img
+store_flags = -drive file=$(1),format=raw,if=none,id=store \
+              -device virtio-blk-pci,drive=store,disable-legacy=on
 
 QEMU_BASE := -M $(MACHINE) -m $(MEM) -smp $(CPUS) \
              -cdrom $(ISO) -boot d \
              -net none \
              -no-reboot -no-shutdown \
-             -vga $(GPU) $(ACCEL) $(QEMU_DEVICES) $(QEMU_EXTRA)
+             -vga $(GPU) $(ACCEL) $(QEMU_DEVICES) $(QEMU_EXTRA) \
+             $(if $(STORE),$(call store_flags,$(STORE)))
 
 QEMU_COMMON := $(QEMU_BASE) -display none
 QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
@@ -59,7 +67,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -77,7 +85,7 @@ kernel:
 # crate built for it. RUSTFLAGS in the environment replaces the ones in
 # .cargo/config.toml outright, and a separate target directory stops the two
 # sets of flags from invalidating each other's build of the crates they share.
-USER_PROGRAMS := edu fault virtio-gpu blob-reader nvidia ps2 terminal panel settings about files control lock menu
+USER_PROGRAMS := edu fault virtio-gpu virtio-blk blob-reader nvidia ps2 terminal panel settings about files control lock menu
 USER_TARGET   := target/user
 USER_BIN      := $(USER_TARGET)/x86_64-unknown-none/release
 USER_RUSTFLAGS := -C relocation-model=static -C strip=debuginfo \
@@ -190,7 +198,8 @@ iso: $(KERNEL) user $(TEST_BLOB) $(ROOT_TAR)
 
 # Interactive boot. Ctrl-A X to quit QEMU.
 run: iso
-	qemu-system-x86_64 $(QEMU_FLAGS)
+	@test -f $(SETTINGS_IMG) || truncate -s 1M $(SETTINGS_IMG)
+	qemu-system-x86_64 $(QEMU_FLAGS) $(if $(STORE),,$(call store_flags,$(SETTINGS_IMG)))
 
 # Live framebuffer over VNC, serial still on stdout.
 #
@@ -200,7 +209,9 @@ run: iso
 # to 127.0.0.1 only, so nothing outside this machine can reach it.
 run-gui: iso
 	@echo "VNC listening -- connect to 127.0.0.1:590$(VNC_DISPLAY)"
-	qemu-system-x86_64 $(QEMU_BASE) -vnc :$(VNC_DISPLAY) -serial stdio
+	@test -f $(SETTINGS_IMG) || truncate -s 1M $(SETTINGS_IMG)
+	qemu-system-x86_64 $(QEMU_BASE) -vnc :$(VNC_DISPLAY) -serial stdio \
+	    $(if $(STORE),,$(call store_flags,$(SETTINGS_IMG)))
 
 # Non-interactive boot for CI and for the agent loop: capture serial, give up
 # after BOOT_TIMEOUT seconds (the kernel halts rather than exiting, so a
@@ -919,6 +930,38 @@ magnify-setting-test: iso
 	    && echo "magnify-setting-test: and the dock now grows to 170%     PASS" \
 	    || echo "magnify-setting-test: and the dock now grows to 170%     FAIL"
 	@test -s build/magnify-large.ppm && pnmtopng build/magnify-large.ppm > build/magnify-large.png 2>/dev/null && rm -f build/magnify-large.ppm && echo "wrote build/magnify-large.png" || true
+
+# Settings survive a reboot. Boot with a fresh disk, open Settings from the
+# dock and pick Light; then boot again with the same disk and touch
+# nothing: the desktop comes up light. build/store.png is the second boot.
+STORE_TEST_IMG := build/store-test.img
+store-test: iso
+	@rm -f $(STORE_TEST_IMG) build/store.ppm build/store.png && truncate -s 1M $(STORE_TEST_IMG)
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move 28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
+	   echo "mouse_move -40 -258"; sleep 0.2; echo "mouse_move -41 -258"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) $(call store_flags,$(STORE_TEST_IMG)) \
+	      -serial file:build/store-first.log -monitor stdio > /dev/null 2>&1 || true
+	@( sleep $(SHOT_DELAY); sleep 1; \
+	   echo "screendump build/store.ppm"; sleep 1; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) $(call store_flags,$(STORE_TEST_IMG)) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -hE "^(store|theme) " build/store-first.log build/serial.log | grep -v PASS || echo "store-test: nothing from the store"
+	@grep -q "^store      : the disk keeps no theme yet" build/store-first.log \
+	    && echo "store-test: a fresh disk keeps no theme                PASS" \
+	    || echo "store-test: a fresh disk keeps no theme                FAIL"
+	@grep -q "^store      : kept the theme on the disk" build/store-first.log \
+	    && echo "store-test: picking Light keeps it on the disk         PASS" \
+	    || echo "store-test: picking Light keeps it on the disk         FAIL"
+	@grep -q "^store      : read the theme kept on the disk (light)" build/serial.log \
+	    && echo "store-test: and the next boot comes up light           PASS" \
+	    || echo "store-test: and the next boot comes up light           FAIL"
+	@grep -q "the disk's driver holds its device, its memory, and nothing else[[:space:]]*PASS" build/serial.log \
+	    && echo "store-test: the driver holds only its device           PASS" \
+	    || echo "store-test: the driver holds only its device           FAIL"
+	@test -s build/store.ppm && pnmtopng build/store.ppm > build/store.png 2>/dev/null && rm -f build/store.ppm && echo "wrote build/store.png" || true
 
 # Boot, open two terminals from the panel's button, close the one on top
 # with its title bar's close button and the other by typing exit. Both

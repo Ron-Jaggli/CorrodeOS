@@ -203,6 +203,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "corrode-virtio-blk"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+ "corrode-theme",
+ "corrode-virtio",
+]
+
+[[package]]
 name = "corrode-virtio-gpu"
 version = "0.0.1"
 dependencies = [

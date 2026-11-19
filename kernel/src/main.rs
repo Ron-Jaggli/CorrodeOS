@@ -24,6 +24,7 @@ mod switcher;
 #[cfg(feature = "efi-log")]
 mod efi_log;
 mod frames;
+mod store;
 mod input;
 mod ipc;
 mod irq;
@@ -4605,6 +4606,13 @@ const DESKTOP_DELAY_MS: u64 = 1200;
 /// answer changed.
 fn render_loop(renderer: &mut Screen) -> ! {
     look::load();
+    // A theme kept from an earlier boot wins over the file: it is what was
+    // last picked.
+    if store::start() {
+        if let Some(theme) = store::load() {
+            look::set(theme);
+        }
+    }
     rtc::init();
     let Some(mut stage) = Stage::new(renderer, time::now_ns()) else {
         println!("scene      : no room for the boot screen's layers");
@@ -4763,6 +4771,7 @@ fn render_loop(renderer: &mut Screen) -> ! {
             }
             desk.restyle(renderer, &mut *stage.scene, theme);
             println!("theme      : changed");
+            store::save(&theme);
         }
 
         // What the keyboard and mouse have done since the last look.

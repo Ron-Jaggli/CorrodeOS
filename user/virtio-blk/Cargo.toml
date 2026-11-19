@@ -1,0 +1,16 @@
+[package]
+name = "corrode-virtio-blk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "virtio-blk"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+corrode-rt = { path = "../rt" }
+corrode-theme = { path = "../../theme" }
+corrode-virtio = { path = "../../virtio" }

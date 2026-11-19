@@ -1332,3 +1332,44 @@ This part, host-tested only:
   and a short buffer.
 - `./corrode test` passes; boot test 170 / 0, dock-test PASS (the
   kernel does not use either yet).
+
+## 55. Keeping settings across reboots, part 2: it works
+
+- New ring 3 driver `user/virtio-blk`, about 300 lines: brings a virtio
+  block device up (3.1.1; version 1, no other features), one request
+  queue, polled (a sector a few times a session needs no interrupt),
+  and answers `store::LOAD` and `store::SAVE`. A load is a theme only if
+  sector 0 passes `Theme::from_record`, so a blank or foreign disk is
+  "nothing kept", never garbage. If the device will not come up, the
+  driver does not exit: it answers every call `Empty`. A driver that had
+  gone would leave the desktop's call waiting forever.
+- New `corrode_abi::store`: slots (SERVE, LOG, DEVICE, QUEUE, BARS, REPLY),
+  QUEUE_PAGES = 3 (ring, header + status, sector), the two labels, and
+  the device ids 0x1042 and 0x1001.
+- New kernel `store.rs`: finds the disk, spawns the driver, mints its
+  endpoint, device, queue memory and BARs into task 0's slots 82..91
+  (all free before), and grants exactly those. Boot check "the disk's
+  driver holds its device, its memory, and nothing else" (4 + BARs
+  slots, as the GPU's check does). The painter calls `store::start` and
+  `store::load` after reading desktop.conf (the kept theme wins), and
+  `store::save` after every theme change. Without a disk it prints
+  "store      : no disk -- settings last until shutdown" and does
+  nothing else, so every existing test boots as before.
+- Makefile: `STORE ?=` attaches a raw image as `virtio-blk-pci` with
+  `disable-legacy=on`; `./corrode` forwards it. `run` and `run-gui`
+  attach build/settings.img (made with `truncate -s 1M` if missing).
+  Nothing outside the project; the ISO's generated boot config gains a
+  module line for the new program, as for any program.
+- New scored `store-test`: two boots on a fresh build/store-test.img.
+  The first opens Settings and picks Light; the second touches nothing.
+  Checks: a fresh disk keeps no theme; picking Light keeps it; the next
+  boot reads it back light; the driver holds only its device.
+  build/store.png (second boot) shows the light desktop.
+- README: Settings is now said to be kept with a disk, and how.
+- Security notes: the driver can read and write only that disk, and
+  only the desktop (task 0) holds its endpoint, so no app can talk to
+  it. Saves happen on the painter, so a slow disk would stall a frame
+  once per theme change; on QEMU it is under a millisecond. Not done:
+  saving from a background task.
+- Full suite PASSes on both GPUs (80 lines, with store-test's 4 each);
+  input-test 170 / 0 and 177 / 0; `./corrode test` passes.
