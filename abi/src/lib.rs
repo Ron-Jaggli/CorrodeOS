@@ -300,6 +300,11 @@ pub mod window {
     /// word 1 is how many seconds until another try is taken, after too
     /// many wrong ones.
     pub const UNLOCK: u64 = 82;
+    /// A call: make the caller's popover word 0 by word 1 pixels, as
+    /// Control Center does when it has more to show. Only a popover, and
+    /// only its own: other windows are sized by the person. The answer's
+    /// word 0 is 1 if it will be; the window then hears [`RESIZE`].
+    pub const GROW: u64 = 83;
     /// The calls only the shell endpoint takes.
     pub const SHELL_ONLY: [u64; 6] = [SET_THEME, QUIT, LIST, RAISE, HISTORY, CONTEXT];
 

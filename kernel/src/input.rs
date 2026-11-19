@@ -1214,6 +1214,21 @@ impl Desk {
     }
 
     /// Bring `window` to the front, as picking it in a dock menu does.
+    /// A popover asked to be `size`: Control Center, as notifications come
+    /// and go. It keeps its place; only its height and width change.
+    pub fn grow<const N: usize>(&mut self, window: usize, scene: &mut Scene<N>, size: (u32, u32)) {
+        if !self.can_resize {
+            return;
+        }
+        if let Some(index) = self
+            .windows
+            .iter()
+            .position(|managed| managed.window == window && managed.popover)
+        {
+            self.resize(scene, index, size);
+        }
+    }
+
     pub fn raise<const N: usize>(&mut self, window: usize, scene: &mut Scene<N>, now: u64) {
         if let Some(index) = self.windows.iter().position(|managed| managed.window == window) {
             println!("desktop    : brought window {} forward", window);

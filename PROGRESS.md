@@ -30,8 +30,8 @@ The short version, for reading first. The numbered log below has the detail.
     shortcuts (12).
   - virtio GPU parity: glass, wallpaper (14), freeing surfaces (30) and
     resizing (31). Before 30, the 14th window under virtio failed to open.
-- **Tests:** `./corrode test` passes. 32 scripted boot tests (`close-test`
-  through `passcode-test`, 44 scored checks) pass on both the default GPU and
+- **Tests:** `./corrode test` passes. 33 scripted boot tests (`close-test`
+  through `grow-test`, 46 scored checks) pass on both the default GPU and
   `GPU=virtio`. The boot self-checks give 172 PASS / 0 FAIL (default) and
   179 / 0 (virtio). Each test writes a screenshot to `build/`. The
   `build/progress-NN-*.png` files are the ones referred to below.
@@ -56,8 +56,8 @@ The short version, for reading first. The numbered log below has the detail.
   adjustable in Settings (50-53).
 - **Known rough edges:** listed under "Known gap" in each section. The
   main ones:
-  - Control Center's notification card is sized when it opens, so later
-    arrivals replace the oldest rather than adding rows (39).
+  - Control Center notices new notifications only every 20 s, not the
+    moment they come (58): there is no event for it yet.
 - **Branch:** everything is on `desktop-glass` (37 commits on top of
   `secure-core/reserve`). Nothing was committed to `main`, and nothing
   outside the project was changed apart from installing podman (Setup).
@@ -1442,3 +1442,31 @@ This part, host-tested only:
   key, and says plainly that the file is readable by anyone with the ISO.
 - Full suite PASSes on both GPUs (88 lines); input-test 172 / 0 and
   179 / 0; `./corrode test` passes; lock-test (no passcode) unchanged.
+
+## 58. Control Center's card grows and shrinks with its notifications
+
+- Closes the rough edge from 39: the card was sized when Control Center
+  opened, so arrivals while it was open pushed the oldest off.
+- New call `window::GROW` (83): a program asks for its popover to be a new
+  size. Only a popover, and only the caller's own (`windows::grow` finds
+  the owner's popover); other windows are still sized only by the
+  person. Queued like RAISE and applied by the painter through
+  `Desk::grow`, which is the existing `Desk::resize` and so tells the
+  program with RESIZE.
+- Popovers now get room up to the whole screen when they open, as
+  resizable windows do (the surface mapping never changes), and
+  `windows::resize` takes popovers as well as resizable windows.
+  Interactive edge-dragging is still checked by `resizable()`, so
+  popovers do not gain draggable edges.
+- Control Center: rows = notifications, 1 to 3. At each 20 s look, and
+  on Clear, it asks for the height for that many if it changed, and
+  redraws on Resize.
+- New scored `grow-test`: a terminal runs `sleep 8` with two `notify`
+  lines queued behind it, Control Center opens with none, they arrive,
+  and at its next look the card resizes for 2 (308x448).
+  build/grow-before.png reads "Nothing new"; build/grow.png shows both
+  with Clear. history-test now also checks the card shrinks after
+  Clear.
+- Known gap: arrivals are noticed only at the 20 s look.
+- Full suite PASSes on both GPUs (92 lines); input-test 172 / 0 and
+  179 / 0; `./corrode test` passes.

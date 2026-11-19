@@ -134,8 +134,9 @@ pub fn open(width: u32, height: u32, flags: u64, asked_title: u64, owner: usize)
         )
     };
     // A window that can be resized gets room for the whole screen: the
-    // largest the desktop will make it.
-    let room = if resizable {
+    // largest the desktop will make it. So does a popover, which may ask
+    // to grow as what it shows does.
+    let room = if resizable || popover {
         SCREEN[0].load(Ordering::Relaxed).min(window::MAX_WIDTH) as u64
             * SCREEN[1].load(Ordering::Relaxed).min(window::MAX_HEIGHT) as u64
     } else {
@@ -209,6 +210,30 @@ pub fn list_titled(title: u64, which: usize) -> (usize, [u64; 3]) {
 
 /// Windows a dock menu asked to have brought forward.
 static RAISED: SpinLock<Vec<usize>> = SpinLock::new(Vec::new());
+/// Popovers that asked to be another size, and the size, for the painter.
+static GROWN: SpinLock<Vec<(usize, u32, u32)>> = SpinLock::new(Vec::new());
+
+/// `owner`'s popover asks to be `width` by `height`, as Control Center does
+/// when more notifications come. Only a popover may, and only its own
+/// program: other windows are sized by the person. Whether it was queued.
+pub fn grow(owner: usize, width: u32, height: u32) -> bool {
+    let index = without_interrupts(|| {
+        TABLE
+            .lock()
+            .iter()
+            .rposition(|window| window.owner == owner && window.popover)
+    });
+    let Some(index) = index else {
+        return false;
+    };
+    without_interrupts(|| GROWN.lock().push((index, width, height)));
+    true
+}
+
+/// Popovers to resize, for the painter.
+pub fn take_grown() -> Vec<(usize, u32, u32)> {
+    without_interrupts(|| core::mem::take(&mut *GROWN.lock()))
+}
 
 /// Ask the painter to bring the `which`th window titled `title` forward.
 pub fn raise_titled(title: u64, which: usize) -> bool {
@@ -369,7 +394,10 @@ pub fn resize(index: usize, width: u32, height: u32) -> Option<(u32, u32)> {
     // window's again.
     let surface = without_interrupts(|| {
         let table = TABLE.lock();
-        table.get(index).filter(|window| window.resizable).map(|window| window.surface)
+        table
+            .get(index)
+            .filter(|window| window.resizable || window.popover)
+            .map(|window| window.surface)
     })?;
     if !surface::resize(surface, width, height) {
         return None;

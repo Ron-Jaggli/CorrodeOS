@@ -472,6 +472,17 @@ pub fn clear_notifications() {
     let _ = corrode_rt::call(app::SHELL, Message::new(window::HISTORY, [0, 2, 0, 0]), None);
 }
 
+/// Ask for this program's popover to be `width` by `height`. It arrives as
+/// an [`Event::Resize`] once the desktop has made it so.
+pub fn grow(width: u32, height: u32) -> bool {
+    corrode_rt::call(
+        app::WINDOWS,
+        Message::new(window::GROW, [width as u64, height as u64, 0, 0]),
+        None,
+    )
+    .is_ok_and(|answer| answer.message.words[0] == 1)
+}
+
 /// Whether the lock screen has to ask for a passcode.
 pub fn passcode_needed() -> bool {
     corrode_rt::call(app::WINDOWS, Message::new(window::UNLOCK, [0, 1, 0, 0]), None)

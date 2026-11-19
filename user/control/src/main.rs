@@ -434,9 +434,19 @@ fn main() {
     };
     let mut theme = Theme::default();
     let mut recent = recent;
-    // Room for as many as there were when it opened; new ones push the
-    // oldest off the end.
-    let room = recent.len().clamp(1, NOTES_SHOWN);
+    // As many rows as there are notifications, up to NOTES_SHOWN: when more
+    // come, or they are cleared, the card asks to be the height for them.
+    let mut rows = recent.len().clamp(1, NOTES_SHOWN);
+    let fit = |window: &Window, rows: &mut usize, count: usize| {
+        let wanted = count.clamp(1, NOTES_SHOWN);
+        if wanted != *rows {
+            let height = (HEIGHT as i32 + GAP + notes_height(wanted)) as u32;
+            if corrode_ui::grow(window.width, height) {
+                println!("the card resizes for {} notification(s)", count.min(NOTES_SHOWN));
+                *rows = wanted;
+            }
+        }
+    };
     // Nothing has the keyboard's ring until a key is pressed, as macOS
     // shows focus only to those using the keyboard.
     let mut focus: Option<usize> = None;
@@ -448,8 +458,13 @@ fn main() {
         match window.wait(corrode_rt::now_ns() + 20_000_000_000) {
             Event::Timeout => {
                 let mut fresh = corrode_ui::notifications();
-                fresh.truncate(room);
+                fresh.truncate(NOTES_SHOWN);
+                fit(&window, &mut rows, fresh.len());
                 recent = fresh;
+                draw(&mut window, &theme, &recent, focus);
+            }
+            Event::Resize { width, height } => {
+                println!("now {}x{}", width, height);
                 draw(&mut window, &theme, &recent, focus);
             }
             Event::Button { x, y, buttons }
@@ -458,6 +473,7 @@ fn main() {
                 corrode_ui::clear_notifications();
                 recent.clear();
                 println!("cleared the notifications");
+                fit(&window, &mut rows, 0);
                 draw(&mut window, &theme, &recent, focus);
             }
             Event::Theme(now) => {

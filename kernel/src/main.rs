@@ -2117,6 +2117,19 @@ fn serve(shell: bool) {
         // A new look for the desktop: kept, and picked up by the painter on
         // its next frame.
         // A notification, filed under the sender's window title.
+        if received.message.label == window::GROW {
+            let size = |word: u64| word.min(u32::MAX as u64) as u32;
+            let queued = windows::grow(received.from, size(words[0]), size(words[1]));
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: window::GROW,
+                    words: [queued as u64, 0, 0, 0],
+                },
+                None,
+            );
+            continue;
+        }
         if received.message.label == window::UNLOCK {
             // Only the lock screen may try: anyone else could guess, or use
             // up the tries and keep the person out.
@@ -4801,6 +4814,9 @@ fn render_loop(renderer: &mut Screen) -> ! {
         // Title bars whose program has given them something new to say.
         for index in windows::take_retitled() {
             desk.retitle(renderer, index, &mut *stage.scene);
+        }
+        for (index, width, height) in windows::take_grown() {
+            desk.grow(index, &mut *stage.scene, (width, height));
         }
         for index in windows::take_raised() {
             desk.raise(index, &mut *stage.scene, now);

@@ -67,7 +67,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test grow-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -524,6 +524,7 @@ history-test: iso
 	    || echo "history-test: Control Center listed both notifications FAIL"
 	@grep -q "^control    : cleared the notifications" build/serial.log \
 	    && grep -q "recent notifications cleared" build/serial.log \
+	    && grep -q "^control    : the card resizes for 0 notification(s)" build/serial.log \
 	    && echo "history-test: Clear emptied the list                 PASS" \
 	    || echo "history-test: Clear emptied the list                 FAIL"
 	@grep -q "^control    : Glass turned Clear" build/serial.log \
@@ -531,6 +532,35 @@ history-test: iso
 	    || echo "history-test: the Glass tile went on to Clear        FAIL"
 	@test -s build/history.ppm && pnmtopng build/history.ppm > build/history.png 2>/dev/null && rm -f build/history.ppm && echo "wrote build/history.png" || true
 	@test -s build/history-cleared.ppm && pnmtopng build/history-cleared.ppm > build/history-cleared.png 2>/dev/null && rm -f build/history-cleared.ppm && echo "wrote build/history-cleared.png" || true
+
+# Control Center's notifications card grows while it is open. A terminal
+# sleeps, with two notifications queued behind the sleep; Control Center
+# opens with none; they arrive, and at its next look (every 20 s) the card
+# grows to show them. build/grow-before.png and build/grow.png.
+grow-test: iso
+	@rm -f build/grow-before.ppm build/grow-before.png build/grow.ppm build/grow.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   for key in s l e e p spc 8 ret; do echo "sendkey $$key"; sleep 0.1; done; \
+	   for key in n o t i f y spc l a t e spc o n e ret; do echo "sendkey $$key"; sleep 0.1; done; \
+	   for key in n o t i f y spc l a t e spc t w o ret; do echo "sendkey $$key"; sleep 0.1; done; sleep 0.3; \
+	   echo "mouse_move 280 -248"; sleep 0.2; echo "mouse_move 280 -248"; sleep 0.2; echo "mouse_move 280 -248"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   echo "screendump build/grow-before.ppm"; sleep 24; \
+	   echo "screendump build/grow.ppm"; sleep 1; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^control |^notify " build/serial.log || echo "grow-test: no Control Center"
+	@grep -q "^control    : 0 recent notifications" build/serial.log \
+	    && echo "grow-test: Control Center opened with none             PASS" \
+	    || echo "grow-test: Control Center opened with none             FAIL"
+	@grep -q "^control    : the card resizes for 2 notification(s)" build/serial.log \
+	    && grep -q "^control    : now " build/serial.log \
+	    && echo "grow-test: and grew for the two that came after        PASS" \
+	    || echo "grow-test: and grew for the two that came after        FAIL"
+	@test -s build/grow-before.ppm && pnmtopng build/grow-before.ppm > build/grow-before.png 2>/dev/null && rm -f build/grow-before.ppm || true
+	@test -s build/grow.ppm && pnmtopng build/grow.ppm > build/grow.png 2>/dev/null && rm -f build/grow.ppm && echo "wrote build/grow.png" || true
 
 # Control Center from the keyboard: the clock opens it, arrows walk to
 # the 24-Hour tile (build/keys.png), Return flips it, Escape closes.
