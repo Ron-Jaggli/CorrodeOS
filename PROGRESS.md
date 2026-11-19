@@ -1168,3 +1168,37 @@ The short version, for reading first. The numbered log below has the detail.
 - Full suite PASSes on both GPUs (32 checks each); input-test is
   170 / 0 default, 177 / 0 virtio; `./corrode test` passes.
 - Screenshot: `build/progress-48-control-half.png`.
+
+## 49. Glass blurs only what is being drawn; a glass benchmark
+
+- `SoftwareRenderer::glass` read and blurred the pane's whole backdrop
+  (pane + blur reach) whatever the scissor. It now takes only the
+  scissored part, plus the reach, plus the lens's largest bend (half the
+  refraction) and 2 px for rounding, never more than before. Its start
+  keeps the whole backdrop's parity, so the half-size grid from 48 lines
+  up between pieces.
+- New unit test `glass_under_a_scissor_matches_the_whole_pane`: for
+  Regular (dark and light) and Clear glass, three scissors including a
+  small one inside the pane. Every pixel under the scissor equals the
+  same pixel of the pane drawn whole. It passes.
+- Honest result: dragging improved only 8.2 → 7.7 ms. I expected more,
+  thinking a pane was drawn once per damaged rectangle, but the frame
+  counter shows one glass command a frame. The gain is for a small
+  change inside a big pane, such as the clock ticking under the menu
+  bar or a hover inside Control Center. That is expected, but not
+  measured.
+- New `./corrode glass-bench`: one 600x40 pane, built optimised on the
+  build host:
+  - Regular: 3.1 ms, of which the blur is about 2.1 ms (no frost: 1.0 ms)
+  - Clear: 0.8 ms
+- Finding, not acted on: the kernel spends about twice the benchmark's
+  time on the same pane. The likely cause is the target,
+  `x86_64-unknown-none`, which turns SSE off, so the pixel loops cannot
+  be vectorised. The host benchmark can. This is not confirmed.
+  Enabling SSE in the kernel and the ring 3 driver means saving SSE
+  state on every task switch and interrupt (xsave/fxsave). That is a
+  kernel change with security weight, and it should be decided with
+  you, not made unattended. It is probably the largest remaining speed
+  lever for everything the software renderer draws.
+- Full suite PASSes on both GPUs (32 checks each); input-test is
+  170 / 0 default, 177 / 0 virtio; `./corrode test` passes.

@@ -518,9 +518,25 @@ impl SoftwareRenderer {
             rect.width.saturating_add(2 * reach as u32),
             rect.height.saturating_add(2 * reach as u32),
         );
-        let Some((bx0, by0, bx1, by1)) = self.clip(around, None) else {
+        let Some((ax0, ay0, ax1, ay1)) = self.clip(around, None) else {
             return;
         };
+        // Of that, only what the pixels being drawn can see: as far around
+        // them as the blur reaches and the lens bends (half the refraction
+        // at most), and a little for rounding. A pane drawn in pieces, one
+        // per damaged rectangle, is then blurred once over, not once per
+        // piece. Every pixel drawn is still a whole reach from the edge, so
+        // it comes out as it would with the whole backdrop, and the start
+        // keeps the parity of the whole one's, so the half-size grid below
+        // lines up from piece to piece and there are no seams.
+        let margin = reach as i64 + pane.refraction as i64 / 2 + 2;
+        let start = |whole: u32, drawn: u32| {
+            let from = (drawn as i64 - margin).max(whole as i64);
+            whole + ((from - whole as i64) as u32 & !1)
+        };
+        let (bx0, by0) = (start(ax0, x0), start(ay0, y0));
+        let bx1 = ((x1 as i64 + margin) as u32).min(ax1);
+        let by1 = ((y1 as i64 + margin) as u32).min(ay1);
         let (bw, bh) = ((bx1 - bx0) as usize, (by1 - by0) as usize);
         let format = self.info.format;
         // Frosted glass is blurred at half size and read back smoothly: a
@@ -1349,5 +1365,88 @@ mod tests {
             },
         ]);
         assert_eq!(lit(&pixels), 0);
+    }
+
+    /// A pane drawn under a scissor blurs only what the scissor needs, and
+    /// comes out exactly as the same pixels of the pane drawn whole.
+    #[test]
+    fn glass_under_a_scissor_matches_the_whole_pane() {
+        use crate::glass::Glass;
+        let (width, height) = (320u32, 200u32);
+        let backdrop: std::vec::Vec<u32> = (0..width * height)
+            .map(|index| {
+                let (x, y) = (index % width, index / width);
+                // Detail the blur has to work on, not just a gradient.
+                (x * 255 / width) << 16 | (y * 255 / height) << 8 | ((x ^ y) & 0x3f) * 4
+            })
+            .collect();
+        let info = SurfaceInfo {
+            width,
+            height,
+            pitch: width * 4,
+            format: PixelFormat::XRGB8888,
+        };
+        let rect = Rect::new(60, 50, 200, 80);
+        let draw = |scissor: Option<Rect>, glass: Glass| {
+            let mut pixels = backdrop.clone();
+            // SAFETY: `pixels` outlives the renderer and is `width * height`.
+            let mut renderer = unsafe { SoftwareRenderer::new(pixels.as_mut_ptr().cast(), info) }.unwrap();
+            renderer.attach_glass_scratch(Box::leak(std::vec![0u32; 1 << 20].into_boxed_slice()));
+            let pane = Command::Glass { rect, glass, alpha: 255 };
+            match scissor {
+                Some(rect) => submit(&mut renderer, &[Command::Scissor { rect }, pane]),
+                None => submit(&mut renderer, &[pane]),
+            }
+            pixels
+        };
+        for glass in [Glass::regular(true), Glass::regular(false), Glass::clear(true)] {
+            let whole = draw(None, glass);
+            for piece in [Rect::new(0, 0, 133, 200), Rect::new(133, 0, 187, 200), Rect::new(100, 87, 60, 9)] {
+                let part = draw(Some(piece), glass);
+                for y in piece.y as u32..(piece.y as u32 + piece.height).min(height) {
+                    for x in piece.x as u32..(piece.x as u32 + piece.width).min(width) {
+                        let at = (y * width + x) as usize;
+                        assert_eq!(part[at], whole[at], "{piece:?} at ({x}, {y})");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Not a check: how long a title bar's worth of glass takes, with and
+    /// without its blur, built optimised. `make glass-bench` runs it.
+    #[test]
+    #[ignore]
+    fn glass_bench() {
+        use crate::glass::Glass;
+        let (width, height) = (1280u32, 800u32);
+        let mut pixels = std::vec![0u32; (width * height) as usize];
+        for (index, pixel) in pixels.iter_mut().enumerate() {
+            let (x, y) = (index as u32 % width, index as u32 / width);
+            *pixel = (x * 255 / width) << 16 | (y * 255 / height) << 8 | 0x60;
+        }
+        let info = SurfaceInfo {
+            width,
+            height,
+            pitch: width * 4,
+            format: PixelFormat::XRGB8888,
+        };
+        // SAFETY: `pixels` outlives the renderer and is `width * height`.
+        let mut renderer = unsafe { SoftwareRenderer::new(pixels.as_mut_ptr().cast(), info) }.unwrap();
+        renderer.attach_glass_scratch(Box::leak(std::vec![0u32; 4 << 20].into_boxed_slice()));
+        let rect = Rect::new(100, 90, 600, 40);
+        let runs = [
+            ("regular", Glass::regular(true)),
+            ("regular, no frost", Glass { frost: 0, ..Glass::regular(true) }),
+            ("clear", Glass::clear(true)),
+        ];
+        for (name, glass) in runs {
+            let start = std::time::Instant::now();
+            let rounds = 200;
+            for _ in 0..rounds {
+                submit(&mut renderer, &[Command::Glass { rect, glass, alpha: 255 }]);
+            }
+            std::println!("glass-bench: {name:<18} {:>6} us a pane", start.elapsed().as_micros() / rounds);
+        }
     }
 }

@@ -101,6 +101,10 @@ HOST_TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
 test:
 	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci -p corrode-elf -p corrode-virtio -p corrode-nv -p corrode-input -p corrode-heap -p corrode-line -p corrode-shell -p corrode-theme --target $(HOST_TARGET)
 
+# What a title bar of glass costs the software renderer, built optimised.
+glass-bench:
+	cargo test --release -p corrode-render --target $(HOST_TARGET) glass_bench -- --ignored --nocapture
+
 # The 3D engine's demo scene, drawn on the build host at each preset, for
 # judging by eye. Built optimised, so the times it prints mean something.
 engine-shot:
