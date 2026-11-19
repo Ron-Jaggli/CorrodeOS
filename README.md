@@ -129,47 +129,57 @@ and in Settings' preset row. Wallpapers are integer-only functions in
 fixed-point port of the optics of [Glass-HQ's liquid glass](https://liquid-glass.glassapp.dev)
 (MIT). `./corrode test` checks all three on the build host.
 
-Keyboard shortcuts use Alt where macOS uses Cmd: **Alt+Tab** shows the
-window switcher (keep Alt held and press Tab again to move along, Shift+Tab
-to go back, Escape to cancel; letting go of Alt switches, and brings back
-a minimized window), **Alt+Q**, **Alt+W** or
-**Alt+F4** closes the one in front, **Alt+M** minimizes, **Alt+Z** zooms,
-**Alt+,** opens Settings, and **Alt+Space** searches apps and files (type, Up and
-Down to pick, Return to open an app or show a file in Files, Escape to
-close).
+### Using the desktop
 
-Programs can post notifications: `corrode_ui::notify("build done")` shows a
-glass banner at the top right under the program's name and dock icon, for
-four seconds or until clicked. From the terminal, `notify TEXT` does the
-same.
+Shortcuts use Alt where macOS uses Cmd:
 
-Click the clock at the right of the menu bar for **Control Center**: tiles
-for Dark Mode, Glass, the dock, shadows and motion, the accent colours, and
-a way into Settings. Click anywhere else (or the clock again) to close it.
-Its Notifications card lists the last three notifications, newest
-first, with how long ago each came. It works from the keyboard too: the arrow keys move a highlight over
-the tiles and colours, Return or Space picks, and Escape closes. Programs can make their own popovers with the `window::POPOVER` flag.
+| Keys | What they do |
+|---|---|
+| **Alt+Tab** / **Alt+Shift+Tab** | The window switcher: hold Alt, Tab to move along, let go to switch (it brings back minimized windows), Escape to cancel |
+| **Alt+Space** | Search apps and files: type, Up/Down, Return opens an app or shows a file in Files, Escape closes |
+| **Alt+Q**, **Alt+W**, **Alt+F4** | Close the window in front |
+| **Alt+M** / **Alt+Z** | Minimize / zoom the window in front |
+| **Alt+,** | Settings |
+| **Alt+L** | Lock the screen |
 
-Right-click the desktop for its menu: New Terminal, Open Files, Next
-Wallpaper, Light/Dark Appearance, Settings, Lock Screen and About. The item
-under the pointer lights up in the accent; the arrow keys and Return work
-too. Right-click a dock icon for that app's menu: New Window, and Quit
-(which closes all its windows) when it is running.
+**Windows.** Drag a title bar to move a window, and its edges or corners
+to resize it. Drag it to the left or right edge of the screen to snap it to
+that half, or to the top to fill the screen; a glass preview shows where it
+will land. Dragging a snapped window away gives it back its size, and the
+green zoom button puts it back where it was.
 
-**Alt+L** (or the Lock tile in Control Center) locks the screen: the whole
-desktop under glass, the date and time large, and Return or the unlock
-button to get back. There are no accounts yet, so there is no password;
-it hides the screen rather than securing it.
+**Control Center.** Click the clock at the right of the menu bar. Tiles
+for Dark Mode, Glass, the dock, shadows, motion and the 24-hour clock, the
+accent colours, Lock and a way into Settings, and below them the last three
+notifications. Arrow keys, Return/Space and Escape work too. Click anywhere
+else (or the clock again) to close it.
 
-Drag a window by its title bar to the left or right edge of the screen to
-snap it to that half, or to the top edge to fill the screen. A glass
-preview shows where it will land. The green zoom button puts a snapped
-window back where it was.
+**Menus.** Right-click the desktop for New Terminal, Open Files, Next
+Wallpaper, Light/Dark Appearance, Settings, Lock Screen and About.
+Right-click a dock icon for New Window and, while it runs, Quit (which
+closes all its windows). The item under the pointer lights up; Up/Down and
+Return work too.
+
+**Notifications** slide in at the top right with the sending program's
+name and dock icon, for four seconds or until clicked. From the terminal,
+`notify TEXT` sends one.
+
+**The lock screen** puts the whole desktop under glass with the date and
+time large; Return or the unlock button gets back. There are no accounts
+yet, so there is no password: it hides the screen rather than securing it.
+
+### For programs
 
 Programs follow the look on their own: a window is sent `window::THEME`
 when it opens and whenever the look changes (`Event::Theme` in the `ui`
 crate). A program can change the look with `corrode_ui::set_theme`, which
-is all Settings does.
+is all Settings does. `corrode_ui::notify(text)` posts a notification, and
+`corrode_ui::notifications()` reads back the recent ones. Window flags
+choose the kind of window: `TRANSLUCENT` (glass behind the program's
+clear pixels), `RESIZABLE`, `POPOVER` (no title bar, under the menu bar,
+closed by a click elsewhere; with `MENU`, at the pointer instead) and
+`COVER` (the whole screen, above everything, with every key, as the lock
+screen is).
 
 ## Layout
 
@@ -199,6 +209,13 @@ kernel/          the privileged kernel
   src/ports.rs     I/O ports, read and written for whoever holds a range
   src/input.rs     keyboard and mouse events, and the window manager
   src/windows.rs   windows: a surface to draw in and a queue of events
+  src/dock.rs      the dock: icons, the bounce, the running dots, labels
+  src/switcher.rs  Alt+Tab's panel of windows
+  src/spotlight.rs Alt+Space: search for apps and files
+  src/banner.rs    a notification on screen
+  src/notify.rs    notifications waiting to be shown, and the last few
+  src/context.rs   what was right-clicked, for the menu program
+  src/rtc.rs       the CMOS clock, read once, for the menu bar's time
   src/modules.rs   files the bootloader left in RAM
   src/memory.rs    memory a task can map and tell a device about
   src/remote.rs    a Renderer that is a call to a driver in ring 3
@@ -217,6 +234,7 @@ render/          the rendering interface
   src/scene.rs     layers, and the least repainting that keeps up with them
   src/wire.rs      commands as bytes, for a renderer in another process
 gfx/             the 3D engine: integer-only, software, not yet on screen
+theme/           the desktop's look: Theme, presets, desktop.conf, wallpapers, the clock's format
 text/            the text engine
   src/lib.rs       strings to coverage: measuring, placing, inking
   src/font.rs      the typeface, as pen strokes you can read and edit
@@ -228,7 +246,13 @@ user/            ring 3 programs, each an ELF file loaded as a Limine module
   ps2/             the keyboard and mouse driver
   ui/              a window to draw rectangles and text in, and its events
   terminal/        a terminal: corrode-shell, a few commands of its own, line editing, history
-  panel/           the bar along the top: a launcher button and a clock
+  panel/           the menu bar: a launcher button, the app in front, the clock
+  settings/        Settings: every part of the look, applied at once
+  about/           About CorrodeOS
+  files/           Files: places, a list, a preview
+  control/         Control Center: quick toggles, accents, recent notifications
+  lock/            the lock screen
+  menu/            the right-click menus, for the desktop and dock icons
   fault/           a program that faults on purpose
   virtio-gpu/      a display driver: the compositor's frames, on a virtio GPU
   blob-reader/     reads 32 MiB it was handed at boot, and says what was in it

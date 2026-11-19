@@ -7,6 +7,50 @@ before it was committed.
 
 Choices made without asking are marked **Choice:**.
 
+## Where things stand
+
+The short version, for reading first. The numbered log below has the detail.
+
+- **The backlog is done** (sections 1–9): glass rim test fixed and glass on
+  screen, `desktop.conf` with presets, wallpaper and glass menu bar,
+  window chrome, the glass dock, minimize/zoom, live Settings and About,
+  and the README on customizing.
+- **Built since, unasked but in the same spirit** (10–37):
+  - Windows: resize from any edge or corner with resize cursors (16, 22,
+    23), zoom-to-fill (15), snapping to halves or fill with a glass
+    preview (32, 33), fade-out on close (29).
+  - Finding things: Alt+Tab switcher (21), Alt+Space search for apps and
+    files (24, 25), a Files app with wheel scrolling (18, 19), terminal
+    scrollback (20).
+  - The menu bar: the front app's name (11), a real clock from the CMOS
+    RTC with timezone and 12/24h (17), Control Center with toggles,
+    accents, recent notifications and keyboard control (27, 34, 35).
+  - Notifications as glass banners (26), a lock screen on Alt+L (28),
+    right-click menus for the desktop and dock icons (36, 37), keyboard
+    shortcuts (12).
+  - virtio GPU parity: glass, wallpaper (14), freeing surfaces (30) and
+    resizing (31). Before 30, the 14th window under virtio failed to open.
+- **Tests:** `./corrode test` passes. 22 scripted boot tests (`close-test`
+  through `dock-menu-test`) pass on both the default GPU and
+  `GPU=virtio`. The boot self-checks give 170 PASS / 0 FAIL (default) and
+  177 / 0 (virtio). Each test writes a screenshot to `build/`. The
+  `build/progress-NN-*.png` files are the ones referred to below.
+- **Not done, on purpose:**
+  - Settings are not saved across reboots. There is no block driver,
+    and writing a disk or CMOS NVRAM from this kernel on a real machine
+    risks its disks or firmware settings. Too close to "don't touch my
+    boot setup" to do unattended (32).
+  - The lock screen has no password, as there are no accounts (28).
+- **Known rough edges:** listed under "Known gap" in each section. The
+  main ones:
+  - Control Center reads the notification list once, when it opens.
+  - The dock menu has no list of an app's open windows.
+  - Glass in Control Center toggles only Off/Regular (Clear is in
+    Settings).
+- **Branch:** everything is on `desktop-glass` (37 commits on top of
+  `secure-core/reserve`). Nothing was committed to `main`, and nothing
+  outside the project was changed apart from installing podman (Setup).
+
 ## Setup
 
 - Arch had no podman (the Nobara box did). Installed `podman` with pacman
@@ -881,3 +925,18 @@ Choices made without asking are marked **Choice:**.
 - Known gap: no "Show All Windows" or list of open windows in the menu,
   as macOS has.
 - Screenshot: `build/progress-36-dock-menu.png`.
+
+## 38. Tidying the docs
+
+- PROGRESS.md: a "Where things stand" summary at the top, so the log
+  need not be read end to end.
+- README:
+  - The paragraphs added one feature at a time are now a "Using the
+    desktop" subsection: a table of shortcuts, then a paragraph each on
+    windows, Control Center, menus, notifications and the lock screen.
+  - "For programs" covers the theme, notify and window-flag APIs.
+  - Layout lists the new kernel modules (dock, switcher, spotlight,
+    banner, notify, context, rtc), the `theme/` crate, and the user
+    programs Settings, About, Files, Control Center, lock and menu.
+- No code changed. `./corrode test` passes, menu-test PASSes, and
+  input-test is 170 / 0.
