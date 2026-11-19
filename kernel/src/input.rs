@@ -683,6 +683,9 @@ pub struct Desk {
     /// The edge a dragged window would snap to, and the preview showing
     /// where.
     snap: Option<(Snap, LayerId)>,
+    /// The window picked up was snapped or zoomed: the first move of the
+    /// drag gives it back its size from before.
+    unsnap: bool,
     /// Windows placed so far, for staggering the next one.
     placed: i32,
     /// The surfaces of windows that have gone, for the painter to retire.
@@ -793,6 +796,7 @@ impl Desk {
             drag: None,
             drag_from: (0, 0),
             snap: None,
+            unsnap: false,
             placed: 0,
             closed: Vec::new(),
             fading: Vec::new(),
@@ -1541,6 +1545,7 @@ impl Desk {
                             let (x, y) = self.windows[index].at;
                             self.drag = Some((index, self.at.0 - x, self.at.1 - y));
                             self.drag_from = (x, y);
+                            self.unsnap = self.windows[index].unzoomed.is_some();
                         }
                         Part::Body | Part::Shadow => {}
                     }
@@ -2153,6 +2158,31 @@ impl Desk {
         self.move_to(scene, index, at, now);
     }
 
+    /// A snapped or zoomed window being dragged away: back to its size from
+    /// before, held at the same fraction of its bar's width so it stays
+    /// under the pointer. Where it goes back to is forgotten; the drag
+    /// decides that now.
+    fn restore_size<const N: usize>(&mut self, scene: &mut Scene<N>, index: usize, grab_x: i32, grab_y: i32) {
+        let Some(managed) = self.windows.get_mut(index) else {
+            return;
+        };
+        let Some((from, size)) = managed.unzoomed.take() else {
+            return;
+        };
+        let wide = managed.width.max(1) as i32;
+        if size != (managed.width, managed.height) {
+            self.resize(scene, index, size);
+        }
+        let now_wide = self.windows[index].width as i32;
+        let grab_x = grab_x * now_wide / wide;
+        self.drag = Some((index, grab_x, grab_y));
+        self.drag_from = from;
+        println!(
+            "desktop    : window {} unsnapped to {}x{}",
+            self.windows[index].window, self.windows[index].width, self.windows[index].height
+        );
+    }
+
     /// Where a window snapped to `snap` goes, frame and all: the room
     /// between the menu bar and the dock, the half or the whole of it.
     fn snap_rect(&self, screen: Rect, snap: Snap) -> Rect {
@@ -2550,6 +2580,10 @@ impl Desk {
         }
         // Dragging a window by its bar: it follows the pointer, held where
         // it was picked up.
+        if let (Some((index, grab_x, grab_y)), true) = (self.drag, self.unsnap && buttons & 1 != 0) {
+            self.unsnap = false;
+            self.restore_size(scene, index, grab_x, grab_y);
+        }
         if let Some((index, grab_x, grab_y)) = self.drag {
             if buttons & 1 == 0 {
                 self.drag = None;

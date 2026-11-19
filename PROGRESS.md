@@ -747,3 +747,21 @@ Choices made without asking are marked **Choice:**.
   size, where macOS would restore the old size as it is pulled away.
 - Screenshots: `build/progress-31-snap-preview.png`,
   `build/progress-31-snapped.png`.
+
+## 33. Dragging a snapped window away restores its size
+
+- Closes the gap from section 32. Picking up a window that is snapped or
+  zoomed (it has an `unzoomed` frame saved) now gives it back its earlier
+  size on the first move of the drag (`desktop: window N unsnapped to
+  600x340`), as macOS does.
+  - It stays held at the same fraction of its bar's width, so the pointer
+    stays on the bar where it was grabbed.
+  - The saved position is forgotten, since the drag decides that now.
+- This also applies to zoomed (filled) windows dragged by their bar.
+  Choice: the same rule as snapped ones, because both are "a window
+  filling space it was put in".
+- snap-test now also drags the right-snapped window into the middle and
+  checks that it ends at 600x340 (`build/unsnapped.png`). Full suite
+  PASSes on both GPUs (19 checks each); input-test is 170 / 0 default,
+  177 / 0 virtio.
+- Screenshot: `build/progress-32-unsnapped.png`.

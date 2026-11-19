@@ -449,7 +449,7 @@ lock-test: iso
 # shows the left half (build/snap.png), and letting go snaps it there.
 # Then drag it to the right edge and let go: the right half.
 snap-test: iso
-	@rm -f build/snap.ppm build/snap.png build/snapped.ppm build/snapped.png
+	@rm -f build/snap.ppm build/snap.png build/snapped.ppm build/snapped.png build/unsnapped.ppm build/unsnapped.png
 	@( sleep $(SHOT_DELAY); \
 	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
@@ -462,15 +462,25 @@ snap-test: iso
 	   echo "mouse_button 1"; sleep 0.3; \
 	   for step in 1 2 3 4 5; do echo "mouse_move 220 0"; sleep 0.2; done; sleep 0.6; \
 	   echo "mouse_button 0"; sleep 1.2; \
-	   echo "screendump build/snapped.ppm"; sleep 1; echo quit ) \
+	   echo "screendump build/snapped.ppm"; sleep 1; \
+	   echo "mouse_move -300 0"; sleep 0.4; \
+	   echo "mouse_button 1"; sleep 0.3; \
+	   echo "mouse_move -200 120"; sleep 0.2; echo "mouse_move -100 60"; sleep 0.6; \
+	   echo "mouse_button 0"; sleep 1.2; \
+	   echo "screendump build/unsnapped.ppm"; sleep 1; echo quit ) \
 	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
 	@grep -E "snapped|is now" build/serial.log || echo "snap-test: nothing snapped"
 	@grep -q "snapped Left" build/serial.log && grep -q "snapped Right" build/serial.log \
 	    && echo "snap-test: dragged to the left half, then the right  PASS" \
 	    || echo "snap-test: dragged to the left half, then the right  FAIL"
+	@test "$$(grep -c 'unsnapped to 600x340' build/serial.log)" = 2 \
+	    && grep "is now" build/serial.log | tail -1 | grep -q "600x340" \
+	    && echo "snap-test: dragged away, back to its own size       PASS" \
+	    || echo "snap-test: dragged away, back to its own size       FAIL"
 	@test -s build/snap.ppm && pnmtopng build/snap.ppm > build/snap.png 2>/dev/null && rm -f build/snap.ppm && echo "wrote build/snap.png" || true
 	@test -s build/snapped.ppm && pnmtopng build/snapped.ppm > build/snapped.png 2>/dev/null && rm -f build/snapped.ppm && echo "wrote build/snapped.png" || true
+	@test -s build/unsnapped.ppm && pnmtopng build/unsnapped.ppm > build/unsnapped.png 2>/dev/null && rm -f build/unsnapped.ppm && echo "wrote build/unsnapped.png" || true
 
 # Open a terminal from the dock and drag its bottom-right corner 200 by 100
 # pixels bigger, in four steps; then drag its top-left corner 60 by 40
