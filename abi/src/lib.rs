@@ -187,6 +187,10 @@ pub mod app {
     /// For the terminal only: the files packed from `root/` at build time,
     /// a ustar archive, as a read-only blob.
     pub const FILES: usize = 6;
+    /// For Settings, Control Center and the menu only: a send-only endpoint
+    /// to the desktop shell, which takes the calls that reach past the
+    /// caller's own windows -- the look, other apps' windows, notifications.
+    pub const SHELL: usize = 7;
 
     /// Pages in each program's pool.
     pub const POOL_PAGES: u64 = 256;
@@ -285,6 +289,11 @@ pub mod window {
     /// Bring the window `LIST` would name (title in word 0, which in word
     /// 1) to the front, and back from the dock if it was minimized.
     pub const RAISE: u64 = 80;
+    /// The answer to a call the window server's own endpoint does not take:
+    /// one only the shell endpoint does, from a program that lacks it.
+    pub const DENIED: u64 = 81;
+    /// The calls only the shell endpoint takes.
+    pub const SHELL_ONLY: [u64; 6] = [SET_THEME, QUIT, LIST, RAISE, HISTORY, CONTEXT];
 
     /// Most a window may be, either way.
     pub const MAX_WIDTH: u32 = 1920;

@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -562,6 +562,28 @@ menu-test: iso
 	    || echo "menu-test: right-click menu picked, then closed      FAIL"
 	@test -s build/menu.ppm && pnmtopng build/menu.ppm > build/menu.png 2>/dev/null && rm -f build/menu.ppm && echo "wrote build/menu.png" || true
 	@test -s build/menu-after.ppm && pnmtopng build/menu-after.ppm > build/menu-after.png 2>/dev/null && rm -f build/menu-after.ppm && echo "wrote build/menu-after.png" || true
+
+# Settings, then a terminal that types "quit Settings": the terminal holds
+# no shell endpoint, and the window server's refuses the call, so Settings
+# stays (build/shell.png).
+shell-test: iso
+	@rm -f build/shell.ppm build/shell.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move 28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   echo "mouse_move -56 0"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 2; \
+	   for key in q u i t spc shift-s e t t i n g s ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 1.5; \
+	   echo "screendump build/shell.ppm"; sleep 1; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "started|refused call|quit asked|\\$$ quit|window .* closed" build/serial.log || echo "shell-test: nothing"
+	@grep -q "refused call 77 from task" build/serial.log \
+	    && ! grep -q "quit asked" build/serial.log \
+	    && ! grep -q "^settings   : closed" build/serial.log \
+	    && echo "shell-test: the terminal could not quit Settings  PASS" \
+	    || echo "shell-test: the terminal could not quit Settings  FAIL"
+	@test -s build/shell.ppm && pnmtopng build/shell.ppm > build/shell.png 2>/dev/null && rm -f build/shell.ppm && echo "wrote build/shell.png" || true
 
 # A terminal and Files from the dock, then Alt+D: both go
 # (build/show-desktop.png); Alt+D again brings both back.

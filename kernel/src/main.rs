@@ -2042,6 +2042,10 @@ fn start_input() {
 /// with every right, to hand out send-only copies.
 const WINDOWS_ENDPOINT: cap::CapPtr = 64;
 const LAUNCHER_ENDPOINT: cap::CapPtr = 65;
+/// The desktop shell's: the window server's calls that act beyond the
+/// caller's own windows, for the few programs that are the desktop.
+/// Clear of the pool slots just below it (66-69).
+const SHELL_ENDPOINT: cap::CapPtr = 80;
 /// Where bootstrap is given each window's surface -- at this slot plus the
 /// surface's number -- so the renderer can be shown it.
 const WINDOW_SURFACES: cap::CapPtr = 96;
@@ -2058,6 +2062,8 @@ const LAUNCHER_LOG_SLOT: cap::CapPtr = 4;
 const LAUNCHER_FILES_SLOT: cap::CapPtr = 5;
 /// A send endpoint to itself, for Control Center to ask for Settings by.
 const LAUNCHER_SELF_SLOT: cap::CapPtr = 6;
+/// The shell's endpoint, to hand Settings, Control Center and the menu.
+const LAUNCHER_SHELL_SLOT: cap::CapPtr = 7;
 
 fn desktop_check(name: &str, ok: bool) {
     check("desktop", name, ok);
@@ -2070,6 +2076,20 @@ fn desktop_check(name: &str, ok: bool) {
 /// show it to the renderer. Placing the window, and everything after, is the
 /// painter's: this task only makes them.
 extern "C" fn window_server() {
+    serve(false);
+}
+
+/// The desktop shell: the same calls, and those that reach past the
+/// caller's windows, for whoever holds its endpoint.
+extern "C" fn shell_server() {
+    serve(true);
+}
+
+/// Answer window calls on the endpoint in this task's service slot. Only
+/// the shell's takes `window::SHELL_ONLY`; the window server's answers
+/// those with `window::DENIED`, so holding a window is not holding the
+/// desktop.
+fn serve(shell: bool) {
     use corrode_abi::window;
 
     loop {
@@ -2077,6 +2097,21 @@ extern "C" fn window_server() {
             return;
         };
         let words = received.message.words;
+        if !shell && window::SHELL_ONLY.contains(&received.message.label) {
+            println!(
+                "desktop    : refused call {} from task {}: it holds no shell capability",
+                received.message.label, received.from
+            );
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: window::DENIED,
+                    words: [0; 4],
+                },
+                None,
+            );
+            continue;
+        }
         // A new look for the desktop: kept, and picked up by the painter on
         // its next frame.
         // A notification, filed under the sender's window title.
@@ -2264,6 +2299,10 @@ extern "C" fn launcher() {
                 // launcher too -- able to send, not to give it on.
                 let launcher = matches!(program, launcher::CONTROL | launcher::MENU)
                     .then_some(LAUNCHER_SELF_SLOT);
+                // The programs that are the desktop: they change the look,
+                // read notifications and act on other apps' windows.
+                let shell = matches!(program, launcher::SETTINGS | launcher::CONTROL | launcher::MENU)
+                    .then_some(LAUNCHER_SHELL_SLOT);
                 // One lock screen is enough.
                 if program == launcher::LOCK && crate::windows::locked() {
                     let _ = ipc::reply(
@@ -2280,7 +2319,7 @@ extern "C" fn launcher() {
                 let files = (matches!(program, launcher::TERMINAL | launcher::FILES)
                     && cap::identify(LAUNCHER_FILES_SLOT).is_ok())
                 .then_some(LAUNCHER_FILES_SLOT);
-                match start_app(name, LAUNCHER_WINDOWS_SLOT, LAUNCHER_LOG_SLOT, launcher, files) {
+                match start_app(name, LAUNCHER_WINDOWS_SLOT, LAUNCHER_LOG_SLOT, launcher, files, shell) {
                     Ok(_) => 0,
                     Err(error) => error.code(),
                 }
@@ -2308,6 +2347,7 @@ fn start_app(
     log_slot: cap::CapPtr,
     launcher_slot: Option<cap::CapPtr>,
     files_slot: Option<cap::CapPtr>,
+    shell_slot: Option<cap::CapPtr>,
 ) -> Result<usize, cap::CapError> {
     use cap::{CapError, Object, Rights};
     use corrode_abi::app;
@@ -2320,6 +2360,9 @@ fn start_app(
     }
     if let Some(slot) = files_slot {
         cap::grant(id, slot, app::FILES, Rights::READ)?;
+    }
+    if let Some(slot) = shell_slot {
+        cap::grant(id, slot, app::SHELL, Rights::WRITE)?;
     }
     cap::issue_to(
         id,
@@ -2348,6 +2391,13 @@ fn start_desktop() {
             Object::Endpoint(ipc::Endpoint::new()),
             Rights::ALL,
         )
+        .is_ok()
+        && cap::mint(
+            0,
+            SHELL_ENDPOINT,
+            Object::Endpoint(ipc::Endpoint::new()),
+            Rights::ALL,
+        )
         .is_ok();
     desktop_check("mint the window server's and launcher's endpoints", minted);
 
@@ -2368,14 +2418,18 @@ fn start_desktop() {
     desktop_check("a pool gives what it has and no more", pool_rules);
 
     let server = task::spawn("windows", window_server);
+    let shell = task::spawn("shell", shell_server);
     let launcher_task = task::spawn("launcher", launcher);
     let granted = server.is_some_and(|id| {
         cap::grant(id, WINDOWS_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
+    }) && shell.is_some_and(|id| {
+        cap::grant(id, SHELL_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
     }) && launcher_task.is_some_and(|id| {
         cap::grant(id, LAUNCHER_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
             && cap::grant(id, WINDOWS_ENDPOINT, LAUNCHER_WINDOWS_SLOT, Rights::ALL).is_ok()
             && cap::grant(id, LOG_ENDPOINT, LAUNCHER_LOG_SLOT, Rights::ALL).is_ok()
             && cap::grant(id, LAUNCHER_ENDPOINT, LAUNCHER_SELF_SLOT, Rights::ALL).is_ok()
+            && cap::grant(id, SHELL_ENDPOINT, LAUNCHER_SHELL_SLOT, Rights::ALL).is_ok()
     });
     desktop_check("start the window server and the launcher", granted);
 
@@ -2392,7 +2446,7 @@ fn start_desktop() {
         desktop_check("give the launcher the terminal's files", given);
         println!("files      : root.tar, {} KiB", module.bytes.len() / 1024);
     }
-    start_all(&[server, launcher_task]);
+    start_all(&[server, shell, launcher_task]);
 }
 
 /// Start the panel. Done by the painter once it knows the screen's size --
@@ -2408,7 +2462,10 @@ fn start_panel() {
         LOG_ENDPOINT,
         Some(LAUNCHER_ENDPOINT),
         None,
+        None,
     );
+    // Four, and not the shell: the panel shows the desktop, it does not
+    // run it.
     desktop_check(
         "start the panel with four capabilities",
         panel.is_ok_and(|id| cap::slots_used(id) == Some(4)),

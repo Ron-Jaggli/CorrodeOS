@@ -41,6 +41,8 @@ The short version, for reading first. The numbered log below has the detail.
     risks its disks or firmware settings. Too close to "don't touch my
     boot setup" to do unattended (32).
   - The lock screen has no password, as there are no accounts (28).
+- **Security:** calls that act on other apps need the shell capability,
+  held only by Settings, Control Center and the menu (46).
 - **Known rough edges:** listed under "Known gap" in each section. The
   main ones:
   - Control Center's notification card is sized when it opens, so later
@@ -1060,3 +1062,39 @@ The short version, for reading first. The numbered log below has the detail.
   (`build/show-desktop.png`). Full suite PASSes on both GPUs (31 checks
   each); input-test is 170 / 0 default, 177 / 0 virtio.
 - Screenshot: `build/progress-45-show-desktop.png`.
+
+## 46. The desktop's calls need a capability
+
+- The problem (mine, from 26–41): any program holding a window could
+  change the look for everyone, quit other apps, list and raise their
+  windows, read every app's notifications, and read the menu's context.
+  That is ambient authority, which a capability kernel is meant not to
+  have.
+- The fix: a second endpoint, the **shell** (bootstrap slot 80, a
+  `shell` task running the same `serve` loop as the window server).
+  - The launcher hands a send-only copy at `app::SHELL` (7) to Settings,
+    Control Center and the menu only.
+  - `window::SHELL_ONLY` lists SET_THEME, QUIT, LIST, RAISE, HISTORY and
+    CONTEXT. The `ui` crate sends those to `app::SHELL`.
+  - The window server's own endpoint answers them with `window::DENIED`
+    (81) and logs the refusal. `set_theme` turns DENIED into an error.
+  - NOTIFY and SUBTITLE stay on the ordinary endpoint. They only add the
+    caller's own text under the caller's own title.
+  - The panel still holds four capabilities, not the shell (the boot
+    check says so).
+- Bug found by the full suite and fixed: the shell endpoint first went
+  in slot 66, which is `BOOT_POOL`. Every desktop test passed, but the
+  boot self-check "a pool gives what it has and no more" failed. Moved
+  to 80.
+- The terminal gained `quit APP`. It tries the shell (it holds none:
+  "no shell capability (Empty)"), then the window server ("refused it"),
+  and `caps` names slot 7.
+- Known gap: a window's title is whatever its program says, so a
+  program could name itself "Settings" and post notifications as
+  Settings. Notifications can only show text; fixing it needs titles
+  given by the launcher, not chosen by the app.
+- New `./corrode shell-test`: Settings, then a terminal types
+  `quit Settings`. Settings stays, and the log shows "refused call 77"
+  (`build/shell.png`). Full suite PASSes on both GPUs (32 checks each);
+  input-test is 170 / 0 default, 177 / 0 virtio.
+- Screenshot: `build/progress-46-shell.png`.

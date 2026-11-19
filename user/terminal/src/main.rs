@@ -60,7 +60,7 @@ const SLOTS: usize = 16;
 
 /// The terminal's own commands, how to call them, and what they do. The
 /// shell lists them in `help` after its own.
-const COMMANDS: [About; 10] = [
+const COMMANDS: [About; 11] = [
     ("clear", "", "start with an empty window (or Ctrl+L)"),
     ("history", "", "the lines typed so far"),
     ("uptime", "", "time since the machine started"),
@@ -69,6 +69,7 @@ const COMMANDS: [About; 10] = [
     ("sleep", "SECONDS", "wait; Ctrl+C to stop early"),
     ("caps", "", "the capabilities this terminal holds"),
     ("notify", "TEXT", "show TEXT as a notification"),
+    ("quit", "APP", "try to close APP's windows (the terminal may not)"),
     ("about", "", "what this is"),
     ("exit", "", "close this terminal"),
 ];
@@ -350,6 +351,32 @@ impl Host for System<'_> {
                     0
                 }
             }
+            // The desktop's calls are not the terminal's to make: it holds
+            // no shell endpoint, and the window server's own refuses them.
+            // Both are tried, to show it.
+            "quit" => {
+                let Some(app_name) = args.get(1) else {
+                    out.error("quit: which app");
+                    return Some(1);
+                };
+                let mut word = [0u8; 8];
+                for (slot, byte) in word.iter_mut().zip(app_name.bytes()) {
+                    *slot = byte;
+                }
+                let message = corrode_rt::Message::new(window::QUIT, [u64::from_le_bytes(word), 0, 0, 0]);
+                match corrode_rt::call(app::SHELL, message, None) {
+                    Ok(_) => out.line("quit: the shell took it"),
+                    Err(error) => out.error(&format!("quit: no shell capability ({error:?})")),
+                }
+                match corrode_rt::call(app::WINDOWS, message, None) {
+                    Ok(answer) if answer.message.label == window::DENIED => {
+                        out.error("quit: the window server refused it")
+                    }
+                    Ok(_) => out.line("quit: the window server took it"),
+                    Err(error) => out.error(&format!("quit: {error:?}")),
+                }
+                1
+            }
             "about" => {
                 out.line("CorrodeOS terminal: a ring 3 program holding a window,");
                 out.line("a pool of memory, the log and the boot medium's files,");
@@ -419,6 +446,7 @@ fn caps(out: &mut Output) {
             app::WINDOW => "this window",
             app::HEAP => "the heap",
             app::FILES => "the files",
+            app::SHELL => "the desktop shell",
             _ => "",
         };
         out.line(format!("{slot:>3}  {letters}  {name}  {what}").trim_end());

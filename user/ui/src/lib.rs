@@ -323,12 +323,13 @@ impl Window {
 /// [`Event::Theme`], this one included.
 pub fn set_theme(theme: &Theme) -> Result<()> {
     let answer = corrode_rt::call(
-        app::WINDOWS,
+        app::SHELL,
         Message::new(window::SET_THEME, theme.to_words()),
         None,
     )?;
-    match answer.message.words[0] {
-        0 => Ok(()),
+    match (answer.message.label, answer.message.words[0]) {
+        (window::DENIED, _) => Err(corrode_rt::Error::Refused),
+        (_, 0) => Ok(()),
         _ => Err(corrode_rt::Error::Refused),
     }
 }
@@ -347,7 +348,7 @@ pub fn notify(text: &str) -> Result<()> {
 /// What the desktop's menu was opened for: the kind (0 the desktop, 1 a
 /// dock icon), the program, whether it runs, and its title.
 pub fn context() -> [u64; 4] {
-    corrode_rt::call(app::WINDOWS, Message::new(window::CONTEXT, [0; 4]), None)
+    corrode_rt::call(app::SHELL, Message::new(window::CONTEXT, [0; 4]), None)
         .map_or([0; 4], |answer| answer.message.words)
 }
 
@@ -358,7 +359,7 @@ pub fn quit(title: &str) -> u64 {
         *slot = byte;
     }
     corrode_rt::call(
-        app::WINDOWS,
+        app::SHELL,
         Message::new(window::QUIT, [u64::from_le_bytes(word), 0, 0, 0]),
         None,
     )
@@ -385,7 +386,7 @@ pub fn notifications() -> alloc::vec::Vec<Note> {
     };
     let ask = |which: usize, part: u64| {
         corrode_rt::call(
-            app::WINDOWS,
+            app::SHELL,
             Message::new(window::HISTORY, [which as u64, part, 0, 0]),
             None,
         )
@@ -433,7 +434,7 @@ pub fn windows_titled(title: &str) -> alloc::vec::Vec<alloc::string::String> {
     let mut found = alloc::vec::Vec::new();
     let mut which = 0u64;
     loop {
-        let Ok(answer) = corrode_rt::call(app::WINDOWS, Message::new(window::LIST, [title, which, 0, 0]), None)
+        let Ok(answer) = corrode_rt::call(app::SHELL, Message::new(window::LIST, [title, which, 0, 0]), None)
         else {
             break;
         };
@@ -460,7 +461,7 @@ pub fn raise(title: &str, which: usize) {
         *slot = byte;
     }
     let _ = corrode_rt::call(
-        app::WINDOWS,
+        app::SHELL,
         Message::new(window::RAISE, [u64::from_le_bytes(word), which as u64, 0, 0]),
         None,
     );
@@ -468,7 +469,7 @@ pub fn raise(title: &str, which: usize) {
 
 /// Forget the recent notifications.
 pub fn clear_notifications() {
-    let _ = corrode_rt::call(app::WINDOWS, Message::new(window::HISTORY, [0, 2, 0, 0]), None);
+    let _ = corrode_rt::call(app::SHELL, Message::new(window::HISTORY, [0, 2, 0, 0]), None);
 }
 
 /// How tall a line of `style` is.

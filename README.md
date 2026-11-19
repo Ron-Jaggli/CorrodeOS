@@ -177,8 +177,7 @@ yet, so there is no password: it hides the screen rather than securing it.
 
 Programs follow the look on their own: a window is sent `window::THEME`
 when it opens and whenever the look changes (`Event::Theme` in the `ui`
-crate). A program can change the look with `corrode_ui::set_theme`, which
-is all Settings does. `corrode_ui::notify(text)` posts a notification, and
+crate). Settings changes the look with `corrode_ui::set_theme`. `corrode_ui::notify(text)` posts a notification, and
 `corrode_ui::notifications()` reads back the recent ones. `corrode_ui::subtitle(text)`
 puts text after the window's title, as the terminal and Files show their
 folder ("Terminal - /etc", "Files - etc"); the dock and Quit still go by the title alone. Window flags
@@ -187,6 +186,14 @@ clear pixels), `RESIZABLE`, `POPOVER` (no title bar, under the menu bar,
 closed by a click elsewhere; with `MENU`, at the pointer instead) and
 `COVER` (the whole screen, above everything, with every key, as the lock
 screen is).
+
+Calls that reach past a program's own windows go to the **shell**
+endpoint (`app::SHELL`), which only Settings, Control Center and the menu
+are given: changing the look, quitting, listing and raising other apps'
+windows, reading notifications, and the menu's context
+(`window::SHELL_ONLY`). The window server's own endpoint, which every
+program holds, answers those with `window::DENIED`. In the terminal,
+`quit Settings` shows both refusals, and `caps` lists what it does hold.
 
 ## Layout
 
