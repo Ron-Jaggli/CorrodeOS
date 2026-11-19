@@ -43,8 +43,6 @@ The short version, for reading first. The numbered log below has the detail.
   - The lock screen has no password, as there are no accounts (28).
 - **Known rough edges:** listed under "Known gap" in each section. The
   main ones:
-  - The dock menu has no list of an app's open windows. All of an app's
-    windows share its title, so the list would say "Terminal" twice.
   - Control Center's notification card is sized when it opens, so later
     arrivals replace the oldest rather than adding rows (39).
 - **Branch:** everything is on `desktop-glass` (37 commits on top of
@@ -982,3 +980,25 @@ The short version, for reading first. The numbered log below has the detail.
 - Next it makes sense to list an app's windows by caption in its dock
   menu, now that two terminals can be told apart.
 - Screenshot: `build/progress-40-title.png`.
+
+## 41. Dock menus list the app's windows
+
+- A running app's dock menu now starts with its windows, oldest first,
+  each named by its subtitle (or the title, if it has none): two
+  terminals show as "/etc" and "/". Picking one brings it forward, and
+  back from the dock if it was minimized (`Desk::restore`, as Alt+Tab
+  does).
+- New calls:
+  - `window::LIST` (79): count, and the nth window's subtitle, for a
+    title.
+  - `window::RAISE` (80): queues the nth window for the painter, which
+    takes it with `windows::take_raised` each frame.
+  - `corrode_ui::windows_titled` and `corrode_ui::raise` wrap them.
+- They count the same windows Quit closes: live, undocked, with that
+  title.
+- At most 8 are listed.
+- New `./corrode dock-windows-test`: two terminals, the first in /etc.
+  Right-click the icon (`build/dock-windows.png`), pick /etc; the log
+  shows "brought window 1 forward". Full suite PASSes on both GPUs (27
+  checks each); input-test is 170 / 0 default, 177 / 0 virtio.
+- Screenshot: `build/progress-41-dock-windows.png`.

@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -577,6 +577,30 @@ title-test: iso
 	    && echo "title-test: the title bar follows the terminal's folder PASS" \
 	    || echo "title-test: the title bar follows the terminal's folder FAIL"
 	@test -s build/title.ppm && pnmtopng build/title.ppm > build/title.png 2>/dev/null && rm -f build/title.ppm && echo "wrote build/title.png" || true
+
+# Two terminals, the first in /etc; the Terminal icon's menu lists both
+# by folder (build/dock-windows.png), and picking /etc brings it forward.
+dock-windows-test: iso
+	@rm -f build/dock-windows.ppm build/dock-windows.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 2; \
+	   for key in c d spc slash e t c ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 1; \
+	   for step in 1 2 3; do echo "mouse_move -147 -248"; sleep 0.2; done; sleep 0.3; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   for step in 1 2 3; do echo "mouse_move 147 248"; sleep 0.2; done; sleep 0.5; \
+	   echo "mouse_button 2"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   echo "screendump build/dock-windows.ppm"; sleep 1; \
+	   echo "mouse_move 0 -149"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^menu |now says|brought window" build/serial.log || echo "dock-windows-test: nothing"
+	@grep -q "^menu       : picked /etc" build/serial.log \
+	    && grep -q "brought window .* forward" build/serial.log \
+	    && echo "dock-windows-test: the dock menu listed and raised a window PASS" \
+	    || echo "dock-windows-test: the dock menu listed and raised a window FAIL"
+	@test -s build/dock-windows.ppm && pnmtopng build/dock-windows.ppm > build/dock-windows.png 2>/dev/null && rm -f build/dock-windows.ppm && echo "wrote build/dock-windows.png" || true
 
 # Two terminals from the dock, then a right click on its Terminal icon:
 # the app's menu opens above it (build/dock-menu.png); Quit Terminal

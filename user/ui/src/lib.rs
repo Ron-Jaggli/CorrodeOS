@@ -422,6 +422,50 @@ pub fn subtitle(text: &str) {
     );
 }
 
+/// The subtitles of the windows titled `title`, oldest first: what a dock
+/// icon's menu lists.
+pub fn windows_titled(title: &str) -> alloc::vec::Vec<alloc::string::String> {
+    let mut word = [0u8; 8];
+    for (slot, byte) in word.iter_mut().zip(title.bytes()) {
+        *slot = byte;
+    }
+    let title = u64::from_le_bytes(word);
+    let mut found = alloc::vec::Vec::new();
+    let mut which = 0u64;
+    loop {
+        let Ok(answer) = corrode_rt::call(app::WINDOWS, Message::new(window::LIST, [title, which, 0, 0]), None)
+        else {
+            break;
+        };
+        let words = answer.message.words;
+        if which >= words[0] || which >= 8 {
+            break;
+        }
+        let text: alloc::string::String = words[1..]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .take_while(|byte| *byte != 0)
+            .map(|byte| byte as char)
+            .collect();
+        found.push(text);
+        which += 1;
+    }
+    found
+}
+
+/// Bring the `which`th window titled `title` forward.
+pub fn raise(title: &str, which: usize) {
+    let mut word = [0u8; 8];
+    for (slot, byte) in word.iter_mut().zip(title.bytes()) {
+        *slot = byte;
+    }
+    let _ = corrode_rt::call(
+        app::WINDOWS,
+        Message::new(window::RAISE, [u64::from_le_bytes(word), which as u64, 0, 0]),
+        None,
+    );
+}
+
 /// Forget the recent notifications.
 pub fn clear_notifications() {
     let _ = corrode_rt::call(app::WINDOWS, Message::new(window::HISTORY, [0, 2, 0, 0]), None);

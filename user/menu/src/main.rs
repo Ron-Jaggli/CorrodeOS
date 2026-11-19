@@ -43,6 +43,8 @@ enum Item {
     Header(String),
     /// Close every window of the app titled so.
     Quit(String),
+    /// One of the app's windows: its title, which one, and what it says.
+    Window(String, usize, String),
 }
 
 impl Item {
@@ -70,7 +72,15 @@ fn items() -> Vec<Item> {
             .take_while(|byte| **byte != 0)
             .map(|byte| *byte as char)
             .collect();
-        let mut items = alloc::vec![Item::Header(name.clone()), Item::Start("New Window", program)];
+        let mut items = alloc::vec![Item::Header(name.clone())];
+        // Its windows first, as macOS's dock menus list them.
+        if running != 0 {
+            for (which, subtitle) in corrode_ui::windows_titled(&name).into_iter().enumerate() {
+                items.push(Item::Window(name.clone(), which, subtitle));
+            }
+            items.push(Item::Rule);
+        }
+        items.push(Item::Start("New Window", program));
         if running != 0 {
             items.push(Item::Rule);
             items.push(Item::Quit(name));
@@ -119,6 +129,8 @@ fn label(item: &Item, theme: &Theme) -> String {
         Item::Rule => "",
         Item::Header(name) => name,
         Item::Quit(name) => return alloc::format!("Quit {name}"),
+        Item::Window(name, _, subtitle) if subtitle.is_empty() => name,
+        Item::Window(_, _, subtitle) => subtitle,
     })
 }
 
@@ -178,6 +190,7 @@ fn pick(items: &[Item], index: usize, theme: &Theme) -> ! {
         Item::Quit(name) => {
             println!("asked {} window(s) to close", corrode_ui::quit(name));
         }
+        Item::Window(name, which, _) => corrode_ui::raise(name, *which),
         Item::Rule | Item::Header(_) => {}
     }
     corrode_rt::exit();

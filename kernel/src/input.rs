@@ -1176,6 +1176,14 @@ impl Desk {
         println!("desktop    : window {} now says {}", window, caption);
     }
 
+    /// Bring `window` to the front, as picking it in a dock menu does.
+    pub fn raise<const N: usize>(&mut self, window: usize, scene: &mut Scene<N>, now: u64) {
+        if let Some(index) = self.windows.iter().position(|managed| managed.window == window) {
+            println!("desktop    : brought window {} forward", window);
+            self.restore(scene, index, now);
+        }
+    }
+
     fn title_src(slot: usize, width: u32) -> Rect {
         let (slot_width, slot_height) = TITLE_SLOT;
         Rect::new(

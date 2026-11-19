@@ -156,8 +156,9 @@ else (or the clock again) to close it.
 
 **Menus.** Right-click the desktop for New Terminal, Open Files, Next
 Wallpaper, Light/Dark Appearance, Settings, Lock Screen and About.
-Right-click a dock icon for New Window and, while it runs, Quit (which
-closes all its windows). The item under the pointer lights up; Up/Down and
+Right-click a dock icon for its open windows (by what each says after
+its title, such as a terminal's folder; pick one to bring it forward), New
+Window, and, while it runs, Quit (which closes all its windows). The item under the pointer lights up; Up/Down and
 Return work too.
 
 **Notifications** slide in at the top right with the sending program's

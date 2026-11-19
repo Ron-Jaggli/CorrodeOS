@@ -124,6 +124,54 @@ pub fn open(width: u32, height: u32, flags: u64, title: u64, owner: usize) -> Op
     Some(index)
 }
 
+/// The live windows titled `title` (8 bytes, as stored), oldest first.
+fn titled(title: u64) -> Vec<usize> {
+    let title = title.to_le_bytes();
+    let matching: Vec<(usize, usize)> = without_interrupts(|| {
+        TABLE
+            .lock()
+            .iter()
+            .enumerate()
+            .filter(|(_, window)| window.title == title && !window.docked)
+            .map(|(index, window)| (index, window.owner))
+            .collect()
+    });
+    matching
+        .into_iter()
+        .filter(|(_, owner)| task::state_of(*owner) != Some(State::Finished))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// How many live windows are titled `title`, and the subtitle of the
+/// `which`th, as three words.
+pub fn list_titled(title: u64, which: usize) -> (usize, [u64; 3]) {
+    let all = titled(title);
+    let subtitle = all
+        .get(which)
+        .and_then(|index| without_interrupts(|| TABLE.lock().get(*index).map(|window| window.subtitle)))
+        .unwrap_or([0; 24]);
+    let word = |at: usize| u64::from_le_bytes(subtitle[at..at + 8].try_into().unwrap_or([0; 8]));
+    (all.len(), [word(0), word(8), word(16)])
+}
+
+/// Windows a dock menu asked to have brought forward.
+static RAISED: SpinLock<Vec<usize>> = SpinLock::new(Vec::new());
+
+/// Ask the painter to bring the `which`th window titled `title` forward.
+pub fn raise_titled(title: u64, which: usize) -> bool {
+    let Some(index) = titled(title).get(which).copied() else {
+        return false;
+    };
+    without_interrupts(|| RAISED.lock().push(index));
+    true
+}
+
+/// Windows to bring forward, for the painter.
+pub fn take_raised() -> Vec<usize> {
+    without_interrupts(|| core::mem::take(&mut *RAISED.lock()))
+}
+
 /// Windows whose subtitle changed since the painter last looked.
 static RETITLED: SpinLock<Vec<usize>> = SpinLock::new(Vec::new());
 

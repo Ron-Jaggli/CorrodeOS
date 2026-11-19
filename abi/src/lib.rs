@@ -279,6 +279,12 @@ pub mod window {
     /// Set what the caller's windows say after their title, as a terminal
     /// names its folder: up to 24 bytes in words 0-2, unused ones zero.
     pub const SUBTITLE: u64 = 78;
+    /// The windows titled word 0, for a dock icon's menu: word 1 picks
+    /// which. Answers the count, then that one's subtitle in words 1-3.
+    pub const LIST: u64 = 79;
+    /// Bring the window `LIST` would name (title in word 0, which in word
+    /// 1) to the front, and back from the dock if it was minimized.
+    pub const RAISE: u64 = 80;
 
     /// Most a window may be, either way.
     pub const MAX_WIDTH: u32 = 1920;

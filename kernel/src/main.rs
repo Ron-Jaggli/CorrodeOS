@@ -2094,6 +2094,24 @@ extern "C" fn window_server() {
             );
             continue;
         }
+        // A dock icon's menu, listing its app's windows or picking one.
+        if received.message.label == window::LIST || received.message.label == window::RAISE {
+            let answer = if received.message.label == window::LIST {
+                let (count, subtitle) = windows::list_titled(words[0], words[1] as usize);
+                [count as u64, subtitle[0], subtitle[1], subtitle[2]]
+            } else {
+                [windows::raise_titled(words[0], words[1] as usize) as u64, 0, 0, 0]
+            };
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: received.message.label,
+                    words: answer,
+                },
+                None,
+            );
+            continue;
+        }
         // A program naming what its windows show, after their title.
         if received.message.label == window::SUBTITLE {
             let count = windows::set_subtitle(received.from, [words[0], words[1], words[2]]);
@@ -4659,6 +4677,9 @@ fn render_loop(renderer: &mut Screen) -> ! {
         // Title bars whose program has given them something new to say.
         for index in windows::take_retitled() {
             desk.retitle(renderer, index, &mut *stage.scene);
+        }
+        for index in windows::take_raised() {
+            desk.raise(index, &mut *stage.scene, now);
         }
 
         // A new look, from Settings: a new wallpaper, and everything on it
