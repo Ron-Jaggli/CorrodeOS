@@ -77,6 +77,61 @@ with no PCI Express, `GPU=virtio` to give QEMU a virtio GPU instead of its
 plain VGA (the compositor's frames then go through a ring 3 driver), and
 `QEMU_EXTRA='-device …'` to plug emulated devices in for one run.
 
+## Customizing the desktop
+
+The desktop is liquid glass in the spirit of macOS Tahoe, with Plasma's
+habit of letting you change everything. There are three ways to change it,
+easiest first.
+
+**1. Settings, while it runs.** Click the cog in the dock. Every row applies
+at once to the whole desktop: wallpaper, glass, every window's frame and
+buttons, the dock, and the colours inside every open program. Nothing is
+saved yet: the root filesystem is a read-only tar on the ISO, so a reboot
+goes back to the file below.
+
+**2. `root/etc/desktop.conf`, for the look it boots with.** One `key =
+value` a line, `#` for comments. Edit it, then `./corrode iso` (or `./corrode
+run`). A line that makes no sense is skipped and the rest still apply, so a
+typo cannot break the desktop. The file explains every key; in short:
+
+| Key | Values | What it does |
+|---|---|---|
+| `preset` | `corrode` `tahoe` `tahoe-light` `breeze` `crystal` `plain` | Where to start; later lines override it |
+| `appearance` | `dark` `light` | Text, surfaces, wallpaper tone |
+| `accent` | `#rrggbb` | Focused title bars, highlights, the panel's name |
+| `glass` | `regular` `clear` `off` | Frosted, see-through-and-bent, or solid |
+| `refraction` | `0`-`120` | How hard the glass's edge bends what is behind it |
+| `frost` | `0`-`200` | How frosted `regular` glass is, in percent |
+| `tint` / `tint_amount` | `none` or `#rrggbb` / `0`-`255` | A colour wash over every pane, and how much |
+| `corner_radius` | pixels | Window corners |
+| `buttons` | `left` `right` | macOS's traffic lights, or Plasma's order on the right |
+| `wallpaper` | `aurora` `ribbons` `dunes` `gradient` | Drawn at boot from three colours |
+| `wallpaper_colors` | three `#rrggbb` | The wallpaper's colours |
+| `dock` / `dock_size` | `on` `off` / pixels | The dock and its icon size |
+| `bounce` | `on` `off` | Dock icons jump when they start something |
+| `shadows` | `on` `off` | Window shadows |
+| `animation_speed` | percent, `0` for none | Every animation's pace |
+
+A preset plus a line or two is usually all you need:
+
+```
+preset = breeze
+accent = #3daee9
+corner_radius = 6
+```
+
+**3. The code, for new presets or looks.** Presets are plain `Theme` values
+in `theme/src/lib.rs` (`PRESETS`). Add one there and it works in the file
+and in Settings' preset row. Wallpapers are integer-only functions in
+`theme/src/wallpaper.rs`. The glass itself is `render/src/glass.rs`, a
+fixed-point port of the optics of [Glass-HQ's liquid glass](https://liquid-glass.glassapp.dev)
+(MIT). `./corrode test` checks all three on the build host.
+
+Programs follow the look on their own: a window is sent `window::THEME`
+when it opens and whenever the look changes (`Event::Theme` in the `ui`
+crate). A program can change the look with `corrode_ui::set_theme`, which
+is all Settings does.
+
 ## Layout
 
 ```

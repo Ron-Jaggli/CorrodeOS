@@ -197,3 +197,19 @@ Choices made without asking are marked **Choice:**.
 - Known gap: repainting the wallpaper takes a noticeable moment (it is
   computed per pixel on the painter). Fine for a settings click.
 - Screenshot: `build/progress-7-settings.png`.
+
+## 9. README: customizing
+
+- New README section "Customizing the desktop":
+  - the three ways to change the look (Settings live, `desktop.conf` at
+    boot, presets and wallpapers in code);
+  - a table of every `desktop.conf` key;
+  - a three-line example;
+  - how programs follow the look (`Event::Theme`) and change it
+    (`corrode_ui::set_theme`).
+- Verified the example: booted with just `preset = breeze`,
+  `accent = #3daee9` and `corner_radius = 6`. It came up with Plasma-order
+  buttons on the right, the ribbons wallpaper, a blue accent and 6 px
+  corners. Screenshot: `build/progress-8-breeze.png`. Then restored the
+  default `desktop.conf`.
+- **The original backlog is done.** Next steps, chosen by me, are below.
