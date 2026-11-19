@@ -16,7 +16,7 @@ extern crate alloc;
 use corrode_rt::abi::{app, launcher, window as flags};
 use corrode_rt::{println, Message};
 use corrode_ui::theme::{Color, GlassMode};
-use corrode_ui::{line_height, rgb, Event, Rgb, Style, Theme, Weight, Window, CLEAR};
+use corrode_ui::{line_height, rgb, width_of, Event, Note, Rgb, Style, Theme, Weight, Window, CLEAR};
 
 corrode_rt::entry!(main);
 
@@ -28,6 +28,49 @@ const ROWS: i32 = 4;
 const SWATCHES: i32 = 44;
 const WIDTH: u32 = (2 * MARGIN + COLUMNS * TILE.0 + (COLUMNS - 1) * GAP) as u32;
 const HEIGHT: u32 = (2 * MARGIN + ROWS * TILE.1 + ROWS * GAP + SWATCHES) as u32;
+/// The notifications card: a heading, then a row for each of the last few
+/// (or one saying there are none).
+const HEADING: i32 = 30;
+const NOTE_ROW: i32 = 40;
+const NOTES_SHOWN: usize = 3;
+
+/// How tall the card of notifications is, for `count` of them.
+fn notes_height(count: usize) -> i32 {
+    HEADING + NOTE_ROW * count.clamp(1, NOTES_SHOWN) as i32 + 6
+}
+
+/// "now", "5m ago", "2h ago": how long ago, briefly.
+fn ago(seconds: u64) -> alloc::string::String {
+    match seconds {
+        0..=59 => alloc::string::String::from("now"),
+        60..=3599 => alloc::format!("{}m ago", seconds / 60),
+        _ => alloc::format!("{}h ago", seconds / 3600),
+    }
+}
+
+/// The card of recent notifications, under the swatches.
+fn notes(window: &mut Window, look: &Look, notes: &[Note]) {
+    let top = HEIGHT as i32 - MARGIN + GAP;
+    let width = window.width - 2 * MARGIN as u32;
+    window.rounded(MARGIN, top, width, notes_height(notes.len()) as u32, 14, look.tile);
+    window.text(MARGIN + 12, top + 9, "Notifications", LABEL, look.text);
+    let right = MARGIN + width as i32 - 12;
+    if notes.is_empty() {
+        window.text(MARGIN + 12, top + HEADING + 10, "Nothing new", STATE, look.secondary);
+        return;
+    }
+    for (index, note) in notes.iter().take(NOTES_SHOWN).enumerate() {
+        let y = top + HEADING + index as i32 * NOTE_ROW;
+        if index > 0 {
+            window.fill(MARGIN + 12, y - 3, width - 24, 1, look.off);
+        }
+        window.rounded(MARGIN + 12, y + 6, 8, 8, 4, look.accent);
+        window.text(MARGIN + 28, y + 1, &note.from, LABEL, look.text);
+        let when = ago(note.age);
+        window.text(right - width_of(&when, STATE) as i32, y + 3, &when, STATE, look.secondary);
+        window.text(MARGIN + 28, y + 1 + line_height(LABEL) as i32, &note.text, STATE, look.secondary);
+    }
+}
 
 const LABEL: Style = Style::px(13).weight(Weight::Bold);
 const STATE: Style = Style::px(11);
@@ -209,7 +252,7 @@ fn icon(window: &mut Window, icon: Icon, x: i32, y: i32, back: Rgb) {
     }
 }
 
-fn draw(window: &mut Window, theme: &Theme) {
+fn draw(window: &mut Window, theme: &Theme, recent: &[Note]) {
     let look = Look::of(theme);
     let (width, height) = (window.width, window.height);
     window.fill(0, 0, width, height, CLEAR);
@@ -242,6 +285,7 @@ fn draw(window: &mut Window, theme: &Theme) {
         }
         window.rounded(x - 9, y - 9, 18, 18, 9, rgb(*color));
     }
+    notes(window, &look, recent);
     window.commit_all();
 }
 
@@ -284,9 +328,13 @@ fn main() {
         println!("no memory for a heap");
         corrode_rt::exit();
     }
+    // What has been said lately, asked once: Control Center is opened
+    // afresh each time it is wanted.
+    let recent = corrode_ui::notifications();
+    println!("{} recent notifications", recent.len());
     let mut window = match Window::open_titled(
         WIDTH,
-        HEIGHT,
+        (HEIGHT as i32 + GAP + notes_height(recent.len())) as u32,
         flags::POPOVER | flags::TRANSLUCENT,
         "Control",
     ) {
@@ -297,14 +345,14 @@ fn main() {
         }
     };
     let mut theme = Theme::default();
-    draw(&mut window, &theme);
+    draw(&mut window, &theme, &recent);
     println!("open");
 
     loop {
         match window.wait(u64::MAX) {
             Event::Theme(now) => {
                 theme = now;
-                draw(&mut window, &theme);
+                draw(&mut window, &theme, &recent);
             }
             Event::Button { x, y, buttons } if buttons & 1 != 0 => match click(&theme, x, y) {
                 Some(Action::Theme(changed)) => {

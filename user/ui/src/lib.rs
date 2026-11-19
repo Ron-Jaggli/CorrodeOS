@@ -338,6 +338,48 @@ pub fn notify(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// A notification from the last few.
+pub struct Note {
+    pub from: alloc::string::String,
+    pub text: alloc::string::String,
+    /// How long ago it came, in seconds.
+    pub age: u64,
+}
+
+/// The most recent notifications, newest first: up to five.
+pub fn notifications() -> alloc::vec::Vec<Note> {
+    let text = |words: [u64; 4]| -> alloc::string::String {
+        words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .take_while(|byte| *byte != 0)
+            .map(|byte| byte as char)
+            .collect()
+    };
+    let ask = |which: usize, part: u64| {
+        corrode_rt::call(
+            app::WINDOWS,
+            Message::new(window::HISTORY, [which as u64, part, 0, 0]),
+            None,
+        )
+        .map(|answer| answer.message.words)
+    };
+    let mut notes = alloc::vec::Vec::new();
+    for which in 0..5 {
+        let Ok(head) = ask(which, 0) else { break };
+        if which as u64 >= head[0] {
+            break;
+        }
+        let Ok(body) = ask(which, 1) else { break };
+        notes.push(Note {
+            from: text([head[1], 0, 0, 0]),
+            text: text(body),
+            age: head[2],
+        });
+    }
+    notes
+}
+
 /// How tall a line of `style` is.
 pub fn line_height(style: Style) -> u32 {
     corrode_text::measure("Mg", style).height

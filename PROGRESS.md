@@ -765,3 +765,32 @@ Choices made without asking are marked **Choice:**.
   PASSes on both GPUs (19 checks each); input-test is 170 / 0 default,
   177 / 0 virtio.
 - Screenshot: `build/progress-32-unsnapped.png`.
+
+## 34. Recent notifications in Control Center
+
+- The kernel keeps the last 5 notifications with when they came
+  (`notify::recent`), whether or not their banner was ever shown.
+- New window-server call `window::HISTORY` (74). Word 0 picks which
+  (0 = newest), word 1 picks the part:
+  - part 0 answers the count, the sender's 8-byte title and the age in
+    seconds;
+  - part 1 answers the 32-byte text.
+- `corrode_ui::notifications()` returns them as `Note { from, text, age }`.
+- Control Center fetches them when it opens and adds a Notifications card
+  under the accent swatches:
+  - an accent dot, the sender in bold and "now / 5m ago / 2h ago" on the
+    right, with the text below;
+  - up to 3 rows, or "Nothing new". The popover's height follows.
+- Banners and popovers no longer overlap:
+  - opening a popover dismisses any banner on screen, as opening
+    Notification Center does on macOS;
+  - new banners wait in the queue until the popover is gone.
+- New `./corrode history-test`: two `notify` commands from the terminal,
+  then the clock; it checks for "2 recent notifications"
+  (`build/history.png`). Full suite PASSes on both GPUs (20 checks each);
+  input-test is 170 / 0 default, 177 / 0 virtio.
+- Known gaps:
+  - Control Center reads the list once, when it opens, so it doesn't
+    update while open.
+  - There is no way to clear the list.
+- Screenshot: `build/progress-33-history.png`.

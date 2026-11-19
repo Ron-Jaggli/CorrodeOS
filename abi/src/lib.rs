@@ -258,6 +258,11 @@ pub mod window {
     /// words little-endian and NUL-padded, under the caller's window title.
     /// The answer's word 0 is 0.
     pub const NOTIFY: u64 = 73;
+    /// Ask for a recent notification: word 0 which (0 the newest), word 1
+    /// which part. Part 0 answers how many there are, the sender's title
+    /// (8 bytes) and how many seconds ago it came; part 1 its text, 32
+    /// bytes. Past the last, every word is zero but the count.
+    pub const HISTORY: u64 = 74;
 
     /// Most a window may be, either way.
     pub const MAX_WIDTH: u32 = 1920;

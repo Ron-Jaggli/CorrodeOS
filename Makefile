@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -481,6 +481,26 @@ snap-test: iso
 	@test -s build/snap.ppm && pnmtopng build/snap.ppm > build/snap.png 2>/dev/null && rm -f build/snap.ppm && echo "wrote build/snap.png" || true
 	@test -s build/snapped.ppm && pnmtopng build/snapped.ppm > build/snapped.png 2>/dev/null && rm -f build/snapped.ppm && echo "wrote build/snapped.png" || true
 	@test -s build/unsnapped.ppm && pnmtopng build/unsnapped.ppm > build/unsnapped.png 2>/dev/null && rm -f build/unsnapped.ppm && echo "wrote build/unsnapped.png" || true
+
+# Two notifications from the terminal, then Control Center from the clock:
+# its Notifications card lists both, newest first (build/history.png).
+history-test: iso
+	@rm -f build/history.ppm build/history.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   for key in n o t i f y spc b u i l d spc d o n e ret; do echo "sendkey $$key"; sleep 0.1; done; sleep 0.5; \
+	   for key in n o t i f y spc a l l spc t e s t s spc p a s s e d ret; do echo "sendkey $$key"; sleep 0.1; done; sleep 0.5; \
+	   echo "mouse_move 280 -248"; sleep 0.2; echo "mouse_move 280 -248"; sleep 0.2; echo "mouse_move 280 -248"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   echo "screendump build/history.ppm"; sleep 1; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^notify |recent notifications" build/serial.log || echo "history-test: nothing"
+	@grep -q "^control    : 2 recent notifications" build/serial.log \
+	    && echo "history-test: Control Center listed both notifications PASS" \
+	    || echo "history-test: Control Center listed both notifications FAIL"
+	@test -s build/history.ppm && pnmtopng build/history.ppm > build/history.png 2>/dev/null && rm -f build/history.ppm && echo "wrote build/history.png" || true
 
 # Open a terminal from the dock and drag its bottom-right corner 200 by 100
 # pixels bigger, in four steps; then drag its top-left corner 60 by 40

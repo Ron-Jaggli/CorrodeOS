@@ -1152,6 +1152,13 @@ impl Desk {
             (120 + 40 * step, 90 + 36 * step)
         };
         let radius = if docked || cover { 0 } else { theme.radius as u16 };
+        // A popover hangs where banners slide in: it sends any away, as
+        // opening Notification Center does on macOS.
+        if popover {
+            if let Some(banner) = &mut self.banner {
+                banner.dismiss(scene, &theme, now);
+            }
+        }
         // Nothing else is to be used while the screen is covered.
         if cover {
             if let Some(spotlight) = self.spotlight.take() {
@@ -1813,6 +1820,10 @@ impl Desk {
                 banner.close(scene);
                 println!("desktop    : notification gone");
             }
+        }
+        // Under an open popover they would cover it: they wait.
+        if self.windows.iter().any(|managed| managed.popover) {
+            return;
         }
         let Some((from, text)) = crate::notify::take() else {
             return;

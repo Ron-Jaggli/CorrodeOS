@@ -146,7 +146,8 @@ same.
 Click the clock at the right of the menu bar for **Control Center**: tiles
 for Dark Mode, Glass, the dock, shadows and motion, the accent colours, and
 a way into Settings. Click anywhere else (or the clock again) to close it.
-Programs can make their own popovers with the `window::POPOVER` flag.
+Its Notifications card lists the last three notifications, newest
+first, with how long ago each came. Programs can make their own popovers with the `window::POPOVER` flag.
 
 **Alt+L** (or the Lock tile in Control Center) locks the screen: the whole
 desktop under glass, the date and time large, and Return or the unlock

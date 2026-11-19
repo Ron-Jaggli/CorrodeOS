@@ -2093,6 +2093,24 @@ extern "C" fn window_server() {
             );
             continue;
         }
+        // Control Center asking what has been said lately.
+        if received.message.label == window::HISTORY {
+            let (count, entry) = notify::recent(words[0] as usize);
+            let answer = match (entry, words[1]) {
+                (Some((from, _, age)), 0) => [count as u64, notify::pack(&from)[0], age, 0],
+                (Some((_, text, _)), _) => notify::pack(&text),
+                (None, _) => [count as u64, 0, 0, 0],
+            };
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: window::HISTORY,
+                    words: answer,
+                },
+                None,
+            );
+            continue;
+        }
         if received.message.label == window::SET_THEME {
             look::set(corrode_theme::Theme::from_words(words));
             let _ = ipc::reply(
