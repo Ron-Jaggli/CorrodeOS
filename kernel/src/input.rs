@@ -343,6 +343,9 @@ fn resize_arrow(cursor: Cursor, grow: i32) -> Vec<u8> {
     coverage
 }
 
+/// Where a popover's top edge hangs: just under the menu bar.
+const POPOVER_TOP: i32 = 28 + 6;
+
 /// Height of a window's title bar.
 const BAR: u32 = 28;
 
@@ -496,6 +499,9 @@ struct Managed {
     window: usize,
     surface: usize,
     docked: bool,
+    /// Under the menu bar, with no title bar; closes when anything else
+    /// is clicked.
+    popover: bool,
     /// Where the window's top left is -- its title bar's, if it has one.
     at: (i32, i32),
     width: u32,
@@ -530,7 +536,7 @@ enum Part {
 
 impl Managed {
     fn bar(&self) -> u32 {
-        if self.docked {
+        if self.docked || self.popover {
             0
         } else {
             BAR
@@ -974,9 +980,11 @@ impl Desk {
     /// Tell docked windows -- the menu bar -- which app is in front, when
     /// that has changed since they were last told.
     fn announce(&mut self) {
+        // A popover is the menu bar's, not a program in front of it.
         let front = self
             .focus
             .and_then(|index| self.windows.get(index))
+            .filter(|managed| !managed.popover)
             .map(|managed| managed.name.clone())
             .unwrap_or_default();
         if self.announced.as_ref() == Some(&front) {
@@ -1062,8 +1070,14 @@ impl Desk {
             return;
         };
         let theme = self.theme;
+        let popover = crate::windows::popover(window);
+        let chrome = !docked && !popover;
         let at = if docked {
             (0, 0)
+        } else if popover {
+            // Under the right-hand end of the menu bar, as Control Center
+            // hangs from it.
+            (scene.screen().width as i32 - width as i32 - 8, POPOVER_TOP)
         } else {
             let step = self.placed % 6;
             self.placed += 1;
@@ -1077,13 +1091,14 @@ impl Desk {
         // its place under the window.
         let shadow = (!docked)
             .then(|| {
-                scene.add(Layer::shadow(0, 0, width, height + BAR, radius, SHADOW_BLUR))
+                let bar = if popover { 0 } else { BAR };
+                scene.add(Layer::shadow(0, 0, width, height + bar, radius, SHADOW_BLUR))
             })
             .flatten();
-        let frame_height = height + if docked { 0 } else { BAR };
+        let frame_height = height + if chrome { BAR } else { 0 };
         let frame = scene.add(pane(Rect::new(0, 0, width, frame_height), radius, &theme));
         let mut lights = [None; 3];
-        if !docked && self.stencils {
+        if chrome && self.stencils {
             for (slot, button) in lights.iter_mut().zip(Button::order(theme.buttons)) {
                 *slot = scene
                     .add(Layer::mask(0, 0, DOT_SRC, button.color()))
@@ -1091,7 +1106,7 @@ impl Desk {
             }
         }
         let name = crate::windows::title(window);
-        let title = if docked {
+        let title = if !chrome {
             None
         } else {
             self.draw_title(renderer, &name)
@@ -1130,6 +1145,7 @@ impl Desk {
             window,
             surface,
             docked,
+            popover,
             at,
             width,
             height,
@@ -1150,9 +1166,11 @@ impl Desk {
                 if !docked && rise > 0 {
                     layer.opacity =
                         Animation::ease(now, rise, Fx::ZERO, Fx::from_int(255), Ease::Out);
+                    // A popover drops from the menu bar; a window rises.
+                    let from = if popover { y - 10 } else { y + 24 };
                     layer.y = Animation::spring(
                         now,
-                        Fx::from_int(y + 24),
+                        Fx::from_int(from),
                         Fx::from_int(y),
                         corrode_render::anim::Velocity::ZERO,
                         corrode_render::anim::Spring::SMOOTH,
@@ -1242,6 +1260,10 @@ impl Desk {
                 continue;
             };
             crate::windows::push(managed.window, window::FOCUS, [gained as u64, 0, 0, 0]);
+            // A popover lasts as long as it has the keyboard.
+            if !gained && managed.popover {
+                crate::windows::push(managed.window, window::CLOSE, [0; 4]);
+            }
             if gained && !managed.docked {
                 let id = managed.window;
                 self.recent.retain(|recent| *recent != id);
@@ -1336,6 +1358,26 @@ impl Desk {
     /// given the keyboard and told, and anything else takes the keyboard
     /// away from every window.
     fn click<const N: usize>(&mut self, scene: &mut Scene<N>, buttons: u8, pressed: u8, now: u64) {
+        // A click anywhere but on an open popover closes it. On the menu
+        // bar it does nothing more, so clicking the clock again shuts
+        // Control Center rather than opening it anew.
+        if pressed & 1 != 0 {
+            let open: Vec<usize> = (0..self.windows.len())
+                .filter(|index| self.windows[*index].popover)
+                .collect();
+            if !open.is_empty() {
+                let hit = self.under(scene).ok().map(|(index, _)| index);
+                if hit.is_none_or(|hit| !open.contains(&hit)) {
+                    for index in open {
+                        crate::windows::push(self.windows[index].window, window::CLOSE, [0; 4]);
+                    }
+                    println!("input      : popover closed by a click outside it");
+                    if hit.is_some_and(|hit| self.windows[hit].docked) {
+                        return;
+                    }
+                }
+            }
+        }
         // The dock first: it is above every window.
         if pressed & 1 != 0 {
             let pointer = self.pointer.unwrap_or([LayerId::NONE; 2]);
@@ -1577,10 +1619,10 @@ impl Desk {
             .recent
             .iter()
             .filter_map(|id| self.windows.iter().position(|managed| managed.window == *id))
-            .filter(|index| !self.windows[*index].docked)
+            .filter(|index| !self.windows[*index].docked && !self.windows[*index].popover)
             .collect();
         for (index, managed) in self.windows.iter().enumerate() {
-            if !managed.docked && !order.contains(&index) {
+            if !managed.docked && !managed.popover && !order.contains(&index) {
                 order.push(index);
             }
         }

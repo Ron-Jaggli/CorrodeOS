@@ -40,6 +40,7 @@ pub struct Window {
     pub docked: bool,
     pub translucent: bool,
     pub resizable: bool,
+    pub popover: bool,
     /// What its title bar says: up to eight bytes, unused ones zero.
     title: [u8; 8],
     /// The task that asked for it. When it finishes, the window goes.
@@ -66,7 +67,8 @@ pub fn set_screen(width: u32, height: u32) {
 pub fn open(width: u32, height: u32, flags: u64, title: u64, owner: usize) -> Option<usize> {
     let docked = flags & window::DOCKED != 0;
     let translucent = flags & window::TRANSLUCENT != 0;
-    let resizable = flags & window::RESIZABLE != 0 && !docked;
+    let popover = flags & window::POPOVER != 0 && !docked;
+    let resizable = flags & window::RESIZABLE != 0 && !docked && !popover;
     let (width, height) = if docked {
         (SCREEN[0].load(Ordering::Relaxed), height.clamp(16, 64))
     } else {
@@ -93,6 +95,7 @@ pub fn open(width: u32, height: u32, flags: u64, title: u64, owner: usize) -> Op
             docked,
             translucent,
             resizable,
+            popover,
             // Printable ASCII only: a title is drawn, never interpreted.
             title: title
                 .to_le_bytes()
@@ -136,6 +139,11 @@ pub fn title(index: usize) -> alloc::string::String {
 pub fn title_of_owner(owner: usize) -> Option<alloc::string::String> {
     let index = without_interrupts(|| TABLE.lock().iter().position(|window| window.owner == owner))?;
     Some(title(index)).filter(|title| !title.is_empty())
+}
+
+/// Whether a window is a popover: no title bar, under the menu bar.
+pub fn popover(index: usize) -> bool {
+    without_interrupts(|| TABLE.lock().get(index).is_some_and(|window| window.popover))
 }
 
 /// Whether the desktop may resize a window.

@@ -589,3 +589,33 @@ Choices made without asking are marked **Choice:**.
   - No Notification Center listing past notifications.
   - Text longer than its slot (256 px) is cut.
 - Screenshot: `build/progress-25-notify.png`.
+
+## 27. Control Center
+
+- New window kind: `window::POPOVER` (flag 8).
+  - No title bar, lights or resizing.
+  - Placed under the right-hand end of the menu bar and drops in from it.
+  - The desk sends it CLOSE when it loses focus, or when anything outside
+    it is clicked.
+  - A click on the menu bar that closes a popover goes no further, so
+    clicking the clock again shuts Control Center instead of reopening it.
+  - Popovers are left out of the switcher, Alt+` cycling and the menu
+    bar's front-app name.
+- New program `user/control` (Control Center), a glass popover:
+  - six tiles: Dark Mode, Glass, Dock, Shadows, Motion, and "Settings..."
+    (asks the launcher for Settings, then closes);
+  - the eight accent swatches below the tiles.
+  - Each toggle goes through `set_theme`, the same as Settings, so every
+    window follows.
+- The panel opens it when clicked within 170 px of the right edge (the
+  clock), via a new `launcher::CONTROL` (5).
+- Choice: the launcher now holds a send capability to itself
+  (LAUNCHER_SELF_SLOT 6), handed only to Control Center so it can ask for
+  Settings. Only programs that get it can start other programs.
+- New `./corrode control-test`: opens it from the clock, turns Dark Mode
+  off, then clicks the clock to close it. PASS, on virtio too. All other
+  tests PASS; 170 / 0.
+- Known gaps:
+  - Glass only toggles Off/Regular; the Clear mode stays in Settings.
+  - No keyboard control inside the popover.
+- Screenshot: `build/progress-26-control.png`.

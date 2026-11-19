@@ -146,6 +146,9 @@ fn draw(window: &mut Window, look: &Look, name: &str, time: &Clock) -> u64 {
     clock(window, look, time)
 }
 
+/// How far in from the right a click opens Control Center: the clock.
+const CLOCK_ROOM: i32 = 170;
+
 fn inside(x: i32, y: i32) -> bool {
     let (left, top, width, height) = BUTTON_AT;
     x >= left && x < left + width as i32 && y >= top && y < top + height as i32
@@ -193,6 +196,19 @@ fn main() {
                     .map(|byte| *byte as char)
                     .collect();
                 front(&mut window, &look, &name);
+            }
+            // The clock opens Control Center, as macOS's menu bar end does.
+            Event::Button { x, buttons, .. }
+                if buttons & 1 != 0 && x >= window.width as i32 - CLOCK_ROOM =>
+            {
+                match corrode_rt::call(
+                    app::LAUNCHER,
+                    Message::new(launcher::LAUNCH, [launcher::CONTROL, 0, 0, 0]),
+                    None,
+                ) {
+                    Ok(_) => println!("opened Control Center"),
+                    Err(error) => println!("no launcher: {:?}", error),
+                }
             }
             Event::Button { x, y, buttons } if inside(x, y) => {
                 let down = buttons & 1 != 0;

@@ -212,6 +212,9 @@ pub mod window {
     /// may resize the window -- zoom fills the screen with it -- and says
     /// so with [`RESIZE`].
     pub const RESIZABLE: u64 = 4;
+    /// A popover: no title bar, under the right-hand end of the menu bar,
+    /// and told to close when anything else is clicked.
+    pub const POPOVER: u64 = 8;
 
     /// A key, while this window has the keyboard. Words as `ps2::LABEL_KEY`.
     pub const KEY: u64 = 62;
@@ -268,6 +271,8 @@ pub mod launcher {
     pub const SETTINGS: u64 = 2;
     pub const ABOUT: u64 = 3;
     pub const FILES: u64 = 4;
+    /// Control Center, the menu bar's quick settings.
+    pub const CONTROL: u64 = 5;
 }
 
 /// Rights, as bits: in the low byte of what `SYS_IDENTIFY` reports, and as

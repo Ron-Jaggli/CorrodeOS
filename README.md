@@ -143,6 +143,11 @@ glass banner at the top right under the program's name and dock icon, for
 four seconds or until clicked. From the terminal, `notify TEXT` does the
 same.
 
+Click the clock at the right of the menu bar for **Control Center**: tiles
+for Dark Mode, Glass, the dock, shadows and motion, the accent colours, and
+a way into Settings. Click anywhere else (or the clock again) to close it.
+Programs can make their own popovers with the `window::POPOVER` flag.
+
 Programs follow the look on their own: a window is sent `window::THEME`
 when it opens and whenever the look changes (`Event::Theme` in the `ui`
 crate). A program can change the look with `corrode_ui::set_theme`, which

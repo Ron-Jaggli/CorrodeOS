@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -77,7 +77,7 @@ kernel:
 # crate built for it. RUSTFLAGS in the environment replaces the ones in
 # .cargo/config.toml outright, and a separate target directory stops the two
 # sets of flags from invalidating each other's build of the crates they share.
-USER_PROGRAMS := edu fault virtio-gpu blob-reader nvidia ps2 terminal panel settings about files
+USER_PROGRAMS := edu fault virtio-gpu blob-reader nvidia ps2 terminal panel settings about files control
 USER_TARGET   := target/user
 USER_BIN      := $(USER_TARGET)/x86_64-unknown-none/release
 USER_RUSTFLAGS := -C relocation-model=static -C strip=debuginfo \
@@ -396,6 +396,28 @@ notify-test: iso
 	    && echo "notify-test: one banner timed out, one was clicked   PASS" \
 	    || echo "notify-test: one banner timed out, one was clicked   FAIL"
 	@test -s build/notify.ppm && pnmtopng build/notify.ppm > build/notify.png 2>/dev/null && rm -f build/notify.ppm && echo "wrote build/notify.png" || true
+
+# Click the menu bar clock for Control Center, turn Dark Mode off from it
+# (build/control.png), then click the clock again: it closes.
+control-test: iso
+	@rm -f build/control.ppm build/control.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move 280 -193"; sleep 0.2; echo "mouse_move 280 -193"; sleep 0.4; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   echo "mouse_move -155 60"; sleep 0.4; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   echo "screendump build/control.ppm"; sleep 1; \
+	   echo "mouse_move 155 -60"; sleep 0.4; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^control |popover|Control Center" build/serial.log || echo "control-test: no Control Center"
+	@grep -q "^control    : Dark Mode turned Off" build/serial.log \
+	    && grep -q "^control    : closed" build/serial.log \
+	    && test "$$(grep -c '^control    : open' build/serial.log)" = 1 \
+	    && echo "control-test: clock opened it, toggled, clock closed it PASS" \
+	    || echo "control-test: clock opened it, toggled, clock closed it FAIL"
+	@test -s build/control.ppm && pnmtopng build/control.ppm > build/control.png 2>/dev/null && rm -f build/control.ppm && echo "wrote build/control.png" || true
 
 # Open a terminal from the dock and drag its bottom-right corner 200 by 100
 # pixels bigger, in four steps; then drag its top-left corner 60 by 40

@@ -22,6 +22,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "corrode-control"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+ "corrode-ui",
+]
+
+[[package]]
 name = "corrode-edu"
 version = "0.0.1"
 dependencies = [

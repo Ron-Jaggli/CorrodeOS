@@ -2055,6 +2055,8 @@ const LAUNCHER_WINDOWS_SLOT: cap::CapPtr = 3;
 const LAUNCHER_LOG_SLOT: cap::CapPtr = 4;
 /// The files from `root/`, for the terminal, if the boot medium has them.
 const LAUNCHER_FILES_SLOT: cap::CapPtr = 5;
+/// A send endpoint to itself, for Control Center to ask for Settings by.
+const LAUNCHER_SELF_SLOT: cap::CapPtr = 6;
 
 fn desktop_check(name: &str, ok: bool) {
     check("desktop", name, ok);
@@ -2171,19 +2173,24 @@ extern "C" fn launcher() {
                 program @ (launcher::TERMINAL
                 | launcher::SETTINGS
                 | launcher::ABOUT
-                | launcher::FILES),
+                | launcher::FILES
+                | launcher::CONTROL),
             ) => {
                 let name = match program {
                     launcher::TERMINAL => "terminal",
                     launcher::SETTINGS => "settings",
                     launcher::FILES => "files",
+                    launcher::CONTROL => "control",
                     _ => "about",
                 };
+                // Control Center may ask for Settings, and so holds the
+                // launcher too -- able to send, not to give it on.
+                let launcher = (program == launcher::CONTROL).then_some(LAUNCHER_SELF_SLOT);
                 // Only the terminal and Files read files.
                 let files = (matches!(program, launcher::TERMINAL | launcher::FILES)
                     && cap::identify(LAUNCHER_FILES_SLOT).is_ok())
                 .then_some(LAUNCHER_FILES_SLOT);
-                match start_app(name, LAUNCHER_WINDOWS_SLOT, LAUNCHER_LOG_SLOT, None, files) {
+                match start_app(name, LAUNCHER_WINDOWS_SLOT, LAUNCHER_LOG_SLOT, launcher, files) {
                     Ok(_) => 0,
                     Err(error) => error.code(),
                 }
@@ -2278,6 +2285,7 @@ fn start_desktop() {
         cap::grant(id, LAUNCHER_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
             && cap::grant(id, WINDOWS_ENDPOINT, LAUNCHER_WINDOWS_SLOT, Rights::ALL).is_ok()
             && cap::grant(id, LOG_ENDPOINT, LAUNCHER_LOG_SLOT, Rights::ALL).is_ok()
+            && cap::grant(id, LAUNCHER_ENDPOINT, LAUNCHER_SELF_SLOT, Rights::ALL).is_ok()
     });
     desktop_check("start the window server and the launcher", granted);
 
