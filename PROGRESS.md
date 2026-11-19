@@ -1561,3 +1561,30 @@ This part, host-tested only:
   Frosted glass is now mostly the blur again.
 - Full suite PASSes on both GPUs (94 lines); input-test 172 / 0 and
   179 / 0; `./corrode test` passes; boot screenshot unchanged.
+
+## 62. Halving the backdrop without dividing
+
+- The frosted backdrop is halved before it is blurred. Whole 2x2 blocks
+  are now summed with red and blue together in one word (each sum fits
+  in ten bits of its sixteen) and green on its own, then shifted right
+  by 2. That is exactly `sum / 4` per channel. Only the ragged last
+  column and row, for odd sizes, take the old per-channel loop.
+- Where a frosted pane's time goes now (`glass-bench`, 600x40,
+  measured by switching each part off in turn; none of that was kept):
+
+  | Part | Cost |
+  |---|---|
+  | Wide (fill) blur | ~300 µs |
+  | Fine (frost) blur | ~320 µs |
+  | Halving | ~226 µs (was ~340), for 126k pixels: the pane plus three blur widths of margin each side |
+  | Veil mix | ~32 µs |
+  | Shading and bilinear reading | the rest |
+
+  Total 1522 → 1409 µs.
+- Same pixel-hash check as 61, against the previous commit: identical
+  (aaab5c6facd967a8). Its 61x37 pane covers the odd-size edge path.
+- Not done, noted for later: blurring only the part of the backdrop each
+  later pass still needs would save roughly a third of the blur (exact,
+  but fiddly with the ring).
+- Full suite PASSes on both GPUs (94 lines); input-test 172 / 0 and
+  179 / 0; `./corrode test` passes; dock screenshot unchanged.

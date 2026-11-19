@@ -642,8 +642,37 @@ impl SoftwareRenderer {
         if frosted {
             // Each pixel of the small backdrop is the mean of the (up to)
             // four it stands for.
+            // Whole two-by-two blocks, two rows at a time, with red and
+            // blue added together in one word (each sum fits in ten bits of
+            // its sixteen) and a quarter taken by shifting: what the general
+            // loop below gives them, without dividing.
+            let (whole_w, whole_h) = (bw / 2, bh / 2);
+            for sy in 0..whole_h {
+                // SAFETY: `clip` kept the backdrop on the surface, and
+                // `2 * sy + 1 < bh`.
+                let (top, bottom) = unsafe {
+                    (self.target_row(bx0, by0 + 2 * sy as u32), self.target_row(bx0, by0 + 2 * sy as u32 + 1))
+                };
+                let out = &mut backdrop[sy * sw..sy * sw + whole_w];
+                for (sx, small) in out.iter_mut().enumerate() {
+                    let mut red_blue = 0;
+                    let mut green = 0;
+                    for row in [top, bottom] {
+                        for x in [2 * sx, 2 * sx + 1] {
+                            // SAFETY: `x < 2 * whole_w <= bw` keeps it on the row.
+                            let pixel = unpack(&format, unsafe { row.add(x).read_unaligned() });
+                            red_blue += pixel & 0x00ff_00ff;
+                            green += pixel & 0x0000_ff00;
+                        }
+                    }
+                    *small = (red_blue >> 2) & 0x00ff_00ff | (green >> 2) & 0x0000_ff00;
+                }
+            }
             for sy in 0..sh {
                 for sx in 0..sw {
+                    if sx < whole_w && sy < whole_h {
+                        continue;
+                    }
                     let mut sum = [0u32; 3];
                     let mut count = 0;
                     for y in sy * 2..(sy * 2 + 2).min(bh) {
