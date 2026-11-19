@@ -1303,3 +1303,32 @@ The short version, for reading first. The numbered log below has the detail.
   instead; the screenshot showed it, and the test now clicks (639, 508).
 - Full suite PASSes on both GPUs (72 lines); input-test 170 / 0 and
   177 / 0; `./corrode test` passes.
+
+## 54. Keeping settings across reboots, part 1: formats
+
+Settings chosen in the Settings app are lost at reboot: the files are a
+read-only tar in RAM. There is no disk driver. The plan, decided here:
+- a small ring 3 `virtio-blk` driver that holds only its device, its
+  queue memory and an endpoint, and answers two calls: load the theme,
+  save the theme;
+- the theme's four words kept in sector 0 of the disk, behind a magic and
+  a checksum, so a blank or foreign disk is simply not a saved theme;
+- the desktop loads it at boot over /etc/desktop.conf, and saves on every
+  theme change;
+- tests keep booting without a disk, so one test's theme change cannot
+  leak into the next; a dedicated test attaches a fresh image, changes
+  the theme, reboots and checks; `run` attaches build/settings.img.
+  Nothing outside the project is touched; the ISO's boot config is
+  generated as before.
+
+This part, host-tested only:
+- `corrode_virtio::blk`: the 16-byte request header (type, reserved,
+  sector), status codes, device ids (0x1042 modern, 0x1001
+  transitional), capacity from the device config. Three tests.
+- `Theme::to_record` / `from_record`: 48 bytes, "CORRODE\x01", the four
+  words, FNV-1a of those forty bytes. Test: every preset round-trips,
+  also inside a 512-byte sector with junk after it, and flipping a bit
+  in the magic, a word or the hash gives None, as do a zeroed sector
+  and a short buffer.
+- `./corrode test` passes; boot test 170 / 0, dock-test PASS (the
+  kernel does not use either yet).

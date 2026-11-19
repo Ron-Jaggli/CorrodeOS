@@ -89,6 +89,18 @@ pub struct Theme {
     pub clock_24h: bool,
 }
 
+/// What a kept theme starts with, and how long one is. The last byte is the
+/// format's version.
+pub const RECORD_MAGIC: &[u8; 8] = b"CORRODE\x01";
+pub const RECORD_LEN: usize = 48;
+
+/// FNV-1a, 64-bit.
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ *byte as u64).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// The presets, by name. The first is the default.
 pub const PRESETS: [(&str, Theme); 6] = [
     ("corrode", CORRODE),
@@ -388,6 +400,38 @@ impl Theme {
         }
     }
 
+    /// The theme as it is kept on a disk: [`RECORD_MAGIC`], the four words of
+    /// [`Theme::to_words`], and an FNV-1a hash of those forty bytes, all
+    /// little-endian.
+    pub fn to_record(&self) -> [u8; RECORD_LEN] {
+        let mut out = [0u8; RECORD_LEN];
+        out[..8].copy_from_slice(RECORD_MAGIC);
+        for (index, word) in self.to_words().iter().enumerate() {
+            out[8 + index * 8..16 + index * 8].copy_from_slice(&word.to_le_bytes());
+        }
+        let hash = fnv(&out[..40]);
+        out[40..48].copy_from_slice(&hash.to_le_bytes());
+        out
+    }
+
+    /// A theme kept by [`Theme::to_record`], or `None` if `bytes` are not
+    /// one: a blank disk, someone else's, or one torn mid-write.
+    pub fn from_record(bytes: &[u8]) -> Option<Theme> {
+        let bytes = bytes.get(..RECORD_LEN)?;
+        if &bytes[..8] != RECORD_MAGIC {
+            return None;
+        }
+        let word = |at: usize| {
+            let mut le = [0u8; 8];
+            le.copy_from_slice(&bytes[at..at + 8]);
+            u64::from_le_bytes(le)
+        };
+        if word(40) != fnv(&bytes[..40]) {
+            return None;
+        }
+        Some(Theme::from_words([word(8), word(16), word(24), word(32)]))
+    }
+
     /// Everything, in four words, for a program to be told in a message.
     pub fn to_words(&self) -> [u64; 4] {
         let rgb = |c: Color| (c.r as u64) << 16 | (c.g as u64) << 8 | c.b as u64;
@@ -603,6 +647,25 @@ mod tests {
         assert_eq!(offset("+15"), None);
         assert_eq!(offset("5"), None);
         assert_eq!(offset("UTC"), Some(0));
+    }
+
+    #[test]
+    fn a_kept_theme_comes_back_and_a_damaged_one_does_not() {
+        for (name, theme) in PRESETS {
+            let record = theme.to_record();
+            assert_eq!(Theme::from_record(&record), Some(theme), "{name}");
+            // A sector is longer than a record; what follows is not read.
+            let mut sector = [0x55u8; 512];
+            sector[..RECORD_LEN].copy_from_slice(&record);
+            assert_eq!(Theme::from_record(&sector), Some(theme), "{name}");
+            for at in [0, 7, 8, 39, 40, 47] {
+                let mut damaged = record;
+                damaged[at] ^= 1;
+                assert_eq!(Theme::from_record(&damaged), None, "{name}, byte {at}");
+            }
+        }
+        assert_eq!(Theme::from_record(&[0u8; 512]), None);
+        assert_eq!(Theme::from_record(&[0u8; 10]), None);
     }
 
     #[test]
