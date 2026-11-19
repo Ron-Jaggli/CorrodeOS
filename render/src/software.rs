@@ -522,9 +522,17 @@ impl SoftwareRenderer {
             return;
         };
         let (bw, bh) = ((bx1 - bx0) as usize, (by1 - by0) as usize);
-        let area = bw * bh;
-        let needed = 3 * area + bw.max(bh);
         let format = self.info.format;
+        // Frosted glass is blurred at half size and read back smoothly: a
+        // blur this wide leaves no detail a full-size one would keep, and
+        // it is a quarter of the work. Clear glass is not blurred, so is
+        // read at full size, where its lens can bend every pixel.
+        let (frost_radius, fill_radius) = pane.blur_radii();
+        let frosted = frost_radius + fill_radius > 0;
+        let scale = if frosted { 2 } else { 1 };
+        let (sw, sh) = (bw.div_ceil(scale), bh.div_ceil(scale));
+        let area = sw * sh;
+        let needed = if frosted { 2 * area } else { area } + sw.max(sh);
 
         let shape = (
             rect.width as i64 * Q8,
@@ -536,41 +544,89 @@ impl SoftwareRenderer {
             self.scratch = scratch;
             return self.veil(rect, shape, pane, alpha, (x0, y0, x1, y1));
         };
-        let (source, rest) = buffers.split_at_mut(area);
-        let (frost, rest) = rest.split_at_mut(area);
-        let (fill, rest) = rest.split_at_mut(area);
-        let line = &mut rest[..bw.max(bh)];
+        let (backdrop, rest) = buffers.split_at_mut(area);
 
-        for y in 0..bh {
-            // SAFETY: `clip` kept the backdrop on the surface.
-            let row = unsafe { self.target_row(bx0, by0 + y as u32) };
-            for x in 0..bw {
-                // SAFETY: `x < bw` keeps the pixel on this row.
-                let pixel = unsafe { row.add(x).read_unaligned() };
-                source[y * bw + x] = unpack(&format, pixel);
+        if frosted {
+            // Each pixel of the small backdrop is the mean of the (up to)
+            // four it stands for.
+            for sy in 0..sh {
+                for sx in 0..sw {
+                    let mut sum = [0u32; 3];
+                    let mut count = 0;
+                    for y in sy * 2..(sy * 2 + 2).min(bh) {
+                        // SAFETY: `clip` kept the backdrop on the surface.
+                        let row = unsafe { self.target_row(bx0, by0 + y as u32) };
+                        for x in sx * 2..(sx * 2 + 2).min(bw) {
+                            // SAFETY: `x < bw` keeps the pixel on this row.
+                            let pixel = unpack(&format, unsafe { row.add(x).read_unaligned() });
+                            for (total, channel) in sum.iter_mut().zip(glass::channels(pixel)) {
+                                *total += channel;
+                            }
+                            count += 1;
+                        }
+                    }
+                    backdrop[sy * sw + sx] = glass::pack(sum.map(|total| total / count));
+                }
+            }
+        } else {
+            for y in 0..bh {
+                // SAFETY: `clip` kept the backdrop on the surface.
+                let row = unsafe { self.target_row(bx0, by0 + y as u32) };
+                for x in 0..bw {
+                    // SAFETY: `x < bw` keeps the pixel on this row.
+                    let pixel = unsafe { row.add(x).read_unaligned() };
+                    backdrop[y * bw + x] = unpack(&format, pixel);
+                }
             }
         }
 
-        // Frost: three boxes for each Gaussian, then the veil between them.
-        let (frost_radius, fill_radius) = pane.blur_radii();
-        let backdrop: &[u32] = if frost_radius + fill_radius > 0 {
-            frost.copy_from_slice(source);
-            fill.copy_from_slice(source);
+        // Frost: three boxes for each Gaussian, then the veil between them,
+        // with each radius halved for the half-size backdrop.
+        if frosted {
+            let (fill, rest) = rest.split_at_mut(area);
+            let line = &mut rest[..sw.max(sh)];
+            fill.copy_from_slice(backdrop);
             for _ in 0..3 {
-                glass::box_blur(frost, bw, bh, frost_radius as usize, line);
-                glass::box_blur(fill, bw, bh, fill_radius as usize, line);
+                glass::box_blur(backdrop, sw, sh, frost_radius as usize / scale, line);
+                glass::box_blur(fill, sw, sh, fill_radius as usize / scale, line);
             }
             let veil = pane.fill_opacity();
-            for (frosted, filled) in frost.iter_mut().zip(fill.iter()) {
+            for (frosted, filled) in backdrop.iter_mut().zip(fill.iter()) {
                 let (a, b) = (glass::channels(*frosted), glass::channels(*filled));
                 *frosted = glass::pack([0, 1, 2].map(|i| {
                     let blend = if pane.dark { a[i].min(b[i]) } else { a[i].max(b[i]) };
                     (blend * veil + a[i] * (255 - veil)) / 255
                 }));
             }
-            frost
-        } else {
-            source
+        }
+        let backdrop: &[u32] = backdrop;
+        // The backdrop at full-size pixel `x`, `y` (from its corner): read
+        // straight, or between the four small pixels around it.
+        let seen_at = |x: usize, y: usize| -> u32 {
+            if scale == 1 {
+                return backdrop[y * bw + x];
+            }
+            // A full pixel's centre, in small pixels, in 256ths: (2x + 1) / 4
+            // less a half.
+            let axis = |at: usize, size: usize| {
+                let q = (at as i64 * 128 - 64).max(0);
+                let i0 = ((q >> 8) as usize).min(size - 1);
+                (i0, (i0 + 1).min(size - 1), (q & 255) as u32)
+            };
+            let (x0, x1, fx) = axis(x, sw);
+            let (y0, y1, fy) = axis(y, sh);
+            let [a, b, c, d] = [
+                backdrop[y0 * sw + x0],
+                backdrop[y0 * sw + x1],
+                backdrop[y1 * sw + x0],
+                backdrop[y1 * sw + x1],
+            ]
+            .map(glass::channels);
+            glass::pack([0, 1, 2].map(|i| {
+                let top = a[i] * (256 - fx) + b[i] * fx;
+                let bottom = c[i] * (256 - fx) + d[i] * fx;
+                (top * (256 - fy) + bottom * fy) >> 16
+            }))
         };
 
         let tone = pane.tone();
@@ -595,7 +651,7 @@ impl SoftwareRenderer {
                 };
                 let sx = (x as i64 + (dx + Q8 / 2).div_euclid(Q8)).clamp(bx0 as i64, bx1 as i64 - 1);
                 let sy = (y as i64 + (dy + Q8 / 2).div_euclid(Q8)).clamp(by0 as i64, by1 as i64 - 1);
-                let seen = backdrop[(sy as usize - by0 as usize) * bw + (sx as usize - bx0 as usize)];
+                let seen = seen_at(sx as usize - bx0 as usize, sy as usize - by0 as usize);
 
                 let mut rgb = glass::channels(seen).map(|c| tone[c as usize] as u32);
                 rgb = glass::saturate(rgb, chroma);

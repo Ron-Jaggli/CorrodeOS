@@ -42,8 +42,8 @@ The short version, for reading first. The numbered log below has the detail.
     boot setup" to do unattended (32).
   - The lock screen has no password, as there are no accounts (28).
 - **Speed:** frame timing is in (`./corrode perf-test`). Frosted glass
-  is most of a frame's cost; dragging a window now takes about 14 ms a
-  frame, down from 33 (47).
+  is most of a frame's cost; dragging a window now takes about 8 ms a
+  frame, down from 33 (47, 48).
 - **Security:** calls that act on other apps need the shell capability,
   held only by Settings, Control Center and the menu (46).
 - **Known rough edges:** listed under "Known gap" in each section. The
@@ -1137,3 +1137,34 @@ The short version, for reading first. The numbered log below has the detail.
 - Full suite PASSes on both GPUs (32 checks each); input-test is
   170 / 0 default, 177 / 0 virtio.
 - Screenshot: `build/progress-47-title-after.png`.
+
+## 48. Frosted glass blurred at half size
+
+- `SoftwareRenderer::glass`, for frosted (Regular) glass:
+  - Reads the backdrop into a half-size buffer, each pixel the mean of
+    the 2x2 block it stands for.
+  - Runs the same three box blurs per Gaussian with each radius halved
+    (7 → 3, 21 → 10).
+  - Reads the result back with bilinear filtering wherever the lens
+    looks.
+  - That is a quarter of the pixels for the blur and the veil, and a
+    quarter of the scratch memory.
+- Clear glass has no blur and is still read at full size.
+- Why it does not show: a 21 px Gaussian leaves nothing a half-size
+  buffer cannot hold. Against the committed screenshots the title bar,
+  dock and Control Center differ by at most 2/255 (mean 0.2). The only
+  larger differences on screen are the clock and the pointer.
+- perf-test, draw ms per frame, default / virtio:
+
+  | Scene                        | 47      | 48      |
+  |------------------------------|---------|---------|
+  | Dragging, Regular glass      | 14.5/15 | 8.2/8.0 |
+  | Control Center open, Regular | 32/31   | 19/18.5 |
+  | Clear, Off                   | no change | no change |
+
+- Still to do: a pane redoes its blur every time it is drawn, even when
+  only something on top of it changed. Caching per pane needs to know
+  that nothing beneath it moved.
+- Full suite PASSes on both GPUs (32 checks each); input-test is
+  170 / 0 default, 177 / 0 virtio; `./corrode test` passes.
+- Screenshot: `build/progress-48-control-half.png`.
