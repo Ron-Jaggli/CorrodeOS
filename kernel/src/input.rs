@@ -18,7 +18,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use corrode_abi::{launcher, ps2, window};
-use corrode_render::anim::{Animation, Ease, Fx};
+use corrode_render::anim::{Animation, Ease, Fx, Spring};
 use corrode_render::scene::{Layer, LayerId, Scene};
 use corrode_render::{Color, Rect, Renderer};
 use corrode_text::{Coverage, Style};
@@ -346,6 +346,14 @@ fn resize_arrow(cursor: Cursor, grow: i32) -> Vec<u8> {
 /// How long a closed window takes to fade out.
 const CLOSING_MS: u32 = 180;
 
+/// Where a window dragged to an edge of the screen goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Snap {
+    Left,
+    Right,
+    Fill,
+}
+
 /// A window gone from the desk but still fading off the screen.
 struct Fading {
     layers: Vec<LayerId>,
@@ -669,6 +677,12 @@ pub struct Desk {
     focus: Option<usize>,
     /// A window being dragged by its bar, and where on the bar it was held.
     drag: Option<(usize, i32, i32)>,
+    /// Where the dragged window was when it was picked up, to go back to
+    /// after a snap is undone by zoom.
+    drag_from: (i32, i32),
+    /// The edge a dragged window would snap to, and the preview showing
+    /// where.
+    snap: Option<(Snap, LayerId)>,
     /// Windows placed so far, for staggering the next one.
     placed: i32,
     /// The surfaces of windows that have gone, for the painter to retire.
@@ -777,6 +791,8 @@ impl Desk {
             windows: Vec::new(),
             focus: None,
             drag: None,
+            drag_from: (0, 0),
+            snap: None,
             placed: 0,
             closed: Vec::new(),
             fading: Vec::new(),
@@ -1524,6 +1540,7 @@ impl Desk {
                         Part::Bar => {
                             let (x, y) = self.windows[index].at;
                             self.drag = Some((index, self.at.0 - x, self.at.1 - y));
+                            self.drag_from = (x, y);
                         }
                         Part::Body | Part::Shadow => {}
                     }
@@ -2136,6 +2153,120 @@ impl Desk {
         self.move_to(scene, index, at, now);
     }
 
+    /// Where a window snapped to `snap` goes, frame and all: the room
+    /// between the menu bar and the dock, the half or the whole of it.
+    fn snap_rect(&self, screen: Rect, snap: Snap) -> Rect {
+        let top = 40;
+        let bottom = screen.height as i32 - if self.theme.dock { 92 } else { 8 };
+        let height = (bottom - top) as u32;
+        let half = (screen.width - 24) / 2;
+        match snap {
+            Snap::Left => Rect::new(8, top, half, height),
+            Snap::Right => Rect::new(16 + half as i32, top, half, height),
+            Snap::Fill => Rect::new(8, top, screen.width - 16, height),
+        }
+    }
+
+    /// The pointer moved while dragging window `index`: show, move or take
+    /// away the preview of where it would snap.
+    fn track_snap<const N: usize>(&mut self, scene: &mut Scene<N>, index: usize, now: u64) {
+        let screen = scene.screen();
+        let resizable = self.can_resize
+            && self
+                .windows
+                .get(index)
+                .is_some_and(|managed| crate::windows::resizable(managed.window));
+        let zone = if !resizable {
+            None
+        } else if self.at.0 <= 2 {
+            Some(Snap::Left)
+        } else if self.at.0 >= screen.width as i32 - 3 {
+            Some(Snap::Right)
+        } else if self.at.1 <= 2 {
+            Some(Snap::Fill)
+        } else {
+            None
+        };
+        match (zone, self.snap) {
+            (None, None) => {}
+            (None, Some((_, preview))) => {
+                scene.remove(preview);
+                self.snap = None;
+            }
+            (Some(zone), Some((shown, _))) if zone == shown => {}
+            (Some(zone), Some((_, preview))) => {
+                let rect = self.snap_rect(screen, zone);
+                if let Some(layer) = scene.layer_mut(preview) {
+                    for (animation, to) in [
+                        (&mut layer.x, rect.x),
+                        (&mut layer.y, rect.y),
+                        (&mut layer.width, rect.width as i32),
+                        (&mut layer.height, rect.height as i32),
+                    ] {
+                        *animation = animation.retarget(now, Fx::from_int(to), Spring::SNAPPY);
+                    }
+                }
+                self.snap = Some((zone, preview));
+            }
+            (Some(zone), None) => {
+                let rect = self.snap_rect(screen, zone);
+                // It grows out of the pointer, as Plasma's does.
+                let mut layer = pane(rect, self.theme.radius as u16, &self.theme);
+                let ms = self.theme.ms(160);
+                let strength = Fx::from_int(170);
+                layer.opacity = if ms > 0 {
+                    Animation::ease(now, ms, Fx::ZERO, strength, Ease::Out)
+                } else {
+                    Animation::rest(strength)
+                };
+                if ms > 0 {
+                    let (x, y) = self.at;
+                    for (animation, from, to) in [
+                        (&mut layer.x, x, rect.x),
+                        (&mut layer.y, y, rect.y),
+                        (&mut layer.width, 0, rect.width as i32),
+                        (&mut layer.height, 0, rect.height as i32),
+                    ] {
+                        *animation = Animation::spring(
+                            now,
+                            Fx::from_int(from),
+                            Fx::from_int(to),
+                            corrode_render::anim::Velocity::ZERO,
+                            Spring::SNAPPY,
+                        );
+                    }
+                }
+                if let Some(preview) = scene.add(layer) {
+                    // Behind the window being dragged.
+                    if let Some(managed) = self.windows.get(index) {
+                        let ids: Vec<LayerId> = managed.layers().collect();
+                        for id in ids {
+                            scene.raise(id);
+                        }
+                    }
+                    self.snap = Some((zone, preview));
+                }
+            }
+        }
+    }
+
+    /// The drag of window `index` is over: snap it where the preview was.
+    fn end_snap<const N: usize>(&mut self, scene: &mut Scene<N>, index: usize, now: u64) {
+        let Some((snap, preview)) = self.snap.take() else {
+            return;
+        };
+        scene.remove(preview);
+        let rect = self.snap_rect(scene.screen(), snap);
+        let Some(managed) = self.windows.get_mut(index) else {
+            return;
+        };
+        // Zoom puts it back where and as big as it was before the drag.
+        managed.unzoomed = Some((self.drag_from, (managed.width, managed.height)));
+        println!("desktop    : window {} snapped {:?}", managed.window, snap);
+        self.resize(scene, index, (rect.width, rect.height - BAR));
+        self.move_to(scene, index, (rect.x, rect.y), now);
+    }
+
     /// Make window `index` `size`, its program and every layer of it.
     fn resize<const N: usize>(&mut self, scene: &mut Scene<N>, index: usize, size: (u32, u32)) {
         let Some(managed) = self.windows.get_mut(index) else {
@@ -2422,6 +2553,7 @@ impl Desk {
         if let Some((index, grab_x, grab_y)) = self.drag {
             if buttons & 1 == 0 {
                 self.drag = None;
+                self.end_snap(scene, index, now);
             } else if let Some(managed) = self.windows.get_mut(index) {
                 managed.at = (self.at.0 - grab_x, (self.at.1 - grab_y).max(0));
                 let managed = &self.windows[index];
@@ -2433,6 +2565,7 @@ impl Desk {
                 }
                 // The glyphs go with the buttons they are on.
                 self.hide_glyphs(scene);
+                self.track_snap(scene, index, now);
             }
         }
         self.hover(scene);

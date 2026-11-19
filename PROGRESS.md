@@ -717,3 +717,33 @@ Choices made without asking are marked **Choice:**.
   input-test: 170 / 0 default, 177 / 0 virtio.
 - Screenshot: `build/progress-30-virtio-resize.png` (virtio, after the
   top-left drag to 860x480).
+
+## 32. Window snapping
+
+- Drag a window by its bar to an edge of the screen:
+  - left (pointer within 2 px of it) → the left half;
+  - right → the right half;
+  - top → fill.
+  - The space is the same as zoom's: under the menu bar, above the dock
+    (or 8 px from the bottom with the dock off), 8 px margins and an 8 px
+    gap between halves.
+- While a window is held over a zone, a glass pane at about two-thirds
+  opacity springs out of the pointer to the target rectangle, behind the
+  window, as Plasma's does. Moving from zone to zone retargets it;
+  leaving every zone removes it.
+- Letting go resizes and moves the window there (`desktop: window N
+  snapped Left`). Zoom then puts it back where it was picked up, at its
+  old size.
+- Only resizable windows snap; Settings and About just move as before.
+- Choice: no persistence of settings across boots for now. There is no
+  block driver, and writing a disk or CMOS NVRAM from this kernel on real
+  hardware could damage the machine's disks or firmware settings. That is
+  too close to "don't touch the boot setup" to do unattended.
+- New `./corrode snap-test`: drags a terminal to the left half (preview
+  in `build/snap.png`), then to the right half (`build/snapped.png`).
+  The full suite, 18 boot tests, PASSes on both GPUs; input-test is
+  170 / 0 default, 177 / 0 virtio.
+- Known gap: dragging a snapped window off its half keeps the snapped
+  size, where macOS would restore the old size as it is pulled away.
+- Screenshots: `build/progress-31-snap-preview.png`,
+  `build/progress-31-snapped.png`.

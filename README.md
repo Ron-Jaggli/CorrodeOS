@@ -153,6 +153,11 @@ desktop under glass, the date and time large, and Return or the unlock
 button to get back. There are no accounts yet, so there is no password;
 it hides the screen rather than securing it.
 
+Drag a window by its title bar to the left or right edge of the screen to
+snap it to that half, or to the top edge to fill the screen. A glass
+preview shows where it will land. The green zoom button puts a snapped
+window back where it was.
+
 Programs follow the look on their own: a window is sent `window::THEME`
 when it opens and whenever the look changes (`Event::Theme` in the `ui`
 crate). A program can change the look with `corrode_ui::set_theme`, which

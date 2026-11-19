@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -444,6 +444,33 @@ lock-test: iso
 	    || echo "lock-test: locked twice, shortcuts held off, unlocked twice FAIL"
 	@test -s build/lock.ppm && pnmtopng build/lock.ppm > build/lock.png 2>/dev/null && rm -f build/lock.ppm && echo "wrote build/lock.png" || true
 	@test -s build/lock-fade.ppm && pnmtopng build/lock-fade.ppm > build/lock-fade.png 2>/dev/null && rm -f build/lock-fade.ppm && echo "wrote build/lock-fade.png" || true
+
+# Open a terminal and drag it by its bar to the left edge: a preview
+# shows the left half (build/snap.png), and letting go snaps it there.
+# Then drag it to the right edge and let go: the right half.
+snap-test: iso
+	@rm -f build/snap.ppm build/snap.png build/snapped.ppm build/snapped.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   echo "mouse_move -64 -218"; sleep 0.2; echo "mouse_move -64 -218"; sleep 0.2; echo "mouse_move -64 -219"; sleep 0.4; \
+	   echo "mouse_button 1"; sleep 0.3; \
+	   echo "mouse_move -200 0"; sleep 0.2; echo "mouse_move -200 0"; sleep 0.2; echo "mouse_move -60 0"; sleep 0.8; \
+	   echo "screendump build/snap.ppm"; sleep 0.8; \
+	   echo "mouse_button 0"; sleep 1.2; \
+	   echo "mouse_move 300 -49"; sleep 0.4; \
+	   echo "mouse_button 1"; sleep 0.3; \
+	   for step in 1 2 3 4 5; do echo "mouse_move 220 0"; sleep 0.2; done; sleep 0.6; \
+	   echo "mouse_button 0"; sleep 1.2; \
+	   echo "screendump build/snapped.ppm"; sleep 1; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "snapped|is now" build/serial.log || echo "snap-test: nothing snapped"
+	@grep -q "snapped Left" build/serial.log && grep -q "snapped Right" build/serial.log \
+	    && echo "snap-test: dragged to the left half, then the right  PASS" \
+	    || echo "snap-test: dragged to the left half, then the right  FAIL"
+	@test -s build/snap.ppm && pnmtopng build/snap.ppm > build/snap.png 2>/dev/null && rm -f build/snap.ppm && echo "wrote build/snap.png" || true
+	@test -s build/snapped.ppm && pnmtopng build/snapped.ppm > build/snapped.png 2>/dev/null && rm -f build/snapped.ppm && echo "wrote build/snapped.png" || true
 
 # Open a terminal from the dock and drag its bottom-right corner 200 by 100
 # pixels bigger, in four steps; then drag its top-left corner 60 by 40
