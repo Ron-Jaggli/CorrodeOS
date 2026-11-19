@@ -368,6 +368,8 @@ struct Screen {
     device: Device,
     renderer: SoftwareRenderer,
     info: SurfaceInfo,
+    /// Where the wallpaper is painted, if there was memory for it.
+    wallpaper: Option<&'static mut [u32]>,
 }
 
 fn open_screen(mut device: Device) -> Result<(Screen, u64), Error> {
@@ -502,11 +504,33 @@ fn open_screen(mut device: Device) -> Result<(Screen, u64), Error> {
         renderer.attach_mask_atlas(data, gpu::ATLAS_WIDTH);
     }
 
+    // Glass first, then the wallpaper, in the one block of scratch memory.
+    let mut wallpaper = None;
+    let screen_pixels = (info.width * info.height) as usize;
+    let glass = 3 * screen_pixels + 4096;
+    match Pages::map(gpu::SCRATCH) {
+        Ok(scratch) if scratch.len / 4 >= glass + screen_pixels => {
+            // SAFETY: mapped writable for the life of the task, and these
+            // are the only references to it that will ever exist, split so
+            // they do not overlap.
+            let all = unsafe {
+                core::slice::from_raw_parts_mut(scratch.base.cast::<u32>(), glass + screen_pixels)
+            };
+            let (glass, rest) = all.split_at_mut(glass);
+            renderer.attach_glass_scratch(glass);
+            wallpaper = Some(rest);
+            println!("glass and a wallpaper, in {} KiB of scratch", scratch.len / 1024);
+        }
+        Ok(scratch) => println!("{} KiB of scratch is too little for glass", scratch.len / 1024),
+        Err(error) => println!("no scratch for glass: {:?}", error),
+    }
+
     Ok((
         Screen {
             device,
             renderer,
             info,
+            wallpaper,
         },
         displays,
     ))
@@ -687,6 +711,31 @@ fn serve(
                 .present(&damage)
                 .map_err(|_| Error::Invalid)?;
             screen.present(&rects[..count])?;
+            Ok([0; 4])
+        }
+
+        gpu::WALLPAPER => {
+            let (width, height) = (screen.info.width, screen.info.height);
+            let pixels = screen.wallpaper.as_deref_mut().ok_or(Error::Invalid)?;
+            corrode_theme::wallpaper::paint(
+                &corrode_theme::Theme::from_words(words),
+                pixels,
+                width,
+                height,
+            );
+            let base = pixels.as_ptr();
+            // SAFETY: `pixels` is `width * height` words of this task's
+            // memory, mapped for its life and only written here, between
+            // the frames that read it.
+            unsafe {
+                screen.renderer.attach_surface(
+                    corrode_render::software::SURFACES as u32 - 1,
+                    base,
+                    width,
+                    height,
+                )
+            }
+            .map_err(|_| Error::Invalid)?;
             Ok([0; 4])
         }
 

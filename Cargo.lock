@@ -175,5 +175,6 @@ version = "0.0.1"
 dependencies = [
  "corrode-render",
  "corrode-rt",
+ "corrode-theme",
  "corrode-virtio",
 ]

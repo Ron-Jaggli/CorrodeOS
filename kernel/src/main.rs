@@ -3424,12 +3424,14 @@ impl Screen {
     }
 
     /// Paint `theme`'s wallpaper and show it to the renderer as surface
-    /// [`surface::WALLPAPER`]. False where there is nowhere to paint it: the
-    /// remote renderer has only programs' surfaces, so under it the desktop
-    /// keeps the plain background.
+    /// [`surface::WALLPAPER`]: here, or by the driver in its own memory
+    /// under the remote renderer. False where there is nowhere to paint it,
+    /// and the desktop keeps the plain background.
     fn show_wallpaper(&mut self, theme: &corrode_theme::Theme) -> bool {
-        let Screen::Software(renderer) = self else {
-            return false;
+        let renderer = match self {
+            Screen::Software(renderer) => renderer,
+            // The driver paints it, in its own memory.
+            Screen::Remote(renderer) => return renderer.wallpaper(theme.to_words()).is_ok(),
         };
         let info = renderer.surface_info();
         let Some(pixels) = wallpaper_pixels(&info) else {
@@ -3476,6 +3478,7 @@ const GPU_QUEUE: cap::CapPtr = 28;
 const GPU_SCREEN: cap::CapPtr = 29;
 const GPU_SHARED: cap::CapPtr = 30;
 const GPU_ATLAS: cap::CapPtr = 31;
+const GPU_SCRATCH: cap::CapPtr = 62;
 /// The device's BARs, at `GPU_BARS + n`.
 const GPU_BARS: cap::CapPtr = 32;
 /// A read-only copy of the screen memory, to check what that forbids.
@@ -3526,6 +3529,9 @@ fn start_gpu() -> Option<remote::RemoteRenderer> {
     let screen = memory::create(gpu::SCREEN_PAGES, true);
     let shared = memory::create(gpu::SHARED_PAGES, true);
     let atlas = memory::create(atlas_pages, false);
+    // Glass and a wallpaper, if there is memory for them: the driver works
+    // without, as plainly as before.
+    let scratch = memory::create(gpu::SCRATCH_PAGES, false);
     let (Some(queue), Some(screen), Some(shared), Some(atlas)) = (queue, screen, shared, atlas)
     else {
         gpu_check("make the driver's memory", false);
@@ -3568,6 +3574,16 @@ fn start_gpu() -> Option<remote::RemoteRenderer> {
         && cap::grant(driver, GPU_SCREEN, gpu::SCREEN, Rights::READ_WRITE).is_ok()
         && cap::grant(driver, GPU_SHARED, gpu::SHARED, Rights::READ).is_ok()
         && cap::grant(driver, GPU_ATLAS, gpu::ATLAS, Rights::READ_WRITE).is_ok();
+    if let Some(scratch) = scratch {
+        let minted = cap::mint(0, GPU_SCRATCH, cap::Object::Memory(scratch), Rights::ALL);
+        let given = minted.and_then(|_| cap::grant(driver, GPU_SCRATCH, gpu::SCRATCH, Rights::READ_WRITE));
+        if let Err(error) = given {
+            println!("gpu        : glass scratch not given: {error:?}");
+        }
+        granted &= given.is_ok();
+    } else {
+        println!("gpu        : no memory for glass -- it will be a plain veil");
+    }
     if line.is_some() {
         granted &= cap::grant(driver, GPU_IRQ, gpu::IRQ, Rights::READ).is_ok();
     }
@@ -3580,7 +3596,7 @@ fn start_gpu() -> Option<remote::RemoteRenderer> {
             bars += 1;
         }
     }
-    let expected = 7 + bars + line.map_or(0, |_| 1);
+    let expected = 7 + bars + line.map_or(0, |_| 1) + scratch.map_or(0, |_| 1);
     gpu_check(
         "the driver holds its device, its memory, and nothing else",
         granted && cap::slots_used(driver) == Some(expected),

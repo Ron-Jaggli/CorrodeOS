@@ -92,6 +92,20 @@ impl RemoteRenderer {
         .map(|_| ())
     }
 
+    /// Have the driver paint the wallpaper of the theme in `words` and show
+    /// it as the last surface.
+    pub fn wallpaper(&mut self, words: [u64; 4]) -> Result<(), Error> {
+        call(
+            self.endpoint,
+            Message {
+                label: gpu::WALLPAPER,
+                words,
+            },
+            None,
+        )
+        .map(|_| ())
+    }
+
     /// The shared memory, as bytes.
     fn shared(&mut self) -> &mut [u8] {
         // SAFETY: `memory::create` mapped `shared_len` bytes writable at

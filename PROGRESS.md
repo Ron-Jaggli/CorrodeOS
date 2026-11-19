@@ -287,3 +287,25 @@ Choices made without asking are marked **Choice:**.
 - All boot tests PASS; 170 PASS / 0 FAIL.
 - Screenshot: `build/progress-11-dock-hover.png` (Settings hovered, and
   dark-mode Settings open).
+
+## 14. Glass and wallpaper on the virtio GPU
+
+- With `GPU=virtio` the ring-3 driver does the drawing. It had no memory
+  for glass (so panes fell back to a veil) and could not show a wallpaper.
+- New optional capability `gpu::SCRATCH`, 32 MiB of memory (enough for
+  1920x1080). The driver splits it into the glass's scratch and the
+  wallpaper's pixels.
+- New message `gpu::WALLPAPER` carrying the theme's four words. The
+  driver paints the wallpaper itself with `corrode-theme`, in its own
+  memory, and attaches it as the last surface. Live theme changes work the
+  same way.
+- The driver logs what it got ("glass and a wallpaper, in 32784 KiB of
+  scratch"). Without the memory it carries on as before.
+- Bug found on the way: slot 46 collided with the NVIDIA firmware blobs,
+  which fill slots upward from 45. Moved to 62.
+- `GPU=virtio ./corrode settings-test` PASS, and its screenshot matches
+  the software path. Boot under virtio 177 PASS / 0 FAIL; default path
+  170 / 0; every other boot test PASS.
+- Still open under virtio: closed windows' surfaces are not reused (the
+  driver keeps them mapped).
+- Screenshot: `build/progress-12-virtio.png`.

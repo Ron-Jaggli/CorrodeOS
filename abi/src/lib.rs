@@ -404,6 +404,10 @@ pub mod gpu {
     pub const BARS: usize = 8;
     /// Where the capability to answer a call lands.
     pub const REPLY: usize = 14;
+    /// Memory for the glass's scratch and the wallpaper's pixels:
+    /// [`SCRATCH_PAGES`] pages. Optional: without it, glass is a plain veil
+    /// and there is no wallpaper.
+    pub const SCRATCH: usize = 15;
     /// Where the `n`th surface the kernel hands over lands.
     pub const SURFACES: usize = 16;
 
@@ -413,6 +417,9 @@ pub mod gpu {
     pub const SCREEN_PAGES: usize = 2048;
     pub const ATLAS_WIDTH: u32 = 1024;
     pub const ATLAS_HEIGHT: u32 = 512;
+    /// Three screens for the glass, a little for its line buffer, and one
+    /// for the wallpaper.
+    pub const SCRATCH_PAGES: usize = 4 * SCREEN_PAGES + 4;
 
     /// Labels of the kernel's calls. The answer's label is zero for done,
     /// or an error code.
@@ -430,6 +437,9 @@ pub mod gpu {
     pub const UPLOAD: u64 = 4;
     /// Word 0 rectangles are in shared memory: show them.
     pub const PRESENT: u64 = 5;
+    /// Paint the wallpaper of the theme in the four words, and show it as
+    /// the renderer's last surface. Needs [`SCRATCH`].
+    pub const WALLPAPER: u64 = 6;
 
     /// The PCI identity of a modern virtio GPU.
     pub const VIRTIO_VENDOR: u16 = 0x1af4;
