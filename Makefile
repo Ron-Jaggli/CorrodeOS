@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -251,6 +251,25 @@ input-test: iso
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
 	@grep -E "^(input|ps2|panel|terminal) " build/serial.log || echo "input-test: nothing from the input path"
 	@test -s build/input.ppm && pnmtopng build/input.ppm > build/input.png 2>/dev/null && rm -f build/input.ppm && echo "wrote build/input.png" || true
+
+# Open a terminal from the dock and drag its bottom-right corner 200 by
+# 100 pixels bigger, in four steps. build/resize.png shows the result.
+resize-test: iso
+	@rm -f build/resize.ppm build/resize.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -56 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   echo "mouse_move 132 -304"; sleep 0.5; echo "mouse_button 1"; sleep 0.3; \
+	   for step in 1 2 3 4; do echo "mouse_move 50 25"; sleep 0.3; done; \
+	   echo "mouse_button 0"; sleep 1; \
+	   echo "screendump build/resize.ppm"; sleep 2; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "is now|^terminal   : resized" build/serial.log | tail -3 || true
+	@grep -q "is now 800x440" build/serial.log \
+	    && echo "resize-test: dragged the corner to 800x440            PASS" \
+	    || echo "resize-test: dragged the corner to 800x440            FAIL"
+	@test -s build/resize.ppm && pnmtopng build/resize.ppm > build/resize.png 2>/dev/null && rm -f build/resize.ppm && echo "wrote build/resize.png" || true
 
 # Open a terminal and About from the dock, then work the windows from the
 # keyboard: Alt+Tab to the terminal, Alt+M it away, Alt+comma for Settings,

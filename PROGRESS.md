@@ -335,3 +335,22 @@ Choices made without asking are marked **Choice:**.
   are still 0 FAIL, but `minimize-test`'s size checks fail there by design.
 - Known gap: no dragging window edges to resize. Only zoom resizes.
 - Screenshot: `build/progress-13-zoom-fill.png`.
+
+## 16. Resize by dragging an edge
+
+- Press within 8 px of a resizable window's right edge, bottom edge or
+  bottom-right corner and drag: the window follows.
+  - The program hears nothing of that press.
+  - The new size is applied at most once per frame, however many pointer
+    moves arrived, so the program redraws per frame, not per move.
+  - Limits: no smaller than 240x120, and no further than the screen's
+    edge.
+- A hand resize forgets the zoom's saved size, so green zooms from the
+  new size.
+- `./corrode resize-test` drags a terminal's corner from 600x340 to
+  800x440. PASS. All other boot tests PASS; 170 PASS / 0 FAIL.
+- Known gaps:
+  - no resize cursor (the pointer has one shape);
+  - no left or top edges;
+  - like zoom, only on the software renderer.
+- Screenshot: `build/progress-14-resize.png`.
