@@ -84,6 +84,16 @@ pub struct SoftwareRenderer {
 // concurrent *shared* use is still prevented by `submit` requiring `&mut self`.
 unsafe impl Send for SoftwareRenderer {}
 
+/// What a pane's lens and rim make of one point of it.
+#[derive(Clone, Copy)]
+struct Shade {
+    covered: u32,
+    dx: i64,
+    dy: i64,
+    light: u32,
+    opacity: u32,
+}
+
 impl SoftwareRenderer {
     /// Wrap a framebuffer supplied by firmware.
     ///
@@ -613,7 +623,9 @@ impl SoftwareRenderer {
         } else {
             sw.max(sh)
         };
-        let needed = if frosted { 2 * area } else { area } + blur_line;
+        // After the blur, what the lens makes of each column's sides.
+        let columns = 2 * (x1 - x0) as usize;
+        let needed = area + if frosted { area + blur_line } else { blur_line }.max(columns);
 
         let shape = (
             rect.width as i64 * Q8,
@@ -713,33 +725,74 @@ impl SoftwareRenderer {
         let tone = pane.tone();
         let chroma = pane.chroma();
         let (width, height, radius) = shape;
+        // What the lens and the rim make of a point: how much of it is
+        // covered, how far it looks (whole pixels), and the rim's light and
+        // opacity there (none, inside the rim).
+        let shade = |field: &glass::Field| -> Shade {
+            let lens = field.distance > -glass::BEZEL * Q8;
+            let (dx, dy) = match lens && pane.refraction > 0 {
+                true => glass::displacement(field, pane.refraction),
+                false => (0, 0),
+            };
+            let (light, opacity) = match pane.rim && field.distance > -5 * Q8 {
+                true => glass::rim(field, pane.dark),
+                false => (0, 0),
+            };
+            Shade {
+                covered: glass::coverage(field),
+                dx: (dx + Q8 / 2).div_euclid(Q8),
+                dy: (dy + Q8 / 2).div_euclid(Q8),
+                light,
+                opacity,
+            }
+        };
+        // Beside the left and right sides that is the same all down a
+        // column, and beside the top and bottom all along a row
+        // (`glass::part`): found once for each, not for every pixel.
+        let columns = &mut rest[..columns];
+        for x in x0..x1 {
+            let lx = (x as i64 - rect.x as i64) * Q8 + Q8 / 2;
+            let at = (x - x0) as usize * 2;
+            let side = shade(&glass::field(lx, height / 2, width, height, radius));
+            columns[at] = side.covered | side.light << 8 | side.opacity << 16;
+            columns[at + 1] = side.dx as i32 as u32;
+        }
+        let columns: &[u32] = columns;
         for y in y0..y1 {
             // SAFETY: `clip` returned bounds already intersected with the
             // surface.
             let row = unsafe { self.target_row(x0, y) };
             let ly = (y as i64 - rect.y as i64) * Q8 + Q8 / 2;
+            let end = shade(&glass::field(width / 2, ly, width, height, radius));
             for x in x0..x1 {
                 let lx = (x as i64 - rect.x as i64) * Q8 + Q8 / 2;
-                let field = glass::field(lx, ly, width, height, radius);
-                let covered = glass::coverage(&field);
+                let at = match glass::part(lx, ly, width, height, radius) {
+                    glass::Part::Corner => shade(&glass::field(lx, ly, width, height, radius)),
+                    glass::Part::End => end,
+                    glass::Part::Side => {
+                        let (packed, dx) = (columns[(x - x0) as usize * 2], columns[(x - x0) as usize * 2 + 1]);
+                        Shade {
+                            covered: packed & 0xff,
+                            dx: dx as i32 as i64,
+                            dy: 0,
+                            light: (packed >> 8) & 0xff,
+                            opacity: packed >> 16,
+                        }
+                    }
+                };
+                let covered = at.covered;
                 if covered == 0 {
                     continue;
                 }
-                let lens = field.distance > -glass::BEZEL * Q8;
-                let (dx, dy) = match lens && pane.refraction > 0 {
-                    true => glass::displacement(&field, pane.refraction),
-                    false => (0, 0),
-                };
-                let sx = (x as i64 + (dx + Q8 / 2).div_euclid(Q8)).clamp(bx0 as i64, bx1 as i64 - 1);
-                let sy = (y as i64 + (dy + Q8 / 2).div_euclid(Q8)).clamp(by0 as i64, by1 as i64 - 1);
+                let sx = (x as i64 + at.dx).clamp(bx0 as i64, bx1 as i64 - 1);
+                let sy = (y as i64 + at.dy).clamp(by0 as i64, by1 as i64 - 1);
                 let seen = seen_at(sx as usize - bx0 as usize, sy as usize - by0 as usize);
 
                 let mut rgb = glass::channels(seen).map(|c| tone[c as usize] as u32);
                 rgb = glass::saturate(rgb, chroma);
                 rgb = glass::tint(rgb, pane);
-                if pane.rim && field.distance > -5 * Q8 {
-                    let (light, opacity) = glass::rim(&field, pane.dark);
-                    rgb = rgb.map(|c| (c * (255 - opacity) / 255 + light).min(255));
+                if at.opacity | at.light != 0 {
+                    rgb = rgb.map(|c| (c * (255 - at.opacity) / 255 + at.light).min(255));
                 }
                 let color = Color::rgb(rgb[0] as u8, rgb[1] as u8, rgb[2] as u8);
                 let alpha = crate::blend::div255(covered * alpha as u32) as u8;

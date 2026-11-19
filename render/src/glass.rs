@@ -234,12 +234,7 @@ pub struct Field {
 /// circular corner is the same field to within a pixel at the radii a
 /// desktop uses, and is a square root rather than a search.
 pub fn field(x: i64, y: i64, width: i64, height: i64, radius: i64) -> Field {
-    let (half_w, half_h) = (width / 2, height / 2);
-    let radius = radius.clamp(0, half_w.min(half_h));
-    let (px, py) = (x - half_w, y - half_h);
-    let (sx, sy) = (if px < 0 { -1 } else { 1 }, if py < 0 { -1 } else { 1 });
-    let qx = px.abs() - (half_w - radius);
-    let qy = py.abs() - (half_h - radius);
+    let (sx, sy, qx, qy, radius) = quarter(x, y, width, height, radius);
     if qx > 0 && qy > 0 {
         let length = isqrt((qx * qx + qy * qy) as u64) as i64;
         let length = length.max(1);
@@ -258,6 +253,39 @@ pub fn field(x: i64, y: i64, width: i64, height: i64, radius: i64) -> Field {
             normal: (0, sy * ONE),
         }
     }
+}
+
+/// Which case of [`field`] a point is in. Beside a left or right side the
+/// field is the same all the way down a column, and beside the top or
+/// bottom all the way along a row, so it can be found once for each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    Corner,
+    /// Nearest the left or right: as at `(x, height / 2)`.
+    Side,
+    /// Nearest the top or bottom: as at `(width / 2, y)`.
+    End,
+}
+
+pub fn part(x: i64, y: i64, width: i64, height: i64, radius: i64) -> Part {
+    let (_, _, qx, qy, _) = quarter(x, y, width, height, radius);
+    if qx > 0 && qy > 0 {
+        Part::Corner
+    } else if qx > qy {
+        Part::Side
+    } else {
+        Part::End
+    }
+}
+
+/// The point folded into the bottom-right quarter, past where the corner's
+/// curve starts: which way it was folded, and how far past on each axis.
+fn quarter(x: i64, y: i64, width: i64, height: i64, radius: i64) -> (i64, i64, i64, i64, i64) {
+    let (half_w, half_h) = (width / 2, height / 2);
+    let radius = radius.clamp(0, half_w.min(half_h));
+    let (px, py) = (x - half_w, y - half_h);
+    let (sx, sy) = (if px < 0 { -1 } else { 1 }, if py < 0 { -1 } else { 1 });
+    (sx, sy, px.abs() - (half_w - radius), py.abs() - (half_h - radius), radius)
 }
 
 /// How much of a pixel the shape covers, out of 255, a pixel's width of
@@ -556,6 +584,25 @@ mod tests {
             let inverse = reciprocal(span);
             for n in 0..=255 * span {
                 assert_eq!(divide(n, inverse), n / span, "{n} / {span}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_side_has_one_field_all_along_it() {
+        // Odd and even sizes, square, and corners from none to more than
+        // fit; every quarter-pixel of each, and a little outside.
+        for (width, height, radius) in [(40, 40, 10), (37, 21, 9), (600, 40, 12), (9, 30, 0), (20, 50, 99)] {
+            let (w, h, r) = (width * Q8, height * Q8, radius * Q8);
+            for y in (-2 * Q8..h + 2 * Q8).step_by(Q8 as usize / 4) {
+                for x in (-2 * Q8..w + 2 * Q8).step_by(Q8 as usize / 4) {
+                    let at = field(x, y, w, h, r);
+                    match part(x, y, w, h, r) {
+                        Part::Corner => {}
+                        Part::Side => assert_eq!(at, field(x, h / 2, w, h, r), "{x},{y} of {width}x{height}"),
+                        Part::End => assert_eq!(at, field(w / 2, y, w, h, r), "{x},{y} of {width}x{height}"),
+                    }
+                }
             }
         }
     }

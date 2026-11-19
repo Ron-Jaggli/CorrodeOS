@@ -45,8 +45,8 @@ The short version, for reading first. The numbered log below has the detail.
     there are no accounts and no secret storage. It keeps a passer-by
     out, not someone holding the disk.
 - **Speed:** frame timing is in (`./corrode perf-test`). Frosted glass
-  is most of a frame's cost; dragging a window now takes about 7.5 ms a
-  frame, down from 33 (47, 48, 49, 60). The likely next big lever, the
+  is most of a frame's cost; dragging a window now takes about 6.5 ms a
+  frame, down from 33 (47, 48, 49, 60, 61). The likely next big lever, the
   kernel's disabled SSE, is yours to decide (49).
 - **Security:** calls that act on other apps need the shell capability,
   held only by Settings, Control Center and the menu (46). The desktop's
@@ -1521,3 +1521,43 @@ This part, host-tested only:
 - The pixels are identical, so no screenshot can change. Full suite
   PASSes on both GPUs (94 lines); input-test 172 / 0 and 179 / 0;
   `./corrode test` passes.
+
+## 61. The lens worked out per column and row, not per pixel
+
+- Along a straight side, a pane's field (distance and normal) changes
+  only across that side. So the lens offset, coverage and rim it gives
+  are the same all down a column beside the left and right sides, and
+  all along a row beside the top and bottom.
+- New `glass::part(x, y, …)` says which case of `glass::field` a point
+  is in (`Corner`, `Side`, `End`). `field` and `part` share one
+  `quarter()` helper, so they cannot disagree.
+- The software renderer now works out each column's side shade once
+  into the scratch after the blur (two words a column), and each row's
+  end shade once a row. Only corner pixels still do the full field,
+  square root and lens per pixel. A small `Shade` struct carries
+  coverage, whole-pixel offset, and rim light and opacity. Where there
+  is no rim, both are 0, which leaves the colour exactly as it was.
+- Exactness:
+  - New test `a_side_has_one_field_all_along_it` checks every
+    quarter-pixel of five shapes (odd, even, square-cornered, corners
+    too big to fit) against the field at the column's or row's middle.
+  - A one-off pixel hash over 70 renders gave the same FNV-1a hash
+    (aaab5c6facd967a8) from the old commit and the new code. The renders
+    were 5 shapes, including off-screen and square-cornered, 7 looks
+    (Regular and Clear, light and dark, no frost, no rim, heavy
+    refraction) and 2 opacities. The test was not kept; the field test
+    covers the reasoning.
+- Timings:
+
+  | | Before | After |
+  |---|---|---|
+  | `glass-bench` regular | 2233 µs | 1522 µs |
+  | `glass-bench` no frost | 1025 µs | 333 µs |
+  | `glass-bench` clear | 805 µs | 221 µs |
+  | Kernel, dragging, Regular | 6.8–8.8 ms a frame | 5.8–7.1 ms |
+  | Kernel, dragging, Clear | 3.4 ms | 2.6 ms (glass Off: 2.2 ms) |
+  | Kernel, Control Center open | 16.3 ms | 14.4 ms |
+
+  Frosted glass is now mostly the blur again.
+- Full suite PASSes on both GPUs (94 lines); input-test 172 / 0 and
+  179 / 0; `./corrode test` passes; boot screenshot unchanged.
