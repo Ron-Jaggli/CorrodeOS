@@ -433,6 +433,21 @@ impl Dock {
     }
 
     /// What icon `index`'s program titles its windows.
+    /// Where icon `index` rests: its top left.
+    pub fn at(&self, index: usize) -> Option<(i32, i32)> {
+        self.icons.get(index).map(|icon| icon.at)
+    }
+
+    /// The launcher's number for icon `index`'s program.
+    pub fn program(&self, index: usize) -> u64 {
+        APPS.get(index).map_or(0, |app| app.program)
+    }
+
+    /// Whether icon `index`'s program has a window open.
+    pub fn is_running(&self, index: usize) -> bool {
+        self.icons.get(index).is_some_and(|icon| icon.running)
+    }
+
     pub fn title(&self, index: usize) -> &'static str {
         APPS.get(index).map_or("", |app| app.title)
     }

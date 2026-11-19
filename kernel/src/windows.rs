@@ -152,6 +152,29 @@ pub fn title_of_owner(owner: usize) -> Option<alloc::string::String> {
     Some(title(index)).filter(|title| !title.is_empty())
 }
 
+/// Ask every window titled `title` (8 bytes, as stored) whose program is
+/// still running to close. How many were asked.
+pub fn close_titled(title: u64) -> usize {
+    let title = title.to_le_bytes();
+    let matching: Vec<(usize, usize)> = without_interrupts(|| {
+        TABLE
+            .lock()
+            .iter()
+            .enumerate()
+            .filter(|(_, window)| window.title == title && !window.docked)
+            .map(|(index, window)| (index, window.owner))
+            .collect()
+    });
+    let mut asked = 0;
+    for (index, owner) in matching {
+        if task::state_of(owner) != Some(State::Finished) {
+            push(index, window::CLOSE, [0; 4]);
+            asked += 1;
+        }
+    }
+    asked
+}
+
 /// Whether a window is a popover: no title bar, under the menu bar.
 pub fn popover(index: usize) -> bool {
     without_interrupts(|| TABLE.lock().get(index).is_some_and(|window| window.popover))

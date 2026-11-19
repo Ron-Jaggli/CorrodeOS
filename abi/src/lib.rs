@@ -268,6 +268,13 @@ pub mod window {
     pub const HISTORY: u64 = 74;
     /// To a popover: the pointer is over it, at x, y from its corner.
     pub const HOVER: u64 = 75;
+    /// Ask what was last right-clicked: the kind (0 the desktop, 1 a dock
+    /// icon), the launcher's number for its program, whether it is
+    /// running, and its window title (8 bytes).
+    pub const CONTEXT: u64 = 76;
+    /// Close every window titled word 0 (8 bytes): Quit, from the dock.
+    /// Answers how many were asked to close.
+    pub const QUIT: u64 = 77;
 
     /// Most a window may be, either way.
     pub const MAX_WIDTH: u32 = 1920;

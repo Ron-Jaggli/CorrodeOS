@@ -17,6 +17,7 @@ mod device;
 mod dock;
 mod rtc;
 mod banner;
+mod context;
 mod notify;
 mod spotlight;
 mod switcher;
@@ -2088,6 +2089,25 @@ extern "C" fn window_server() {
                 ipc::Message {
                     label: window::NOTIFY,
                     words: [0; 4],
+                },
+                None,
+            );
+            continue;
+        }
+        // The menu program asking what it was opened for.
+        if received.message.label == window::CONTEXT || received.message.label == window::QUIT {
+            let answer = if received.message.label == window::CONTEXT {
+                context::get()
+            } else {
+                let asked = windows::close_titled(words[0]);
+                println!("desktop    : quit asked {} window(s) to close", asked);
+                [asked as u64, 0, 0, 0]
+            };
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: received.message.label,
+                    words: answer,
                 },
                 None,
             );

@@ -853,3 +853,31 @@ Choices made without asking are marked **Choice:**.
   (22 checks each); input-test is 170 / 0 default, 177 / 0 virtio.
 - Screenshots: `build/progress-35-menu.png`,
   `build/progress-35-ribbons.png`.
+
+## 37. Dock icon menus
+
+- Right-click a dock icon: the menu program opens above it, centred on
+  the icon, with:
+  - the app's name in bold (not pickable);
+  - New Window;
+  - Quit <app>, only if it is running.
+- How the menu knows what it is for: the desk records what was
+  right-clicked in `kernel/src/context.rs`: the kind (desktop or dock),
+  the launcher program, whether it runs, and the title. The menu asks
+  with the new `window::CONTEXT` (76) / `corrode_ui::context()` and
+  builds its items at run time (a `Vec<Item>` now, not a const list).
+- Quit: the new `window::QUIT` (77) / `corrode_ui::quit(title)`. The
+  window server sends CLOSE to every live, undocked window with that
+  title (`windows::close_titled`) and answers how many.
+- The dock's hover label is taken down when a context menu opens and
+  stays down while one is open. Before this fix it sat over the menu's
+  bottom item.
+- New dock accessors: `at`, `program`, `is_running`.
+- New `./corrode dock-menu-test`: a terminal from the dock and one from
+  the menu bar button, then right-click the Terminal icon
+  (`build/dock-menu.png`) and pick Quit Terminal; "quit asked 2
+  window(s)". Full suite PASSes on both GPUs (23 checks each);
+  input-test is 170 / 0 default, 177 / 0 virtio.
+- Known gap: no "Show All Windows" or list of open windows in the menu,
+  as macOS has.
+- Screenshot: `build/progress-36-dock-menu.png`.

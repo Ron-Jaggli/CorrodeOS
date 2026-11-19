@@ -704,6 +704,8 @@ pub struct Desk {
     unsnap: bool,
     /// Where the desktop was last right-clicked: where its menu opens.
     menu_at: (i32, i32),
+    /// The menu goes above `menu_at`, centred on it: a dock icon's menu.
+    menu_above: bool,
     /// Where a popover was last told the pointer is, so it is told once.
     hovered_at: Option<(usize, i32, i32)>,
     /// Windows placed so far, for staggering the next one.
@@ -818,6 +820,7 @@ impl Desk {
             snap: None,
             unsnap: false,
             menu_at: (0, 0),
+            menu_above: false,
             hovered_at: None,
             placed: 0,
             closed: Vec::new(),
@@ -1165,9 +1168,14 @@ impl Desk {
         let at = if docked || cover {
             (0, 0)
         } else if popover && crate::windows::menu(window) {
-            // A context menu: its corner at the pointer, kept on screen.
+            // A context menu: its corner at the pointer, or above a dock
+            // icon and centred on it; kept on screen.
             let screen = scene.screen();
-            let (x, y) = self.menu_at;
+            let (x, y) = if self.menu_above {
+                (self.menu_at.0 - width as i32 / 2, self.menu_at.1 - height as i32)
+            } else {
+                self.menu_at
+            };
             (
                 x.min(screen.width as i32 - width as i32 - 4).max(4),
                 y.min(screen.height as i32 - height as i32 - 4).max(4),
@@ -1182,6 +1190,12 @@ impl Desk {
             (120 + 40 * step, 90 + 36 * step)
         };
         let radius = if docked || cover { 0 } else { theme.radius as u16 };
+        // A context menu takes down the dock's label, which could be over it.
+        if popover && crate::windows::menu(window) {
+            if let Some(dock) = &mut self.dock {
+                dock.hover(scene, None, now);
+            }
+        }
         // A popover hangs where banners slide in: it sends any away, as
         // opening Notification Center does on macOS.
         if popover {
@@ -1513,8 +1527,13 @@ impl Desk {
             }
         }
         // The right button on the bare desktop: its menu, at the pointer.
+        if pressed & 2 != 0 && self.covered().is_none() && self.dock_menu(scene) {
+            return;
+        }
         if pressed & 2 != 0 && self.covered().is_none() && self.on_desktop(scene) {
             self.menu_at = self.at;
+            self.menu_above = false;
+            crate::context::set([crate::context::DESKTOP, 0, 0, 0]);
             println!("input      : right click on the desktop at ({}, {})", self.at.0, self.at.1);
             launch(launcher::MENU);
             return;
@@ -2447,6 +2466,40 @@ impl Desk {
         core::mem::take(&mut self.closed)
     }
 
+    /// A right click on a dock icon: its menu, above it. False if the
+    /// pointer is not on one.
+    fn dock_menu<const N: usize>(&mut self, scene: &Scene<N>) -> bool {
+        let pointer = self.pointer.unwrap_or([LayerId::NONE; 2]);
+        let top = scene
+            .layers_at(self.at.0, self.at.1)
+            .find(|id| !pointer.contains(id));
+        let Some((dock, icon)) = self
+            .dock
+            .as_ref()
+            .and_then(|dock| top.and_then(|top| dock.icon(top)).map(|icon| (dock, icon)))
+        else {
+            return false;
+        };
+        let Some((x, y)) = dock.at(icon) else {
+            return false;
+        };
+        let mut title = [0u8; 8];
+        for (slot, byte) in title.iter_mut().zip(dock.title(icon).bytes()) {
+            *slot = byte;
+        }
+        crate::context::set([
+            crate::context::DOCK,
+            dock.program(icon),
+            dock.is_running(icon) as u64,
+            u64::from_le_bytes(title),
+        ]);
+        self.menu_at = (x + dock.size() as i32 / 2, y - 10);
+        self.menu_above = true;
+        println!("input      : right click on {} in the dock", dock.title(icon));
+        launch(launcher::MENU);
+        true
+    }
+
     /// Whether the pointer is on the bare desktop: no window under it (the
     /// wallpaper is a layer too, so "nothing" is not the test), nor the
     /// dock, nor a notification.
@@ -2495,7 +2548,13 @@ impl Desk {
         // The dock is out of sight under a cover; whatever the pointer is
         // "over" there is the cover. (The top-layer check below sees that
         // too, but a cover that is still fading in may not be on top yet.)
-        if self.covered().is_some() {
+        // Nor while a context menu is up: its label would sit on the menu
+        // of the very icon it names.
+        let menu_open = self
+            .windows
+            .iter()
+            .any(|managed| managed.popover && crate::windows::menu(managed.window));
+        if self.covered().is_some() || menu_open {
             if let Some(dock) = &mut self.dock {
                 dock.hover(scene, None, now);
             }

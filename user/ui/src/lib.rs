@@ -344,6 +344,27 @@ pub fn notify(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// What the desktop's menu was opened for: the kind (0 the desktop, 1 a
+/// dock icon), the program, whether it runs, and its title.
+pub fn context() -> [u64; 4] {
+    corrode_rt::call(app::WINDOWS, Message::new(window::CONTEXT, [0; 4]), None)
+        .map_or([0; 4], |answer| answer.message.words)
+}
+
+/// Ask every window titled `title` to close. How many were asked.
+pub fn quit(title: &str) -> u64 {
+    let mut word = [0u8; 8];
+    for (slot, byte) in word.iter_mut().zip(title.bytes()) {
+        *slot = byte;
+    }
+    corrode_rt::call(
+        app::WINDOWS,
+        Message::new(window::QUIT, [u64::from_le_bytes(word), 0, 0, 0]),
+        None,
+    )
+    .map_or(0, |answer| answer.message.words[0])
+}
+
 /// A notification from the last few.
 pub struct Note {
     pub from: alloc::string::String,

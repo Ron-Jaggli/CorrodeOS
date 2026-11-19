@@ -1,5 +1,6 @@
 //! The desktop's right-click menu: a glass list at the pointer, as
-//! macOS's desktop menu and Plasma's are.
+//! macOS's desktop menu and Plasma's are. Opened from a dock icon, it is
+//! that app's menu instead: its name, New Window, and Quit if it runs.
 //!
 //! The item under the pointer is lit in the accent; clicking it, or
 //! Return on the one picked with the arrows, does it and closes the menu.
@@ -13,7 +14,10 @@ extern crate alloc;
 use corrode_rt::abi::{app, launcher, window as flags};
 use corrode_rt::{println, Message};
 use corrode_ui::theme::Wallpaper;
-use corrode_ui::{line_height, rgb, Event, Rgb, Style, Theme, Window, CLEAR};
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use corrode_ui::{line_height, rgb, Event, Rgb, Style, Theme, Weight, Window, CLEAR};
 
 corrode_rt::entry!(main);
 
@@ -22,78 +26,111 @@ const PAD: i32 = 6;
 const ROW: i32 = 26;
 const RULE: i32 = 9;
 const TEXT: Style = Style::px(13);
+const HEADER: Style = Style::px(13).weight(Weight::Bold);
 
 const KEY_ESCAPE: u8 = 0x01;
 const KEY_ENTER: u8 = 0x1c;
 const KEY_UP: u8 = 0x80 | 0x48;
 const KEY_DOWN: u8 = 0x80 | 0x50;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Item {
     Start(&'static str, u64),
     Wallpaper,
     Appearance,
     Rule,
+    /// A dock icon's menu: its app's name, not to be picked.
+    Header(String),
+    /// Close every window of the app titled so.
+    Quit(String),
 }
 
-const ITEMS: [Item; 9] = [
-    Item::Start("New Terminal", launcher::TERMINAL),
-    Item::Start("Open Files", launcher::FILES),
-    Item::Rule,
-    Item::Wallpaper,
-    Item::Appearance,
-    Item::Rule,
-    Item::Start("Settings...", launcher::SETTINGS),
-    Item::Start("Lock Screen", launcher::LOCK),
-    Item::Start("About CorrodeOS", launcher::ABOUT),
-];
+impl Item {
+    fn pickable(&self) -> bool {
+        !matches!(self, Item::Rule | Item::Header(_))
+    }
 
-fn height() -> u32 {
-    let rows: i32 = ITEMS
-        .iter()
-        .map(|item| if matches!(item, Item::Rule) { RULE } else { ROW })
-        .sum();
-    (2 * PAD + rows) as u32
+    fn height(&self) -> i32 {
+        if matches!(self, Item::Rule) {
+            RULE
+        } else {
+            ROW
+        }
+    }
+}
+
+/// The desktop's items, or a dock icon's, from what the desktop says was
+/// right-clicked.
+fn items() -> Vec<Item> {
+    let [kind, program, running, title] = corrode_ui::context();
+    if kind == 1 {
+        let name: String = title
+            .to_le_bytes()
+            .iter()
+            .take_while(|byte| **byte != 0)
+            .map(|byte| *byte as char)
+            .collect();
+        let mut items = alloc::vec![Item::Header(name.clone()), Item::Start("New Window", program)];
+        if running != 0 {
+            items.push(Item::Rule);
+            items.push(Item::Quit(name));
+        }
+        return items;
+    }
+    alloc::vec![
+        Item::Start("New Terminal", launcher::TERMINAL),
+        Item::Start("Open Files", launcher::FILES),
+        Item::Rule,
+        Item::Wallpaper,
+        Item::Appearance,
+        Item::Rule,
+        Item::Start("Settings...", launcher::SETTINGS),
+        Item::Start("Lock Screen", launcher::LOCK),
+        Item::Start("About CorrodeOS", launcher::ABOUT),
+    ]
+}
+
+fn height(items: &[Item]) -> u32 {
+    (2 * PAD + items.iter().map(Item::height).sum::<i32>()) as u32
 }
 
 /// Where item `index` starts, down from the top.
-fn top_of(index: usize) -> i32 {
-    PAD + ITEMS[..index]
-        .iter()
-        .map(|item| if matches!(item, Item::Rule) { RULE } else { ROW })
-        .sum::<i32>()
+fn top_of(items: &[Item], index: usize) -> i32 {
+    PAD + items[..index].iter().map(Item::height).sum::<i32>()
 }
 
 /// The item at `y`, if it is one that can be picked.
-fn item_at(x: i32, y: i32) -> Option<usize> {
+fn item_at(items: &[Item], x: i32, y: i32) -> Option<usize> {
     if x < 0 || x >= WIDTH as i32 {
         return None;
     }
-    (0..ITEMS.len()).find(|index| {
-        let top = top_of(*index);
-        !matches!(ITEMS[*index], Item::Rule) && y >= top && y < top + ROW
+    (0..items.len()).find(|index| {
+        let top = top_of(items, *index);
+        items[*index].pickable() && y >= top && y < top + ROW
     })
 }
 
-fn label(item: Item, theme: &Theme) -> &'static str {
-    match item {
+fn label(item: &Item, theme: &Theme) -> String {
+    String::from(match item {
         Item::Start(label, _) => label,
         Item::Wallpaper => "Next Wallpaper",
         Item::Appearance if theme.dark => "Light Appearance",
         Item::Appearance => "Dark Appearance",
         Item::Rule => "",
-    }
+        Item::Header(name) => name,
+        Item::Quit(name) => return alloc::format!("Quit {name}"),
+    })
 }
 
-fn draw(window: &mut Window, theme: &Theme, lit: Option<usize>) {
+fn draw(window: &mut Window, items: &[Item], theme: &Theme, lit: Option<usize>) {
     let (text, rule): (Rgb, Rgb) = if theme.dark {
         (rgb(theme.text()), 0xc0ff_ffff)
     } else {
         (rgb(theme.text()), 0xc000_0000)
     };
     window.fill(0, 0, window.width, window.height, CLEAR);
-    for (index, item) in ITEMS.iter().enumerate() {
-        let top = top_of(index);
+    for (index, item) in items.iter().enumerate() {
+        let top = top_of(items, index);
         if matches!(item, Item::Rule) {
             window.fill(PAD + 8, top + RULE / 2, WIDTH - 2 * (PAD as u32 + 8), 1, rule);
             continue;
@@ -104,21 +141,22 @@ fn draw(window: &mut Window, theme: &Theme, lit: Option<usize>) {
         } else {
             text
         };
-        let y = top + (ROW - line_height(TEXT) as i32) / 2;
-        window.text(PAD + 10, y, label(*item, theme), TEXT, color);
+        let style = if matches!(item, Item::Header(_)) { HEADER } else { TEXT };
+        let y = top + (ROW - line_height(style) as i32) / 2;
+        window.text(PAD + 10, y, &label(item, theme), style, color);
     }
     window.commit_all();
 }
 
 /// Do item `index`, then go.
-fn pick(index: usize, theme: &Theme) -> ! {
-    let item = ITEMS[index];
+fn pick(items: &[Item], index: usize, theme: &Theme) -> ! {
+    let item = &items[index];
     println!("picked {}", label(item, theme));
     match item {
         Item::Start(_, program) => {
             let _ = corrode_rt::call(
                 app::LAUNCHER,
-                Message::new(launcher::LAUNCH, [program, 0, 0, 0]),
+                Message::new(launcher::LAUNCH, [*program, 0, 0, 0]),
                 None,
             );
         }
@@ -137,19 +175,22 @@ fn pick(index: usize, theme: &Theme) -> ! {
                 ..*theme
             });
         }
-        Item::Rule => {}
+        Item::Quit(name) => {
+            println!("asked {} window(s) to close", corrode_ui::quit(name));
+        }
+        Item::Rule | Item::Header(_) => {}
     }
     corrode_rt::exit();
 }
 
 /// The next item that can be picked from `from`, up or down, round the
 /// ends.
-fn next(from: Option<usize>, down: bool) -> usize {
-    let count = ITEMS.len();
+fn next(items: &[Item], from: Option<usize>, down: bool) -> usize {
+    let count = items.len();
     let mut at = from.unwrap_or(if down { count - 1 } else { 0 });
     loop {
         at = if down { (at + 1) % count } else { (at + count - 1) % count };
-        if !matches!(ITEMS[at], Item::Rule) {
+        if items[at].pickable() {
             return at;
         }
     }
@@ -161,9 +202,10 @@ fn main() {
         println!("no memory for a heap");
         corrode_rt::exit();
     }
+    let items = items();
     let mut window = match Window::open_titled(
         WIDTH,
-        height(),
+        height(&items),
         flags::POPOVER | flags::MENU | flags::TRANSLUCENT,
         "Menu",
     ) {
@@ -175,20 +217,20 @@ fn main() {
     };
     let mut theme = Theme::default();
     let mut lit = None;
-    draw(&mut window, &theme, lit);
+    draw(&mut window, &items, &theme, lit);
     println!("open");
 
     loop {
         match window.wait(u64::MAX) {
             Event::Theme(now) => {
                 theme = now;
-                draw(&mut window, &theme, lit);
+                draw(&mut window, &items, &theme, lit);
             }
             Event::Hover { x, y } => {
-                let now = item_at(x, y);
+                let now = item_at(&items, x, y);
                 if now != lit {
                     lit = now;
-                    draw(&mut window, &theme, lit);
+                    draw(&mut window, &items, &theme, lit);
                 }
             }
             Event::Key {
@@ -196,8 +238,8 @@ fn main() {
                 pressed: true,
                 ..
             } => {
-                lit = Some(next(lit, key == KEY_DOWN));
-                draw(&mut window, &theme, lit);
+                lit = Some(next(&items, lit, key == KEY_DOWN));
+                draw(&mut window, &items, &theme, lit);
             }
             Event::Key {
                 key: KEY_ENTER,
@@ -205,7 +247,7 @@ fn main() {
                 ..
             } => {
                 if let Some(index) = lit {
-                    pick(index, &theme);
+                    pick(&items, index, &theme);
                 }
             }
             Event::Key {
@@ -214,8 +256,8 @@ fn main() {
                 ..
             } => corrode_rt::exit(),
             Event::Button { x, y, buttons } if buttons & 1 != 0 => {
-                if let Some(index) = item_at(x, y) {
-                    pick(index, &theme);
+                if let Some(index) = item_at(&items, x, y) {
+                    pick(&items, index, &theme);
                 }
             }
             Event::Close => {

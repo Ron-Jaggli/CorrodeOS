@@ -153,7 +153,8 @@ the tiles and colours, Return or Space picks, and Escape closes. Programs can ma
 Right-click the desktop for its menu: New Terminal, Open Files, Next
 Wallpaper, Light/Dark Appearance, Settings, Lock Screen and About. The item
 under the pointer lights up in the accent; the arrow keys and Return work
-too.
+too. Right-click a dock icon for that app's menu: New Window, and Quit
+(which closes all its windows) when it is running.
 
 **Alt+L** (or the Lock tile in Control Center) locks the screen: the whole
 desktop under glass, the date and time large, and Return or the unlock
