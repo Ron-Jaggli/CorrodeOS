@@ -540,6 +540,20 @@ impl Shortcut {
     }
 }
 
+/// How tall a window's glass frame is. Under an opaque body the glass
+/// would be painted over, and frosting is most of a frame's cost, so the
+/// frame is only the title bar and one corner's radius more: enough to
+/// reach under the body's square top edge, whose own rounding is only at
+/// the bottom. A translucent body, or a window without a bar, shows the
+/// glass through, so has all of it.
+fn frame_height(body: u32, bar: u32, translucent: bool, radius: u32) -> u32 {
+    if translucent || bar == 0 {
+        body + bar
+    } else {
+        bar + radius.min(body)
+    }
+}
+
 /// A pane of the desktop's material at `rect`: glass, or a solid colour
 /// where the theme has glass off.
 pub(crate) fn pane(rect: Rect, radius: u16, theme: &Theme) -> Layer {
@@ -1293,7 +1307,7 @@ impl Desk {
                 scene.add(Layer::shadow(0, 0, width, height + bar, radius, SHADOW_BLUR))
             })
             .flatten();
-        let frame_height = height + if chrome { BAR } else { 0 };
+        let frame_height = frame_height(height, if chrome { BAR } else { 0 }, translucent, radius as u32);
         let frame = scene.add(pane(Rect::new(0, 0, width, frame_height), radius, &theme));
         let mut lights = [None; 3];
         if chrome && self.stencils {
@@ -2493,7 +2507,16 @@ impl Desk {
         let blur = SHADOW_BLUR as u32;
         let sizes = [
             (managed.shadow, width + 2 * blur, height + BAR + 2 * blur),
-            (managed.frame, width, height + managed.bar()),
+            (
+                managed.frame,
+                width,
+                frame_height(
+                    height,
+                    managed.bar(),
+                    crate::windows::translucent(managed.window),
+                    self.theme.radius as u32,
+                ),
+            ),
             (Some(managed.body), width, height),
         ];
         for (id, w, h) in sizes {
@@ -2538,9 +2561,20 @@ impl Desk {
             let managed = &mut self.windows[index];
             crate::windows::push(managed.window, window::THEME, theme.to_words());
             let radius = if managed.docked { 0 } else { theme.radius as u16 };
-            let (width, height) = (managed.width, managed.height + managed.bar());
+            let width = managed.width;
+            let height = frame_height(
+                managed.height,
+                managed.bar(),
+                crate::windows::translucent(managed.window),
+                radius as u32,
+            );
             if let Some(id) = managed.frame {
                 let fresh = pane(Rect::new(0, 0, width, height), radius, &theme);
+                if let Some(layer) = scene.layer_mut(id) {
+                    layer.height = Animation::rest(Fx::from_int(height as i32));
+                }
+                // The old frame may have been taller: all of it is stale.
+                scene.damage(id, Rect::new(0, 0, width, managed.height + managed.bar()));
                 if let Some(layer) = scene.layer_mut(id) {
                     layer.content = fresh.content;
                     layer.color = fresh.color;

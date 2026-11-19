@@ -563,6 +563,28 @@ menu-test: iso
 	@test -s build/menu.ppm && pnmtopng build/menu.ppm > build/menu.png 2>/dev/null && rm -f build/menu.ppm && echo "wrote build/menu.png" || true
 	@test -s build/menu-after.ppm && pnmtopng build/menu-after.ppm > build/menu-after.png 2>/dev/null && rm -f build/menu-after.ppm && echo "wrote build/menu-after.png" || true
 
+# Frame timing: drag a terminal around for a few seconds with glass
+# Regular, then Clear, then Off (Control Center's Glass tile from the
+# keyboard). build/serial.log has a "paint" line every two seconds of
+# drawing; the "Glass turned" lines mark where each run starts.
+DRAG_LOOP = for i in $$(seq 30); do echo "mouse_move 12 6"; sleep 0.04; done; \
+	   for i in $$(seq 30); do echo "mouse_move -12 -6"; sleep 0.04; done
+perf-test: iso
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 2; \
+	   for step in 1 2 3; do echo "mouse_move -31 -218"; sleep 0.2; done; echo "mouse_move -1 -1"; sleep 0.5; \
+	   for glass in regular clear off; do \
+	     sleep 2.5; echo "mouse_button 1"; sleep 0.2; $(DRAG_LOOP); $(DRAG_LOOP); echo "mouse_button 0"; sleep 2.5; \
+	     for step in 1 2 3 4; do echo "mouse_move 170 -22"; sleep 0.2; done; sleep 0.3; \
+	     echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.2; \
+	     for key in right right ret esc; do echo "sendkey $$key"; sleep 0.4; done; sleep 0.8; \
+	     for step in 1 2 3 4; do echo "mouse_move -170 22"; sleep 0.2; done; \
+	   done; echo quit ) \
+	  | timeout --foreground 150 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^paint |Glass turned" build/serial.log || echo "perf-test: no frames"
+
 # Settings, then a terminal that types "quit Settings": the terminal holds
 # no shell endpoint, and the window server's refuses the call, so Settings
 # stays (build/shell.png).

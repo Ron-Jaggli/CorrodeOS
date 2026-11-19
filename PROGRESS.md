@@ -41,6 +41,9 @@ The short version, for reading first. The numbered log below has the detail.
     risks its disks or firmware settings. Too close to "don't touch my
     boot setup" to do unattended (32).
   - The lock screen has no password, as there are no accounts (28).
+- **Speed:** frame timing is in (`./corrode perf-test`). Frosted glass
+  is most of a frame's cost; dragging a window now takes about 14 ms a
+  frame, down from 33 (47).
 - **Security:** calls that act on other apps need the shell capability,
   held only by Settings, Control Center and the menu (46).
 - **Known rough edges:** listed under "Known gap" in each section. The
@@ -1098,3 +1101,39 @@ The short version, for reading first. The numbered log below has the detail.
   (`build/shell.png`). Full suite PASSes on both GPUs (32 checks each);
   input-test is 170 / 0 default, 177 / 0 virtio.
 - Screenshot: `build/progress-46-shell.png`.
+
+## 47. Frame timing, and half the glass cost
+
+- New `kernel/src/frames.rs`. The `Screen` wrapper times each
+  `submit` (drawing the command list) and `present` (to the screen),
+  and counts glass commands and their pixels. About every 2 s of
+  drawing it prints a `paint      : N frames in ...` line.
+- New `./corrode perf-test`: drag a terminal for ~5 s each with glass
+  Regular, Clear and Off (switched from Control Center with the
+  keyboard). It reports numbers and does not PASS or FAIL. Times in a VM
+  are too noisy for a limit.
+- What it showed, dragging (KVM, 1280x800, software renderer). Each cell
+  is draw ms per frame, default / virtio:
+
+  | Glass   | before    | after     | glass pixels a frame |
+  |---------|-----------|-----------|----------------------|
+  | Regular | 33 / 32   | 14.5 / 15 | 235k → ~37k          |
+  | Clear   | 7.0 / 7.2 | 3.4 / 3.3 | 220k → 24k           |
+  | Off     | 2.1 / 2.0 | 2.1 / 2.0 | 0                    |
+
+- The fix: every window's glass frame was as big as the whole window,
+  but an opaque body paints over all of it except the title bar. The
+  frame is now the bar plus one corner radius (`frame_height`), enough
+  to sit under the body's square top edge. The body rounds only its
+  bottom corners. Translucent windows, popovers and the panel keep
+  full-size glass, since it shows through them.
+- Looks: compared pixel by pixel with the screenshot from 40, only 16
+  pixels changed, all on the anti-aliased edge of the bottom corners
+  (by at most 21/255), where a sliver of glass used to show through.
+- Known: Regular glass still costs far more per pixel than its area
+  suggests (37k pixels ≈ 12 ms). The blur works on a backdrop larger
+  than the pane, and in two passes, every frame. Caching a pane's
+  blurred backdrop until what is behind it changes is the next step.
+- Full suite PASSes on both GPUs (32 checks each); input-test is
+  170 / 0 default, 177 / 0 virtio.
+- Screenshot: `build/progress-47-title-after.png`.

@@ -23,6 +23,7 @@ mod spotlight;
 mod switcher;
 #[cfg(feature = "efi-log")]
 mod efi_log;
+mod frames;
 mod input;
 mod ipc;
 mod irq;
@@ -3550,10 +3551,13 @@ impl Renderer for Screen {
     }
 
     fn submit(&mut self, list: &corrode_render::CommandList<'_>) -> Result<(), ScreenError> {
-        match self {
+        let start = time::now_ns();
+        let result = match self {
             Screen::Software(renderer) => renderer.submit(list).map_err(ScreenError::Software),
             Screen::Remote(renderer) => renderer.submit(list).map_err(ScreenError::Remote),
-        }
+        };
+        frames::submitted(list, time::now_ns() - start);
+        result
     }
 
     fn upload_mask(&mut self, at: Rect, coverage: &[u8]) -> Result<(), ScreenError> {
@@ -3568,10 +3572,13 @@ impl Renderer for Screen {
     }
 
     fn present(&mut self, damage: &corrode_render::damage::Damage) -> Result<(), ScreenError> {
-        match self {
+        let start = time::now_ns();
+        let result = match self {
             Screen::Software(renderer) => renderer.present(damage).map_err(ScreenError::Software),
             Screen::Remote(renderer) => renderer.present(damage).map_err(ScreenError::Remote),
-        }
+        };
+        frames::presented(time::now_ns() - start);
+        result
     }
 }
 
