@@ -16,9 +16,9 @@ extern crate alloc;
 
 use alloc::format;
 
-use corrode_rt::abi::{app, launcher};
+use corrode_rt::abi::{app, launcher, window as flags};
 use corrode_rt::{println, Message};
-use corrode_ui::{line_height, width_of, Event, Rgb, Style, Weight, Window};
+use corrode_ui::{line_height, width_of, Event, Rgb, Style, Weight, Window, CLEAR};
 
 corrode_rt::entry!(main);
 
@@ -26,17 +26,24 @@ const HEIGHT: u32 = 32;
 const NAME: Style = Style::px(16).weight(Weight::Bold);
 const LABEL: Style = Style::px(14);
 
-const BACKGROUND: Rgb = 0x001c_1f26;
-const NAME_COLOR: Rgb = 0x00e0_7a3c;
-const TEXT: Rgb = 0x00e8_e4dc;
-const BUTTON: Rgb = 0x003a_3d45;
-const BUTTON_PRESSED: Rgb = 0x00b7_410e;
+/// The panel is drawn over the desktop's glass: where it draws nothing,
+/// the glass shows.
+const BACKGROUND: Rgb = CLEAR;
+const NAME_COLOR: Rgb = 0x00f0_8a4c;
+const TEXT: Rgb = 0x00f4_f1ec;
+/// A pale wash over the glass, mostly see-through: the top byte is how
+/// transparent.
+const BUTTON: Rgb = 0xd8ff_ffff;
+const BUTTON_PRESSED: Rgb = 0x60e0_6a2c;
 
 /// The Terminal button.
 const BUTTON_AT: (i32, i32, u32, u32) = (132, 5, 92, 22);
 
 fn button(window: &mut Window, pressed: bool) {
     let (x, y, width, height) = BUTTON_AT;
+    // Cleared first: the wash is see-through, so it would otherwise
+    // pile up on what was there.
+    window.fill(x, y, width, height, BACKGROUND);
     window.fill(
         x,
         y,
@@ -82,7 +89,7 @@ fn main() {
         println!("no memory for a heap");
         corrode_rt::exit();
     }
-    let mut window = match Window::open(0, HEIGHT, true) {
+    let mut window = match Window::open_with(0, HEIGHT, flags::DOCKED | flags::TRANSLUCENT) {
         Ok(window) => window,
         Err(error) => {
             println!("no window: {:?}", error);

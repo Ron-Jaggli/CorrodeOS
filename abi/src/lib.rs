@@ -201,7 +201,12 @@ pub mod window {
     /// carries the window's capability and says its size in words 0 and 1.
     pub const OPEN: u64 = 60;
     pub const OPENED: u64 = 61;
+    /// Flags, in word 2 of `OPEN`.
     pub const DOCKED: u64 = 1;
+    /// The top byte of each pixel says how transparent it is: 0 opaque,
+    /// 255 not there. A translucent window is drawn over glass where the
+    /// desktop has it, so a panel can be a pane rather than a slab.
+    pub const TRANSLUCENT: u64 = 2;
 
     /// A key, while this window has the keyboard. Words as `ps2::LABEL_KEY`.
     pub const KEY: u64 = 62;

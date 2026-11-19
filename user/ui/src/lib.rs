@@ -24,12 +24,27 @@ const fn div255(x: u32) -> u32 {
     (t + (t >> 8)) >> 8
 }
 
+/// A pixel that is not there, in a translucent window: whatever is behind
+/// the window shows through it.
+pub const CLEAR: Rgb = 0xff00_0000;
+
 /// `src` over `dst` at `alpha` out of 255, channel by channel.
+///
+/// The top byte of a translucent window's pixel is how transparent it is,
+/// so `dst` may be partly there. Its colour then counts for only as much
+/// of it as there is, or text drawn on a clear pixel would come out with a
+/// dark fringe from the black that is not there.
 fn blend(src: Rgb, dst: Rgb, alpha: u32) -> Rgb {
-    let mut out = 0;
+    let there = 255 - (dst >> 24);
+    let below = div255(there * (255 - alpha));
+    let opacity = alpha + below;
+    if opacity == 0 {
+        return CLEAR;
+    }
+    let mut out = (255 - opacity) << 24;
     for shift in [0, 8, 16] {
         let (s, d) = ((src >> shift) & 0xff, (dst >> shift) & 0xff);
-        out |= div255(s * alpha + d * (255 - alpha)) << shift;
+        out |= ((s * alpha + d * below + opacity / 2) / opacity).min(255) << shift;
     }
     out
 }
@@ -68,6 +83,12 @@ impl Window {
     /// `docked` asks for a panel along the top of the screen instead, as wide
     /// as the screen whatever `width` says.
     pub fn open(width: u32, height: u32, docked: bool) -> Result<Window> {
+        Self::open_with(width, height, if docked { window::DOCKED } else { 0 })
+    }
+
+    /// As [`Window::open`], with the flags `window::OPEN` takes: docked,
+    /// translucent.
+    pub fn open_with(width: u32, height: u32, flags: u64) -> Result<Window> {
         let answer = corrode_rt::call(
             app::WINDOWS,
             Message::new(
@@ -75,7 +96,7 @@ impl Window {
                 [
                     width as u64,
                     height as u64,
-                    if docked { window::DOCKED } else { 0 },
+                    flags,
                     0,
                 ],
             ),

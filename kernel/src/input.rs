@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 
 use corrode_abi::{ps2, window};
 use corrode_render::anim::{Animation, Ease, Fx};
+use corrode_render::glass::Glass;
 use corrode_render::scene::{Layer, LayerId, Scene};
 use corrode_render::{Color, Rect, Renderer};
 use corrode_text::{Coverage, Style};
@@ -242,6 +243,16 @@ const BAR_IDLE: Color = Color::rgb(0x3a, 0x3d, 0x45);
 const CLOSE_SIZE: u32 = 12;
 const CLOSE_COLOR: Color = Color::rgb(0xf2, 0xee, 0xe8);
 
+/// The glass the desktop's own panes are made of.
+const PANE: Glass = Glass {
+    radius: 0,
+    ..Glass::regular(true)
+};
+/// The dock: a pane floating above the bottom edge.
+const DOCK_WIDTH: u32 = 360;
+const DOCK_HEIGHT: u32 = 64;
+const DOCK_GAP: i32 = 10;
+
 /// The close button's cross, as coverage out of 255: both diagonals, a
 /// pixel and three quarters thick, sampled four by four per pixel.
 fn cross() -> Vec<u8> {
@@ -276,6 +287,8 @@ struct Managed {
     bar: Option<LayerId>,
     /// The close button on the bar.
     close: Option<LayerId>,
+    /// A pane of glass behind the window, for a docked one.
+    pane: Option<LayerId>,
     body: LayerId,
     /// Where the window's top left is -- its bar's, if it has one.
     at: (i32, i32),
@@ -297,7 +310,9 @@ impl Managed {
 
     /// Every layer the window is drawn with, bottom first.
     fn layers(&self) -> impl Iterator<Item = LayerId> {
-        [self.bar, self.close, Some(self.body)].into_iter().flatten()
+        [self.pane, self.bar, self.close, Some(self.body)]
+            .into_iter()
+            .flatten()
     }
 }
 
@@ -308,6 +323,8 @@ pub struct Desk {
     pointer: Option<[LayerId; 2]>,
     /// Whether the close button's cross made it into the atlas.
     cross: bool,
+    /// The dock's pane, along the bottom of the screen.
+    dock: Option<LayerId>,
     at: (i32, i32),
     buttons: u8,
     line: Option<LayerId>,
@@ -353,10 +370,24 @@ impl Desk {
             .upload_mask(CLOSE_SRC, &cross())
             .is_ok();
 
+        let dock = scene.add(Layer::glass(
+            Rect::new(
+                (screen.width as i32 - DOCK_WIDTH as i32) / 2,
+                screen.height as i32 - DOCK_HEIGHT as i32 - DOCK_GAP,
+                DOCK_WIDTH,
+                DOCK_HEIGHT,
+            ),
+            Glass {
+                radius: 22,
+                ..PANE
+            },
+        ));
+
         let line_height = corrode_text::measure("> ", LINE_STYLE).height;
         let mut desk = Self {
             pointer,
             cross,
+            dock,
             at: (screen.width as i32 / 2, screen.height as i32 / 2),
             buttons: 0,
             line: None,
@@ -513,15 +544,20 @@ impl Desk {
         if bar.is_some() {
             managed_body_y += BAR as i32;
         }
-        let Some(body) = scene.add(Layer::surface(
-            at.0,
-            managed_body_y,
-            surface as u32,
-            width,
-            height,
-        )) else {
+        let translucent = crate::windows::translucent(window);
+        // A docked window is a pane of glass with the program's pixels
+        // over it; transparent ones let the glass through.
+        let pane = docked
+            .then(|| scene.add(Layer::glass(Rect::new(at.0, at.1, width, height), PANE)))
+            .flatten();
+        let make = if translucent {
+            Layer::translucent_surface
+        } else {
+            Layer::surface
+        };
+        let Some(body) = scene.add(make(at.0, managed_body_y, surface as u32, width, height)) else {
             println!("desktop    : no room in the scene for another window");
-            for id in [bar, close].into_iter().flatten() {
+            for id in [bar, close, pane].into_iter().flatten() {
                 scene.remove(id);
             }
             return;
@@ -547,6 +583,7 @@ impl Desk {
             surface,
             bar,
             close,
+            pane,
             body,
             at,
             width,
@@ -587,8 +624,13 @@ impl Desk {
         if wanted.is_some() && scene.top() == wanted {
             return;
         }
+        if let Some(dock) = self.dock {
+            scene.raise(dock);
+        }
         for managed in self.windows.iter().filter(|managed| managed.docked) {
-            scene.raise(managed.body);
+            for id in managed.layers() {
+                scene.raise(id);
+            }
         }
         if let Some([below, above]) = self.pointer {
             scene.raise(below);

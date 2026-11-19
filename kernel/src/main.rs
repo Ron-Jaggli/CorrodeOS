@@ -2073,7 +2073,7 @@ extern "C" fn window_server() {
                 windows::open(
                     size(words[0]),
                     size(words[1]),
-                    words[2] == window::DOCKED,
+                    words[2],
                     received.from,
                 )
             })
@@ -3637,6 +3637,14 @@ fn init_software_renderer() -> Option<SoftwareRenderer> {
         None => println!("backbuffer : none -- drawing straight onto the screen"),
     }
 
+    match map_glass_scratch(&info) {
+        Some(scratch) => {
+            println!("glass      : {} KiB to blur in", scratch.len() * 4 / 1024);
+            renderer.attach_glass_scratch(scratch);
+        }
+        None => println!("glass      : no room to blur in -- panes are a plain veil"),
+    }
+
     // Somewhere to keep stencils -- text, for now. Off the kernel heap, and
     // never freed: the renderer holds it for as long as there is a screen.
     let atlas = alloc::vec![0u8; (ATLAS_WIDTH * ATLAS_HEIGHT) as usize];
@@ -3669,7 +3677,25 @@ const BACK_BUFFER_RESERVE: usize = 1024;
 
 /// Map ordinary RAM to compose frames in.
 fn map_back_buffer(info: &SurfaceInfo) -> Option<*mut u8> {
-    let bytes = SoftwareRenderer::back_buffer_len(info);
+    map_ram(BACK_BUFFER_BASE, SoftwareRenderer::back_buffer_len(info))
+}
+
+/// Where glass works: just past the largest back buffer.
+const GLASS_SCRATCH_BASE: u64 = BACK_BUFFER_BASE + BACK_BUFFER_MAX as u64;
+
+/// Map the renderer room for glass to blur in: three screens of pixels, so
+/// a pane as large as the screen still fits, and a line over.
+fn map_glass_scratch(info: &SurfaceInfo) -> Option<&'static mut [u32]> {
+    let pixels = 3 * info.width as usize * info.height as usize + 4096;
+    let base = map_ram(GLASS_SCRATCH_BASE, pixels * 4)?;
+    // SAFETY: `map_ram` mapped `pixels * 4` writable bytes there from frames
+    // fresh off the allocator, overlapping nothing, and the mapping is never
+    // removed. This slice is the only way to them.
+    Some(unsafe { core::slice::from_raw_parts_mut(base.cast::<u32>(), pixels) })
+}
+
+/// Map `bytes` of fresh RAM at `base`, writable, never executable.
+fn map_ram(base: u64, bytes: usize) -> Option<*mut u8> {
     if bytes == 0 || bytes > BACK_BUFFER_MAX {
         return None;
     }
@@ -3687,7 +3713,7 @@ fn map_back_buffer(info: &SurfaceInfo) -> Option<*mut u8> {
         let frame = mm::frame::alloc()?;
         let mapped = mm::paging::with_kernel_mapper(|mapper| {
             mapper.map_4k(
-                BACK_BUFFER_BASE + i * 4096,
+                base + i * 4096,
                 frame.addr(),
                 mm::paging::WRITABLE | mm::paging::NO_EXECUTE | mm::paging::GLOBAL,
             )
@@ -3696,7 +3722,7 @@ fn map_back_buffer(info: &SurfaceInfo) -> Option<*mut u8> {
             return None;
         }
     }
-    Some(BACK_BUFFER_BASE as *mut u8)
+    Some(base as *mut u8)
 }
 
 /// Side of the white corner markers.
