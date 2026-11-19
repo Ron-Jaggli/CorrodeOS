@@ -236,6 +236,8 @@ pub mod launcher {
     pub const LAUNCH: u64 = 70;
     pub const LAUNCHED: u64 = 71;
     pub const TERMINAL: u64 = 1;
+    pub const SETTINGS: u64 = 2;
+    pub const ABOUT: u64 = 3;
 }
 
 /// Rights, as bits: in the low byte of what `SYS_IDENTIFY` reports, and as

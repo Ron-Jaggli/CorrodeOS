@@ -116,3 +116,26 @@ Choices made without asking are marked **Choice:**.
 - Known gap: the shadow has no drop. It is cut out by its own shape, so
   dropping it would leave an unshaded strip under the window.
 - Screenshot: `build/progress-4-chrome.png`.
+
+## 6. The dock
+
+- `kernel/src/dock.rs`: a glass pane centred above the bottom edge with
+  an icon per program the launcher knows: Terminal (`>_`), Settings (a
+  cog), About (`i`). Icons are superellipse tiles (Apple's icon shape)
+  drawn as atlas stencils with a white glyph over them; size from
+  `dock_size`.
+- Clicking an icon asks the launcher through the same endpoint the panel
+  holds, so the dock can start nothing the panel could not. The icon
+  jumps on a bouncy spring while it starts (off with `bounce = off`,
+  `animation_speed = 0`, or the `breeze` and `plain` presets).
+- A dot under an icon while that program has a window open (matched by
+  window title).
+- The launcher now knows program numbers 1 terminal, 2 settings,
+  3 about. Settings and About do not exist yet, so the launcher refuses
+  them cleanly ("would not start Settings (9)"). They are the next items.
+- `./corrode dock-test` starts a terminal from the dock. PASS.
+  `close-test` PASS, boot 170 PASS / 0 FAIL.
+- **Choice:** the painter calls the launcher synchronously, so the desktop
+  pauses for the few milliseconds a program takes to load. Fine in QEMU;
+  worth a queue if it ever shows.
+- Screenshot: `build/progress-5-dock.png`.

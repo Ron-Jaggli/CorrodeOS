@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test
+.PHONY: input-test terminal-test close-test dock-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -251,6 +251,24 @@ input-test: iso
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
 	@grep -E "^(input|ps2|panel|terminal) " build/serial.log || echo "input-test: nothing from the input path"
 	@test -s build/input.ppm && pnmtopng build/input.ppm > build/input.png 2>/dev/null && rm -f build/input.ppm && echo "wrote build/input.png" || true
+
+# Boot, start a terminal from the dock's first icon, then click the second.
+# build/dock.png shows the dock with the terminal's running dot under it.
+dock-test: iso
+	@rm -f build/dock.ppm build/dock.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -56 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
+	   echo "mouse_move 56 0"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 0.3; \
+	   echo "screendump build/dock.ppm"; sleep 2; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^(input|dock|terminal|desktop) " build/serial.log | grep -v PASS || echo "dock-test: nothing from the desktop"
+	@grep -q "dock       : started Terminal" build/serial.log \
+	    && echo "dock-test: the dock started a terminal                    PASS" \
+	    || echo "dock-test: the dock started a terminal                    FAIL"
+	@test -s build/dock.ppm && pnmtopng build/dock.ppm > build/dock.png 2>/dev/null && rm -f build/dock.ppm && echo "wrote build/dock.png" || true
 
 # Boot, open two terminals from the panel's button, close the one on top
 # with its title bar's close button and the other by typing exit. Both

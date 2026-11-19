@@ -267,10 +267,11 @@ const GLYPH_SRC: [Rect; 3] = [
 ];
 const GLYPH_COLOR: Color = Color::rgb(0x4d, 0x1f, 0x10);
 
-/// Title text: slots in the atlas below the typed line, four across.
+/// Title text: slots in the left half of the atlas below the typed line,
+/// two across. The dock keeps its icons in the right half.
 const TITLE_ROW: u32 = ATLAS_ROW + 64;
 const TITLE_SLOT: (u32, u32) = (256, 22);
-const TITLE_SLOTS: usize = 4 * ((512 - TITLE_ROW) / TITLE_SLOT.1) as usize;
+const TITLE_SLOTS: usize = 2 * ((512 - TITLE_ROW) / TITLE_SLOT.1) as usize;
 const TITLE_STYLE: Style = Style::px(14).weight(corrode_text::Weight::Bold);
 
 /// How far a window's shadow spreads, and how far down it falls. The
@@ -280,12 +281,6 @@ const TITLE_STYLE: Style = Style::px(14).weight(corrode_text::Weight::Bold);
 const SHADOW_BLUR: u8 = 26;
 const SHADOW_DROP: i32 = 0;
 
-/// The dock floats this far above the bottom edge, with this much around
-/// its icons.
-const DOCK_GAP: i32 = 10;
-const DOCK_PAD: u32 = 8;
-/// Icons in the dock, for now.
-const DOCK_ICONS: u32 = 4;
 
 /// One of the window buttons' stencils, as coverage out of 255: a disc,
 /// or the glyph drawn over it -- a cross, a bar, a plus -- each sampled
@@ -324,7 +319,7 @@ fn stencil(kind: Option<Button>) -> Vec<u8> {
 
 /// A pane of the desktop's material at `rect`: glass, or a solid colour
 /// where the theme has glass off.
-fn pane(rect: Rect, radius: u16, theme: &Theme) -> Layer {
+pub(crate) fn pane(rect: Rect, radius: u16, theme: &Theme) -> Layer {
     match theme.pane(radius) {
         Some(glass) => Layer::glass(rect, glass),
         None => Layer::solid(rect, theme.surface()),
@@ -348,6 +343,8 @@ struct Managed {
     lights: [Option<(Button, LayerId)>; 3],
     /// The title, its slot in the atlas, and how wide it came out.
     title: Option<(LayerId, usize, u32)>,
+    /// What the title says, for the dock to know what is running.
+    name: String,
     body: LayerId,
 }
 
@@ -460,8 +457,8 @@ pub struct Desk {
     hovering: Option<usize>,
     /// Title slots in the atlas in use, one bit each.
     titles: u64,
-    /// The dock's pane, along the bottom of the screen.
-    dock: Option<LayerId>,
+    /// Along the bottom of the screen.
+    dock: Option<crate::dock::Dock>,
     theme: Theme,
     windows: Vec<Managed>,
     /// Which of `windows` has the keyboard.
@@ -504,26 +501,7 @@ impl Desk {
                 .all(|(button, src)| renderer.upload_mask(src, &stencil(Some(*button))).is_ok());
 
         let theme = crate::look::current();
-        let size = theme.dock_size as u32;
-        let (dock_width, dock_height) = (
-            DOCK_ICONS * (size + DOCK_PAD) + DOCK_PAD,
-            size + 2 * DOCK_PAD,
-        );
-        let dock = theme
-            .dock
-            .then(|| {
-                scene.add(pane(
-                    Rect::new(
-                        (screen.width as i32 - dock_width as i32) / 2,
-                        screen.height as i32 - dock_height as i32 - DOCK_GAP,
-                        dock_width,
-                        dock_height,
-                    ),
-                    (dock_height / 2 - 4) as u16,
-                    &theme,
-                ))
-            })
-            .flatten();
+        let dock = crate::dock::Dock::new(renderer, scene, &theme);
 
         let line_height = corrode_text::measure("> ", LINE_STYLE).height;
         let mut desk = Self {
@@ -693,8 +671,8 @@ impl Desk {
     fn title_src(slot: usize, width: u32) -> Rect {
         let (slot_width, slot_height) = TITLE_SLOT;
         Rect::new(
-            (slot % 4) as i32 * slot_width as i32,
-            TITLE_ROW as i32 + (slot / 4) as i32 * slot_height as i32,
+            (slot % 2) as i32 * slot_width as i32,
+            TITLE_ROW as i32 + (slot / 2) as i32 * slot_height as i32,
             width.min(slot_width),
             slot_height,
         )
@@ -744,10 +722,11 @@ impl Desk {
                     .map(|id| (button, id));
             }
         }
+        let name = crate::windows::title(window);
         let title = if docked {
             None
         } else {
-            self.draw_title(renderer, &crate::windows::title(window))
+            self.draw_title(renderer, &name)
                 .and_then(|(slot, text_width)| {
                     let src = Self::title_src(slot, text_width);
                     scene
@@ -790,6 +769,7 @@ impl Desk {
             frame,
             lights,
             title,
+            name,
             body,
         };
         let rise = theme.ms(250);
@@ -811,6 +791,7 @@ impl Desk {
             }
         }
         self.windows.push(managed);
+        self.show_running(scene);
         crate::windows::push(window, window::THEME, theme.to_words());
         let index = self.windows.len() - 1;
         self.paint_focus(scene, index, false);
@@ -890,8 +871,11 @@ impl Desk {
         if wanted.is_some() && scene.top() == wanted {
             return;
         }
-        if let Some(dock) = self.dock {
-            scene.raise(dock);
+        if let Some(dock) = &self.dock {
+            let ids: Vec<LayerId> = dock.layers().collect();
+            for id in ids {
+                scene.raise(id);
+            }
         }
         for managed in self.windows.iter().filter(|managed| managed.docked) {
             for id in managed.layers() {
@@ -938,7 +922,24 @@ impl Desk {
     /// means: a bar is picked up, a window button pressed, a window body
     /// given the keyboard and told, and anything else takes the keyboard
     /// away from every window.
-    fn click<const N: usize>(&mut self, scene: &mut Scene<N>, buttons: u8, pressed: u8) {
+    fn click<const N: usize>(&mut self, scene: &mut Scene<N>, buttons: u8, pressed: u8, now: u64) {
+        // The dock first: it is above every window.
+        if pressed & 1 != 0 {
+            let pointer = self.pointer.unwrap_or([LayerId::NONE; 2]);
+            let top = scene
+                .layers_at(self.at.0, self.at.1)
+                .find(|id| !pointer.contains(id));
+            if let (Some(dock), Some(top)) = (&self.dock, top) {
+                if let Some(icon) = dock.icon(top) {
+                    println!("input      : click at ({}, {}) on the dock", self.at.0, self.at.1);
+                    dock.launch(icon, scene, now);
+                    return;
+                }
+                if dock.contains(top) {
+                    return;
+                }
+            }
+        }
         let hit = self.under(scene);
 
         if pressed & 1 != 0 {
@@ -1057,6 +1058,7 @@ impl Desk {
                 self.titles &= !(1 << slot);
             }
             println!("desktop    : window {} closed", managed.window);
+            self.show_running(scene);
             // Indices past this one have moved down by one.
             let shift = |at: usize| match at.cmp(&index) {
                 core::cmp::Ordering::Less => Some(at),
@@ -1073,6 +1075,13 @@ impl Desk {
                     layer.opacity = Animation::rest(Fx::ZERO);
                 }
             }
+        }
+    }
+
+    /// Light the dock's dots for the programs with a window open.
+    fn show_running<const N: usize>(&mut self, scene: &mut Scene<N>) {
+        if let Some(dock) = &mut self.dock {
+            dock.running(scene, self.windows.iter().map(|managed| managed.name.as_str()));
         }
     }
 
@@ -1142,7 +1151,7 @@ impl Desk {
         let pressed = buttons & !self.buttons;
         let released = self.buttons & !buttons;
         if pressed != 0 || released != 0 {
-            self.click(scene, buttons, pressed);
+            self.click(scene, buttons, pressed, now);
         }
         self.buttons = buttons;
     }

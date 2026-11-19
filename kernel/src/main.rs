@@ -14,6 +14,7 @@ mod arch;
 mod blob;
 mod cap;
 mod device;
+mod dock;
 #[cfg(feature = "efi-log")]
 mod efi_log;
 mod input;
@@ -2131,17 +2132,17 @@ extern "C" fn launcher() {
         };
         let words = received.message.words;
         let status = match (received.message.label, words[0]) {
-            (launcher::LAUNCH, launcher::TERMINAL) => {
-                let files = cap::identify(LAUNCHER_FILES_SLOT)
-                    .is_ok()
-                    .then_some(LAUNCHER_FILES_SLOT);
-                match start_app(
-                    "terminal",
-                    LAUNCHER_WINDOWS_SLOT,
-                    LAUNCHER_LOG_SLOT,
-                    None,
-                    files,
-                ) {
+            (launcher::LAUNCH, program @ (launcher::TERMINAL | launcher::SETTINGS | launcher::ABOUT)) => {
+                let name = match program {
+                    launcher::TERMINAL => "terminal",
+                    launcher::SETTINGS => "settings",
+                    _ => "about",
+                };
+                // Only the terminal reads files.
+                let files = (program == launcher::TERMINAL
+                    && cap::identify(LAUNCHER_FILES_SLOT).is_ok())
+                .then_some(LAUNCHER_FILES_SLOT);
+                match start_app(name, LAUNCHER_WINDOWS_SLOT, LAUNCHER_LOG_SLOT, None, files) {
                     Ok(_) => 0,
                     Err(error) => error.code(),
                 }
