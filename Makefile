@@ -67,7 +67,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test grow-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test grow-test zoom-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -532,6 +532,25 @@ history-test: iso
 	    || echo "history-test: the Glass tile went on to Clear        FAIL"
 	@test -s build/history.ppm && pnmtopng build/history.ppm > build/history.png 2>/dev/null && rm -f build/history.ppm && echo "wrote build/history.png" || true
 	@test -s build/history-cleared.ppm && pnmtopng build/history-cleared.ppm > build/history-cleared.png 2>/dev/null && rm -f build/history-cleared.ppm && echo "wrote build/history-cleared.png" || true
+
+# A window zooms in from 90% as it opens: Terminal from the dock, a
+# screenshot a moment in (build/zoom-in.png) and once it has settled
+# (build/zoom.png).
+zoom-test: iso
+	@rm -f build/zoom-in.ppm build/zoom-in.png build/zoom.ppm build/zoom.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.05; echo "mouse_button 0"; sleep 0.02; \
+	   echo "screendump build/zoom-in.ppm"; sleep 1.5; \
+	   echo "screendump build/zoom.ppm"; sleep 0.5; echo quit ) \
+	  | timeout --foreground 60 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "zooms in" build/serial.log || echo "zoom-test: no window opened"
+	@grep -q "^desktop    : window [0-9]* zooms in from 90%" build/serial.log \
+	    && echo "zoom-test: the terminal zoomed in as it opened        PASS" \
+	    || echo "zoom-test: the terminal zoomed in as it opened        FAIL"
+	@test -s build/zoom-in.ppm && pnmtopng build/zoom-in.ppm > build/zoom-in.png 2>/dev/null && rm -f build/zoom-in.ppm || true
+	@test -s build/zoom.ppm && pnmtopng build/zoom.ppm > build/zoom.png 2>/dev/null && rm -f build/zoom.ppm && echo "wrote build/zoom.png" || true
 
 # Control Center's notifications card grows while it is open. A terminal
 # sleeps, with two notifications queued behind the sleep; Control Center

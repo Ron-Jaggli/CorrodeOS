@@ -243,6 +243,17 @@ pub enum Command {
         /// under its title bar, so only its bottom corners are its own.
         radius: u8,
     },
+    /// As [`Command::Image`], but the whole surface stretched (or shrunk)
+    /// to fill `rect`, read smoothly between its pixels: a window zooming
+    /// in as it opens.
+    ScaledImage {
+        rect: Rect,
+        surface: u32,
+        alpha: u8,
+        translucent: bool,
+        /// Round the lower two corners of `rect` to this radius.
+        radius: u8,
+    },
     /// The soft shadow of a rounded rectangle: `rect` is the shape, and the
     /// shadow spreads `blur` pixels beyond it, at most `alpha` dark. Nothing
     /// is drawn inside the shape itself, so a shadow never darkens a

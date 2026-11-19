@@ -31,7 +31,7 @@ The short version, for reading first. The numbered log below has the detail.
   - virtio GPU parity: glass, wallpaper (14), freeing surfaces (30) and
     resizing (31). Before 30, the 14th window under virtio failed to open.
 - **Tests:** `./corrode test` passes. 33 scripted boot tests (`close-test`
-  through `grow-test`, 47 scored checks) pass on both the default GPU and
+  through `zoom-test`, 48 scored checks) pass on both the default GPU and
   `GPU=virtio`. The boot self-checks give 172 PASS / 0 FAIL (default) and
   179 / 0 (virtio). Each test writes a screenshot to `build/`. The
   `build/progress-NN-*.png` files are the ones referred to below.
@@ -39,8 +39,6 @@ The short version, for reading first. The numbered log below has the detail.
   - Settings are kept only on a virtio disk (55): `./corrode run` uses
     build/settings.img, inside the project. Real machines' disks and
     CMOS NVRAM are still never written; there is no AHCI/NVMe driver.
-  - Windows do not zoom in from small when they open: that needs the
-    scene to scale a window's layers as a group, which it cannot yet.
   - The lock screen's passcode (57) is in desktop.conf in the clear:
     there are no accounts and no secret storage. It keeps a passer-by
     out, not someone holding the disk.
@@ -54,9 +52,19 @@ The short version, for reading first. The numbered log below has the detail.
   notification as Settings or be taken for it by the dock (56). The disk
   driver holds only its disk (55).
 - **Look:** dock icons magnify under the pointer, sharp at every size,
-  adjustable in Settings (50-53).
-- **Known rough edges:** listed under "Known gap" in each section. The
-  main ones:
+  adjustable in Settings (50-53). Windows zoom in from 90% as they open
+  (63).
+- **Known rough edges:** listed under "Known gap" in each section; some
+  older ones were fixed by later sections. The main ones still open:
+  - No USB at all (no xHCI driver), so no USB keyboards, mice or keys.
+  - Only the programs built into the image can run, and only those on
+    the launcher's list (Terminal, Settings, About, Files, Control
+    Center, Lock, Menu).
+  - The secure core runs and passes its checks but nothing on the
+    desktop uses it yet: the passcode and saved settings are not
+    encrypted (57, 55).
+  - Fading windows show the frame's lower rim through their body for a
+    moment (63).
 - **Branch:** everything is on `desktop-glass` (37 commits on top of
   `secure-core/reserve`). Nothing was committed to `main`, and nothing
   outside the project was changed apart from installing podman (Setup).
@@ -1588,3 +1596,47 @@ This part, host-tested only:
   but fiddly with the ring).
 - Full suite PASSes on both GPUs (94 lines); input-test 172 / 0 and
   179 / 0; `./corrode test` passes; dock screenshot unchanged.
+
+## 63. Windows zoom in as they open
+
+- New renderer command `Command::ScaledImage { rect, surface, alpha,
+  translucent, radius }`: a whole surface stretched over `rect`, read
+  bilinearly in 256ths (all four bytes, so a translucent surface's
+  transparency is smoothed too), lower corners rounded. Wire kind 10;
+  the virtio driver gets it for free through the shared software
+  renderer.
+- Tests:
+  - `a_scaled_image_at_its_own_size_is_the_image`: identical to `Image`
+    at alpha 255 and 130, and with rounded corners.
+  - `a_scaled_image_fills_its_rect_from_corner_to_corner`: corners kept,
+    every pixel within the picture's range, monotonic down an edge.
+  - The wire round trip includes one.
+- The scene: `Content::Surface` gains `stretch`. A stretched layer is not
+  limited to its surface's size and is drawn with `ScaledImage` whenever
+  its size differs. A client's redraw of a stretched layer at another
+  size repaints the whole layer, since the client's rectangle is in its
+  own pixels. The random damage test now stretches a third of its
+  windows, and still matches a full repaint every frame.
+- The desk: a window (not the dock, a popover or the lock screen) opens
+  from 90% (`ZOOM_FROM`) about its own middle over the theme's 250 ms,
+  fading in. Every layer runs the same ease-out, so they stay together:
+  - frame, shadow and body grow with it, the body stretched;
+  - the traffic lights and the title, which are atlas stencils at their
+    own size, only move.
+  Resizing clears `stretch`. Popovers still drop from the menu bar and
+  the lock screen still fades. With motion off nothing animates.
+  Logs "desktop    : window N zooms in from 90%".
+- Fixed on the way: `Desk::retitle`, which runs when a program sets its
+  subtitle (the terminal does so at once), put every layer of the
+  window back in place with no animation. That cut the zoom and the old
+  rise short. Now it moves only the title, and springs it there if the
+  window is still moving.
+- New scored `zoom-test`: Terminal from the dock; screenshot moments in
+  (`build/progress-63-zoom-in.png`: about 93%, centred where it ends)
+  and settled (`build/zoom.png`). Checked by eye on both GPUs.
+- Known gap: while it fades in, the frame's lower rim (a pane only bar +
+  radius tall, under the body's top corners) shows through the
+  half-transparent body as a thin line under the title bar for a
+  moment. The old fade-and-rise had it too.
+- Full suite PASSes on both GPUs (96 lines); input-test 172 / 0 and
+  179 / 0; `./corrode test` passes.

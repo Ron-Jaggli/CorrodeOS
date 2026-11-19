@@ -30,6 +30,7 @@ const SCISSOR: u8 = 6;
 const GLASS: u8 = 7;
 const SHADOW: u8 = 8;
 const SCALED_MASK: u8 = 9;
+const SCALED_IMAGE: u8 = 10;
 
 /// Bits of a glass record's flags byte, and of an image's.
 const REGULAR: u8 = 1 << 0;
@@ -162,6 +163,20 @@ pub fn encode(command: &Command, out: &mut [u8; RECORD]) {
             rect(out, src);
             position(out, *x, *y);
         }
+        Command::ScaledImage {
+            rect: r,
+            surface,
+            alpha,
+            translucent,
+            radius,
+        } => {
+            out[0] = SCALED_IMAGE;
+            out[1] = *radius;
+            out[4..6].copy_from_slice(&surface.to_le_bytes()[..2]);
+            out[6] = if *translucent { TRANSLUCENT } else { 0 };
+            out[7] = *alpha;
+            rect(out, r);
+        }
         Command::Scissor { rect: r } => {
             out[0] = SCISSOR;
             rect(out, r);
@@ -238,6 +253,13 @@ pub fn decode(bytes: &[u8; RECORD]) -> Option<Command> {
             y,
             src: rect,
             // Two bytes: more surfaces than any renderer has.
+            surface: u32::from_le_bytes([bytes[4], bytes[5], 0, 0]),
+            alpha,
+            translucent: bytes[6] & TRANSLUCENT != 0,
+            radius: bytes[1],
+        },
+        SCALED_IMAGE => Command::ScaledImage {
+            rect,
             surface: u32::from_le_bytes([bytes[4], bytes[5], 0, 0]),
             alpha,
             translucent: bytes[6] & TRANSLUCENT != 0,
@@ -321,6 +343,13 @@ mod tests {
                 translucent: true,
                 radius: 12,
             },
+            Command::ScaledImage {
+                rect: Rect::new(-40, 30, 900, 610),
+                surface: 3,
+                alpha: 222,
+                translucent: false,
+                radius: 9,
+            },
             Command::Scissor { rect },
             Command::Glass {
                 rect,
@@ -362,7 +391,7 @@ mod tests {
     #[test]
     fn a_record_that_is_not_a_command_is_refused() {
         // The first kind past the last there is, and some far off.
-        for kind in [0u8, SCALED_MASK + 1, 0x80, 0xff] {
+        for kind in [0u8, SCALED_IMAGE + 1, 0x80, 0xff] {
             let mut bytes = [0x5a; RECORD];
             bytes[0] = kind;
             assert!(decode(&bytes).is_none());

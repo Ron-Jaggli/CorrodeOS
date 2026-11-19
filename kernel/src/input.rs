@@ -381,6 +381,8 @@ struct Fading {
 
 /// Where a popover's top edge hangs: just under the menu bar.
 const POPOVER_TOP: i32 = 28 + 6;
+/// How large, in percent, a window starts as it zooms in to open.
+const ZOOM_FROM: i32 = 90;
 
 /// Height of a window's title bar.
 const BAR: u32 = 28;
@@ -1178,7 +1180,13 @@ impl Desk {
     /// Draw a window's title bar text again, after its program changed its
     /// subtitle. The new text goes in a free slot before the old one is
     /// given back, so a full atlas keeps the old title rather than none.
-    pub fn retitle<R: Renderer, const N: usize>(&mut self, renderer: &mut R, window: usize, scene: &mut Scene<N>) {
+    pub fn retitle<R: Renderer, const N: usize>(
+        &mut self,
+        renderer: &mut R,
+        window: usize,
+        scene: &mut Scene<N>,
+        now: u64,
+    ) {
         let Some(index) = self.windows.iter().position(|managed| managed.window == window) else {
             return;
         };
@@ -1203,11 +1211,18 @@ impl Desk {
         let managed = &mut self.windows[index];
         managed.title = Some((id, slot, width));
         if !managed.minimized {
-            for (id, (x, y)) in managed.places(managed.at, self.theme.buttons) {
-                if let Some(layer) = scene.layer_mut(id) {
-                    layer.x = Animation::rest(Fx::from_int(x));
-                    layer.y = Animation::rest(Fx::from_int(y));
-                }
+            // Only the title moves, to stay centred at its new width. The
+            // rest of the window may be zooming in: the title goes on to
+            // its new place from wherever it is, rather than jumping there.
+            let place = managed.places(managed.at, self.theme.buttons).into_iter().find(|(at, _)| *at == id);
+            if let (Some((_, (x, y))), Some(layer)) = (place, scene.layer_mut(id)) {
+                let moving = layer.x.end_ns() > now || layer.y.end_ns() > now;
+                let to = |animation: &Animation, place: i32| match moving {
+                    true => animation.retarget(now, Fx::from_int(place), Spring::SMOOTH),
+                    false => Animation::rest(Fx::from_int(place)),
+                };
+                layer.x = to(&layer.x, x);
+                layer.y = to(&layer.y, y);
             }
         }
         println!("desktop    : window {} now says {}", window, caption);
@@ -1387,10 +1402,47 @@ impl Desk {
             body,
         };
         let rise = theme.ms(250);
+        // A window zooms in from a little smaller, about its own middle, as
+        // a macOS window opens: every layer of it from the same point, on
+        // the same curve, so they stay together. Glass, shadow and body grow
+        // with it, the body's surface stretched meanwhile; the buttons and
+        // the title, cut from the atlas at their own size, only move.
+        let middle = (
+            at.0 + width as i32 / 2,
+            at.1 + (managed.bar() + height) as i32 / 2,
+        );
+        let zoom_in = |place: i32, size: i32, middle: i32, grows: bool| -> (i32, i32) {
+            let (scaled, from_size) = match grows {
+                true => (middle + (place - middle) * ZOOM_FROM / 100, size * ZOOM_FROM / 100),
+                false => (middle + (place + size / 2 - middle) * ZOOM_FROM / 100 - size / 2, size),
+            };
+            (scaled, from_size)
+        };
+        if chrome && rise > 0 {
+            println!("desktop    : window {} zooms in from {}%", window, ZOOM_FROM);
+        }
         for (id, (x, y)) in managed.places(at, theme.buttons) {
             if let Some(layer) = scene.layer_mut(id) {
                 layer.x = Animation::rest(Fx::from_int(x));
                 layer.y = Animation::rest(Fx::from_int(y));
+                if chrome && rise > 0 {
+                    layer.opacity =
+                        Animation::ease(now, rise, Fx::ZERO, Fx::from_int(255), Ease::Out);
+                    use corrode_render::scene::Content;
+                    let grows = !matches!(layer.content, Content::Mask { .. } | Content::ScaledMask { .. });
+                    if let Content::Surface { stretch, .. } = &mut layer.content {
+                        *stretch = true;
+                    }
+                    let (w, h) = (layer.width.target().round(), layer.height.target().round());
+                    let (from_x, from_w) = zoom_in(x, w, middle.0, grows);
+                    let (from_y, from_h) = zoom_in(y, h, middle.1, grows);
+                    let ease = |from: i32, to: i32| Animation::ease(now, rise, Fx::from_int(from), Fx::from_int(to), Ease::Out);
+                    layer.x = ease(from_x, x);
+                    layer.y = ease(from_y, y);
+                    layer.width = ease(from_w, w);
+                    layer.height = ease(from_h, h);
+                    continue;
+                }
                 if !docked && rise > 0 {
                     layer.opacity =
                         Animation::ease(now, rise, Fx::ZERO, Fx::from_int(255), Ease::Out);
@@ -2538,11 +2590,17 @@ impl Desk {
             if let Some(layer) = id.and_then(|id| scene.layer_mut(id)) {
                 layer.width = Animation::rest(Fx::from_int(w as i32));
                 layer.height = Animation::rest(Fx::from_int(h as i32));
-                if let corrode_render::scene::Content::Surface { width: sw, height: sh, .. } =
-                    &mut layer.content
+                if let corrode_render::scene::Content::Surface {
+                    width: sw,
+                    height: sh,
+                    stretch,
+                    ..
+                } = &mut layer.content
                 {
                     *sw = w;
                     *sh = h;
+                    // Cut to its new size from here on, not stretched.
+                    *stretch = false;
                 }
             }
         }

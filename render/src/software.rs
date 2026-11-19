@@ -522,6 +522,92 @@ impl SoftwareRenderer {
         }
     }
 
+    /// A whole surface stretched over `rect`; see [`Command::ScaledImage`].
+    /// Each pixel reads the four surface pixels around where its centre
+    /// falls, in 256ths, as [`Self::scaled_mask`] does.
+    fn scaled_image(
+        &mut self,
+        rect: Rect,
+        surface: u32,
+        alpha: u8,
+        translucent: bool,
+        radius: u8,
+        scissor: Option<Rect>,
+    ) {
+        if alpha == 0 || rect.is_empty() {
+            return;
+        }
+        let Some(Some(pixels)) = self.surfaces.get(surface as usize).copied() else {
+            return;
+        };
+        if pixels.width == 0 || pixels.height == 0 {
+            return;
+        }
+        let Some((x0, y0, x1, y1)) = self.clip(rect, scissor) else {
+            return;
+        };
+        // Where a target pixel's centre falls on the surface, less half a
+        // pixel, in 256ths; and the two pixels either side and how far
+        // between them.
+        let axis = |at: i64, from: i32, size: u32, out: u32| {
+            let q = (((at - from as i64) * 2 + 1) * size as i64 * 128 / out as i64 - 128).max(0);
+            let i0 = ((q >> 8) as u32).min(size - 1);
+            (i0, (i0 + 1).min(size - 1), (q & 255) as u32)
+        };
+        let read = |x: u32, y: u32| -> u32 {
+            // SAFETY: `x < width` and `y < height`, among the pixels
+            // `attach_surface` was promised. By value: the client may be
+            // writing.
+            unsafe {
+                pixels
+                    .base
+                    .add(y as usize * pixels.width as usize + x as usize)
+                    .read_volatile()
+            }
+        };
+        let format = self.info.format;
+        let (full_w, full_h) = (rect.width as i64 * Q8, rect.height as i64 * Q8);
+        for row_y in y0..y1 {
+            let (sy0, sy1, fy) = axis(row_y as i64, rect.y, pixels.height, rect.height);
+            let corner_row = radius > 0 && row_y as i64 >= rect.y as i64 + rect.height as i64 - radius as i64;
+            let ly = (row_y as i64 - rect.y as i64) * Q8 + Q8 / 2;
+            // SAFETY: `clip` returned bounds already intersected with the
+            // target.
+            let row = unsafe { self.target_row(x0, row_y) };
+            for x in x0..x1 {
+                let (sx0, sx1, fx) = axis(x as i64, rect.x, pixels.width, rect.width);
+                let [a, b, c, d] = [read(sx0, sy0), read(sx1, sy0), read(sx0, sy1), read(sx1, sy1)];
+                // All four bytes, the top one being how transparent a
+                // translucent surface is there.
+                let mix = |shift: u32| {
+                    let at = |pixel: u32| (pixel >> shift) & 0xff;
+                    let top = at(a) * (256 - fx) + at(b) * fx;
+                    let bottom = at(c) * (256 - fx) + at(d) * fx;
+                    (top * (256 - fy) + bottom * fy) >> 16
+                };
+                let color = Color::rgb(mix(16) as u8, mix(8) as u8, mix(0) as u8);
+                let mut alpha = match translucent {
+                    true => crate::blend::div255((255 - mix(24)) * alpha as u32) as u8,
+                    false => alpha,
+                };
+                if corner_row {
+                    let lx = (x as i64 - rect.x as i64) * Q8 + Q8 / 2;
+                    let field = glass::field(lx, ly, full_w, full_h, radius as i64 * Q8);
+                    alpha = crate::blend::div255(glass::coverage(&field) * alpha as u32) as u8;
+                }
+                // SAFETY: `x` is inside the clipped bounds, on this row.
+                unsafe {
+                    let target = row.add((x - x0) as usize);
+                    match alpha {
+                        0 => {}
+                        255 => target.write_unaligned(format.pack(color)),
+                        _ => target.write_unaligned(Blend::new(&format, color, alpha).over(target.read_unaligned())),
+                    }
+                }
+            }
+        }
+    }
+
     /// The soft shadow around a rounded rectangle; see [`Command::Shadow`].
     fn shadow(&mut self, rect: Rect, radius: u16, blur: u8, alpha: u8, scissor: Option<Rect>) {
         if alpha == 0 || rect.is_empty() {
@@ -942,6 +1028,13 @@ impl Renderer for SoftwareRenderer {
                     translucent,
                     radius,
                 } => self.image((x, y), src, surface, alpha, translucent, radius, scissor),
+                Command::ScaledImage {
+                    rect,
+                    surface,
+                    alpha,
+                    translucent,
+                    radius,
+                } => self.scaled_image(rect, surface, alpha, translucent, radius, scissor),
                 Command::Shadow {
                     rect,
                     radius,
@@ -1230,6 +1323,50 @@ mod tests {
         let row: std::vec::Vec<u32> = wide[..SIDE as usize].iter().map(|pixel| pixel & 0xff).collect();
         assert!(row.windows(2).all(|pair| pair[0] <= pair[1]), "{row:?}");
         assert_eq!((row[0], row[SIDE as usize - 1]), (0, 48));
+    }
+
+    #[test]
+    fn a_scaled_image_at_its_own_size_is_the_image() {
+        for (alpha, radius) in [(255, 0), (255, 2), (130, 0)] {
+            let plain = pictured(&[Command::Image {
+                x: 2,
+                y: 3,
+                src: Rect::new(0, 0, PICTURE, PICTURE),
+                surface: 3,
+                alpha,
+                translucent: false,
+                radius,
+            }]);
+            let scaled = pictured(&[Command::ScaledImage {
+                rect: Rect::new(2, 3, PICTURE, PICTURE),
+                surface: 3,
+                alpha,
+                translucent: false,
+                radius,
+            }]);
+            assert_eq!(plain, scaled, "alpha {alpha}, radius {radius}");
+        }
+    }
+
+    #[test]
+    fn a_scaled_image_fills_its_rect_from_corner_to_corner() {
+        let pixels = pictured(&[Command::ScaledImage {
+            rect: Rect::new(0, 0, SIDE, SIDE),
+            surface: 3,
+            alpha: 255,
+            translucent: false,
+            radius: 0,
+        }]);
+        let picture = picture();
+        let last = (PICTURE * PICTURE - 1) as usize;
+        // The corners are the picture's corners, and nothing is outside its
+        // range: twice the size, smoothly, with no grey left showing.
+        assert_eq!(pixels[0], picture[0]);
+        assert_eq!(pixels[(SIDE * SIDE - 1) as usize], picture[last]);
+        assert!(pixels.iter().all(|pixel| (picture[0]..=picture[last]).contains(pixel)));
+        // Down the left edge it never goes back up the picture.
+        let column: std::vec::Vec<u32> = (0..SIDE).map(|y| pixels[(y * SIDE) as usize]).collect();
+        assert!(column.windows(2).all(|pair| pair[0] <= pair[1]), "{column:x?}");
     }
 
     #[test]

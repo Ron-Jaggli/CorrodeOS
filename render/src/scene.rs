@@ -75,6 +75,10 @@ pub enum Content {
         translucent: bool,
         /// Its lower corners are rounded to this.
         radius: u8,
+        /// Drawn stretched to the layer's size rather than cropped by it,
+        /// with no limit on how large the layer is: a window zooming in.
+        /// At the surface's own size the two are the same.
+        stretch: bool,
     },
     /// The shadow of a rounded rectangle of corner `radius`, spreading
     /// `blur` pixels outside it: the layer's rectangle is the shadow's
@@ -142,6 +146,7 @@ impl Layer {
             height,
             translucent: false,
             radius: 0,
+            stretch: false,
         };
         layer
     }
@@ -156,6 +161,7 @@ impl Layer {
             height,
             translucent: true,
             radius: 0,
+            stretch: false,
         };
         layer
     }
@@ -183,7 +189,12 @@ impl Layer {
         let whole = |animation: &Animation| animation.sample(now).value.round();
         // A surface has no pixels past its own edge to show.
         let (most_wide, most_tall) = match self.content {
-            Content::Surface { width, height, .. } => (width, height),
+            Content::Surface {
+                width,
+                height,
+                stretch: false,
+                ..
+            } => (width, height),
             _ => (u32::MAX, u32::MAX),
         };
         Shown {
@@ -514,7 +525,21 @@ impl<const N: usize> Scene<N> {
                 Some(layer) => layer.at(now),
                 None => Shown::NOTHING,
             };
-            let redrawn = core::mem::replace(redrawn, NOWHERE);
+            let mut redrawn = core::mem::replace(redrawn, NOWHERE);
+            // A surface stretched to another size: the client's rectangle
+            // is in its own pixels, not the layer's, and smoothing spreads
+            // it. The whole layer, rather than working out how far.
+            if let Content::Surface {
+                width,
+                height,
+                stretch: true,
+                ..
+            } = now_shown.content
+            {
+                if redrawn != NOWHERE && (now_shown.rect.width, now_shown.rect.height) != (width, height) {
+                    redrawn = EVERYWHERE;
+                }
+            }
             if now_shown == *shown {
                 // In the same place looking the same, as far as the scene can
                 // tell -- but its client says otherwise about part of it.
@@ -638,6 +663,23 @@ impl<const N: usize> Scene<N> {
                     ),
                     color: shown.color,
                     alpha,
+                },
+                (
+                    Content::Surface {
+                        id,
+                        width,
+                        height,
+                        translucent,
+                        radius,
+                        stretch: true,
+                    },
+                    alpha,
+                ) if (shown.rect.width, shown.rect.height) != (width, height) => Command::ScaledImage {
+                    rect: shown.rect,
+                    surface: id,
+                    alpha,
+                    translucent,
+                    radius,
                 },
                 (
                     Content::Surface {
@@ -1256,6 +1298,8 @@ mod tests {
                             height: WINDOW.1,
                             translucent: false,
                             radius: 0,
+                            // Now and then grown or shrunk to the layer.
+                            stretch: random.below(3) == 0,
                         };
                     }
                     ids.extend(scene.add(layer));

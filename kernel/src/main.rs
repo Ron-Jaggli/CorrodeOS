@@ -4816,7 +4816,7 @@ fn render_loop(renderer: &mut Screen) -> ! {
 
         // Title bars whose program has given them something new to say.
         for index in windows::take_retitled() {
-            desk.retitle(renderer, index, &mut *stage.scene);
+            desk.retitle(renderer, index, &mut *stage.scene, now);
         }
         for (index, width, height) in windows::take_grown() {
             desk.grow(index, &mut *stage.scene, (width, height));
