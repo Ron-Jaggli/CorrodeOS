@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -316,6 +316,26 @@ switcher-test: iso
 	    && echo "switcher-test: Alt+Tab showed three and switched     PASS" \
 	    || echo "switcher-test: Alt+Tab showed three and switched     FAIL"
 	@test -s build/switcher.ppm && pnmtopng build/switcher.ppm > build/switcher.png 2>/dev/null && rm -f build/switcher.ppm && echo "wrote build/switcher.png" || true
+
+# Open a terminal from the dock and hover its right edge, then its
+# bottom-right corner: the pointer turns into resize arrows, the corner's
+# in build/cursor.png.
+cursor-test: iso
+	@rm -f build/cursor.ppm build/cursor.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   echo "mouse_move 104 -229"; sleep 0.2; echo "mouse_move 0 -229"; sleep 0.8; \
+	   echo "mouse_move 0 154"; sleep 0.8; \
+	   echo "screendump build/cursor.ppm"; sleep 2; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "pointer is now" build/serial.log || echo "cursor-test: the pointer never changed"
+	@grep -q "pointer is now Across" build/serial.log \
+	    && grep -q "pointer is now Falling" build/serial.log \
+	    && echo "cursor-test: resize arrows over an edge and a corner  PASS" \
+	    || echo "cursor-test: resize arrows over an edge and a corner  FAIL"
+	@test -s build/cursor.ppm && pnmtopng build/cursor.ppm > build/cursor.png 2>/dev/null && rm -f build/cursor.ppm && echo "wrote build/cursor.png" || true
 
 # Open a terminal from the dock and drag its bottom-right corner 200 by 100
 # pixels bigger, in four steps; then drag its top-left corner 60 by 40

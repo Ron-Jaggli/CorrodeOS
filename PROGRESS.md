@@ -490,3 +490,23 @@ Choices made without asking are marked **Choice:**.
   - Edge resizing remains software-renderer only; virtio can't show a
     surface at a new size yet.
 - Screenshot: `build/progress-20-edges.png`.
+
+## 23. Resize cursors
+
+- Over a resizable window's edge, the pointer becomes a double-headed
+  arrow: ↔ on the left and right edges, ↕ on the top and bottom, ⤡ and ⤢
+  on the corners. The arrow is held through the whole drag, and dragging
+  a title bar keeps the normal arrow.
+- Four new stencils (outline and fill each), 21 px square, sit in the
+  pointer's atlas row from x 96. They are sampled four by four like the
+  arrow. The hot spot is in the middle. If they can't be uploaded, the
+  plain arrow simply stays.
+- Edge detection is now one function, `Desk::edges`, shared by the hover
+  cursor and the press that picks up an edge. They can't disagree about
+  where an edge is.
+- New `./corrode cursor-test` hovers a terminal's right edge, then its
+  bottom-right corner. Log "pointer is now Across", then "Falling". PASS.
+  `build/progress-21-cursor.png` is a 4x crop of the corner cursor.
+  - Under GPU=virtio it reports FAIL by design: resizing is software-only,
+    so no edge exists and the arrow stays.
+- All other tests PASS; 170 / 0.

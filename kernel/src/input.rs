@@ -241,6 +241,107 @@ fn arrow(grow: i32) -> Vec<u8> {
     coverage
 }
 
+/// What the pointer looks like: the arrow, or a double-headed arrow over an
+/// edge that would resize the window, pointing the ways it would go.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Cursor {
+    Arrow,
+    /// Left and right.
+    Across,
+    /// Up and down.
+    UpDown,
+    /// Top left and bottom right.
+    Falling,
+    /// Bottom left and top right.
+    Rising,
+}
+
+/// A resize cursor's box, with its hot spot in the middle.
+const RESIZE_SIZE: u32 = 21;
+/// Where the resize cursors keep their stencils: along the pointer's row,
+/// after the window buttons' -- an outline and a fill each.
+const RESIZE_X: i32 = 96;
+
+impl Cursor {
+    const RESIZING: [Cursor; 4] = [Cursor::Across, Cursor::UpDown, Cursor::Falling, Cursor::Rising];
+
+    /// The stencils, the outline's then the fill's, and the hot spot.
+    fn stencils(self) -> ([Rect; 2], (i32, i32)) {
+        let (width, height) = POINTER_SIZE;
+        let Some(slot) = Self::RESIZING.iter().position(|cursor| *cursor == self) else {
+            let row = ATLAS_ROW as i32;
+            let outline = Rect::new(0, row, width, height);
+            let fill = Rect::new(width as i32, row, width, height);
+            // The tip is a pixel in from the stencil's corner.
+            return ([outline, fill], (1, 1));
+        };
+        let size = RESIZE_SIZE;
+        let x = RESIZE_X + (slot as i32 * 2) * size as i32;
+        let half = size as i32 / 2;
+        (
+            [
+                Rect::new(x, ATLAS_ROW as i32, size, size),
+                Rect::new(x + size as i32, ATLAS_ROW as i32, size, size),
+            ],
+            (half, half),
+        )
+    }
+
+    /// Which edges a press would pick up: left, top, right, bottom.
+    fn of(edges: (bool, bool, bool, bool)) -> Cursor {
+        match edges {
+            (true, true, ..) | (.., true, true) => Cursor::Falling,
+            (_, true, true, _) | (true, _, _, true) => Cursor::Rising,
+            (true, ..) | (_, _, true, _) => Cursor::Across,
+            (_, true, ..) | (.., true) => Cursor::UpDown,
+            _ => Cursor::Arrow,
+        }
+    }
+}
+
+/// A double-headed arrow across a `RESIZE_SIZE` box, along `cursor`'s way,
+/// as coverage out of 255; the outline is it grown by `grow` pixels.
+fn resize_arrow(cursor: Cursor, grow: i32) -> Vec<u8> {
+    let size = RESIZE_SIZE as i32;
+    let mut coverage = alloc::vec![0u8; (size * size) as usize];
+    // In sixteenths of a pixel from the middle. Diagonals are turned by
+    // 45 degrees with 181/256, near enough to one over root two.
+    let half = size * 8;
+    let along = |x: i32, y: i32| -> (i32, i32) {
+        match cursor {
+            Cursor::Across => (x, y),
+            Cursor::UpDown => (y, x),
+            Cursor::Falling => ((x + y) * 181 / 256, (y - x) * 181 / 256),
+            _ => ((x - y) * 181 / 256, (x + y) * 181 / 256),
+        }
+    };
+    let grow = grow * 16;
+    // Tips 9 pixels out; heads 5 long and 5 wide either side; a shaft 1
+    // wide either side between them.
+    let (tip, head, wing, shaft) = (9 * 16, 5 * 16, 5 * 16, 16);
+    let inside = |x: i32, y: i32| {
+        let (u, v) = along(x - half, y - half);
+        let (u, v) = (u.abs(), v.abs());
+        let in_shaft = u <= tip - head + grow && v <= shaft + grow;
+        // The head narrows from `wing` at its base to nothing at the tip.
+        let in_head = u <= tip + grow
+            && u >= tip - head - grow
+            && v * head <= (tip - u) * wing + grow * (head + wing);
+        in_shaft || in_head
+    };
+    for py in 0..size {
+        for px in 0..size {
+            let mut hits = 0u32;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    hits += inside(px * 16 + sx * 4 + 2, py * 16 + sy * 4 + 2) as u32;
+                }
+            }
+            coverage[(py * size + px) as usize] = (hits * 255 / 16) as u8;
+        }
+    }
+    coverage
+}
 
 /// Height of a window's title bar.
 const BAR: u32 = 28;
@@ -546,6 +647,10 @@ pub struct Desk {
     /// A window being resized by an edge: which, where the pointer and the
     /// size were when it was picked up, and which edges move.
     sizing: Option<Sizing>,
+    /// What the pointer looks like now.
+    cursor: Cursor,
+    /// Whether the resize cursors' stencils are there to show.
+    resize_cursors: bool,
     /// The size the pointer has dragged it to, applied once a poll.
     /// With where its right and bottom edges are to stay, when its left
     /// or top edge is being dragged.
@@ -584,6 +689,12 @@ impl Desk {
         let mut pointer = None;
         let outline = Rect::new(0, ATLAS_ROW as i32, width, height);
         let fill = Rect::new(width as i32, ATLAS_ROW as i32, width, height);
+        // The resize cursors are a nicety: without them the arrow stays.
+        let resizing = Cursor::RESIZING.iter().all(|cursor| {
+            let ([outline, fill], _) = cursor.stencils();
+            renderer.upload_mask(outline, &resize_arrow(*cursor, 1)).is_ok()
+                && renderer.upload_mask(fill, &resize_arrow(*cursor, 0)).is_ok()
+        });
         if renderer.upload_mask(outline, &arrow(1)).is_ok()
             && renderer.upload_mask(fill, &arrow(0)).is_ok()
         {
@@ -633,6 +744,8 @@ impl Desk {
             can_resize: false,
             resized: Vec::new(),
             sizing: None,
+            cursor: Cursor::Arrow,
+            resize_cursors: resizing,
             wanted: None,
             switcher: None,
             recent: Vec::new(),
@@ -1221,32 +1334,11 @@ impl Desk {
         }
 
         // Pressed near an edge of a resizable window: the edge is picked
-        // up, and the program hears nothing of it. The top edge is the
-        // title bar's own top, which would otherwise start a drag.
-        let edge_hit = match hit {
-            Ok((index, part @ (Part::Body | Part::Bar))) if pressed & 1 != 0 => Some((index, part)),
-            _ => None,
-        };
-        if let Some((index, part)) = edge_hit {
-            let managed = &self.windows[index];
-            let (left, top) = managed.at;
-            let (right, bottom) = (
-                left + managed.width as i32,
-                top + (managed.bar() + managed.height) as i32,
-            );
-            let near_top = part == Part::Bar && self.at.1 < top + TOP_EDGE;
-            // Along the bar, only its top edge and corners are edges.
-            let sides = part == Part::Body || near_top;
-            let edges = (
-                sides && self.at.0 < left + EDGE,
-                near_top,
-                sides && self.at.0 >= right - EDGE,
-                part == Part::Body && self.at.1 >= bottom - EDGE,
-            );
-            if self.can_resize
-                && (edges.0 || edges.1 || edges.2 || edges.3)
-                && crate::windows::resizable(managed.window)
-            {
+        // up, and the program hears nothing of it.
+        if let (Ok((index, part)), true) = (hit, pressed & 1 != 0) {
+            let edges = self.edges(index, part);
+            if edges.0 || edges.1 || edges.2 || edges.3 {
+                let managed = &self.windows[index];
                 self.drag = None;
                 self.sizing = Some(Sizing {
                     index,
@@ -1799,6 +1891,67 @@ impl Desk {
         }
     }
 
+    /// Put the pointer's layers where it is, as the cursor it should be:
+    /// a resize arrow over a window's edge, or while dragging one.
+    fn place_pointer<const N: usize>(&mut self, scene: &mut Scene<N>) {
+        let cursor = match (&self.sizing, self.drag) {
+            (Some(sizing), _) => Cursor::of((sizing.left, sizing.top, sizing.right, sizing.bottom)),
+            (None, Some(_)) => Cursor::Arrow,
+            (None, None) if self.resize_cursors => match self.under(scene) {
+                Ok((index, part)) => Cursor::of(self.edges(index, part)),
+                Err(_) => Cursor::Arrow,
+            },
+            _ => Cursor::Arrow,
+        };
+        if cursor != self.cursor {
+            println!("input      : the pointer is now {:?}", cursor);
+            self.cursor = cursor;
+        }
+        let (stencils, hot) = cursor.stencils();
+        let (x, y) = (self.at.0 - hot.0, self.at.1 - hot.1);
+        let Some(layers) = self.pointer else { return };
+        for (id, src) in layers.into_iter().zip(stencils) {
+            if let Some(layer) = scene.layer_mut(id) {
+                layer.x = Animation::rest(Fx::from_int(x));
+                layer.y = Animation::rest(Fx::from_int(y));
+                layer.width = Animation::rest(Fx::from_int(src.width as i32));
+                layer.height = Animation::rest(Fx::from_int(src.height as i32));
+                layer.content = corrode_render::scene::Content::Mask { src };
+            }
+        }
+    }
+
+    /// Which edges of window `index` a press on `part` at the pointer would
+    /// pick up -- left, top, right, bottom -- none if it cannot be resized.
+    /// The top edge is the title bar's own top, which would otherwise
+    /// start a drag.
+    fn edges(&self, index: usize, part: Part) -> (bool, bool, bool, bool) {
+        let none = (false, false, false, false);
+        let Some(managed) = self.windows.get(index) else {
+            return none;
+        };
+        if !self.can_resize
+            || !matches!(part, Part::Body | Part::Bar)
+            || !crate::windows::resizable(managed.window)
+        {
+            return none;
+        }
+        let (left, top) = managed.at;
+        let (right, bottom) = (
+            left + managed.width as i32,
+            top + (managed.bar() + managed.height) as i32,
+        );
+        let near_top = part == Part::Bar && self.at.1 < top + TOP_EDGE;
+        // Along the bar, only its top edge and corners are edges.
+        let sides = part == Part::Body || near_top;
+        (
+            sides && self.at.0 < left + EDGE,
+            near_top,
+            sides && self.at.0 >= right - EDGE,
+            part == Part::Body && self.at.1 >= bottom - EDGE,
+        )
+    }
+
     fn show_pointer<const N: usize>(&mut self, scene: &mut Scene<N>, now: u64) {
         let Some(layers) = self.pointer else { return };
         for id in layers {
@@ -1824,16 +1977,7 @@ impl Desk {
             (self.at.0 + dx).clamp(0, screen.width as i32 - 1),
             (self.at.1 + dy).clamp(0, screen.height as i32 - 1),
         );
-        // The tip is a pixel in from the stencil's corner.
-        let (x, y) = (self.at.0 - 1, self.at.1 - 1);
-        if let Some(layers) = self.pointer {
-            for id in layers {
-                if let Some(layer) = scene.layer_mut(id) {
-                    layer.x = Animation::rest(Fx::from_int(x));
-                    layer.y = Animation::rest(Fx::from_int(y));
-                }
-            }
-        }
+        self.place_pointer(scene);
         self.show_pointer(scene, now);
         if !self.moved && (dx != 0 || dy != 0) {
             self.moved = true;
