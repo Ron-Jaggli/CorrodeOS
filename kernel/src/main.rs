@@ -16,6 +16,7 @@ mod cap;
 mod device;
 mod dock;
 mod rtc;
+mod spotlight;
 mod switcher;
 #[cfg(feature = "efi-log")]
 mod efi_log;

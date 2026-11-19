@@ -448,6 +448,12 @@ const KEY_TAB: u8 = 0x0f;
 const KEY_ESCAPE: u8 = 0x01;
 const KEY_LEFT_ALT: u8 = 0x38;
 const KEY_RIGHT_ALT: u8 = 0x80 | 0x38;
+/// And search.
+const KEY_SPACE: u8 = 0x39;
+const KEY_ENTER: u8 = 0x1c;
+const KEY_BACKSPACE: u8 = 0x0e;
+const KEY_UP: u8 = 0x80 | 0x48;
+const KEY_DOWN: u8 = 0x80 | 0x50;
 
 /// What the desktop does with Alt and a key, whatever window is in front.
 /// The desktop's Alt shortcuts. Alt+Tab is the switcher's, not here.
@@ -625,6 +631,8 @@ pub struct Desk {
     dock: Option<crate::dock::Dock>,
     /// The Alt+Tab panel, while Alt is held.
     switcher: Option<crate::switcher::Switcher>,
+    /// Alt+Space's search field, while it is up.
+    spotlight: Option<crate::spotlight::Spotlight>,
     /// Window ids, the one most recently in front first: the switcher's
     /// order.
     recent: Vec<usize>,
@@ -748,6 +756,7 @@ impl Desk {
             resize_cursors: resizing,
             wanted: None,
             switcher: None,
+            spotlight: None,
             recent: Vec::new(),
         };
         let src = Rect::new(0, LINE_ROW as i32, 1, line_height);
@@ -843,6 +852,38 @@ impl Desk {
                     modifiers,
                     ..
                 } if modifiers & ALT != 0 => self.switch(renderer, scene, modifiers & SHIFT != 0, now),
+                // Alt+Space: search, or put search away.
+                Event::Key {
+                    key: KEY_SPACE,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers & ALT != 0 => match self.spotlight.take() {
+                    Some(spotlight) => spotlight.close(scene),
+                    None => {
+                        self.spotlight = crate::spotlight::Spotlight::open(
+                            renderer,
+                            scene,
+                            &self.theme,
+                            self.dock.as_ref(),
+                            now,
+                        );
+                        match self.spotlight {
+                            Some(_) => println!("desktop    : search up"),
+                            None => println!("desktop    : no dock to search"),
+                        }
+                    }
+                },
+                // While search is up, it has the keyboard.
+                Event::Key {
+                    key,
+                    pressed: true,
+                    text,
+                    modifiers,
+                } if self.spotlight.is_some() && modifiers & ALT == 0 => {
+                    self.search_key(renderer, scene, key, text, now)
+                }
+                Event::Key { .. } if self.spotlight.is_some() => {}
                 // The desktop's own shortcuts come first, and go no further.
                 Event::Key {
                     key,
@@ -1227,6 +1268,12 @@ impl Desk {
                 scene.raise(id);
             }
         }
+        if let Some(spotlight) = &self.spotlight {
+            let ids: Vec<LayerId> = spotlight.layers().collect();
+            for id in ids {
+                scene.raise(id);
+            }
+        }
         if let Some([below, above]) = self.pointer {
             scene.raise(below);
             scene.raise(above);
@@ -1543,6 +1590,54 @@ impl Desk {
             Some(_) => println!("desktop    : switcher up, {} windows", order.len()),
             // No room in the scene for it: just go to the pick.
             None => self.restore(scene, order[picked], now),
+        }
+    }
+
+    /// A key pressed while search is up.
+    fn search_key<R: Renderer, const N: usize>(
+        &mut self,
+        renderer: &mut R,
+        scene: &mut Scene<N>,
+        key: u8,
+        text: Option<char>,
+        now: u64,
+    ) {
+        let Some(spotlight) = &mut self.spotlight else { return };
+        match key {
+            KEY_ESCAPE => {
+                if let Some(spotlight) = self.spotlight.take() {
+                    spotlight.close(scene);
+                }
+            }
+            KEY_UP | KEY_DOWN => spotlight.pick(scene, key == KEY_UP),
+            KEY_BACKSPACE => spotlight.typed(renderer, scene, self.dock.as_ref(), None),
+            KEY_ENTER => {
+                let (picked, query) = (spotlight.picked(), String::from(spotlight.query()));
+                if let Some(spotlight) = self.spotlight.take() {
+                    spotlight.close(scene);
+                }
+                let (Some(app), Some(dock)) = (picked, &self.dock) else {
+                    println!("desktop    : nothing matches {:?}", query);
+                    return;
+                };
+                let title = dock.title(app);
+                println!("desktop    : search {:?} opens {}", query, title);
+                // Already open: its window comes forward, as Spotlight
+                // brings a running app forward rather than starting another.
+                let open = self
+                    .windows
+                    .iter()
+                    .rposition(|managed| !managed.docked && managed.name == title);
+                match open {
+                    Some(index) => self.restore(scene, index, now),
+                    None => dock.launch(app, scene, now),
+                }
+            }
+            _ => {
+                if let Some(text) = text {
+                    spotlight.typed(renderer, scene, self.dock.as_ref(), Some(text));
+                }
+            }
         }
     }
 

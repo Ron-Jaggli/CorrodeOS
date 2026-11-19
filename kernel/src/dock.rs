@@ -418,6 +418,20 @@ impl Dock {
         self.size
     }
 
+    /// How many programs the dock knows.
+    pub fn apps(&self) -> usize {
+        self.icons.len()
+    }
+
+    /// Icon `index`'s name stencil, the one its tooltip shows.
+    pub fn label<const N: usize>(&self, scene: &Scene<N>, index: usize) -> Option<Rect> {
+        let [_, text] = self.icons.get(index)?.tooltip?;
+        match scene.layer(text)?.content {
+            corrode_render::scene::Content::Mask { src } => Some(src),
+            _ => None,
+        }
+    }
+
     /// What icon `index`'s program titles its windows.
     pub fn title(&self, index: usize) -> &'static str {
         APPS.get(index).map_or("", |app| app.title)

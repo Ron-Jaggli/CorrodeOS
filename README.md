@@ -133,8 +133,9 @@ Keyboard shortcuts use Alt where macOS uses Cmd: **Alt+Tab** shows the
 window switcher (keep Alt held and press Tab again to move along, Shift+Tab
 to go back, Escape to cancel; letting go of Alt switches, and brings back
 a minimized window), **Alt+Q**, **Alt+W** or
-**Alt+F4** closes the one in front, **Alt+M** minimizes, **Alt+Z** zooms, and
-**Alt+,** opens Settings.
+**Alt+F4** closes the one in front, **Alt+M** minimizes, **Alt+Z** zooms,
+**Alt+,** opens Settings, and **Alt+Space** searches the apps (type, Up and
+Down to pick, Return to open or bring forward, Escape to close).
 
 Programs follow the look on their own: a window is sent `window::THEME`
 when it opens and whenever the look changes (`Event::Theme` in the `ui`

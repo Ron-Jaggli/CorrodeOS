@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -336,6 +336,24 @@ cursor-test: iso
 	    && echo "cursor-test: resize arrows over an edge and a corner  PASS" \
 	    || echo "cursor-test: resize arrows over an edge and a corner  FAIL"
 	@test -s build/cursor.ppm && pnmtopng build/cursor.ppm > build/cursor.png 2>/dev/null && rm -f build/cursor.ppm && echo "wrote build/cursor.png" || true
+
+# Alt+Space for search, type "s" -- Settings, which starts with it, then
+# Files, which has one -- and press Return: Settings opens.
+# build/search.png shows the field before Return.
+search-test: iso
+	@rm -f build/search.ppm build/search.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "sendkey alt-spc"; sleep 0.8; echo "sendkey s"; sleep 0.8; \
+	   echo "screendump build/search.ppm"; sleep 1.5; \
+	   echo "sendkey ret"; sleep 2; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^desktop .*search|^dock .*Settings" build/serial.log || echo "search-test: no search"
+	@grep -q 'search "s" opens Settings' build/serial.log \
+	    && grep -q "dock       : started Settings" build/serial.log \
+	    && echo "search-test: Alt+Space, s, Return opened Settings    PASS" \
+	    || echo "search-test: Alt+Space, s, Return opened Settings    FAIL"
+	@test -s build/search.ppm && pnmtopng build/search.ppm > build/search.png 2>/dev/null && rm -f build/search.ppm && echo "wrote build/search.png" || true
 
 # Open a terminal from the dock and drag its bottom-right corner 200 by 100
 # pixels bigger, in four steps; then drag its top-left corner 60 by 40

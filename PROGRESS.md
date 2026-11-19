@@ -510,3 +510,30 @@ Choices made without asking are marked **Choice:**.
   - Under GPU=virtio it reports FAIL by design: resizing is software-only,
     so no edge exists and the arrow stays.
 - All other tests PASS; 170 / 0.
+
+## 24. Search (Alt+Space)
+
+- `kernel/src/spotlight.rs`: Spotlight and KRunner in one. Alt+Space puts
+  a glass field near the top of the screen, with a magnifier and a faint
+  "Search" placeholder. Typing narrows the dock's programs to those whose
+  names contain it, names that start with it first. Each result shows the
+  dock's icon and name, and the pick gets an accent highlight.
+  - Up and Down move the pick.
+  - Return opens the pick, or brings its window forward if it's already
+    running, as Spotlight does.
+  - Escape or Alt+Space again closes it.
+- While search is up it has the keyboard; keys don't reach windows.
+- Atlas: the query line (400x28) and the magnifier sit in the right half
+  at row 408, past the switcher's highlight. Icons and names reuse the
+  dock's stencils (new `Dock::apps`/`Dock::label`).
+- New `./corrode search-test`: Alt+Space, type "s", Return. Settings is
+  listed first (starts with s) above Files (contains s), and Settings
+  opens. PASS on the default and virtio displays. All other tests PASS;
+  170 / 0.
+- README shortcuts updated.
+- Known gaps:
+  - Only programs are searched, not files.
+  - With `dock = false` there is nothing to search, and the log says so.
+  - The pick highlight is a plain rectangle; the atlas has no room left
+    for a wide rounded stencil.
+- Screenshot: `build/progress-22-search.png`.
