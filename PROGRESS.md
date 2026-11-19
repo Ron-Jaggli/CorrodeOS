@@ -1002,3 +1002,16 @@ The short version, for reading first. The numbered log below has the detail.
   shows "brought window 1 forward". Full suite PASSes on both GPUs (27
   checks each); input-test is 170 / 0 default, 177 / 0 virtio.
 - Screenshot: `build/progress-41-dock-windows.png`.
+
+## 42. Files names its folder
+
+- Files sets its subtitle to the folder it shows, as Finder's title bar
+  does: "Files - etc", and "Files - CorrodeOS" at the root (the name its
+  sidebar uses).
+- The Alt+Tab switcher needed no change. It copies its labels from the
+  window's title layer, which `Desk::retitle` updates, so a picked
+  terminal reads "Terminal - /".
+- files-test checks for "now says Files - etc". Full suite PASSes on
+  both GPUs (28 checks each); input-test is 170 / 0 default, 177 / 0
+  virtio.
+- Screenshot: `build/progress-42-files-title.png`.

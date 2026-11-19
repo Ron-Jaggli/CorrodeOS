@@ -131,6 +131,10 @@ fn fit(text: &str, style: Style, width: u32) -> String {
 
 impl Browser {
     fn open(&mut self, dir: &str) {
+        if self.cwd != dir {
+            // The title bar names the folder, as Finder's does.
+            corrode_ui::subtitle(if dir == "/" { "CorrodeOS" } else { name_of(dir) });
+        }
         self.cwd = String::from(dir);
         let mut folders = Vec::new();
         let mut files = Vec::new();

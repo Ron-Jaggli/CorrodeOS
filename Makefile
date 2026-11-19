@@ -270,6 +270,9 @@ files-test: iso
 	@grep -q "^files      : /etc (3 items)" build/serial.log \
 	    && echo "files-test: opened /etc from the keyboard            PASS" \
 	    || echo "files-test: opened /etc from the keyboard            FAIL"
+	@grep -q "now says Files - etc" build/serial.log \
+	    && echo "files-test: the title bar names the folder           PASS" \
+	    || echo "files-test: the title bar names the folder           FAIL"
 	@test -s build/files.ppm && pnmtopng build/files.ppm > build/files.png 2>/dev/null && rm -f build/files.ppm && echo "wrote build/files.png" || true
 
 # Open a terminal from the dock, fill it with help twice, then turn the
