@@ -215,6 +215,9 @@ pub mod window {
     /// A popover: no title bar, under the right-hand end of the menu bar,
     /// and told to close when anything else is clicked.
     pub const POPOVER: u64 = 8;
+    /// A cover: the whole screen, above everything, with every key and
+    /// click while it is up. The lock screen is one.
+    pub const COVER: u64 = 16;
 
     /// A key, while this window has the keyboard. Words as `ps2::LABEL_KEY`.
     pub const KEY: u64 = 62;
@@ -273,6 +276,8 @@ pub mod launcher {
     pub const FILES: u64 = 4;
     /// Control Center, the menu bar's quick settings.
     pub const CONTROL: u64 = 5;
+    /// The lock screen.
+    pub const LOCK: u64 = 6;
 }
 
 /// Rights, as bits: in the low byte of what `SYS_IDENTIFY` reports, and as

@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -77,7 +77,7 @@ kernel:
 # crate built for it. RUSTFLAGS in the environment replaces the ones in
 # .cargo/config.toml outright, and a separate target directory stops the two
 # sets of flags from invalidating each other's build of the crates they share.
-USER_PROGRAMS := edu fault virtio-gpu blob-reader nvidia ps2 terminal panel settings about files control
+USER_PROGRAMS := edu fault virtio-gpu blob-reader nvidia ps2 terminal panel settings about files control lock
 USER_TARGET   := target/user
 USER_BIN      := $(USER_TARGET)/x86_64-unknown-none/release
 USER_RUSTFLAGS := -C relocation-model=static -C strip=debuginfo \
@@ -418,6 +418,31 @@ control-test: iso
 	    && echo "control-test: clock opened it, toggled, clock closed it PASS" \
 	    || echo "control-test: clock opened it, toggled, clock closed it FAIL"
 	@test -s build/control.ppm && pnmtopng build/control.ppm > build/control.png 2>/dev/null && rm -f build/control.ppm && echo "wrote build/control.png" || true
+
+# Open a terminal, lock with Alt+L, try Alt+Tab and Alt+Space under the
+# lock (neither may answer), screenshot it (build/lock.png), then Return
+# unlocks. Then Alt+L again and unlock by clicking the button.
+lock-test: iso
+	@rm -f build/lock.ppm build/lock.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   echo "sendkey alt-l"; sleep 1.5; \
+	   echo "sendkey alt-tab"; sleep 0.3; echo "sendkey alt-spc"; sleep 0.3; echo "sendkey x"; sleep 0.8; \
+	   echo "screendump build/lock.ppm"; sleep 1; \
+	   echo "sendkey ret"; sleep 1.2; \
+	   echo "sendkey alt-l"; sleep 1.5; \
+	   echo "mouse_move 0 -60"; sleep 0.4; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.2; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^lock |covered|switcher up|search up" build/serial.log || echo "lock-test: no lock screen"
+	@test "$$(grep -c '^lock       : locked' build/serial.log)" = 2 \
+	    && test "$$(grep -c '^lock       : unlocked' build/serial.log)" = 2 \
+	    && ! grep -q "switcher up\|search up" build/serial.log \
+	    && echo "lock-test: locked twice, shortcuts held off, unlocked twice PASS" \
+	    || echo "lock-test: locked twice, shortcuts held off, unlocked twice FAIL"
+	@test -s build/lock.ppm && pnmtopng build/lock.ppm > build/lock.png 2>/dev/null && rm -f build/lock.ppm && echo "wrote build/lock.png" || true
 
 # Open a terminal from the dock and drag its bottom-right corner 200 by 100
 # pixels bigger, in four steps; then drag its top-left corner 60 by 40

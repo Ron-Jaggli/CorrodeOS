@@ -24,7 +24,7 @@ const MARGIN: i32 = 12;
 const GAP: i32 = 8;
 const TILE: (i32, i32) = (138, 56);
 const COLUMNS: i32 = 2;
-const ROWS: i32 = 3;
+const ROWS: i32 = 4;
 const SWATCHES: i32 = 44;
 const WIDTH: u32 = (2 * MARGIN + COLUMNS * TILE.0 + (COLUMNS - 1) * GAP) as u32;
 const HEIGHT: u32 = (2 * MARGIN + ROWS * TILE.1 + ROWS * GAP + SWATCHES) as u32;
@@ -60,10 +60,12 @@ enum Icon {
     Dock,
     Shadow,
     Motion,
+    Clock,
+    Lock,
     Gear,
 }
 
-const TILES: [Tile; 6] = [
+const TILES: [Tile; 8] = [
     Tile {
         label: "Dark Mode",
         on: |theme| theme.dark,
@@ -104,7 +106,21 @@ const TILES: [Tile; 6] = [
         flip: |theme| theme.speed = if theme.speed > 0 { 0 } else { 100 },
         icon: Icon::Motion,
     },
-    // Not a toggle: a way into the rest.
+    Tile {
+        label: "24-Hour",
+        on: |theme| theme.clock_24h,
+        states: ["12-hour clock", "24-hour clock"],
+        flip: |theme| theme.clock_24h = !theme.clock_24h,
+        icon: Icon::Clock,
+    },
+    // Not toggles: the lock screen, and a way into the rest.
+    Tile {
+        label: "Lock",
+        on: |_| false,
+        states: ["Alt+L", "Alt+L"],
+        flip: |_| {},
+        icon: Icon::Lock,
+    },
     Tile {
         label: "Settings...",
         on: |_| false,
@@ -175,6 +191,17 @@ fn icon(window: &mut Window, icon: Icon, x: i32, y: i32, back: Rgb) {
             }
             window.rounded(x + 6, y - 5, 4, 11, 2, white);
         }
+        Icon::Clock => {
+            window.rounded(x - 8, y - 8, 16, 16, 8, white);
+            window.rounded(x - 6, y - 6, 12, 12, 6, back);
+            window.fill(x, y - 5, 1, 6, white);
+            window.fill(x, y, 4, 1, white);
+        }
+        Icon::Lock => {
+            window.rounded(x - 5, y - 9, 10, 12, 5, white);
+            window.rounded(x - 3, y - 7, 6, 10, 3, back);
+            window.rounded(x - 7, y - 2, 14, 11, 2, white);
+        }
         Icon::Gear => {
             window.rounded(x - 8, y - 8, 16, 16, 8, white);
             window.rounded(x - 4, y - 4, 8, 8, 4, back);
@@ -191,7 +218,7 @@ fn draw(window: &mut Window, theme: &Theme) {
         window.rounded(x, y, TILE.0 as u32, TILE.1 as u32, 14, look.tile);
         let on = (tile.on)(theme);
         // The round button: the accent when on, as macOS's are.
-        let circle = if on || matches!(tile.icon, Icon::Gear) {
+        let circle = if on || matches!(tile.icon, Icon::Gear | Icon::Lock) {
             look.accent
         } else {
             look.off
@@ -218,18 +245,20 @@ fn draw(window: &mut Window, theme: &Theme) {
     window.commit_all();
 }
 
-/// What a click at `x`, `y` does: a new theme, or Settings opened.
+/// What a click at `x`, `y` does: a new theme, or a program started.
 enum Action {
     Theme(Theme),
-    Settings,
+    Launch(u64),
 }
 
 fn click(theme: &Theme, x: i32, y: i32) -> Option<Action> {
     for (index, tile) in TILES.iter().enumerate() {
         let (left, top) = tile_at(index);
         if x >= left && x < left + TILE.0 && y >= top && y < top + TILE.1 {
-            if matches!(tile.icon, Icon::Gear) {
-                return Some(Action::Settings);
+            match tile.icon {
+                Icon::Gear => return Some(Action::Launch(launcher::SETTINGS)),
+                Icon::Lock => return Some(Action::Launch(launcher::LOCK)),
+                _ => {}
             }
             let mut changed = *theme;
             (tile.flip)(&mut changed);
@@ -283,13 +312,13 @@ fn main() {
                         println!("the look could not change: {:?}", error);
                     }
                 }
-                Some(Action::Settings) => {
+                Some(Action::Launch(program)) => {
                     let asked = corrode_rt::call(
                         app::LAUNCHER,
-                        Message::new(launcher::LAUNCH, [launcher::SETTINGS, 0, 0, 0]),
+                        Message::new(launcher::LAUNCH, [program, 0, 0, 0]),
                         None,
                     );
-                    println!("asked for Settings: {}", if asked.is_ok() { "yes" } else { "no" });
+                    println!("asked for program {}: {}", program, if asked.is_ok() { "yes" } else { "no" });
                     // Out of the way, as Control Center goes once used.
                     corrode_rt::exit();
                 }

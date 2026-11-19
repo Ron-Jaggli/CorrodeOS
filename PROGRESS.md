@@ -619,3 +619,38 @@ Choices made without asking are marked **Choice:**.
   - Glass only toggles Off/Regular; the Clear mode stays in Settings.
   - No keyboard control inside the popover.
 - Screenshot: `build/progress-26-control.png`.
+
+## 28. Lock screen
+
+- New window kind: `window::COVER` (flag 16).
+  - It takes the whole screen, with no chrome and no shadow, and fades in.
+  - The desk raises it above everything except the pointer (menu bar,
+    dock, banners, switcher and search included).
+  - While it is up, every key goes to it, so Alt+Tab, Alt+Space and the
+    other shortcuts do nothing.
+  - Covering the screen puts away any open search or switcher.
+  - Covers get the CLOCK anchor, as docked windows do.
+- New program `user/lock`, the lock screen:
+  - a clear surface over a full-screen glass pane, so it is the blurred
+    desktop;
+  - the date, the time at 112 px bold, an avatar circle in the accent
+    colour with "CorrodeOS" under it, and a "Press Return to unlock" pill;
+  - it updates every minute.
+  - Return or clicking the pill unlocks it (the program exits).
+- Alt+L locks (new `Shortcut::Lock`, `launcher::LOCK` = 6). The launcher
+  starts only one lock screen at a time (`windows::locked()`, which skips
+  windows whose program has exited).
+- Control Center is now 4x2 tiles: a 24-Hour clock toggle and a Lock tile
+  were added.
+- Choice: no password, since there are no accounts or a keyring to check
+  one against. The README says it hides the screen rather than securing
+  it.
+- New `./corrode lock-test`: locks with Alt+L, checks that Alt+Tab and
+  Alt+Space do nothing under it, unlocks with Return, then locks again and
+  unlocks with a click. PASS, on virtio too. All other tests PASS;
+  170 / 0.
+- Known gaps:
+  - No unlock animation; it just vanishes.
+  - The dock still notices the pointer under the cover (unseen).
+- Screenshots: `build/progress-27-lock.png`,
+  `build/progress-27-control.png`.

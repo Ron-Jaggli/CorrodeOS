@@ -41,6 +41,7 @@ pub struct Window {
     pub translucent: bool,
     pub resizable: bool,
     pub popover: bool,
+    pub cover: bool,
     /// What its title bar says: up to eight bytes, unused ones zero.
     title: [u8; 8],
     /// The task that asked for it. When it finishes, the window goes.
@@ -67,10 +68,16 @@ pub fn set_screen(width: u32, height: u32) {
 pub fn open(width: u32, height: u32, flags: u64, title: u64, owner: usize) -> Option<usize> {
     let docked = flags & window::DOCKED != 0;
     let translucent = flags & window::TRANSLUCENT != 0;
-    let popover = flags & window::POPOVER != 0 && !docked;
-    let resizable = flags & window::RESIZABLE != 0 && !docked && !popover;
+    let cover = flags & window::COVER != 0 && !docked;
+    let popover = flags & window::POPOVER != 0 && !docked && !cover;
+    let resizable = flags & window::RESIZABLE != 0 && !docked && !popover && !cover;
     let (width, height) = if docked {
         (SCREEN[0].load(Ordering::Relaxed), height.clamp(16, 64))
+    } else if cover {
+        (
+            SCREEN[0].load(Ordering::Relaxed).min(window::MAX_WIDTH),
+            SCREEN[1].load(Ordering::Relaxed).min(window::MAX_HEIGHT),
+        )
     } else {
         (
             width.clamp(64, window::MAX_WIDTH),
@@ -96,6 +103,7 @@ pub fn open(width: u32, height: u32, flags: u64, title: u64, owner: usize) -> Op
             translucent,
             resizable,
             popover,
+            cover,
             // Printable ASCII only: a title is drawn, never interpreted.
             title: title
                 .to_le_bytes()
@@ -144,6 +152,19 @@ pub fn title_of_owner(owner: usize) -> Option<alloc::string::String> {
 /// Whether a window is a popover: no title bar, under the menu bar.
 pub fn popover(index: usize) -> bool {
     without_interrupts(|| TABLE.lock().get(index).is_some_and(|window| window.popover))
+}
+
+/// Whether any window covers the screen: the desktop is locked.
+pub fn locked() -> bool {
+    let owners: Vec<usize> = without_interrupts(|| {
+        TABLE.lock().iter().filter(|window| window.cover).map(|window| window.owner).collect()
+    });
+    owners.into_iter().any(|owner| task::state_of(owner) != Some(State::Finished))
+}
+
+/// Whether a window covers the screen, as the lock screen does.
+pub fn cover(index: usize) -> bool {
+    without_interrupts(|| TABLE.lock().get(index).is_some_and(|window| window.cover))
 }
 
 /// Whether the desktop may resize a window.

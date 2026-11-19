@@ -17,7 +17,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use corrode_abi::{ps2, window};
+use corrode_abi::{launcher, ps2, window};
 use corrode_render::anim::{Animation, Ease, Fx};
 use corrode_render::scene::{Layer, LayerId, Scene};
 use corrode_render::{Color, Rect, Renderer};
@@ -470,6 +470,8 @@ enum Shortcut {
     Zoom,
     /// Alt+comma, as Cmd+comma opens an app's settings on macOS.
     Settings,
+    /// Alt+L: lock the screen.
+    Lock,
 }
 
 impl Shortcut {
@@ -480,6 +482,7 @@ impl Shortcut {
             0x32 => Shortcut::Minimize,
             0x2c => Shortcut::Zoom,
             0x33 => Shortcut::Settings,
+            0x26 => Shortcut::Lock,
             _ => return None,
         })
     }
@@ -502,6 +505,8 @@ struct Managed {
     /// Under the menu bar, with no title bar; closes when anything else
     /// is clicked.
     popover: bool,
+    /// The whole screen, above everything, with every key and click.
+    cover: bool,
     /// Where the window's top left is -- its title bar's, if it has one.
     at: (i32, i32),
     width: u32,
@@ -536,7 +541,7 @@ enum Part {
 
 impl Managed {
     fn bar(&self) -> u32 {
-        if self.docked || self.popover {
+        if self.docked || self.popover || self.cover {
             0
         } else {
             BAR
@@ -846,6 +851,26 @@ impl Desk {
                         self.show_pointer(scene, now);
                     }
                 }
+                // While the screen is covered, the cover has every key.
+                Event::Key {
+                    key,
+                    pressed,
+                    text,
+                    modifiers,
+                } if self.covered().is_some() => {
+                    if let Some(index) = self.covered() {
+                        crate::windows::push(
+                            self.windows[index].window,
+                            window::KEY,
+                            [
+                                key as u64,
+                                pressed as u64,
+                                text.map_or(0, |c| c as u64),
+                                modifiers as u64,
+                            ],
+                        );
+                    }
+                }
                 // While the switcher is up, it has the keyboard: Tab moves
                 // the pick, letting go of Alt takes it, Escape takes none.
                 Event::Key {
@@ -979,12 +1004,17 @@ impl Desk {
 
     /// Tell docked windows -- the menu bar -- which app is in front, when
     /// that has changed since they were last told.
+    /// The window covering the screen, if one is.
+    fn covered(&self) -> Option<usize> {
+        self.windows.iter().rposition(|managed| managed.cover)
+    }
+
     fn announce(&mut self) {
         // A popover is the menu bar's, not a program in front of it.
         let front = self
             .focus
             .and_then(|index| self.windows.get(index))
-            .filter(|managed| !managed.popover)
+            .filter(|managed| !managed.popover && !managed.cover)
             .map(|managed| managed.name.clone())
             .unwrap_or_default();
         if self.announced.as_ref() == Some(&front) {
@@ -1071,8 +1101,9 @@ impl Desk {
         };
         let theme = self.theme;
         let popover = crate::windows::popover(window);
-        let chrome = !docked && !popover;
-        let at = if docked {
+        let cover = crate::windows::cover(window);
+        let chrome = !docked && !popover && !cover;
+        let at = if docked || cover {
             (0, 0)
         } else if popover {
             // Under the right-hand end of the menu bar, as Control Center
@@ -1083,13 +1114,23 @@ impl Desk {
             self.placed += 1;
             (120 + 40 * step, 90 + 36 * step)
         };
-        let radius = if docked { 0 } else { theme.radius as u16 };
+        let radius = if docked || cover { 0 } else { theme.radius as u16 };
+        // Nothing else is to be used while the screen is covered.
+        if cover {
+            if let Some(spotlight) = self.spotlight.take() {
+                spotlight.close(scene);
+            }
+            if let Some(switcher) = self.switcher.take() {
+                switcher.close(scene);
+            }
+            println!("desktop    : screen covered");
+        }
         let translucent = crate::windows::translucent(window);
 
         // Bottom first, so each lands above the last. The shadow is there
         // even with shadows off, unseen, so turning them on can show it in
         // its place under the window.
-        let shadow = (!docked)
+        let shadow = (!docked && !cover)
             .then(|| {
                 let bar = if popover { 0 } else { BAR };
                 scene.add(Layer::shadow(0, 0, width, height + bar, radius, SHADOW_BLUR))
@@ -1146,6 +1187,7 @@ impl Desk {
             surface,
             docked,
             popover,
+            cover,
             at,
             width,
             height,
@@ -1166,8 +1208,15 @@ impl Desk {
                 if !docked && rise > 0 {
                     layer.opacity =
                         Animation::ease(now, rise, Fx::ZERO, Fx::from_int(255), Ease::Out);
-                    // A popover drops from the menu bar; a window rises.
-                    let from = if popover { y - 10 } else { y + 24 };
+                    // A popover drops from the menu bar; a cover fades in
+                    // where it is; a window rises.
+                    let from = if popover {
+                        y - 10
+                    } else if cover {
+                        y
+                    } else {
+                        y + 24
+                    };
                     layer.y = Animation::spring(
                         now,
                         Fx::from_int(from),
@@ -1184,7 +1233,7 @@ impl Desk {
             self.reveal = None;
             crate::windows::push(window, window::REVEAL, words);
         }
-        if docked {
+        if docked || cover {
             self.announced = None;
             if let Some((unix, at)) = crate::rtc::anchor() {
                 crate::windows::push(window, window::CLOCK, [unix as u64, at, 0, 0]);
@@ -1317,6 +1366,12 @@ impl Desk {
         if let Some(banner) = &self.banner {
             let ids: Vec<LayerId> = banner.layers().collect();
             for id in ids {
+                scene.raise(id);
+            }
+        }
+        // A cover goes over everything but the pointer.
+        for managed in self.windows.iter().filter(|managed| managed.cover) {
+            for id in managed.layers() {
                 scene.raise(id);
             }
         }
@@ -1619,10 +1674,13 @@ impl Desk {
             .recent
             .iter()
             .filter_map(|id| self.windows.iter().position(|managed| managed.window == *id))
-            .filter(|index| !self.windows[*index].docked && !self.windows[*index].popover)
+            .filter(|index| {
+                let managed = &self.windows[*index];
+                !managed.docked && !managed.popover && !managed.cover
+            })
             .collect();
         for (index, managed) in self.windows.iter().enumerate() {
-            if !managed.docked && !managed.popover && !order.contains(&index) {
+            if !managed.docked && !managed.popover && !managed.cover && !order.contains(&index) {
                 order.push(index);
             }
         }
@@ -1853,6 +1911,20 @@ impl Desk {
             Shortcut::Zoom => {
                 if let Some(index) = front {
                     self.zoom(scene, index, now);
+                }
+            }
+            Shortcut::Lock => {
+                let answer = crate::ipc::call(
+                    crate::LAUNCHER_ENDPOINT,
+                    crate::ipc::Message {
+                        label: launcher::LAUNCH,
+                        words: [launcher::LOCK, 0, 0, 0],
+                    },
+                    None,
+                    None,
+                );
+                if answer.is_err() {
+                    println!("desktop    : no launcher to lock the screen with");
                 }
             }
             Shortcut::Settings => {

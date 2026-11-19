@@ -29,6 +29,7 @@ members = [
     "user/about",
     "user/files",
     "user/control",
+    "user/lock",
 ]
 
 [workspace.package]

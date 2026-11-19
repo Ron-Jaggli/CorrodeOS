@@ -2174,18 +2174,32 @@ extern "C" fn launcher() {
                 | launcher::SETTINGS
                 | launcher::ABOUT
                 | launcher::FILES
-                | launcher::CONTROL),
+                | launcher::CONTROL
+                | launcher::LOCK),
             ) => {
                 let name = match program {
                     launcher::TERMINAL => "terminal",
                     launcher::SETTINGS => "settings",
                     launcher::FILES => "files",
                     launcher::CONTROL => "control",
+                    launcher::LOCK => "lock",
                     _ => "about",
                 };
                 // Control Center may ask for Settings, and so holds the
                 // launcher too -- able to send, not to give it on.
                 let launcher = (program == launcher::CONTROL).then_some(LAUNCHER_SELF_SLOT);
+                // One lock screen is enough.
+                if program == launcher::LOCK && crate::windows::locked() {
+                    let _ = ipc::reply(
+                        SERVICE_REPLY_SLOT,
+                        ipc::Message {
+                            label: launcher::LAUNCHED,
+                            words: [0, 0, 0, 0],
+                        },
+                        None,
+                    );
+                    continue;
+                }
                 // Only the terminal and Files read files.
                 let files = (matches!(program, launcher::TERMINAL | launcher::FILES)
                     && cap::identify(LAUNCHER_FILES_SLOT).is_ok())

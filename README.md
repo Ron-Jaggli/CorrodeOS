@@ -148,6 +148,11 @@ for Dark Mode, Glass, the dock, shadows and motion, the accent colours, and
 a way into Settings. Click anywhere else (or the clock again) to close it.
 Programs can make their own popovers with the `window::POPOVER` flag.
 
+**Alt+L** (or the Lock tile in Control Center) locks the screen: the whole
+desktop under glass, the date and time large, and Return or the unlock
+button to get back. There are no accounts yet, so there is no password;
+it hides the screen rather than securing it.
+
 Programs follow the look on their own: a window is sent `window::THEME`
 when it opens and whenever the look changes (`Event::Theme` in the `ui`
 crate). A program can change the look with `corrode_ui::set_theme`, which
