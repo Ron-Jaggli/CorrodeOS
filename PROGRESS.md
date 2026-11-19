@@ -160,3 +160,40 @@ Choices made without asking are marked **Choice:**.
 - Known gap: real zoom-to-fill needs surfaces that programs can resize.
   That needs a RESIZE event plus surface reallocation; noted for later.
 - Screenshot: `build/progress-6-zoom.png`.
+
+## 8. Settings (live) and About
+
+- **Settings** (`user/settings`, the cog in the dock) is a System
+  Settings-style inset card with one row per `desktop.conf` setting:
+  preset, appearance, accent (eight macOS swatches), glass, wallpaper,
+  buttons (macOS left / Plasma right), corners, dock, shadows and motion.
+- A click sends the whole theme to the window server as a new
+  `window::SET_THEME` message. The painter notices the change on its next
+  frame and:
+  - repaints the wallpaper;
+  - re-makes every window's glass frame, corner radius, button order,
+    title colour and shadow;
+  - rebuilds the dock (size, on/off);
+  - sends `THEME` to every program, so the panel, the terminal and
+    Settings itself redraw in the new colours.
+- Settings redraws only when that echo arrives, so it always shows what
+  the desktop actually has.
+- **About** (`user/about`, the `i` in the dock): an accent-coloured logo
+  tile, the name and version, a few facts, and a live uptime line.
+- `ui` crate: `Window::rounded()` (antialiased rounded rect, blended),
+  `corrode_ui::set_theme()`, and a re-export of the theme crate.
+- Shadows always exist now, at opacity 0 when `shadows = off`, so toggling
+  them live puts them back under the window. They are lighter on a light
+  desktop.
+- Fixed: a minimized window's title and shadow came back when focus moved
+  (`paint_focus` now leaves minimized windows alone).
+- `./corrode settings-test` opens Settings from the dock, switches to
+  Light, Dunes and a blue accent, then opens About. PASS. All other boot
+  tests PASS; 170 PASS / 0 FAIL.
+- **Choice:** any program with a window may change the look. It is
+  cosmetic, and a separate capability for it felt like overkill for now.
+- Known gap: changes are not saved. The root filesystem is a read-only
+  tar on the ISO, so a reboot goes back to `/etc/desktop.conf`.
+- Known gap: repainting the wallpaper takes a noticeable moment (it is
+  computed per pixel on the painter). Fine for a settings click.
+- Screenshot: `build/progress-7-settings.png`.

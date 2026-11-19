@@ -7,6 +7,14 @@ name = "corrode-abi"
 version = "0.0.1"
 
 [[package]]
+name = "corrode-about"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+ "corrode-ui",
+]
+
+[[package]]
 name = "corrode-blob-reader"
 version = "0.0.1"
 dependencies = [
@@ -109,6 +117,14 @@ dependencies = [
  "corrode-abi",
  "corrode-heap",
  "corrode-pci",
+]
+
+[[package]]
+name = "corrode-settings"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+ "corrode-ui",
 ]
 
 [[package]]

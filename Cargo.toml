@@ -25,6 +25,8 @@ members = [
     "user/ui",
     "user/terminal",
     "user/panel",
+    "user/settings",
+    "user/about",
 ]
 
 [workspace.package]

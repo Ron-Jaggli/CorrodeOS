@@ -2069,6 +2069,20 @@ extern "C" fn window_server() {
             return;
         };
         let words = received.message.words;
+        // A new look for the desktop: kept, and picked up by the painter on
+        // its next frame.
+        if received.message.label == window::SET_THEME {
+            look::set(corrode_theme::Theme::from_words(words));
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: window::SET_THEME,
+                    words: [0; 4],
+                },
+                None,
+            );
+            continue;
+        }
         let size = |word: u64| word.min(u32::MAX as u64) as u32;
         let opened = (received.message.label == window::OPEN)
             .then(|| {
@@ -4385,6 +4399,8 @@ fn render_loop(renderer: &mut Screen) -> ! {
     // the name is on screen, and the boot screen's layers go once it is
     // covered.
     let theme = look::current();
+    let mut seen_changes = look::changes();
+    let mut wallpaper_layer = None;
     let boot: alloc::vec::Vec<LayerId> = stage.scene.ids().collect();
     let desktop_at = time::now_ns() + DESKTOP_DELAY_MS * 1_000_000;
     let fade = theme.ms(700);
@@ -4398,7 +4414,8 @@ fn render_loop(renderer: &mut Screen) -> ! {
             screen.height,
         );
         wallpaper.opacity = Animation::ease(desktop_at, fade, Fx::ZERO, Fx::from_int(255), Ease::Out);
-        if stage.scene.add(wallpaper).is_none() {
+        wallpaper_layer = stage.scene.add(wallpaper);
+        if wallpaper_layer.is_none() {
             println!("desktop    : no room for the wallpaper");
         }
     } else {
@@ -4498,6 +4515,24 @@ fn render_loop(renderer: &mut Screen) -> ! {
             } else {
                 println!("desktop    : the renderer cannot show window {index}");
             }
+        }
+
+        // A new look, from Settings: a new wallpaper, and everything on it
+        // restyled.
+        let changes = look::changes();
+        if changes != seen_changes {
+            seen_changes = changes;
+            let theme = look::current();
+            if renderer.show_wallpaper(&theme) {
+                if let Some(id) = wallpaper_layer {
+                    let screen = stage.scene.screen();
+                    stage
+                        .scene
+                        .damage(id, Rect::new(0, 0, screen.width, screen.height));
+                }
+            }
+            desk.restyle(renderer, &mut *stage.scene, theme);
+            println!("theme      : changed");
         }
 
         // What the keyboard and mouse have done since the last look.

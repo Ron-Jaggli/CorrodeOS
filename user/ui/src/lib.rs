@@ -15,6 +15,8 @@ use corrode_rt::abi::{app, window};
 use corrode_rt::{Message, Result};
 pub use corrode_text::{Style, Weight};
 pub use corrode_theme::Theme;
+/// The theme's parts, for programs that change it.
+pub use corrode_theme as theme;
 
 /// A colour, as a window stores it.
 pub type Rgb = u32;
@@ -193,6 +195,41 @@ impl Window {
         extent.width
     }
 
+    /// Fill a rectangle with rounded corners, smoothed at the edges, over
+    /// what is there. `color`'s top byte is how transparent it is.
+    pub fn rounded(&mut self, x: i32, y: i32, width: u32, height: u32, radius: u32, color: Rgb) {
+        let Some((x0, y0, x1, y1)) = self.clip(x, y, width, height) else {
+            return;
+        };
+        let alpha = 255 - (color >> 24);
+        let radius = radius.min(width / 2).min(height / 2) as i64;
+        // In quarters of a pixel, from the rectangle's corner.
+        let (w, h, r) = (width as i64 * 4, height as i64 * 4, radius * 4);
+        for row in y0..y1 {
+            for column in x0..x1 {
+                let (px, py) = (column as i64 - x as i64, row as i64 - y as i64);
+                let mut hits = 0;
+                for sy in 0..4 {
+                    for sx in 0..4 {
+                        let (qx, qy) = (px * 4 + sx, py * 4 + sy);
+                        // Distance into the nearest corner's square, if in one.
+                        let dx = (r - qx).max(qx - (w - 1 - r)).max(0);
+                        let dy = (r - qy).max(qy - (h - 1 - r)).max(0);
+                        hits += (dx * dx + dy * dy <= r * r) as u32;
+                    }
+                }
+                if hits == 0 {
+                    continue;
+                }
+                // SAFETY: as for `fill`.
+                unsafe {
+                    let pixel = self.pixels.add(row * self.stride + column);
+                    pixel.write(blend(color, pixel.read(), alpha * hits / 16));
+                }
+            }
+        }
+    }
+
     /// Say that a rectangle has been redrawn, so it gets shown.
     pub fn commit(&self, x: i32, y: i32, width: u32, height: u32) {
         let _ = corrode_rt::commit(app::WINDOW, x, y, width, height);
@@ -230,6 +267,20 @@ impl Window {
             window::THEME => Event::Theme(Theme::from_words(words)),
             _ => Event::Timeout,
         }
+    }
+}
+
+/// Make `theme` the desktop's look. Every window hears of it as an
+/// [`Event::Theme`], this one included.
+pub fn set_theme(theme: &Theme) -> Result<()> {
+    let answer = corrode_rt::call(
+        app::WINDOWS,
+        Message::new(window::SET_THEME, theme.to_words()),
+        None,
+    )?;
+    match answer.message.words[0] {
+        0 => Ok(()),
+        _ => Err(corrode_rt::Error::Refused),
     }
 }
 

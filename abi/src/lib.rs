@@ -223,6 +223,10 @@ pub mod window {
     /// The desktop's look, in the four words `corrode-theme` packs it
     /// into. Sent when a window opens and whenever the look changes.
     pub const THEME: u64 = 66;
+    /// To the window server: make this the desktop's look, in the same four
+    /// words as [`THEME`]. Every window is told, and the desktop restyles
+    /// itself. Answered with word 0 zero.
+    pub const SET_THEME: u64 = 67;
 
     /// Most a window may be, either way.
     pub const MAX_WIDTH: u32 = 1024;

@@ -248,6 +248,15 @@ enum Button {
 }
 
 impl Button {
+    /// Along the bar from the left: macOS's order on the left, Plasma's on
+    /// the right.
+    const fn order(buttons: Buttons) -> [Button; 3] {
+        match buttons {
+            Buttons::Left => [Button::Close, Button::Minimize, Button::Zoom],
+            Buttons::Right => [Button::Minimize, Button::Zoom, Button::Close],
+        }
+    }
+
     const fn color(self) -> Color {
         match self {
             Button::Close => Color::rgb(0xff, 0x5f, 0x57),
@@ -706,8 +715,10 @@ impl Desk {
         let radius = if docked { 0 } else { theme.radius as u16 };
         let translucent = crate::windows::translucent(window);
 
-        // Bottom first, so each lands above the last.
-        let shadow = (!docked && theme.shadows)
+        // Bottom first, so each lands above the last. The shadow is there
+        // even with shadows off, unseen, so turning them on can show it in
+        // its place under the window.
+        let shadow = (!docked)
             .then(|| {
                 scene.add(Layer::shadow(0, 0, width, height + BAR, radius, SHADOW_BLUR))
             })
@@ -716,11 +727,7 @@ impl Desk {
         let frame = scene.add(pane(Rect::new(0, 0, width, frame_height), radius, &theme));
         let mut lights = [None; 3];
         if !docked && self.stencils {
-            let order = match theme.buttons {
-                Buttons::Left => [Button::Close, Button::Minimize, Button::Zoom],
-                Buttons::Right => [Button::Minimize, Button::Zoom, Button::Close],
-            };
-            for (slot, button) in lights.iter_mut().zip(order) {
+            for (slot, button) in lights.iter_mut().zip(Button::order(theme.buttons)) {
                 *slot = scene
                     .add(Layer::mask(0, 0, DOT_SRC, button.color()))
                     .map(|id| (button, id));
@@ -813,7 +820,8 @@ impl Desk {
         let Some(managed) = self.windows.get(index) else {
             return;
         };
-        if managed.docked {
+        // A window put away stays unseen until it is brought back.
+        if managed.docked || managed.minimized {
             return;
         }
         let theme = &self.theme;
@@ -840,7 +848,15 @@ impl Desk {
             layer.opacity = Animation::rest(Fx::from_int(if focused { 255 } else { 140 }));
         }
         if let Some(layer) = managed.shadow.and_then(|id| scene.layer_mut(id)) {
-            layer.opacity = Animation::rest(Fx::from_int(if focused { 120 } else { 70 }));
+            // Lighter on a light desktop, where a dark shadow is a smudge.
+            let opacity = match (theme.shadows, focused, theme.dark) {
+                (false, ..) => 0,
+                (true, true, true) => 120,
+                (true, false, true) => 70,
+                (true, true, false) => 64,
+                (true, false, false) => 36,
+            };
+            layer.opacity = Animation::rest(Fx::from_int(opacity));
         }
     }
 
@@ -1206,6 +1222,73 @@ impl Desk {
         };
         println!("desktop    : window {} zoomed", managed.window);
         self.move_to(scene, index, at, now);
+    }
+
+    /// The theme changed: restyle every window and the dock to match it, and
+    /// tell every program.
+    pub fn restyle<R: Renderer, const N: usize>(
+        &mut self,
+        renderer: &mut R,
+        scene: &mut Scene<N>,
+        theme: Theme,
+    ) {
+        use corrode_render::scene::Content;
+
+        self.theme = theme;
+        self.hide_glyphs(scene);
+        for index in 0..self.windows.len() {
+            let managed = &mut self.windows[index];
+            crate::windows::push(managed.window, window::THEME, theme.to_words());
+            let radius = if managed.docked { 0 } else { theme.radius as u16 };
+            let (width, height) = (managed.width, managed.height + managed.bar());
+            if let Some(id) = managed.frame {
+                let fresh = pane(Rect::new(0, 0, width, height), radius, &theme);
+                if let Some(layer) = scene.layer_mut(id) {
+                    layer.content = fresh.content;
+                    layer.color = fresh.color;
+                }
+                scene.damage(id, Rect::new(0, 0, width, height));
+            }
+            if let Some(layer) = scene.layer_mut(managed.body) {
+                if let Content::Surface { radius: corner, .. } = &mut layer.content {
+                    *corner = radius.min(255) as u8;
+                }
+            }
+            if let Some(layer) = managed.shadow.and_then(|id| scene.layer_mut(id)) {
+                if let Content::Shadow { radius: corner, .. } = &mut layer.content {
+                    *corner = radius;
+                }
+            }
+            for (light, button) in managed.lights.iter_mut().zip(Button::order(theme.buttons)) {
+                if let Some((which, _)) = light {
+                    *which = button;
+                }
+            }
+            if let Some(layer) = managed.title.and_then(|(id, ..)| scene.layer_mut(id)) {
+                layer.color = theme.text();
+            }
+            if !managed.minimized {
+                for (id, (x, y)) in managed.places(managed.at, theme.buttons) {
+                    if let Some(layer) = scene.layer_mut(id) {
+                        layer.x = Animation::rest(Fx::from_int(x));
+                        layer.y = Animation::rest(Fx::from_int(y));
+                    }
+                }
+            }
+            self.paint_focus(scene, index, self.focus == Some(index));
+        }
+
+        // The dock is drawn from the theme -- its size, whether it is there
+        // at all -- so it is drawn again.
+        if let Some(dock) = self.dock.take() {
+            let ids: Vec<LayerId> = dock.layers().collect();
+            for id in ids {
+                scene.remove(id);
+            }
+        }
+        self.dock = crate::dock::Dock::new(renderer, scene, &theme);
+        self.show_running(scene);
+        self.restack(scene);
     }
 
     /// Take the glyphs off the buttons: the next hover puts them back
