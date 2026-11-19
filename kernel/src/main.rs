@@ -2168,6 +2168,9 @@ fn serve(shell: bool) {
                 alloc::string::String::from(task::name_of(received.from).unwrap_or("A program"))
             });
             notify::post(from, notify::unpack(words));
+            // Control Center, if it is open, shows the list: now, not at
+            // its next look.
+            windows::tell_titled(b"Control", window::NOTIFIED);
             let _ = ipc::reply(
                 SERVICE_REPLY_SLOT,
                 ipc::Message {

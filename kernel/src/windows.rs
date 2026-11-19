@@ -428,6 +428,19 @@ pub fn abandoned(index: usize) -> bool {
 }
 
 /// Give a window an event, and wake its program if it is waiting.
+/// Tell every live window titled `title` (8 bytes, as stored) `label`.
+/// How many were told. Titles that say which program a window is are
+/// kept to that program (see `RESERVED`), so this reaches only it.
+pub fn tell_titled(title: &[u8], label: u64) -> usize {
+    let mut bytes = [0u8; 8];
+    bytes[..title.len().min(8)].copy_from_slice(&title[..title.len().min(8)]);
+    let windows = titled(u64::from_le_bytes(bytes));
+    for index in &windows {
+        push(*index, label, [0; 4]);
+    }
+    windows.len()
+}
+
 pub fn push(index: usize, label: u64, words: [u64; 4]) {
     let waiter = without_interrupts(|| {
         let mut table = TABLE.lock();

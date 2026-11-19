@@ -456,7 +456,12 @@ fn main() {
     loop {
         // Every 20 s, the list again: new arrivals, and ages that move on.
         match window.wait(corrode_rt::now_ns() + 20_000_000_000) {
-            Event::Timeout => {
+            // A notification just posted, or the 20 s look for ages that
+            // move on.
+            event @ (Event::Timeout | Event::Notified) => {
+                if event == Event::Notified {
+                    println!("told of a new notification");
+                }
                 let mut fresh = corrode_ui::notifications();
                 fresh.truncate(NOTES_SHOWN);
                 fit(&window, &mut rows, fresh.len());

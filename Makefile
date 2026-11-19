@@ -535,8 +535,9 @@ history-test: iso
 
 # Control Center's notifications card grows while it is open. A terminal
 # sleeps, with two notifications queued behind the sleep; Control Center
-# opens with none; they arrive, and at its next look (every 20 s) the card
-# grows to show them. build/grow-before.png and build/grow.png.
+# opens with none; they arrive, Control Center is told at once, and the
+# card grows to show them well before its own 20 s look.
+# build/grow-before.png and build/grow.png.
 grow-test: iso
 	@rm -f build/grow-before.ppm build/grow-before.png build/grow.ppm build/grow.png
 	@( sleep $(SHOT_DELAY); \
@@ -547,7 +548,7 @@ grow-test: iso
 	   for key in n o t i f y spc l a t e spc t w o ret; do echo "sendkey $$key"; sleep 0.1; done; sleep 0.3; \
 	   echo "mouse_move 280 -248"; sleep 0.2; echo "mouse_move 280 -248"; sleep 0.2; echo "mouse_move 280 -248"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
-	   echo "screendump build/grow-before.ppm"; sleep 24; \
+	   echo "screendump build/grow-before.ppm"; sleep 6; \
 	   echo "screendump build/grow.ppm"; sleep 1; echo quit ) \
 	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
@@ -559,6 +560,9 @@ grow-test: iso
 	    && grep -q "^control    : now " build/serial.log \
 	    && echo "grow-test: and grew for the two that came after        PASS" \
 	    || echo "grow-test: and grew for the two that came after        FAIL"
+	@test "$$(grep -c '^control    : told of a new notification' build/serial.log)" = 2 \
+	    && echo "grow-test: told of each one as it came, not at 20 s    PASS" \
+	    || echo "grow-test: told of each one as it came, not at 20 s    FAIL"
 	@test -s build/grow-before.ppm && pnmtopng build/grow-before.ppm > build/grow-before.png 2>/dev/null && rm -f build/grow-before.ppm || true
 	@test -s build/grow.ppm && pnmtopng build/grow.ppm > build/grow.png 2>/dev/null && rm -f build/grow.ppm && echo "wrote build/grow.png" || true
 

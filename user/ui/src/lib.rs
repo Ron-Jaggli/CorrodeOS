@@ -89,6 +89,8 @@ pub enum Event {
     Scroll { notches: i32, x: i32, y: i32 },
     /// To Files, from search: show the file at this path.
     Reveal([u8; 32]),
+    /// A notification was posted: Control Center's list is out of date.
+    Notified,
     /// To a popover: the pointer is at x, y on it; -1, -1 when it leaves.
     Hover { x: i32, y: i32 },
     /// The deadline came before anything else did.
@@ -292,6 +294,7 @@ impl Window {
                 x: words[1] as i64 as i32,
                 y: words[2] as i64 as i32,
             },
+            window::NOTIFIED => Event::Notified,
             window::REVEAL => {
                 let mut path = [0u8; 32];
                 for (chunk, word) in path.chunks_mut(8).zip(words) {

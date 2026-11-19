@@ -31,7 +31,7 @@ The short version, for reading first. The numbered log below has the detail.
   - virtio GPU parity: glass, wallpaper (14), freeing surfaces (30) and
     resizing (31). Before 30, the 14th window under virtio failed to open.
 - **Tests:** `./corrode test` passes. 33 scripted boot tests (`close-test`
-  through `grow-test`, 46 scored checks) pass on both the default GPU and
+  through `grow-test`, 47 scored checks) pass on both the default GPU and
   `GPU=virtio`. The boot self-checks give 172 PASS / 0 FAIL (default) and
   179 / 0 (virtio). Each test writes a screenshot to `build/`. The
   `build/progress-NN-*.png` files are the ones referred to below.
@@ -56,8 +56,6 @@ The short version, for reading first. The numbered log below has the detail.
   adjustable in Settings (50-53).
 - **Known rough edges:** listed under "Known gap" in each section. The
   main ones:
-  - Control Center notices new notifications only every 20 s, not the
-    moment they come (58): there is no event for it yet.
 - **Branch:** everything is on `desktop-glass` (37 commits on top of
   `secure-core/reserve`). Nothing was committed to `main`, and nothing
   outside the project was changed apart from installing podman (Setup).
@@ -1469,4 +1467,20 @@ This part, host-tested only:
   Clear.
 - Known gap: arrivals are noticed only at the 20 s look.
 - Full suite PASSes on both GPUs (92 lines); input-test 172 / 0 and
+  179 / 0; `./corrode test` passes.
+
+## 59. Control Center hears of notifications as they come
+
+- New window event `window::NOTIFIED` (84), no words. When the kernel
+  posts a notification it tells every live window titled "Control"
+  (`windows::tell_titled`). That title is reserved for the real Control
+  Center since 56, so no other program hears it. `corrode_ui::Event::Notified`;
+  Control Center refetches and fits its card on it, as at its 20 s look
+  (which stays, for the ages that move on).
+- grow-test now waits 6 s, not 24, so the 20 s look cannot be what found
+  them, and checks "told of a new notification" twice. The first
+  arrival already sized the card for 2: both `notify` lines ran back to
+  back before Control Center refetched.
+- Closes the gap from 58.
+- Full suite PASSes on both GPUs (94 lines); input-test 172 / 0 and
   179 / 0; `./corrode test` passes.

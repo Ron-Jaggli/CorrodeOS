@@ -305,6 +305,9 @@ pub mod window {
     /// only its own: other windows are sized by the person. The answer's
     /// word 0 is 1 if it will be; the window then hears [`RESIZE`].
     pub const GROW: u64 = 83;
+    /// To Control Center: a notification was just posted, so the list it
+    /// shows is out of date. Nothing in the words; ask again.
+    pub const NOTIFIED: u64 = 84;
     /// The calls only the shell endpoint takes.
     pub const SHELL_ONLY: [u64; 6] = [SET_THEME, QUIT, LIST, RAISE, HISTORY, CONTEXT];
 
