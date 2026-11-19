@@ -794,3 +794,28 @@ Choices made without asking are marked **Choice:**.
     update while open.
   - There is no way to clear the list.
 - Screenshot: `build/progress-33-history.png`.
+
+## 35. Control Center from the keyboard
+
+- Closes the keyboard gap from section 27. Control Center has the
+  keyboard when it opens, and:
+  - the arrows move a highlight over the 8 tiles (a 2-column grid) and
+    the 8 swatches below. Down from the last row of tiles goes to the
+    swatches under that column, and Up from a swatch goes back to the
+    tile above its half of the row;
+  - Return or Space acts on the highlighted item, through the same
+    `click()` the mouse uses (at its centre), so they cannot disagree;
+  - Escape closes it.
+- The highlight only appears once a key is pressed, as macOS shows focus
+  only to keyboard users.
+- How it looks: an accent rounded rectangle 3 px larger than the item,
+  under it. The tiles are translucent, so it reads as an accent ring
+  round an accent-tinted tile.
+  - Choice: I meant to clear the inside for a plain ring, but the ui's
+    `rounded` blends rather than replacing, so CLEAR does nothing. The
+    tinted look works as a highlight, so I kept it.
+- New `./corrode keys-test`: Down ×3 and Right from the clock-opened
+  popover land on 24-Hour (`build/keys.png`), Return flips it, Escape
+  closes. Full suite PASSes on both GPUs (21 checks each); input-test is
+  170 / 0 default, 177 / 0 virtio.
+- Screenshot: `build/progress-34-keys.png`.

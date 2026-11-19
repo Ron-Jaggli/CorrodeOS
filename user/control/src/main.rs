@@ -252,10 +252,64 @@ fn icon(window: &mut Window, icon: Icon, x: i32, y: i32, back: Rgb) {
     }
 }
 
-fn draw(window: &mut Window, theme: &Theme, recent: &[Note]) {
+/// Keys, by scancode (set 1; 0x80 marks the extended ones).
+const KEY_ESCAPE: u8 = 0x01;
+const KEY_ENTER: u8 = 0x1c;
+const KEY_SPACE: u8 = 0x39;
+const KEY_UP: u8 = 0x80 | 0x48;
+const KEY_DOWN: u8 = 0x80 | 0x50;
+const KEY_LEFT: u8 = 0x80 | 0x4b;
+const KEY_RIGHT: u8 = 0x80 | 0x4d;
+
+/// What the keyboard can reach: the tiles, then the swatches.
+const REACHABLE: usize = TILES.len() + ACCENTS.len();
+
+/// The centre of keyboard stop `stop`, and the corner radius of what is
+/// there, for the ring round it and for acting as a click on it would.
+fn stop_at(stop: usize) -> (i32, i32, u32, u32, u32) {
+    if stop < TILES.len() {
+        let (x, y) = tile_at(stop);
+        (x, y, TILE.0 as u32, TILE.1 as u32, 14)
+    } else {
+        let (x, y) = swatch_at(stop - TILES.len());
+        (x - 9, y - 9, 18, 18, 9)
+    }
+}
+
+/// Where an arrow key moves the keyboard from `stop`: about the grid of
+/// tiles, then along the row of swatches beneath it.
+fn step(stop: usize, key: u8) -> usize {
+    let tiles = TILES.len();
+    let last_row = tiles - COLUMNS as usize;
+    let per_column = ACCENTS.len() / COLUMNS as usize;
+    match (key, stop < tiles) {
+        (KEY_LEFT, _) => stop.saturating_sub(1),
+        (KEY_RIGHT, _) => (stop + 1).min(REACHABLE - 1),
+        (KEY_UP, true) => stop.saturating_sub(COLUMNS as usize).min(stop),
+        (KEY_DOWN, true) if stop >= last_row => tiles + (stop - last_row) * per_column,
+        (KEY_DOWN, true) => stop + COLUMNS as usize,
+        // Up from a swatch: the tile above its half of the row.
+        (KEY_UP, false) => last_row + (stop - tiles) / per_column,
+        _ => stop,
+    }
+}
+
+/// The keyboard's highlight on stop `stop`: the accent, three pixels
+/// out, under it. The tile drawn over it is translucent, so it reads as a
+/// ring round an accent-tinted tile.
+fn ring(window: &mut Window, look: &Look, stop: usize) {
+    let (x, y, width, height, radius) = stop_at(stop);
+    window.rounded(x - 3, y - 3, width + 6, height + 6, radius + 3, look.accent);
+}
+
+fn draw(window: &mut Window, theme: &Theme, recent: &[Note], focus: Option<usize>) {
     let look = Look::of(theme);
     let (width, height) = (window.width, window.height);
     window.fill(0, 0, width, height, CLEAR);
+    // Under what it surrounds, which is drawn over it.
+    if let Some(stop) = focus {
+        ring(window, &look, stop);
+    }
     for (index, tile) in TILES.iter().enumerate() {
         let (x, y) = tile_at(index);
         window.rounded(x, y, TILE.0 as u32, TILE.1 as u32, 14, look.tile);
@@ -345,38 +399,79 @@ fn main() {
         }
     };
     let mut theme = Theme::default();
-    draw(&mut window, &theme, &recent);
+    // Nothing has the keyboard's ring until a key is pressed, as macOS
+    // shows focus only to those using the keyboard.
+    let mut focus: Option<usize> = None;
+    draw(&mut window, &theme, &recent, focus);
     println!("open");
 
     loop {
         match window.wait(u64::MAX) {
             Event::Theme(now) => {
                 theme = now;
-                draw(&mut window, &theme, &recent);
+                draw(&mut window, &theme, &recent, focus);
             }
-            Event::Button { x, y, buttons } if buttons & 1 != 0 => match click(&theme, x, y) {
-                Some(Action::Theme(changed)) => {
-                    if let Err(error) = corrode_ui::set_theme(&changed) {
-                        println!("the look could not change: {:?}", error);
-                    }
+            Event::Key {
+                key: KEY_ESCAPE,
+                pressed: true,
+                ..
+            } => {
+                println!("closed from the keyboard");
+                corrode_rt::exit();
+            }
+            Event::Key {
+                key: key @ (KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT),
+                pressed: true,
+                ..
+            } => {
+                let moved = focus.map_or(0, |stop| step(stop, key));
+                focus = Some(moved);
+                println!("keyboard on {}", label_of(moved));
+                draw(&mut window, &theme, &recent, focus);
+            }
+            Event::Key {
+                key: KEY_ENTER | KEY_SPACE,
+                pressed: true,
+                ..
+            } => {
+                if let Some(stop) = focus {
+                    let (x, y, width, height, _) = stop_at(stop);
+                    act(click(&theme, x + width as i32 / 2, y + height as i32 / 2));
                 }
-                Some(Action::Launch(program)) => {
-                    let asked = corrode_rt::call(
-                        app::LAUNCHER,
-                        Message::new(launcher::LAUNCH, [program, 0, 0, 0]),
-                        None,
-                    );
-                    println!("asked for program {}: {}", program, if asked.is_ok() { "yes" } else { "no" });
-                    // Out of the way, as Control Center goes once used.
-                    corrode_rt::exit();
-                }
-                None => {}
-            },
+            }
+            Event::Button { x, y, buttons } if buttons & 1 != 0 => act(click(&theme, x, y)),
             Event::Close => {
                 println!("closed");
                 corrode_rt::exit();
             }
             _ => {}
         }
+    }
+}
+
+/// What keyboard stop `stop` is called, for the log.
+fn label_of(stop: usize) -> &'static str {
+    TILES.get(stop).map_or("an accent", |tile| tile.label)
+}
+
+/// Do what a click or a key asked.
+fn act(action: Option<Action>) {
+    match action {
+        Some(Action::Theme(changed)) => {
+            if let Err(error) = corrode_ui::set_theme(&changed) {
+                println!("the look could not change: {:?}", error);
+            }
+        }
+        Some(Action::Launch(program)) => {
+            let asked = corrode_rt::call(
+                app::LAUNCHER,
+                Message::new(launcher::LAUNCH, [program, 0, 0, 0]),
+                None,
+            );
+            println!("asked for program {}: {}", program, if asked.is_ok() { "yes" } else { "no" });
+            // Out of the way, as Control Center goes once used.
+            corrode_rt::exit();
+        }
+        None => {}
     }
 }

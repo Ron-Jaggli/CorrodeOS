@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -501,6 +501,26 @@ history-test: iso
 	    && echo "history-test: Control Center listed both notifications PASS" \
 	    || echo "history-test: Control Center listed both notifications FAIL"
 	@test -s build/history.ppm && pnmtopng build/history.ppm > build/history.png 2>/dev/null && rm -f build/history.ppm && echo "wrote build/history.png" || true
+
+# Control Center from the keyboard: the clock opens it, arrows walk to
+# the 24-Hour tile (build/keys.png), Return flips it, Escape closes.
+keys-test: iso
+	@rm -f build/keys.ppm build/keys.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move 280 -193"; sleep 0.2; echo "mouse_move 280 -193"; sleep 0.4; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   for key in down down down right; do echo "sendkey $$key"; sleep 0.3; done; sleep 0.5; \
+	   echo "screendump build/keys.ppm"; sleep 1; \
+	   echo "sendkey ret"; sleep 0.8; echo "sendkey esc"; sleep 1; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^control " build/serial.log || echo "keys-test: no Control Center"
+	@grep "^control    : keyboard on" build/serial.log | tail -1 | grep -q "24-Hour" \
+	    && grep -q "^control    : 24-Hour turned" build/serial.log \
+	    && grep -q "^control    : closed from the keyboard" build/serial.log \
+	    && echo "keys-test: arrows, Return and Escape in Control Center PASS" \
+	    || echo "keys-test: arrows, Return and Escape in Control Center FAIL"
+	@test -s build/keys.ppm && pnmtopng build/keys.ppm > build/keys.png 2>/dev/null && rm -f build/keys.ppm && echo "wrote build/keys.png" || true
 
 # Open a terminal from the dock and drag its bottom-right corner 200 by 100
 # pixels bigger, in four steps; then drag its top-left corner 60 by 40
