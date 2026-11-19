@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 
 use corrode_input::Key;
 use corrode_line::{Editor, Outcome};
-use corrode_rt::abi::{app, kind, rights};
+use corrode_rt::abi::{app, kind, rights, window};
 use corrode_rt::println;
 use corrode_shell::{About, Fs, Host, Output, Shell};
 use corrode_ui::{line_height, width_of, Event, Rgb, Style, Window};
@@ -446,7 +446,7 @@ fn main() {
         println!("no memory for a heap");
         corrode_rt::exit();
     }
-    let window = match Window::open_titled(WIDTH, HEIGHT, 0, "Terminal") {
+    let window = match Window::open_titled(WIDTH, HEIGHT, window::RESIZABLE, "Terminal") {
         Ok(window) => window,
         Err(error) => {
             println!("no window: {:?}", error);
@@ -490,6 +490,8 @@ fn main() {
             } => terminal.key(Key(key), text, modifiers),
             Event::Focus(focused) => terminal.focused = focused,
             Event::Close => close(),
+            // Everything is laid out from the window's size each time.
+            Event::Resize { width, height } => println!("resized to {}x{}", width, height),
             Event::Timeout => match terminal.busy_until {
                 Some(until) if corrode_rt::now_ns() >= until => terminal.finish(),
                 _ => continue,

@@ -78,6 +78,9 @@ pub enum Event {
     /// To docked windows: the title of the window with the keyboard, empty
     /// if none has it.
     Active([u8; 8]),
+    /// The window is a new size, already in effect: `width` and `height`
+    /// say what it is now. Everything needs drawing again.
+    Resize { width: u32, height: u32 },
     /// The deadline came before anything else did.
     Timeout,
 }
@@ -244,8 +247,9 @@ impl Window {
     }
 
     /// Wait for something to happen, or for the clock to read `deadline`
-    /// nanoseconds; `u64::MAX` for ever.
-    pub fn wait(&self, deadline: u64) -> Event {
+    /// nanoseconds; `u64::MAX` for ever. A resize takes effect before it is
+    /// returned.
+    pub fn wait(&mut self, deadline: u64) -> Event {
         let Ok(Some(message)) = corrode_rt::wait(app::WINDOW, deadline) else {
             return Event::Timeout;
         };
@@ -269,6 +273,17 @@ impl Window {
             window::CLOSE => Event::Close,
             window::THEME => Event::Theme(Theme::from_words(words)),
             window::ACTIVE => Event::Active(words[0].to_le_bytes()),
+            window::RESIZE => {
+                // The kernel checked the new size fits the mapping, which
+                // never changes.
+                self.width = words[0] as u32;
+                self.height = words[1] as u32;
+                self.stride = self.width as usize;
+                Event::Resize {
+                    width: self.width,
+                    height: self.height,
+                }
+            }
             _ => Event::Timeout,
         }
     }

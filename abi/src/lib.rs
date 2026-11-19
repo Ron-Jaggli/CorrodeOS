@@ -208,6 +208,10 @@ pub mod window {
     /// 255 not there. A translucent window is drawn over glass where the
     /// desktop has it, so a panel can be a pane rather than a slab.
     pub const TRANSLUCENT: u64 = 2;
+    /// An `OPEN` flag: the program can draw at any size, so the desktop
+    /// may resize the window -- zoom fills the screen with it -- and says
+    /// so with [`RESIZE`].
+    pub const RESIZABLE: u64 = 4;
 
     /// A key, while this window has the keyboard. Words as `ps2::LABEL_KEY`.
     pub const KEY: u64 = 62;
@@ -231,10 +235,13 @@ pub mod window {
     /// titled word 0 (its eight ASCII bytes, little-endian), or none if 0.
     /// What the menu bar shows as the app in front.
     pub const ACTIVE: u64 = 68;
+    /// The window is now word 0 by word 1 pixels, `width * 4` bytes a row,
+    /// in the same mapping. Redraw all of it. Only to resizable windows.
+    pub const RESIZE: u64 = 69;
 
     /// Most a window may be, either way.
-    pub const MAX_WIDTH: u32 = 1024;
-    pub const MAX_HEIGHT: u32 = 768;
+    pub const MAX_WIDTH: u32 = 1920;
+    pub const MAX_HEIGHT: u32 = 1200;
 }
 
 /// The launcher: start one of the programs the system was booted with.

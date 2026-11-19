@@ -4451,6 +4451,7 @@ fn render_loop(renderer: &mut Screen) -> ! {
     }
     let mut retire_at = Some(desktop_at + fade as u64 * 1_000_000);
     let mut desk = input::Desk::new(renderer, &mut *stage.scene);
+    desk.allow_resize(matches!(renderer, Screen::Software(_)));
     {
         let screen = stage.scene.screen();
         windows::set_screen(screen.width, screen.height);
@@ -4570,6 +4571,11 @@ fn render_loop(renderer: &mut Screen) -> ! {
         // left the scene this poll and are painted away below; the renderer
         // forgets them now, so it never reads them again. Under the remote
         // renderer the driver holds them mapped, so they stay as they are.
+        for resized in desk.take_resized() {
+            if !renderer.show_surface(resized, WINDOW_SURFACES + resized) {
+                println!("desktop    : the renderer cannot show surface {resized} resized");
+            }
+        }
         for closed in desk.take_closed() {
             if renderer.forget_surface(closed) {
                 let _ = cap::delete(WINDOW_SURFACES + closed);

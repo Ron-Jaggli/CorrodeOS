@@ -333,11 +333,14 @@ minimize-test: iso
 	   echo "mouse_move -404 -654"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 1.5; \
 	   echo "mouse_move 300 200"; sleep 0.5; \
-	   echo "screendump build/minimize.ppm"; sleep 2; echo quit ) \
+	   echo "screendump build/minimize.ppm"; sleep 2; \
+	   echo "mouse_move -412 -250"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 1.5; echo quit ) \
 	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
 	@grep -E "^(input|dock|desktop) " build/serial.log | grep -v PASS || echo "minimize-test: nothing from the desktop"
 	@grep -q "minimized" build/serial.log && grep -q "restored" build/serial.log && grep -q "zoomed" build/serial.log \
+	    && grep -q "is now 1264x640" build/serial.log && grep -q "is now 600x340" build/serial.log \
 	    && echo "minimize-test: minimized, restored and zoomed          PASS" \
 	    || echo "minimize-test: minimized, restored and zoomed          FAIL"
 	@test -s build/minimize.ppm && pnmtopng build/minimize.ppm > build/minimize.png 2>/dev/null && rm -f build/minimize.ppm && echo "wrote build/minimize.png" || true

@@ -388,8 +388,9 @@ struct Managed {
     name: String,
     /// Put away by its yellow button, until its dock icon is clicked.
     minimized: bool,
-    /// Where it was before its green button centred it, to go back to.
-    unzoomed: Option<(i32, i32)>,
+    /// Where it was, and how big, before its green button zoomed it, to go
+    /// back to.
+    unzoomed: Option<((i32, i32), (u32, u32))>,
     body: LayerId,
 }
 
@@ -516,6 +517,10 @@ pub struct Desk {
     closed: Vec<usize>,
     /// What docked windows were last told has the keyboard.
     announced: Option<String>,
+    /// Whether the renderer can be shown a surface again at a new size.
+    can_resize: bool,
+    /// Surfaces resized since the painter last asked, to show again.
+    resized: Vec<usize>,
 }
 
 impl Desk {
@@ -573,6 +578,8 @@ impl Desk {
             placed: 0,
             closed: Vec::new(),
             announced: None,
+            can_resize: false,
+            resized: Vec::new(),
         };
         let src = Rect::new(0, LINE_ROW as i32, 1, line_height);
         let y = screen.height as i32 - 40 - line_height as i32;
@@ -1334,23 +1341,89 @@ impl Desk {
     /// zoom can mean for now.
     fn zoom<const N: usize>(&mut self, scene: &mut Scene<N>, index: usize, now: u64) {
         let screen = scene.screen();
+        let dock = self.theme.dock;
+        let can_resize = self.can_resize;
         let Some(managed) = self.windows.get_mut(index) else {
             return;
         };
-        let at = match managed.unzoomed.take() {
+        // The room between the panel and the dock.
+        let (top, bottom) = (40, screen.height as i32 - if dock { 92 } else { 8 });
+        let resizable = can_resize && crate::windows::resizable(managed.window);
+        let (at, size) = match managed.unzoomed.take() {
             Some(back) => back,
             None => {
-                managed.unzoomed = Some(managed.at);
-                let total = (managed.height + managed.bar()) as i32;
-                let (top, bottom) = (40, screen.height as i32 - 90);
-                (
-                    (screen.width as i32 - managed.width as i32) / 2,
-                    (top + (bottom - top - total) / 2).max(top),
-                )
+                managed.unzoomed = Some((managed.at, (managed.width, managed.height)));
+                if resizable {
+                    // Fill the room, a margin in from its edges.
+                    let width = screen.width - 16;
+                    let height = (bottom - top) as u32 - BAR;
+                    ((8, top), (width, height))
+                } else {
+                    let total = (managed.height + managed.bar()) as i32;
+                    (
+                        (
+                            (screen.width as i32 - managed.width as i32) / 2,
+                            (top + (bottom - top - total) / 2).max(top),
+                        ),
+                        (managed.width, managed.height),
+                    )
+                }
             }
         };
         println!("desktop    : window {} zoomed", managed.window);
+        let mut at = at;
+        if resizable && size != (managed.width, managed.height) {
+            self.resize(scene, index, size);
+            // It may have come out smaller than asked: centred, then.
+            let width = self.windows[index].width;
+            if width < size.0 {
+                at.0 += (size.0 - width) as i32 / 2;
+            }
+        }
         self.move_to(scene, index, at, now);
+    }
+
+    /// Make window `index` `size`, its program and every layer of it.
+    fn resize<const N: usize>(&mut self, scene: &mut Scene<N>, index: usize, size: (u32, u32)) {
+        let Some(managed) = self.windows.get_mut(index) else {
+            return;
+        };
+        let Some((width, height)) = crate::windows::resize(managed.window, size.0, size.1) else {
+            return;
+        };
+        println!("desktop    : window {} is now {}x{}", managed.window, width, height);
+        managed.width = width;
+        managed.height = height;
+        let blur = SHADOW_BLUR as u32;
+        let sizes = [
+            (managed.shadow, width + 2 * blur, height + BAR + 2 * blur),
+            (managed.frame, width, height + managed.bar()),
+            (Some(managed.body), width, height),
+        ];
+        for (id, w, h) in sizes {
+            if let Some(layer) = id.and_then(|id| scene.layer_mut(id)) {
+                layer.width = Animation::rest(Fx::from_int(w as i32));
+                layer.height = Animation::rest(Fx::from_int(h as i32));
+                if let corrode_render::scene::Content::Surface { width: sw, height: sh, .. } =
+                    &mut layer.content
+                {
+                    *sw = w;
+                    *sh = h;
+                }
+            }
+        }
+        self.resized.push(managed.surface);
+    }
+
+    /// Let zoom resize windows: only where the renderer can be shown a
+    /// surface again at a new size.
+    pub fn allow_resize(&mut self, allowed: bool) {
+        self.can_resize = allowed;
+    }
+
+    /// Surfaces resized since the last call, to show the renderer again.
+    pub fn take_resized(&mut self) -> Vec<usize> {
+        core::mem::take(&mut self.resized)
     }
 
     /// The theme changed: restyle every window and the dock to match it, and

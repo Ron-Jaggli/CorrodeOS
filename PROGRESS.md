@@ -309,3 +309,29 @@ Choices made without asking are marked **Choice:**.
 - Still open under virtio: closed windows' surfaces are not reused (the
   driver keeps them mapped).
 - Screenshot: `build/progress-12-virtio.png`.
+
+## 15. Zoom fills the screen (resizable windows)
+
+- New `OPEN` flag `window::RESIZABLE` and event `window::RESIZE`
+  (`width`, `height`).
+  - A resizable window's surface is allocated with room for the whole
+    screen up front.
+  - A resize only changes its logical size (rows are `width` pixels
+    apart), within frames that are already mapped. Nothing is remapped or
+    reallocated.
+- `corrode_ui`: `Window::wait` now takes `&mut self` and applies a resize
+  before returning `Event::Resize`. The terminal opts in and simply
+  redraws, since it already lays itself out from the window's size.
+- Green (and Alt+Z) on a resizable window fills the room between the
+  panel and the dock (1264x640 on a 1280x800 screen); pressing it again
+  puts back the old size and place. Every part of the window follows: the
+  frame, shadow and body sizes, the title re-centred, Plasma-side buttons
+  re-placed. Non-resizable windows (Settings, About) still just centre.
+- Window size limit raised from 1024x768 to 1920x1200.
+- `minimize-test` now checks 1264x640 on zoom and 600x340 on unzoom.
+  PASS. Every other boot test PASS; 170 PASS / 0 FAIL.
+- Known gap: under `GPU=virtio` zoom only centres. The driver would need
+  telling the new size of a surface it already maps. Its boot self-checks
+  are still 0 FAIL, but `minimize-test`'s size checks fail there by design.
+- Known gap: no dragging window edges to resize. Only zoom resizes.
+- Screenshot: `build/progress-13-zoom-fill.png`.

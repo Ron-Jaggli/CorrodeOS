@@ -104,7 +104,13 @@ pub fn user_address(index: usize) -> u64 {
 /// creates an object and no authority over it: that is a capability, and
 /// minting one is the caller's decision.
 pub fn create(width: u32, height: u32) -> Option<usize> {
-    let bytes = width as u64 * height as u64 * 4;
+    create_with_room(width, height, width as u64 * height as u64)
+}
+
+/// As [`create`], with frames enough for `room` pixels, so the surface can
+/// later be [`resize`]d to any size that many pixels hold.
+pub fn create_with_room(width: u32, height: u32, room: u64) -> Option<usize> {
+    let bytes = (width as u64 * height as u64).max(room) * 4;
     if bytes == 0 || bytes > SPAN {
         return None;
     }
@@ -197,6 +203,24 @@ fn reuse(width: u32, height: u32, pages: usize) -> Option<usize> {
         }
     });
     Some(index)
+}
+
+/// Make surface `index` `width` by `height`, if its frames hold that many
+/// pixels. Its rows are then `width` pixels apart; what was in it is
+/// whatever the old rows make of the new shape, until its client redraws.
+pub fn resize(index: usize, width: u32, height: u32) -> bool {
+    with(index, |surface| {
+        let fits = width > 0
+            && height > 0
+            && width as u64 * height as u64 * 4 <= surface.frames.len() as u64 * PAGE;
+        if fits {
+            surface.width = width;
+            surface.height = height;
+            surface.redrawn = NOWHERE;
+        }
+        fits
+    })
+    .unwrap_or(false)
 }
 
 /// Free surface `index` for the next window that fits: its window is gone,

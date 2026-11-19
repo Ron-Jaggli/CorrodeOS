@@ -39,6 +39,7 @@ pub struct Window {
     pub height: u32,
     pub docked: bool,
     pub translucent: bool,
+    pub resizable: bool,
     /// What its title bar says: up to eight bytes, unused ones zero.
     title: [u8; 8],
     /// The task that asked for it. When it finishes, the window goes.
@@ -65,6 +66,7 @@ pub fn set_screen(width: u32, height: u32) {
 pub fn open(width: u32, height: u32, flags: u64, title: u64, owner: usize) -> Option<usize> {
     let docked = flags & window::DOCKED != 0;
     let translucent = flags & window::TRANSLUCENT != 0;
+    let resizable = flags & window::RESIZABLE != 0 && !docked;
     let (width, height) = if docked {
         (SCREEN[0].load(Ordering::Relaxed), height.clamp(16, 64))
     } else {
@@ -73,7 +75,15 @@ pub fn open(width: u32, height: u32, flags: u64, title: u64, owner: usize) -> Op
             height.clamp(32, window::MAX_HEIGHT),
         )
     };
-    let surface = surface::create(width, height)?;
+    // A window that can be resized gets room for the whole screen: the
+    // largest the desktop will make it.
+    let room = if resizable {
+        SCREEN[0].load(Ordering::Relaxed).min(window::MAX_WIDTH) as u64
+            * SCREEN[1].load(Ordering::Relaxed).min(window::MAX_HEIGHT) as u64
+    } else {
+        0
+    };
+    let surface = surface::create_with_room(width, height, room)?;
     let index = without_interrupts(|| {
         let mut table = TABLE.lock();
         table.push(Window {
@@ -82,6 +92,7 @@ pub fn open(width: u32, height: u32, flags: u64, title: u64, owner: usize) -> Op
             height,
             docked,
             translucent,
+            resizable,
             // Printable ASCII only: a title is drawn, never interpreted.
             title: title
                 .to_le_bytes()
@@ -119,6 +130,37 @@ pub fn title(index: usize) -> alloc::string::String {
         .take_while(|byte| **byte != 0)
         .map(|byte| *byte as char)
         .collect()
+}
+
+/// Whether the desktop may resize a window.
+pub fn resizable(index: usize) -> bool {
+    without_interrupts(|| TABLE.lock().get(index).is_some_and(|window| window.resizable))
+}
+
+/// Make a resizable window `width` by `height`, clamped to what windows
+/// may be, and tell its program. The size it got, if it could be resized.
+pub fn resize(index: usize, width: u32, height: u32) -> Option<(u32, u32)> {
+    let (width, height) = (
+        width.clamp(64, window::MAX_WIDTH),
+        height.clamp(32, window::MAX_HEIGHT),
+    );
+    // One lock at a time: the window's, then the surface's, then the
+    // window's again.
+    let surface = without_interrupts(|| {
+        let table = TABLE.lock();
+        table.get(index).filter(|window| window.resizable).map(|window| window.surface)
+    })?;
+    if !surface::resize(surface, width, height) {
+        return None;
+    }
+    without_interrupts(|| {
+        if let Some(window) = TABLE.lock().get_mut(index) {
+            window.width = width;
+            window.height = height;
+        }
+    });
+    push(index, window::RESIZE, [width as u64, height as u64, 0, 0]);
+    Some((width, height))
 }
 
 /// Whether a window's pixels say how transparent they are.
