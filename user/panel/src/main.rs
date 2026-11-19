@@ -1,6 +1,7 @@
 //! The panel: a bar along the top of the screen with the system's name, a
 //! button that starts a terminal, the app in front -- in bold, as macOS's
-//! menu bar has it -- and how long the machine has been up.
+//! menu bar has it -- and the date and time, or how long the machine has
+//! been up until the desktop says what time it is.
 //!
 //! It holds one thing the other programs do not: an endpoint to the
 //! launcher. That is the whole of its power to start programs, and it can
@@ -74,24 +75,51 @@ fn button(window: &mut Window, look: &Look, pressed: bool) {
     window.commit(x, y, width, height);
 }
 
-/// Draw the uptime at the right-hand end, and say when it next changes.
-fn clock(window: &mut Window, look: &Look) -> u64 {
+/// What time it is, as the menu bar is told it.
+struct Clock {
+    /// The wall clock and the monotonic clock at one instant, if the
+    /// desktop has said.
+    anchor: Option<(i64, u64)>,
+    theme: Theme,
+}
+
+/// Draw the date and time -- or the uptime, before there is a time to
+/// show -- at the right-hand end, and say when it next changes.
+fn clock(window: &mut Window, look: &Look, time: &Clock) -> u64 {
     let now = corrode_rt::now_ns();
-    let seconds = now / 1_000_000_000;
-    let text = format!(
-        "up {}:{:02}:{:02}",
-        seconds / 3600,
-        seconds / 60 % 60,
-        seconds % 60
-    );
+    let mut buffer = [0u8; 32];
+    let (text, next) = match time.anchor {
+        Some((unix, at)) => {
+            let elapsed = now.saturating_sub(at) / 1_000_000_000;
+            let wall = unix + elapsed as i64;
+            let text = corrode_ui::theme::clock::format(wall, &time.theme, &mut buffer);
+            // The next whole minute, on the monotonic clock.
+            let to_minute = (60 - wall.rem_euclid(60)) as u64;
+            (format!("{text}"), now + to_minute * 1_000_000_000)
+        }
+        None => {
+            let seconds = now / 1_000_000_000;
+            (
+                format!(
+                    "up {}:{:02}:{:02}",
+                    seconds / 3600,
+                    seconds / 60 % 60,
+                    seconds % 60
+                ),
+                (seconds + 1) * 1_000_000_000,
+            )
+        }
+    };
     // Room for the widest the text gets, cleared each time.
-    let room = width_of("up 00:00:00", LABEL) + 16;
+    let room = width_of("Wed 30 Sep  12:59 PM", LABEL) + 16;
     let x = window.width as i32 - room as i32 - 8;
     window.fill(x, 0, room, HEIGHT, CLEAR);
     let y = (HEIGHT as i32 - line_height(LABEL) as i32) / 2;
-    window.text(x + 8, y, &text, LABEL, look.text);
+    // Right-aligned, as macOS's clock is.
+    let x_text = window.width as i32 - width_of(&text, LABEL) as i32 - 16;
+    window.text(x_text, y, &text, LABEL, look.text);
     window.commit(x, 0, room, HEIGHT);
-    (seconds + 1) * 1_000_000_000
+    next
 }
 
 /// Where the app in front is named: after the button, up to the middle.
@@ -108,14 +136,14 @@ fn front(window: &mut Window, look: &Look, name: &str) {
 }
 
 /// Everything, from nothing.
-fn draw(window: &mut Window, look: &Look, name: &str) -> u64 {
+fn draw(window: &mut Window, look: &Look, name: &str, time: &Clock) -> u64 {
     window.fill(0, 0, window.width, window.height, CLEAR);
     let y = (HEIGHT as i32 - line_height(NAME) as i32) / 2;
     window.text(14, y, "CorrodeOS", NAME, look.name);
     window.commit_all();
     button(window, look, false);
     front(window, look, name);
-    clock(window, look)
+    clock(window, look, time)
 }
 
 fn inside(x: i32, y: i32) -> bool {
@@ -139,15 +167,24 @@ fn main() {
     };
     let mut look = Look::of(&Theme::default());
     let mut name = alloc::string::String::new();
-    let mut next = draw(&mut window, &look, &name);
+    let mut time = Clock {
+        anchor: None,
+        theme: Theme::default(),
+    };
+    let mut next = draw(&mut window, &look, &name, &time);
     println!("up, {} pixels wide", window.width);
 
     loop {
         match window.wait(next) {
-            Event::Timeout => next = clock(&mut window, &look),
+            Event::Timeout => next = clock(&mut window, &look, &time),
             Event::Theme(theme) => {
                 look = Look::of(&theme);
-                next = draw(&mut window, &look, &name);
+                time.theme = theme;
+                next = draw(&mut window, &look, &name, &time);
+            }
+            Event::Clock { unix, at } => {
+                time.anchor = Some((unix, at));
+                next = clock(&mut window, &look, &time);
             }
             Event::Active(title) => {
                 name = title

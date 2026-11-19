@@ -111,6 +111,8 @@ typo cannot break the desktop. The file explains every key; in short:
 | `bounce` | `on` `off` | Dock icons jump when they start something |
 | `shadows` | `on` `off` | Window shadows |
 | `animation_speed` | percent, `0` for none | Every animation's pace |
+| `timezone` | `UTC`, `+5`, `-8`, `+05:30` | The menu bar clock's offset from the machine's (UTC) clock |
+| `clock` | `24h` `12h` | The menu bar clock's hours |
 
 A preset plus a line or two is usually all you need:
 

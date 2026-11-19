@@ -64,17 +64,29 @@ const fn on_off(value: bool) -> Option<usize> {
     Some(if value { 0 } else { 1 })
 }
 
-const ROWS: [Row; 10] = [
+const ROWS: [Row; 11] = [
     Row {
         label: "Preset",
         control: Control::Choice {
             options: &["Corrode", "Tahoe", "Light", "Breeze", "Crystal", "Plain"],
+            // The clock is where the person is, not part of a look: kept
+            // across presets, and not counted in which one this is.
             get: |theme| {
-                PRESETS
-                    .iter()
-                    .position(|(_, preset)| preset.to_words() == theme.to_words())
+                PRESETS.iter().position(|(_, preset)| {
+                    Theme {
+                        utc_offset: theme.utc_offset,
+                        clock_24h: theme.clock_24h,
+                        ..*preset
+                    } == *theme
+                })
             },
-            set: |theme, index| *theme = PRESETS[index].1,
+            set: |theme, index| {
+                *theme = Theme {
+                    utc_offset: theme.utc_offset,
+                    clock_24h: theme.clock_24h,
+                    ..PRESETS[index].1
+                }
+            },
         },
     },
     Row {
@@ -144,6 +156,14 @@ const ROWS: [Row; 10] = [
             options: &["On", "Off"],
             get: |theme| on_off(theme.shadows),
             set: |theme, index| theme.shadows = index == 0,
+        },
+    },
+    Row {
+        label: "Clock",
+        control: Control::Choice {
+            options: &["24-hour", "12-hour"],
+            get: |theme| on_off(theme.clock_24h),
+            set: |theme, index| theme.clock_24h = index == 0,
         },
     },
     Row {

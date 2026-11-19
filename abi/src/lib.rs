@@ -238,6 +238,10 @@ pub mod window {
     /// The window is now word 0 by word 1 pixels, `width * 4` bytes a row,
     /// in the same mapping. Redraw all of it. Only to resizable windows.
     pub const RESIZE: u64 = 69;
+    /// To docked windows: the wall clock. Word 0 is seconds since 1970 UTC
+    /// at the monotonic nanosecond in word 1; the time after that is that
+    /// plus how far the monotonic clock has run.
+    pub const CLOCK: u64 = 70;
 
     /// Most a window may be, either way.
     pub const MAX_WIDTH: u32 = 1920;

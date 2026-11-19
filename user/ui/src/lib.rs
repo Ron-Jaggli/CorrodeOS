@@ -81,6 +81,9 @@ pub enum Event {
     /// The window is a new size, already in effect: `width` and `height`
     /// say what it is now. Everything needs drawing again.
     Resize { width: u32, height: u32 },
+    /// To docked windows: the wall clock read `unix` seconds since 1970 UTC
+    /// when the monotonic clock read `at` nanoseconds.
+    Clock { unix: i64, at: u64 },
     /// The deadline came before anything else did.
     Timeout,
 }
@@ -273,6 +276,10 @@ impl Window {
             window::CLOSE => Event::Close,
             window::THEME => Event::Theme(Theme::from_words(words)),
             window::ACTIVE => Event::Active(words[0].to_le_bytes()),
+            window::CLOCK => Event::Clock {
+                unix: words[0] as i64,
+                at: words[1],
+            },
             window::RESIZE => {
                 // The kernel checked the new size fits the mapping, which
                 // never changes.

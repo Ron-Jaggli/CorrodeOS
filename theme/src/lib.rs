@@ -19,6 +19,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod clock;
 pub mod wallpaper;
 
 pub use corrode_render::Color;
@@ -79,6 +80,10 @@ pub struct Theme {
     pub shadows: bool,
     /// Animation speed as a percentage: 100 normal, 0 no animation.
     pub speed: u8,
+    /// The menu bar clock's offset from UTC, in minutes.
+    pub utc_offset: i16,
+    /// 24-hour clock, or 12-hour with AM and PM.
+    pub clock_24h: bool,
 }
 
 /// The presets, by name. The first is the default.
@@ -114,6 +119,8 @@ pub const CORRODE: Theme = Theme {
     bounce: true,
     shadows: true,
     speed: 100,
+    utc_offset: 0,
+    clock_24h: true,
 };
 
 pub const TAHOE: Theme = Theme {
@@ -308,6 +315,15 @@ impl Theme {
                 Some(n) => self.speed = n,
                 None => return false,
             },
+            "timezone" => match offset(value) {
+                Some(minutes) => self.utc_offset = minutes,
+                None => return false,
+            },
+            "clock" => match value {
+                "24h" => self.clock_24h = true,
+                "12h" => self.clock_24h = false,
+                _ => return false,
+            },
             _ => return false,
         }
         true
@@ -379,7 +395,9 @@ impl Theme {
                 | (self.tint_amount as u64) << 56,
             rgb(self.accent) | rgb(self.tint) << 24,
             rgb(self.wallpaper_colors[0]) | rgb(self.wallpaper_colors[1]) << 24,
-            rgb(self.wallpaper_colors[2]),
+            rgb(self.wallpaper_colors[2])
+                | (self.utc_offset as u16 as u64) << 24
+                | (!self.clock_24h as u64) << 40,
         ]
     }
 
@@ -418,6 +436,8 @@ impl Theme {
             accent: rgb(words[1]),
             tint: rgb(words[1] >> 24),
             wallpaper_colors: [rgb(words[2]), rgb(words[2] >> 24), rgb(words[3])],
+            utc_offset: (words[3] >> 24) as u16 as i16,
+            clock_24h: words[3] & 1 << 40 == 0,
         }
     }
 }
@@ -438,6 +458,29 @@ fn uncommented(line: &str) -> &str {
 }
 
 /// A preset by name.
+/// A UTC offset in minutes from `UTC`, `+5`, `-8`, `+05:30` or `-3:30`:
+/// within fourteen hours either way, as every real one is.
+pub fn offset(text: &str) -> Option<i16> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("utc") || text == "0" {
+        return Some(0);
+    }
+    let (sign, rest) = match text.as_bytes().first()? {
+        b'+' => (1, &text[1..]),
+        b'-' => (-1, &text[1..]),
+        _ => return None,
+    };
+    let (hours, minutes) = match rest.split_once(':') {
+        Some((hours, minutes)) => (hours, minutes),
+        None => (rest, "0"),
+    };
+    let (hours, minutes): (i16, i16) = (hours.parse().ok()?, minutes.parse().ok()?);
+    if !(0..=14).contains(&hours) || !(0..60).contains(&minutes) {
+        return None;
+    }
+    Some(sign * (hours * 60 + minutes))
+}
+
 pub fn preset(name: &str) -> Option<Theme> {
     PRESETS
         .iter()
@@ -513,6 +556,19 @@ mod tests {
         assert_eq!(theme.refraction, CORRODE.refraction);
         assert!(!theme.shadows);
         assert_eq!(theme.accent, Color::rgb(1, 2, 3));
+    }
+
+    #[test]
+    fn timezones_and_the_clock_parse_and_pack() {
+        let theme = Theme::parse("timezone = +05:30\nclock = 12h\n");
+        assert_eq!((theme.utc_offset, theme.clock_24h), (330, false));
+        assert_eq!(Theme::from_words(theme.to_words()), theme);
+        let west = Theme::parse("timezone = -8\n");
+        assert_eq!(west.utc_offset, -480);
+        assert_eq!(Theme::from_words(west.to_words()), west);
+        assert_eq!(offset("+15"), None);
+        assert_eq!(offset("5"), None);
+        assert_eq!(offset("UTC"), Some(0));
     }
 
     #[test]

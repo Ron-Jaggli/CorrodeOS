@@ -929,6 +929,9 @@ impl Desk {
         self.windows.push(managed);
         if docked {
             self.announced = None;
+            if let Some((unix, at)) = crate::rtc::anchor() {
+                crate::windows::push(window, window::CLOCK, [unix as u64, at, 0, 0]);
+            }
         }
         self.show_running(scene);
         crate::windows::push(window, window::THEME, theme.to_words());

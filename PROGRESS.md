@@ -354,3 +354,27 @@ Choices made without asking are marked **Choice:**.
   - no left or top edges;
   - like zoom, only on the software renderer.
 - Screenshot: `build/progress-14-resize.png`.
+
+## 17. A real clock in the menu bar
+
+- `kernel/src/rtc.rs` reads the CMOS real-time clock once at boot. It
+  waits out an update in progress, re-reads until two readings agree, and
+  handles BCD and 12-hour modes. It pairs the result with the monotonic
+  clock ("rtc : 2026-11-19 07:13:01 UTC" in the log).
+- New event `window::CLOCK` (wall seconds plus the monotonic nanosecond)
+  goes to docked windows. The panel keeps time from that pair and redraws
+  at each minute boundary.
+- The menu bar shows "Thu 19 Nov  07:13", right-aligned, as macOS does.
+  Uptime is shown only before the clock arrives (it is still in About).
+- `theme/src/clock.rs`: date formatting with no allocation, host-tested
+  (leap day, a timezone that crosses midnight, 12-hour AM/PM).
+- New `desktop.conf` keys `timezone` (`UTC`, `+5`, `-8`, `+05:30`) and
+  `clock` (`24h`/`12h`), packed into the theme word's spare bits. Settings
+  gained a Clock row. Picking a preset in Settings keeps your timezone and
+  clock, since those belong to the person, not the look.
+- All boot tests PASS; 170 / 0 on the default path, 0 FAIL on virtio.
+- **Choice:** the RTC is taken as UTC (QEMU's default). On a machine whose
+  RTC keeps local time, set `timezone = UTC`.
+- Known gap: no NTP, so the clock drifts with the monotonic clock over
+  very long uptimes.
+- Screenshot: `build/progress-15-clock.png`.

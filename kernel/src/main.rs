@@ -15,6 +15,7 @@ mod blob;
 mod cap;
 mod device;
 mod dock;
+mod rtc;
 #[cfg(feature = "efi-log")]
 mod efi_log;
 mod input;
@@ -4415,6 +4416,7 @@ const DESKTOP_DELAY_MS: u64 = 1200;
 /// answer changed.
 fn render_loop(renderer: &mut Screen) -> ! {
     look::load();
+    rtc::init();
     let Some(mut stage) = Stage::new(renderer, time::now_ns()) else {
         println!("scene      : no room for the boot screen's layers");
         idle_loop()
