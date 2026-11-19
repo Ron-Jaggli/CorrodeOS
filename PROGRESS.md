@@ -139,3 +139,24 @@ Choices made without asking are marked **Choice:**.
   pauses for the few milliseconds a program takes to load. Fine in QEMU;
   worth a queue if it ever shows.
 - Screenshot: `build/progress-5-dock.png`.
+
+## 7. Minimize and zoom
+
+- **Yellow** minimizes: the window sinks towards the dock and fades
+  (280 ms ease-in, scaled by `animation_speed`), and gives up the
+  keyboard. Clicking its dock icon brings it back on a spring and focuses
+  it. Clicking the icon of a program whose window is already open now
+  focuses that window instead of starting a second copy, as macOS does.
+- **Green** zooms: windows can't be resized yet (a program's pixels are a
+  fixed-size surface), so for now zoom centres the window between the
+  panel and the dock, and a second click sends it back where it was. Moves
+  use a snappy spring.
+- Fixed: the hover glyphs (x - +) stayed behind when a window moved,
+  minimized or closed. They are now hidden whenever their buttons move.
+- `./corrode minimize-test` minimizes, restores from the dock and zooms.
+  PASS. `close-test` and `dock-test` PASS; boot 170 PASS / 0 FAIL.
+- **Choice:** there is no genie effect. The scene can move and fade layers
+  but not warp them, so minimize is a sink and fade.
+- Known gap: real zoom-to-fill needs surfaces that programs can resize.
+  That needs a RESIZE event plus surface reallocation; noted for later.
+- Screenshot: `build/progress-6-zoom.png`.

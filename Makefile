@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -251,6 +251,30 @@ input-test: iso
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
 	@grep -E "^(input|ps2|panel|terminal) " build/serial.log || echo "input-test: nothing from the input path"
 	@test -s build/input.ppm && pnmtopng build/input.ppm > build/input.png 2>/dev/null && rm -f build/input.ppm && echo "wrote build/input.png" || true
+
+# Start a terminal from the dock, minimize it with its yellow button, bring
+# it back from the dock, then zoom it with its green one. build/minimize.png
+# shows it centred.
+minimize-test: iso
+	@rm -f build/minimize.ppm build/minimize.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -56 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
+	   echo "mouse_move -424 -654"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 1; \
+	   echo "mouse_move 424 654"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 1; \
+	   echo "mouse_move -404 -654"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 1.5; \
+	   echo "mouse_move 300 200"; sleep 0.5; \
+	   echo "screendump build/minimize.ppm"; sleep 2; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^(input|dock|desktop) " build/serial.log | grep -v PASS || echo "minimize-test: nothing from the desktop"
+	@grep -q "minimized" build/serial.log && grep -q "restored" build/serial.log && grep -q "zoomed" build/serial.log \
+	    && echo "minimize-test: minimized, restored and zoomed          PASS" \
+	    || echo "minimize-test: minimized, restored and zoomed          FAIL"
+	@test -s build/minimize.ppm && pnmtopng build/minimize.ppm > build/minimize.png 2>/dev/null && rm -f build/minimize.ppm && echo "wrote build/minimize.png" || true
 
 # Boot, start a terminal from the dock's first icon, then click the second.
 # build/dock.png shows the dock with the terminal's running dot under it.

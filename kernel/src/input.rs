@@ -345,6 +345,10 @@ struct Managed {
     title: Option<(LayerId, usize, u32)>,
     /// What the title says, for the dock to know what is running.
     name: String,
+    /// Put away by its yellow button, until its dock icon is clicked.
+    minimized: bool,
+    /// Where it was before its green button centred it, to go back to.
+    unzoomed: Option<(i32, i32)>,
     body: LayerId,
 }
 
@@ -770,6 +774,8 @@ impl Desk {
             lights,
             title,
             name,
+            minimized: false,
+            unzoomed: None,
             body,
         };
         let rise = theme.ms(250);
@@ -932,7 +938,17 @@ impl Desk {
             if let (Some(dock), Some(top)) = (&self.dock, top) {
                 if let Some(icon) = dock.icon(top) {
                     println!("input      : click at ({}, {}) on the dock", self.at.0, self.at.1);
-                    dock.launch(icon, scene, now);
+                    // A program with a window already comes forward, out of
+                    // the dock if it was put away; one without is started.
+                    let title = dock.title(icon);
+                    let open = self
+                        .windows
+                        .iter()
+                        .rposition(|managed| !managed.docked && managed.name == title);
+                    match open {
+                        Some(index) => self.restore(scene, index, now),
+                        None => dock.launch(icon, scene, now),
+                    }
                     return;
                 }
                 if dock.contains(top) {
@@ -968,7 +984,8 @@ impl Desk {
                         Part::Light(Button::Close) => {
                             crate::windows::push(self.windows[index].window, window::CLOSE, [0; 4])
                         }
-                        Part::Light(_) => {}
+                        Part::Light(Button::Minimize) => self.minimize(scene, index, now),
+                        Part::Light(Button::Zoom) => self.zoom(scene, index, now),
                         Part::Bar => {
                             let (x, y) = self.windows[index].at;
                             self.drag = Some((index, self.at.0 - x, self.at.1 - y));
@@ -1069,11 +1086,135 @@ impl Desk {
             self.drag = self
                 .drag
                 .and_then(|(at, x, y)| shift(at).map(|at| (at, x, y)));
-            self.hovering = None;
-            for glyph in self.glyphs.iter().flatten() {
-                if let Some(layer) = scene.layer_mut(*glyph) {
-                    layer.opacity = Animation::rest(Fx::ZERO);
+            self.hide_glyphs(scene);
+        }
+    }
+
+    /// Move window `index` to `at`, on a spring, every part of it.
+    fn move_to<const N: usize>(&mut self, scene: &mut Scene<N>, index: usize, at: (i32, i32), now: u64) {
+        let Some(managed) = self.windows.get_mut(index) else {
+            return;
+        };
+        managed.at = at;
+        let animate = self.theme.speed > 0;
+        for (id, (x, y)) in managed.places(at, self.theme.buttons) {
+            if let Some(layer) = scene.layer_mut(id) {
+                let (x, y) = (Fx::from_int(x), Fx::from_int(y));
+                if animate {
+                    layer.x = layer.x.retarget(now, x, corrode_render::anim::Spring::SNAPPY);
+                    layer.y = layer.y.retarget(now, y, corrode_render::anim::Spring::SNAPPY);
+                } else {
+                    layer.x = Animation::rest(x);
+                    layer.y = Animation::rest(y);
                 }
+            }
+        }
+        // The glyphs were on the buttons where they were.
+        self.hide_glyphs(scene);
+    }
+
+    /// Put window `index` away: it drops towards the dock and fades, and
+    /// gives up the keyboard. Its dock icon brings it back.
+    fn minimize<const N: usize>(&mut self, scene: &mut Scene<N>, index: usize, now: u64) {
+        let Some(managed) = self.windows.get_mut(index) else {
+            return;
+        };
+        if managed.docked || managed.minimized {
+            return;
+        }
+        managed.minimized = true;
+        println!("desktop    : window {} minimized", managed.window);
+        let drop = scene.screen().height as i32;
+        let ms = self.theme.ms(280);
+        let ids: Vec<(LayerId, (i32, i32))> = managed.places(managed.at, self.theme.buttons);
+        for (id, (_, y)) in ids {
+            if let Some(layer) = scene.layer_mut(id) {
+                let from = layer.opacity.sample(now).value;
+                if ms == 0 {
+                    layer.opacity = Animation::rest(Fx::ZERO);
+                    continue;
+                }
+                layer.opacity = Animation::ease(now, ms, from, Fx::ZERO, Ease::In);
+                layer.y = Animation::ease(
+                    now,
+                    ms,
+                    layer.y.sample(now).value,
+                    Fx::from_int(y + drop / 3),
+                    Ease::In,
+                );
+            }
+        }
+        if self.focus == Some(index) {
+            self.set_focus(scene, None);
+        }
+        self.hide_glyphs(scene);
+    }
+
+    /// Bring window `index` back if it was put away, and give it the
+    /// keyboard either way.
+    fn restore<const N: usize>(&mut self, scene: &mut Scene<N>, index: usize, now: u64) {
+        let Some(managed) = self.windows.get_mut(index) else {
+            return;
+        };
+        if managed.minimized {
+            managed.minimized = false;
+            println!("desktop    : window {} restored", managed.window);
+            let ms = self.theme.ms(250);
+            for (id, (_, y)) in managed.places(managed.at, self.theme.buttons) {
+                if let Some(layer) = scene.layer_mut(id) {
+                    if ms == 0 {
+                        layer.opacity = Animation::rest(Fx::from_int(255));
+                        layer.y = Animation::rest(Fx::from_int(y));
+                        continue;
+                    }
+                    layer.opacity =
+                        Animation::ease(now, ms, Fx::ZERO, Fx::from_int(255), Ease::Out);
+                    layer.y = layer
+                        .y
+                        .retarget(now, Fx::from_int(y), corrode_render::anim::Spring::SMOOTH);
+                }
+            }
+        }
+        // Told again, so the focus paints over the fade's opacities.
+        if self.focus == Some(index) {
+            self.paint_focus(scene, index, true);
+        } else {
+            self.set_focus(scene, Some(index));
+        }
+    }
+
+    /// The green button: centre the window in the room between the panel
+    /// and the dock, or send it back to where it was. Windows cannot be
+    /// resized yet -- their pixels are a fixed size -- so this is what
+    /// zoom can mean for now.
+    fn zoom<const N: usize>(&mut self, scene: &mut Scene<N>, index: usize, now: u64) {
+        let screen = scene.screen();
+        let Some(managed) = self.windows.get_mut(index) else {
+            return;
+        };
+        let at = match managed.unzoomed.take() {
+            Some(back) => back,
+            None => {
+                managed.unzoomed = Some(managed.at);
+                let total = (managed.height + managed.bar()) as i32;
+                let (top, bottom) = (40, screen.height as i32 - 90);
+                (
+                    (screen.width as i32 - managed.width as i32) / 2,
+                    (top + (bottom - top - total) / 2).max(top),
+                )
+            }
+        };
+        println!("desktop    : window {} zoomed", managed.window);
+        self.move_to(scene, index, at, now);
+    }
+
+    /// Take the glyphs off the buttons: the next hover puts them back
+    /// wherever the buttons are now.
+    fn hide_glyphs<const N: usize>(&mut self, scene: &mut Scene<N>) {
+        self.hovering = None;
+        for glyph in self.glyphs.iter().flatten() {
+            if let Some(layer) = scene.layer_mut(*glyph) {
+                layer.opacity = Animation::rest(Fx::ZERO);
             }
         }
     }
@@ -1143,7 +1284,7 @@ impl Desk {
                     }
                 }
                 // The glyphs go with the buttons they are on.
-                self.hovering = None;
+                self.hide_glyphs(scene);
             }
         }
         self.hover(scene);

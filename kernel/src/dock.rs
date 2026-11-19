@@ -283,6 +283,11 @@ impl Dock {
             .position(|icon| icon.tile == id || icon.glyph == Some(id))
     }
 
+    /// What icon `index`'s program titles its windows.
+    pub fn title(&self, index: usize) -> &'static str {
+        APPS.get(index).map_or("", |app| app.title)
+    }
+
     /// Whether `id` is the dock at all.
     pub fn contains(&self, id: LayerId) -> bool {
         self.layers().any(|layer| layer == id)
