@@ -1028,3 +1028,20 @@ The short version, for reading first. The numbered log below has the detail.
   suite PASSes on both GPUs (29 checks each); input-test is 170 / 0
   default, 177 / 0 virtio.
 - Screenshot: `build/progress-43-double-click.png`.
+
+## 44. Snapping from the keyboard
+
+- Alt+Left and Alt+Right snap the window in front to that half, and
+  Alt+Up fills the screen, using the same rectangles as dragging to an
+  edge (`snap_rect`). Alt+Down puts it back where it was, as the zoom
+  button does for a snapped window.
+- Snapping again from a snapped window keeps the place it had before
+  the first snap, so Alt+Down after Left then Right still goes all the
+  way back.
+- Choice: Alt rather than Plasma's Meta, to match the other shortcuts;
+  PS/2 set 1 passes the Windows key, but QEMU's sendkey and many
+  keyboards' layouts make Alt the safer one. Popovers are not snapped.
+- New `./corrode tile-test`: Left, Right, Up, Down; the last size is the
+  terminal's own 600x340 (`build/tile.png`). Full suite PASSes on both
+  GPUs (30 checks each); input-test is 170 / 0 default, 177 / 0 virtio.
+- Screenshot: `build/progress-44-tile.png`.

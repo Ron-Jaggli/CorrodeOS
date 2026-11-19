@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -562,6 +562,26 @@ menu-test: iso
 	    || echo "menu-test: right-click menu picked, then closed      FAIL"
 	@test -s build/menu.ppm && pnmtopng build/menu.ppm > build/menu.png 2>/dev/null && rm -f build/menu.ppm && echo "wrote build/menu.png" || true
 	@test -s build/menu-after.ppm && pnmtopng build/menu-after.ppm > build/menu-after.png 2>/dev/null && rm -f build/menu-after.ppm && echo "wrote build/menu-after.png" || true
+
+# A terminal from the dock, then Alt+Left (build/tile.png), Alt+Right,
+# Alt+Up and Alt+Down: left half, right half, the screen, and back.
+tile-test: iso
+	@rm -f build/tile.ppm build/tile.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 2; \
+	   echo "sendkey alt-left"; sleep 1.2; \
+	   echo "screendump build/tile.ppm"; sleep 1; \
+	   for key in alt-right alt-up alt-down; do echo "sendkey $$key"; sleep 1.2; done; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "shortcut|snapped|zoomed|is now" build/serial.log || echo "tile-test: nothing"
+	@grep -q "snapped Left" build/serial.log && grep -q "snapped Right" build/serial.log \
+	    && grep -q "snapped Fill" build/serial.log \
+	    && test "$$(grep 'is now' build/serial.log | tail -1 | grep -o '[0-9]*x[0-9]*')" = "600x340" \
+	    && echo "tile-test: Alt+arrows snapped, Alt+Down put it back PASS" \
+	    || echo "tile-test: Alt+arrows snapped, Alt+Down put it back FAIL"
+	@test -s build/tile.ppm && pnmtopng build/tile.ppm > build/tile.png 2>/dev/null && rm -f build/tile.ppm && echo "wrote build/tile.png" || true
 
 # A terminal from the dock; two slow clicks on its title bar do nothing,
 # then a double click zooms it (build/double-click.png).

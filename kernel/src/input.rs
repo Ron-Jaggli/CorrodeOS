@@ -511,6 +511,11 @@ enum Shortcut {
     Settings,
     /// Alt+L: lock the screen.
     Lock,
+    /// Alt+Left, Alt+Right, Alt+Up: the window in front to a half of the
+    /// screen, or all of it, as dragging it to that edge does.
+    Snap(Snap),
+    /// Alt+Down: a snapped or zoomed window back where it was.
+    Unsnap,
 }
 
 impl Shortcut {
@@ -522,6 +527,10 @@ impl Shortcut {
             0x2c => Shortcut::Zoom,
             0x33 => Shortcut::Settings,
             0x26 => Shortcut::Lock,
+            0xcb => Shortcut::Snap(Snap::Left),
+            0xcd => Shortcut::Snap(Snap::Right),
+            0xc8 => Shortcut::Snap(Snap::Fill),
+            0xd0 => Shortcut::Unsnap,
             _ => return None,
         })
     }
@@ -2120,6 +2129,25 @@ impl Desk {
                 }
             }
             Shortcut::Lock => launch(launcher::LOCK),
+            Shortcut::Snap(snap) => {
+                if let Some(index) = front.filter(|index| !self.windows[*index].popover) {
+                    let rect = self.snap_rect(scene.screen(), snap);
+                    let managed = &mut self.windows[index];
+                    // Snapped again from snapped: back still means where it
+                    // was before the first.
+                    if managed.unzoomed.is_none() {
+                        managed.unzoomed = Some((managed.at, (managed.width, managed.height)));
+                    }
+                    println!("desktop    : window {} snapped {:?}", managed.window, snap);
+                    self.resize(scene, index, (rect.width, rect.height - BAR));
+                    self.move_to(scene, index, (rect.x, rect.y), now);
+                }
+            }
+            Shortcut::Unsnap => {
+                if let Some(index) = front.filter(|index| self.windows[*index].unzoomed.is_some()) {
+                    self.zoom(scene, index, now);
+                }
+            }
             Shortcut::Settings => {
                 let open = self
                     .windows
