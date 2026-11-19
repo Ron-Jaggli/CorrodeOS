@@ -288,6 +288,11 @@ impl Dock {
         APPS.get(index).map_or("", |app| app.title)
     }
 
+    /// Which icon starts the program that titles its windows `title`.
+    pub fn find(&self, title: &str) -> Option<usize> {
+        APPS.iter().position(|app| app.title == title)
+    }
+
     /// Whether `id` is the dock at all.
     pub fn contains(&self, id: LayerId) -> bool {
         self.layers().any(|layer| layer == id)

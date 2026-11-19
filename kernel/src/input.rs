@@ -326,6 +326,38 @@ fn stencil(kind: Option<Button>) -> Vec<u8> {
     coverage
 }
 
+/// The Alt key: what Cmd is on macOS, and what Plasma's shortcuts use.
+const ALT: u8 = 1 << 2;
+
+/// What the desktop does with Alt and a key, whatever window is in front.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shortcut {
+    /// Alt+Tab: the next window to the front, back from the dock if need be.
+    Next,
+    /// Alt+Q, Alt+W, Alt+F4: ask the window in front to close.
+    Close,
+    /// Alt+M.
+    Minimize,
+    /// Alt+Z.
+    Zoom,
+    /// Alt+comma, as Cmd+comma opens an app's settings on macOS.
+    Settings,
+}
+
+impl Shortcut {
+    /// By scancode, set 1.
+    fn of(key: u8) -> Option<Shortcut> {
+        Some(match key {
+            0x0f => Shortcut::Next,
+            0x10 | 0x11 | 0x3e => Shortcut::Close,
+            0x32 => Shortcut::Minimize,
+            0x2c => Shortcut::Zoom,
+            0x33 => Shortcut::Settings,
+            _ => return None,
+        })
+    }
+}
+
 /// A pane of the desktop's material at `rect`: glass, or a solid colour
 /// where the theme has glass off.
 pub(crate) fn pane(rect: Rect, radius: u16, theme: &Theme) -> Layer {
@@ -614,6 +646,17 @@ impl Desk {
                     crate::check("input", "...and a mouse", mouse);
                     if mouse {
                         self.show_pointer(scene, now);
+                    }
+                }
+                // The desktop's own shortcuts come first, and go no further.
+                Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers & ALT != 0 && Shortcut::of(key).is_some() => {
+                    if let Some(shortcut) = Shortcut::of(key) {
+                        self.shortcut(scene, shortcut, now);
                     }
                 }
                 Event::Key {
@@ -1139,6 +1182,56 @@ impl Desk {
                 .drag
                 .and_then(|(at, x, y)| shift(at).map(|at| (at, x, y)));
             self.hide_glyphs(scene);
+        }
+    }
+
+    /// Do what a shortcut says.
+    fn shortcut<const N: usize>(&mut self, scene: &mut Scene<N>, shortcut: Shortcut, now: u64) {
+        println!("input      : shortcut {:?}", shortcut);
+        let front = self
+            .focus
+            .filter(|index| self.windows.get(*index).is_some_and(|managed| !managed.docked));
+        match shortcut {
+            Shortcut::Next => {
+                let count = self.windows.len();
+                let start = front.map_or(0, |index| index + 1);
+                let next = (0..count)
+                    .map(|step| (start + step) % count)
+                    .find(|index| !self.windows[*index].docked && Some(*index) != front);
+                if let Some(index) = next {
+                    self.restore(scene, index, now);
+                }
+            }
+            Shortcut::Close => {
+                if let Some(index) = front {
+                    crate::windows::push(self.windows[index].window, window::CLOSE, [0; 4]);
+                }
+            }
+            Shortcut::Minimize => {
+                if let Some(index) = front {
+                    self.minimize(scene, index, now);
+                }
+            }
+            Shortcut::Zoom => {
+                if let Some(index) = front {
+                    self.zoom(scene, index, now);
+                }
+            }
+            Shortcut::Settings => {
+                let open = self
+                    .windows
+                    .iter()
+                    .rposition(|managed| !managed.docked && managed.name == "Settings");
+                match (open, &self.dock) {
+                    (Some(index), _) => self.restore(scene, index, now),
+                    (None, Some(dock)) => {
+                        if let Some(icon) = dock.find("Settings") {
+                            dock.launch(icon, scene, now);
+                        }
+                    }
+                    (None, None) => println!("desktop    : no dock to start Settings from"),
+                }
+            }
         }
     }
 

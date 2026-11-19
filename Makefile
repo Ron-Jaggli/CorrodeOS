@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -251,6 +251,28 @@ input-test: iso
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
 	@grep -E "^(input|ps2|panel|terminal) " build/serial.log || echo "input-test: nothing from the input path"
 	@test -s build/input.ppm && pnmtopng build/input.ppm > build/input.png 2>/dev/null && rm -f build/input.ppm && echo "wrote build/input.png" || true
+
+# Open a terminal and About from the dock, then work the windows from the
+# keyboard: Alt+Tab to the terminal, Alt+M it away, Alt+comma for Settings,
+# Alt+Q to close Settings, Alt+Tab to bring the terminal back.
+shortcut-test: iso
+	@rm -f build/shortcut.ppm build/shortcut.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -56 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   echo "mouse_move 112 0"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   for key in alt-tab alt-m alt-comma; do echo "sendkey $$key"; sleep 1.5; done; \
+	   echo "sendkey alt-q"; sleep 1.5; echo "sendkey alt-tab"; sleep 1.5; \
+	   echo "screendump build/shortcut.ppm"; sleep 2; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^(input|dock|desktop|settings) " build/serial.log | grep -v "PASS\|pointer moved" || echo "shortcut-test: nothing from the desktop"
+	@grep -q "minimized" build/serial.log && grep -q "started Settings" build/serial.log \
+	    && grep -q "^settings   : closed" build/serial.log && grep -q "restored" build/serial.log \
+	    && echo "shortcut-test: switch, minimize, settings, close        PASS" \
+	    || echo "shortcut-test: switch, minimize, settings, close        FAIL"
+	@test -s build/shortcut.ppm && pnmtopng build/shortcut.ppm > build/shortcut.png 2>/dev/null && rm -f build/shortcut.ppm && echo "wrote build/shortcut.png" || true
 
 # Open a terminal from the dock and type exit in it, twenty times: more
 # windows than there are surfaces, so it passes only if a closed window's

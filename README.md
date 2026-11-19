@@ -127,6 +127,11 @@ and in Settings' preset row. Wallpapers are integer-only functions in
 fixed-point port of the optics of [Glass-HQ's liquid glass](https://liquid-glass.glassapp.dev)
 (MIT). `./corrode test` checks all three on the build host.
 
+Keyboard shortcuts use Alt where macOS uses Cmd: **Alt+Tab** switches
+windows (and brings back minimized ones), **Alt+Q**, **Alt+W** or
+**Alt+F4** closes the one in front, **Alt+M** minimizes, **Alt+Z** zooms, and
+**Alt+,** opens Settings.
+
 Programs follow the look on their own: a window is sent `window::THEME`
 when it opens and whenever the look changes (`Event::Theme` in the `ui`
 crate). A program can change the look with `corrode_ui::set_theme`, which

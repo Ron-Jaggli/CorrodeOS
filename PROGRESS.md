@@ -251,3 +251,24 @@ Choices made without asking are marked **Choice:**.
   macOS.
 - Boot tests all PASS; 170 PASS / 0 FAIL.
 - Screenshot: `build/progress-9-menubar.png` ("About" in the bar).
+
+## 12. Keyboard shortcuts
+
+- Alt stands in for Cmd. The desktop takes these presses before the
+  window in front sees them:
+  - **Alt+Tab:** next window, restored if minimized;
+  - **Alt+Q / Alt+W / Alt+F4:** close the window in front (sends `CLOSE`,
+    as the red light does);
+  - **Alt+M:** minimize;
+  - **Alt+Z:** zoom;
+  - **Alt+,** : Settings (focus it if open, start it from the dock if not).
+- Documented in the README's customizing section.
+- `./corrode shortcut-test` drives all five with QEMU `sendkey`. PASS.
+  Every other boot test PASS; 170 PASS / 0 FAIL.
+- **Choice:** Alt, not a Super/Windows key. The PS/2 decoder has no
+  Super modifier yet, and Alt is what Plasma uses.
+- Known gap: Alt+Tab switches at once. There is no macOS-style switcher
+  overlay while Alt is held.
+- Known gap: Alt+, needs the dock (`dock = off` means it can only focus a
+  Settings window that is already open).
+- Screenshot: `build/progress-10-shortcuts.png`.
