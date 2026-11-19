@@ -3394,6 +3394,49 @@ impl Screen {
             Screen::Remote(renderer) => renderer.attach_surface(slot, index as u32).is_ok(),
         }
     }
+
+    /// Paint `theme`'s wallpaper and show it to the renderer as surface
+    /// [`surface::WALLPAPER`]. False where there is nowhere to paint it: the
+    /// remote renderer has only programs' surfaces, so under it the desktop
+    /// keeps the plain background.
+    fn show_wallpaper(&mut self, theme: &corrode_theme::Theme) -> bool {
+        let Screen::Software(renderer) = self else {
+            return false;
+        };
+        let info = renderer.surface_info();
+        let Some(pixels) = wallpaper_pixels(&info) else {
+            return false;
+        };
+        corrode_theme::wallpaper::paint(theme, pixels, info.width, info.height);
+        // SAFETY: `wallpaper_pixels` mapped them, page-aligned, from fresh
+        // frames overlapping nothing, and never unmaps them. The renderer
+        // reads them; only this function, on the painter, writes them.
+        unsafe {
+            renderer.attach_surface(
+                surface::WALLPAPER,
+                pixels.as_ptr(),
+                info.width,
+                info.height,
+            )
+        }
+        .is_ok()
+    }
+}
+
+/// Where the wallpaper's pixels live: past the glass scratch.
+const WALLPAPER_BASE: u64 = GLASS_SCRATCH_BASE + BACK_BUFFER_MAX as u64;
+
+/// The wallpaper's pixels, mapped the first time they are asked for.
+fn wallpaper_pixels(info: &SurfaceInfo) -> Option<&'static mut [u32]> {
+    static MAPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    let pixels = info.width as usize * info.height as usize;
+    if !MAPPED.load(core::sync::atomic::Ordering::Acquire) {
+        map_ram(WALLPAPER_BASE, pixels * 4)?;
+        MAPPED.store(true, core::sync::atomic::Ordering::Release);
+    }
+    // SAFETY: mapped above, writable, for `pixels` words, and only the
+    // painter ever asks for them, one borrow at a time.
+    Some(unsafe { core::slice::from_raw_parts_mut(WALLPAPER_BASE as *mut u32, pixels) })
 }
 
 /// The GPU driver's endpoint, the capabilities it is given, and the memory
@@ -3863,7 +3906,7 @@ fn label_layer(screen: Rect, src: Rect, y: i32, color: Color, at: u64) -> Layer 
 /// Nothing here advances per frame. Every moving quantity is a formula held by
 /// a layer in the scene, and the scene works out what went stale.
 struct Stage {
-    scene: Scene<48>,
+    scene: alloc::boxed::Box<Scene<160>>,
     block: LayerId,
     veil: LayerId,
     /// Where the veil rests when it is showing.
@@ -3873,7 +3916,7 @@ struct Stage {
 impl Stage {
     fn new(renderer: &mut impl Renderer, now: u64) -> Option<Self> {
         let info = &renderer.surface_info();
-        let mut scene = Scene::new(info, BACKGROUND);
+        let mut scene = Scene::boxed(info, BACKGROUND);
         let (width, height) = (info.width, info.height);
         let middle = (height / 2) as i32;
         let full_bar = (height / 8).max(1) as i32;
@@ -4317,6 +4360,9 @@ impl Window {
     }
 }
 
+/// How long the boot screen shows before the desktop fades in over it.
+const DESKTOP_DELAY_MS: u64 = 1200;
+
 /// Paint what moved, then sleep until the next interrupt.
 ///
 /// There is no animation task behind this and no frame timer. The loop wakes
@@ -4333,7 +4379,31 @@ fn render_loop(renderer: &mut Screen) -> ! {
     if window.is_none() {
         println!("window     : none -- no memory for a surface or its task");
     }
-    let mut desk = input::Desk::new(renderer, &mut stage.scene);
+    // The desktop comes up over the boot screen: the wallpaper fades in once
+    // the name is on screen, and the boot screen's layers go once it is
+    // covered.
+    let theme = look::current();
+    let boot: alloc::vec::Vec<LayerId> = stage.scene.ids().collect();
+    let desktop_at = time::now_ns() + DESKTOP_DELAY_MS * 1_000_000;
+    let fade = theme.ms(700);
+    if renderer.show_wallpaper(&theme) {
+        let screen = stage.scene.screen();
+        let mut wallpaper = Layer::surface(
+            0,
+            0,
+            surface::WALLPAPER,
+            screen.width,
+            screen.height,
+        );
+        wallpaper.opacity = Animation::ease(desktop_at, fade, Fx::ZERO, Fx::from_int(255), Ease::Out);
+        if stage.scene.add(wallpaper).is_none() {
+            println!("desktop    : no room for the wallpaper");
+        }
+    } else {
+        println!("desktop    : no wallpaper on this renderer");
+    }
+    let mut retire_at = Some(desktop_at + fade as u64 * 1_000_000);
+    let mut desk = input::Desk::new(renderer, &mut *stage.scene);
     {
         let screen = stage.scene.screen();
         windows::set_screen(screen.width, screen.height);
@@ -4382,7 +4452,21 @@ fn render_loop(renderer: &mut Screen) -> ! {
     loop {
         let now = time::now_ns();
 
-        loop {
+        // The wallpaper covers the boot screen now: take it away, and stop
+        // its script, so nothing moves behind the desktop.
+        if retire_at.is_some_and(|at| now >= at) {
+            retire_at = None;
+            for id in &boot {
+                stage.scene.remove(*id);
+            }
+            if let Some(layer) = window.as_ref().and_then(|window| window.layer) {
+                stage.scene.remove(layer);
+            }
+            desk.hide_line(&mut *stage.scene);
+            println!("desktop    : up");
+        }
+
+        while retire_at.is_some() {
             let due = cycle_start + SCRIPT[next_step].at_ms * 1_000_000;
             if now < due {
                 break;
@@ -4398,7 +4482,7 @@ fn render_loop(renderer: &mut Screen) -> ! {
         // Has the window's client drawn anything? One lock and a compare;
         // the client itself is not asked and need not be running.
         if let Some(window) = window.as_mut() {
-            window.poll(&mut stage.scene, now);
+            window.poll(&mut *stage.scene, now);
         }
 
         // Windows programs have asked for since the last look: shown to the
@@ -4408,14 +4492,14 @@ fn render_loop(renderer: &mut Screen) -> ! {
                 continue;
             };
             if renderer.show_surface(surface, WINDOW_SURFACES + surface) {
-                desk.manage(index, &mut stage.scene, now);
+                desk.manage(index, &mut *stage.scene, now);
             } else {
                 println!("desktop    : the renderer cannot show window {index}");
             }
         }
 
         // What the keyboard and mouse have done since the last look.
-        desk.poll(renderer, &mut stage.scene, now);
+        desk.poll(renderer, &mut *stage.scene, now);
 
         let result = frame(&mut stage, renderer, now);
         wakeups += 1;

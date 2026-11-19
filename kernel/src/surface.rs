@@ -74,7 +74,12 @@ struct Surface {
 ///
 /// Only ever locked with interrupts off: a commit arrives through a system
 /// call, and must not find the lock held by the painter it preempted.
-static TABLE: SpinLock<[Option<Surface>; SURFACES]> = SpinLock::new([const { None }; SURFACES]);
+/// The renderer's last surface number is the wallpaper's, which the kernel
+/// draws itself; programs' windows get the others.
+pub const WALLPAPER: u32 = SURFACES as u32 - 1;
+
+static TABLE: SpinLock<[Option<Surface>; SURFACES - 1]> =
+    SpinLock::new([const { None }; SURFACES - 1]);
 
 fn with<R>(index: usize, f: impl FnOnce(&mut Surface) -> R) -> Option<R> {
     without_interrupts(|| TABLE.lock().get_mut(index)?.as_mut().map(f))

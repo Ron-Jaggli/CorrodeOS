@@ -5,3 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+
+[features]
+# Scene::boxed, for a kernel with a heap.
+alloc = []

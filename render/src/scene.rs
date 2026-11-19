@@ -276,8 +276,12 @@ pub struct Painted {
 /// Up to `N` layers over a background, in fixed storage.
 ///
 /// A new layer goes on top, and [`Scene::raise`] brings one to the top again.
-/// A removed layer's place is not reused, so an id never comes to mean a
-/// different layer.
+/// A removed layer's place is not reused while there is room elsewhere, so
+/// an id held past its layer's removal keeps meaning nothing for as long as
+/// it can. Once every place has been used, a new layer takes the place of
+/// one removed and already painted away: a desktop opens and closes windows
+/// for ever, and its scene must not fill up. Whoever removes a layer should
+/// drop its id.
 pub struct Scene<const N: usize> {
     screen: Rect,
     background: Color,
@@ -308,6 +312,36 @@ impl<const N: usize> Scene<N> {
         }
     }
 
+    /// [`Scene::new`], built where it will stay, on the heap. A scene of a
+    /// few hundred layers is too big to build on a kernel stack and move.
+    #[cfg(feature = "alloc")]
+    pub fn boxed(info: &SurfaceInfo, background: Color) -> alloc::boxed::Box<Self> {
+        let mut scene = alloc::boxed::Box::<Self>::new_uninit();
+        let at = scene.as_mut_ptr();
+        // SAFETY: `at` is valid for writes of a whole `Scene` and properly
+        // aligned, being a fresh allocation for one. Every field is written
+        // exactly once below -- the arrays element by element, through raw
+        // pointers so nothing reads the uninitialised memory -- before
+        // `assume_init` claims the scene is whole.
+        unsafe {
+            core::ptr::addr_of_mut!((*at).screen).write(Rect::new(0, 0, info.width, info.height));
+            core::ptr::addr_of_mut!((*at).background).write(background);
+            let layers = core::ptr::addr_of_mut!((*at).layers).cast::<Option<Layer>>();
+            let shown = core::ptr::addr_of_mut!((*at).shown).cast::<Shown>();
+            let redrawn = core::ptr::addr_of_mut!((*at).redrawn).cast::<Rect>();
+            let order = core::ptr::addr_of_mut!((*at).order).cast::<usize>();
+            for slot in 0..N {
+                layers.add(slot).write(None);
+                shown.add(slot).write(Shown::NOTHING);
+                redrawn.add(slot).write(NOWHERE);
+                order.add(slot).write(0);
+            }
+            core::ptr::addr_of_mut!((*at).len).write(0);
+            core::ptr::addr_of_mut!((*at).painted).write(false);
+            scene.assume_init()
+        }
+    }
+
     pub const fn screen(&self) -> Rect {
         self.screen
     }
@@ -315,7 +349,15 @@ impl<const N: usize> Scene<N> {
     /// Put `layer` on top of everything already here. `None` if full.
     pub fn add(&mut self, layer: Layer) -> Option<LayerId> {
         if self.len == N {
-            return None;
+            // A place whose layer is gone and whose last frame has painted
+            // over where it was: nothing of it is left on the glass.
+            let free = (0..N).find(|slot| {
+                self.layers[*slot].is_none() && self.shown[*slot] == Shown::NOTHING
+            })?;
+            self.layers[free] = Some(layer);
+            self.redrawn[free] = NOWHERE;
+            self.raise(LayerId(free));
+            return Some(LayerId(free));
         }
         self.layers[self.len] = Some(layer);
         self.order[self.len] = self.len;
@@ -366,6 +408,14 @@ impl<const N: usize> Scene<N> {
                 let shown = &self.shown[**slot];
                 self.layers[**slot].is_some() && shown.alpha > 0 && shown.rect.contains(&point)
             })
+            .map(|slot| LayerId(*slot))
+    }
+
+    /// Every layer there is, bottom first.
+    pub fn ids(&self) -> impl Iterator<Item = LayerId> + '_ {
+        self.order[..self.len]
+            .iter()
+            .filter(|slot| self.layers[**slot].is_some())
             .map(|slot| LayerId(*slot))
     }
 
@@ -626,6 +676,28 @@ mod tests {
 
     fn fade(now: u64, from: i32, to: i32) -> Animation {
         Animation::ease(now, 100, Fx::from_int(from), Fx::from_int(to), Ease::Linear)
+    }
+
+    #[test]
+    fn a_full_scene_reuses_a_place_once_its_layer_is_painted_away() {
+        let mut scene = Scene::<2>::new(&INFO, GROUND);
+        let first = scene
+            .add(Layer::solid(Rect::new(0, 0, 4, 4), Color::WHITE))
+            .unwrap();
+        scene.add(Layer::solid(Rect::new(8, 0, 4, 4), Color::WHITE)).unwrap();
+        scene.frame(&mut Recorder::default(), 0).unwrap();
+        assert!(scene.add(Layer::solid(Rect::new(0, 8, 4, 4), Color::WHITE)).is_none());
+
+        scene.remove(first);
+        // Still on the glass until a frame paints where it was.
+        assert!(scene.add(Layer::solid(Rect::new(0, 8, 4, 4), Color::WHITE)).is_none());
+        scene.frame(&mut Recorder::default(), MS).unwrap();
+        let again = scene
+            .add(Layer::solid(Rect::new(0, 8, 4, 4), Color::WHITE))
+            .unwrap();
+        assert_eq!(again, first);
+        assert_eq!(scene.top(), Some(again));
+        assert_eq!(scene.ids().count(), 2);
     }
 
     #[test]

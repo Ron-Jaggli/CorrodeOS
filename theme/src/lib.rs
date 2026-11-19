@@ -19,6 +19,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod wallpaper;
+
 pub use corrode_render::Color;
 use corrode_render::glass::{Glass, Material};
 

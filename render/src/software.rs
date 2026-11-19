@@ -47,7 +47,7 @@ pub enum Error {
 }
 
 /// How many surfaces can be attached at once.
-pub const SURFACES: usize = 8;
+pub const SURFACES: usize = 16;
 
 /// A client's pixels for [`Command::Image`] to draw from: rows of `width`
 /// pixels, each `0x00RRGGBB`.

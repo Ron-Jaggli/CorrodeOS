@@ -11,7 +11,7 @@ test = false
 bench = false
 
 [dependencies]
-corrode-render = { path = "../render" }
+corrode-render = { path = "../render", features = ["alloc"] }
 corrode-theme = { path = "../theme" }
 corrode-heap = { path = "../heap" }
 corrode-text = { path = "../text" }

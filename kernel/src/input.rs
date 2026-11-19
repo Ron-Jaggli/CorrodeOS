@@ -420,6 +420,14 @@ impl Desk {
         desk
     }
 
+    /// Take the boot screen's typed line away: the desktop is up. Keys with
+    /// no window to go to are still logged.
+    pub fn hide_line<const N: usize>(&mut self, scene: &mut Scene<N>) {
+        if let Some(line) = self.line.take() {
+            scene.remove(line);
+        }
+    }
+
     /// Draw the typed line into the atlas and fit its layer to it.
     fn redraw_line<R: Renderer, const N: usize>(&mut self, renderer: &mut R, scene: &mut Scene<N>) {
         let Some(id) = self.line else { return };

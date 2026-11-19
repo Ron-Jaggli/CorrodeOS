@@ -69,3 +69,26 @@ Choices made without asking are marked **Choice:**.
 - **Choice:** a `#` only starts a comment at the start of a line or after
   whitespace when followed by whitespace, so `accent = #e2643a` works.
 - Boot: `theme : read /etc/desktop.conf`, 170 checks PASS, 0 FAIL.
+
+## 4. Wallpaper, glass menu bar, translucent panel
+
+- `theme/src/wallpaper.rs`: four wallpapers drawn from the theme's three
+  colours in integer arithmetic (aurora glows, Breeze-style ribbons,
+  layered dunes, plain gradient), light and dark, with a Bayer dither
+  against banding. Host-tested.
+- The kernel paints the wallpaper into its own memory and shows it as the
+  renderer's last surface (`surface::WALLPAPER`; 16 surfaces now, 15 for
+  windows). It fades in 1.2 s after boot; once it covers the boot screen,
+  the boot screen's layers, its script and its typed line go, so nothing
+  moves behind the desktop.
+- Boot checks are unchanged: they all run before the desktop takes over.
+  170 PASS, 0 FAIL.
+- Scenes now reuse a removed layer's slot once they are full and the
+  layer has been painted away. Without that, opening and closing windows
+  would fill the scene for good. New test for it.
+- The painter's scene grew to 160 layers. That is 84 KiB, more than
+  Limine's 64 KiB boot stack, so `Scene::boxed` (behind an `alloc`
+  feature) builds it straight onto the kernel heap.
+- Known gap: under `GPU=virtio` there is no wallpaper (the remote renderer
+  only has programs' surfaces); the plain background shows instead.
+- Screenshot: `build/progress-3-wallpaper.png`.
