@@ -486,7 +486,8 @@ pub mod gpu {
     /// Enough for 1920 by 1080.
     pub const SCREEN_PAGES: usize = 2048;
     pub const ATLAS_WIDTH: u32 = 1024;
-    pub const ATLAS_HEIGHT: u32 = 512;
+    /// The bottom third is the dock's icons drawn at their magnified size.
+    pub const ATLAS_HEIGHT: u32 = 768;
     /// Three screens for the glass, a little for its line buffer, and one
     /// for the wallpaper.
     pub const SCRATCH_PAGES: usize = 4 * SCREEN_PAGES + 4;

@@ -80,6 +80,11 @@ const DOT: u32 = 5;
 const LABEL_Y: i32 = ATLAS_Y + 64;
 const LABEL_SLOT: u32 = 128;
 const LABEL: Style = Style::px(13);
+/// The tile and the glyphs again, at the size they grow to under the
+/// pointer, in a row of their own below everything else. A stencil shrunk
+/// stays sharp; one stretched goes soft.
+const BIG_Y: i32 = crate::input::ATLAS_ROW as i32 + 256;
+const BIG_ROWS: u32 = 256;
 /// How far a hovered icon rises.
 const LIFT: i32 = 6;
 
@@ -103,6 +108,10 @@ struct Icon {
     tooltip: Option<[LayerId; 2]>,
     /// Where the pill rests, for it to follow the icon as it grows.
     tip_at: (i32, i32),
+    /// The tile's and the glyph's stencils at rest, and at the magnified
+    /// size if there was room for them.
+    stencils: [Rect; 2],
+    big: Option<[Rect; 2]>,
 }
 
 pub struct Dock {
@@ -267,6 +276,16 @@ impl Dock {
         let dot_src = Rect::new(ATLAS_X, ATLAS_Y + size as i32 + 2, DOT, DOT);
         let stencils = renderer.upload_mask(tile_src, &tile(size)).is_ok()
             && renderer.upload_mask(dot_src, &dot()).is_ok();
+        // The magnified tile, shared as the small one is, if the row has room
+        // for it and a glyph for every icon.
+        let magnify = if theme.speed > 0 { theme.magnify.clamp(100, 200) as u32 } else { 100 };
+        let big = size * magnify / 100;
+        let big_size = (stencils
+            && magnify > 100
+            && (count + 1) * big <= crate::ATLAS_WIDTH
+            && big <= BIG_ROWS)
+            .then_some(big)
+            .filter(|big| renderer.upload_mask(Rect::new(0, BIG_Y, *big, *big), &tile(*big)).is_ok());
 
         let mut icons = Vec::new();
         for (index, app) in APPS.iter().enumerate() {
@@ -285,6 +304,8 @@ impl Dock {
                     running: false,
                     tooltip: None,
                     tip_at: at,
+                    stencils: [tile_src; 2],
+                    big: None,
                 });
                 continue;
             };
@@ -315,6 +336,16 @@ impl Dock {
             let tip_at = tooltip
                 .and_then(|[pill, _]| scene.layer(pill))
                 .map_or(at, |pill| (pill.x.target().round(), pill.y.target().round()));
+            let big = big_size.and_then(|big| {
+                let glyph = Rect::new((index as i32 + 1) * big as i32, BIG_Y, big, big);
+                let coverage = match app.glyph {
+                    Glyph::Text(label) => text(big, label),
+                    Glyph::Gear => gear(big),
+                    Glyph::Folder => folder(big),
+                };
+                renderer.upload_mask(glyph, &coverage).ok()?;
+                Some([Rect::new(0, BIG_Y, big, big), glyph])
+            });
             icons.push(Icon {
                 tile,
                 glyph,
@@ -323,6 +354,8 @@ impl Dock {
                 running: false,
                 tooltip,
                 tip_at,
+                stencils: [tile_src, glyph_src],
+                big,
             });
         }
         Some(Dock {
@@ -332,7 +365,7 @@ impl Dock {
             size,
             bounce: theme.bounce && theme.speed > 0,
             // Growing needs animating to look like anything.
-            magnify: if theme.speed > 0 { theme.magnify.clamp(100, 200) as u32 } else { 100 },
+            magnify,
             hovered: None,
         })
     }
@@ -424,8 +457,18 @@ impl Dock {
             }
         }
         for (icon, (x, y, size)) in self.icons.iter().zip(places) {
-            for id in [Some(icon.tile), icon.glyph].into_iter().flatten() {
+            // A growing icon draws from its big stencils, shrunk to fit; one
+            // going back to rest from its own.
+            let sources = match icon.big {
+                Some(big) if size > self.size => big,
+                _ => icon.stencils,
+            };
+            for (id, src) in [Some(icon.tile), icon.glyph].into_iter().zip(sources) {
+                let Some(id) = id else { continue };
                 if let Some(layer) = scene.layer_mut(id) {
+                    if let corrode_render::scene::Content::ScaledMask { src: shown } = &mut layer.content {
+                        *shown = src;
+                    }
                     layer.x = layer.x.retarget(now, Fx::from_int(x), Spring::SNAPPY);
                     layer.y = layer.y.retarget(now, Fx::from_int(y), Spring::SNAPPY);
                     layer.width = layer.width.retarget(now, Fx::from_int(size as i32), Spring::SNAPPY);

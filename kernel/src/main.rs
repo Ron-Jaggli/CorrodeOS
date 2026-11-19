@@ -3936,9 +3936,10 @@ fn init_software_renderer() -> Option<SoftwareRenderer> {
     Some(renderer)
 }
 
-/// The mask atlas: room for the boot screen's two lines of text.
-const ATLAS_WIDTH: u32 = 1024;
-const ATLAS_HEIGHT: u32 = 512;
+/// The mask atlas: room for the boot screen's two lines of text, and the
+/// desktop's stencils. The same size as the GPU driver's.
+const ATLAS_WIDTH: u32 = corrode_abi::gpu::ATLAS_WIDTH;
+const ATLAS_HEIGHT: u32 = corrode_abi::gpu::ATLAS_HEIGHT;
 
 /// Where the back buffer is mapped: a gigabyte above the heap, in the same
 /// PML4 slot. That slot is populated before any user address space is forked,

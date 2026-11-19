@@ -1258,3 +1258,26 @@ The short version, for reading first. The numbered log below has the detail.
   the largest size and scale them down instead.
 - Full suite PASSes on both GPUs (34 checks each, 68 lines); input-test
   170 / 0 default and 177 / 0 virtio; `./corrode test` passes.
+
+## 52. Magnified dock icons drawn sharp
+
+- The dock now also draws its tile and each glyph at the magnified size
+  (48 × 140% = 67 px) into a new atlas row, `BIG_Y` = row 512. An icon
+  that is growing (target size above rest) draws from those big stencils,
+  shrunk to fit by `ScaledMask`. An icon going back to rest switches to
+  its own 48 px stencils at once, so at rest it is exactly as before.
+  For the ~150 ms it shrinks it is the small stencil stretched; that
+  was judged fine.
+- The mask atlas grew from 1024x512 to 1024x768 (768 KiB). The kernel's
+  atlas constants now come from `corrode_abi::gpu`, so the software
+  renderer and the virtio driver cannot disagree on its size. The
+  virtio driver sizes its shared mapping from the same constants, and
+  its magnify screenshot matches the default one. Nothing that was in
+  rows 0..512 moved; the title slots still end at 512.
+- If the big row would not fit (dock_size × magnify too wide for five
+  stencils across, or taller than 256) or the upload fails, the dock
+  falls back to stretching, as in 51.
+- Result: the `>_` and the gear keep crisp edges at 67 px
+  (build/progress-52-sharp-magnify.png against progress-51-magnify.png).
+- Full suite PASSes on both GPUs (68 lines); input-test 170 / 0 and
+  177 / 0; `./corrode test` passes.
