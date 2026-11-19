@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -77,7 +77,7 @@ kernel:
 # crate built for it. RUSTFLAGS in the environment replaces the ones in
 # .cargo/config.toml outright, and a separate target directory stops the two
 # sets of flags from invalidating each other's build of the crates they share.
-USER_PROGRAMS := edu fault virtio-gpu blob-reader nvidia ps2 terminal panel settings about files control lock
+USER_PROGRAMS := edu fault virtio-gpu blob-reader nvidia ps2 terminal panel settings about files control lock menu
 USER_TARGET   := target/user
 USER_BIN      := $(USER_TARGET)/x86_64-unknown-none/release
 USER_RUSTFLAGS := -C relocation-model=static -C strip=debuginfo \
@@ -521,6 +521,32 @@ keys-test: iso
 	    && echo "keys-test: arrows, Return and Escape in Control Center PASS" \
 	    || echo "keys-test: arrows, Return and Escape in Control Center FAIL"
 	@test -s build/keys.ppm && pnmtopng build/keys.ppm > build/keys.png 2>/dev/null && rm -f build/keys.ppm && echo "wrote build/keys.png" || true
+
+# Right-click the desktop: the menu opens at the pointer. Hover Next
+# Wallpaper (build/menu.png, lit in the accent) and click it; then open
+# the menu again and click outside it to close it (build/menu-after.png).
+menu-test: iso
+	@rm -f build/menu.ppm build/menu.png build/menu-after.ppm build/menu-after.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_button 2"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   echo "mouse_move 40 80"; sleep 0.8; \
+	   echo "screendump build/menu.ppm"; sleep 1; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   echo "mouse_move -200 -100"; sleep 0.4; \
+	   echo "mouse_button 2"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   echo "mouse_move -150 0"; sleep 0.4; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.2; \
+	   echo "screendump build/menu-after.ppm"; sleep 1; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^menu |right click|popover closed" build/serial.log || echo "menu-test: no menu"
+	@test "$$(grep -c '^menu       : open' build/serial.log)" = 2 \
+	    && grep -q "^menu       : picked Next Wallpaper" build/serial.log \
+	    && grep -q "^menu       : closed" build/serial.log \
+	    && echo "menu-test: right-click menu picked, then closed      PASS" \
+	    || echo "menu-test: right-click menu picked, then closed      FAIL"
+	@test -s build/menu.ppm && pnmtopng build/menu.ppm > build/menu.png 2>/dev/null && rm -f build/menu.ppm && echo "wrote build/menu.png" || true
+	@test -s build/menu-after.ppm && pnmtopng build/menu-after.ppm > build/menu-after.png 2>/dev/null && rm -f build/menu-after.ppm && echo "wrote build/menu-after.png" || true
 
 # Open a terminal from the dock and drag its bottom-right corner 200 by 100
 # pixels bigger, in four steps; then drag its top-left corner 60 by 40

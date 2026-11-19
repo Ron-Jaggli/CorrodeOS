@@ -218,6 +218,9 @@ pub mod window {
     /// A cover: the whole screen, above everything, with every key and
     /// click while it is up. The lock screen is one.
     pub const COVER: u64 = 16;
+    /// With POPOVER: a context menu, placed at the pointer where the
+    /// desktop was right-clicked instead of under the menu bar.
+    pub const MENU: u64 = 32;
 
     /// A key, while this window has the keyboard. Words as `ps2::LABEL_KEY`.
     pub const KEY: u64 = 62;
@@ -263,6 +266,8 @@ pub mod window {
     /// (8 bytes) and how many seconds ago it came; part 1 its text, 32
     /// bytes. Past the last, every word is zero but the count.
     pub const HISTORY: u64 = 74;
+    /// To a popover: the pointer is over it, at x, y from its corner.
+    pub const HOVER: u64 = 75;
 
     /// Most a window may be, either way.
     pub const MAX_WIDTH: u32 = 1920;
@@ -283,6 +288,8 @@ pub mod launcher {
     pub const CONTROL: u64 = 5;
     /// The lock screen.
     pub const LOCK: u64 = 6;
+    /// The desktop's right-click menu.
+    pub const MENU: u64 = 7;
 }
 
 /// Rights, as bits: in the low byte of what `SYS_IDENTIFY` reports, and as

@@ -819,3 +819,37 @@ Choices made without asking are marked **Choice:**.
   closes. Full suite PASSes on both GPUs (21 checks each); input-test is
   170 / 0 default, 177 / 0 virtio.
 - Screenshot: `build/progress-34-keys.png`.
+
+## 36. Desktop right-click menu
+
+- Right-click the bare desktop (not a window, the dock or a banner):
+  the desk notes where, and asks the launcher for the new `menu` program
+  (`launcher::MENU` = 7).
+- `user/menu` opens a glass popover with the new `window::MENU` flag
+  (32). The desk places its corner at the right-click and keeps it on
+  screen.
+- Items:
+  - New Terminal and Open Files;
+  - Next Wallpaper (cycles Aurora → Ribbons → Dunes → Gradient);
+  - Light/Dark Appearance (the label follows the theme);
+  - Settings..., Lock Screen and About CorrodeOS.
+  - Rules separate the groups. Picking an item does it and closes the
+    menu.
+- Hover: new `window::HOVER` (75) / `Event::Hover`. The desk sends a
+  popover the pointer's position on it, only when that changes and only
+  to popovers, plus (-1, -1) when the pointer leaves. The menu lights
+  the item under the pointer in the accent with white text, as macOS
+  menus do.
+- Keyboard: Up/Down (skipping rules, wrapping round), Return and Escape.
+- Any button pressed outside a popover now closes it (it was the left
+  only), so a second right-click replaces the menu.
+- Found while testing: the wallpaper is a layer too, so "nothing under
+  the pointer" never happens. The new `Desk::on_desktop` checks for no
+  window, no dock and no banner.
+- The menu holds the launcher capability, as Control Center does.
+- New `./corrode menu-test`: right-click, hover Next Wallpaper
+  (`build/menu.png`), click it (the wallpaper becomes Ribbons), then
+  right-click and click outside to close. Full suite PASSes on both GPUs
+  (22 checks each); input-test is 170 / 0 default, 177 / 0 virtio.
+- Screenshots: `build/progress-35-menu.png`,
+  `build/progress-35-ribbons.png`.

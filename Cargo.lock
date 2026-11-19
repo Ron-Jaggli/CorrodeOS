@@ -100,6 +100,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "corrode-menu"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+ "corrode-ui",
+]
+
+[[package]]
 name = "corrode-nv"
 version = "0.0.1"
 

@@ -30,6 +30,7 @@ members = [
     "user/files",
     "user/control",
     "user/lock",
+    "user/menu",
 ]
 
 [workspace.package]

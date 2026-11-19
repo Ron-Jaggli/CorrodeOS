@@ -2193,7 +2193,8 @@ extern "C" fn launcher() {
                 | launcher::ABOUT
                 | launcher::FILES
                 | launcher::CONTROL
-                | launcher::LOCK),
+                | launcher::LOCK
+                | launcher::MENU),
             ) => {
                 let name = match program {
                     launcher::TERMINAL => "terminal",
@@ -2201,11 +2202,13 @@ extern "C" fn launcher() {
                     launcher::FILES => "files",
                     launcher::CONTROL => "control",
                     launcher::LOCK => "lock",
+                    launcher::MENU => "menu",
                     _ => "about",
                 };
                 // Control Center may ask for Settings, and so holds the
                 // launcher too -- able to send, not to give it on.
-                let launcher = (program == launcher::CONTROL).then_some(LAUNCHER_SELF_SLOT);
+                let launcher = matches!(program, launcher::CONTROL | launcher::MENU)
+                    .then_some(LAUNCHER_SELF_SLOT);
                 // One lock screen is enough.
                 if program == launcher::LOCK && crate::windows::locked() {
                     let _ = ipc::reply(

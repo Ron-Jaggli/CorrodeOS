@@ -89,6 +89,8 @@ pub enum Event {
     Scroll { notches: i32, x: i32, y: i32 },
     /// To Files, from search: show the file at this path.
     Reveal([u8; 32]),
+    /// To a popover: the pointer is at x, y on it; -1, -1 when it leaves.
+    Hover { x: i32, y: i32 },
     /// The deadline came before anything else did.
     Timeout,
 }
@@ -281,6 +283,10 @@ impl Window {
             window::CLOSE => Event::Close,
             window::THEME => Event::Theme(Theme::from_words(words)),
             window::ACTIVE => Event::Active(words[0].to_le_bytes()),
+            window::HOVER => Event::Hover {
+                x: words[0] as i64 as i32,
+                y: words[1] as i64 as i32,
+            },
             window::SCROLL => Event::Scroll {
                 notches: words[0] as i64 as i32,
                 x: words[1] as i64 as i32,

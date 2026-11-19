@@ -150,6 +150,11 @@ Its Notifications card lists the last three notifications, newest
 first, with how long ago each came. It works from the keyboard too: the arrow keys move a highlight over
 the tiles and colours, Return or Space picks, and Escape closes. Programs can make their own popovers with the `window::POPOVER` flag.
 
+Right-click the desktop for its menu: New Terminal, Open Files, Next
+Wallpaper, Light/Dark Appearance, Settings, Lock Screen and About. The item
+under the pointer lights up in the accent; the arrow keys and Return work
+too.
+
 **Alt+L** (or the Lock tile in Control Center) locks the screen: the whole
 desktop under glass, the date and time large, and Return or the unlock
 button to get back. There are no accounts yet, so there is no password;

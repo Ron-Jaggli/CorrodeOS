@@ -42,6 +42,7 @@ pub struct Window {
     pub resizable: bool,
     pub popover: bool,
     pub cover: bool,
+    pub menu: bool,
     /// What its title bar says: up to eight bytes, unused ones zero.
     title: [u8; 8],
     /// The task that asked for it. When it finishes, the window goes.
@@ -70,6 +71,7 @@ pub fn open(width: u32, height: u32, flags: u64, title: u64, owner: usize) -> Op
     let translucent = flags & window::TRANSLUCENT != 0;
     let cover = flags & window::COVER != 0 && !docked;
     let popover = flags & window::POPOVER != 0 && !docked && !cover;
+    let menu = popover && flags & window::MENU != 0;
     let resizable = flags & window::RESIZABLE != 0 && !docked && !popover && !cover;
     let (width, height) = if docked {
         (SCREEN[0].load(Ordering::Relaxed), height.clamp(16, 64))
@@ -104,6 +106,7 @@ pub fn open(width: u32, height: u32, flags: u64, title: u64, owner: usize) -> Op
             resizable,
             popover,
             cover,
+            menu,
             // Printable ASCII only: a title is drawn, never interpreted.
             title: title
                 .to_le_bytes()
@@ -152,6 +155,11 @@ pub fn title_of_owner(owner: usize) -> Option<alloc::string::String> {
 /// Whether a window is a popover: no title bar, under the menu bar.
 pub fn popover(index: usize) -> bool {
     without_interrupts(|| TABLE.lock().get(index).is_some_and(|window| window.popover))
+}
+
+/// Whether a popover is a context menu, placed at the pointer.
+pub fn menu(index: usize) -> bool {
+    without_interrupts(|| TABLE.lock().get(index).is_some_and(|window| window.menu))
 }
 
 /// Whether any window covers the screen: the desktop is locked.

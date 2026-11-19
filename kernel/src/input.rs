@@ -346,6 +346,22 @@ fn resize_arrow(cursor: Cursor, grow: i32) -> Vec<u8> {
 /// How long a closed window takes to fade out.
 const CLOSING_MS: u32 = 180;
 
+/// Ask the launcher for `program`.
+fn launch(program: u64) {
+    let answer = crate::ipc::call(
+        crate::LAUNCHER_ENDPOINT,
+        crate::ipc::Message {
+            label: launcher::LAUNCH,
+            words: [program, 0, 0, 0],
+        },
+        None,
+        None,
+    );
+    if answer.is_err() {
+        println!("desktop    : no launcher to start program {}", program);
+    }
+}
+
 /// Where a window dragged to an edge of the screen goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Snap {
@@ -686,6 +702,10 @@ pub struct Desk {
     /// The window picked up was snapped or zoomed: the first move of the
     /// drag gives it back its size from before.
     unsnap: bool,
+    /// Where the desktop was last right-clicked: where its menu opens.
+    menu_at: (i32, i32),
+    /// Where a popover was last told the pointer is, so it is told once.
+    hovered_at: Option<(usize, i32, i32)>,
     /// Windows placed so far, for staggering the next one.
     placed: i32,
     /// The surfaces of windows that have gone, for the painter to retire.
@@ -797,6 +817,8 @@ impl Desk {
             drag_from: (0, 0),
             snap: None,
             unsnap: false,
+            menu_at: (0, 0),
+            hovered_at: None,
             placed: 0,
             closed: Vec::new(),
             fading: Vec::new(),
@@ -1142,6 +1164,14 @@ impl Desk {
         let chrome = !docked && !popover && !cover;
         let at = if docked || cover {
             (0, 0)
+        } else if popover && crate::windows::menu(window) {
+            // A context menu: its corner at the pointer, kept on screen.
+            let screen = scene.screen();
+            let (x, y) = self.menu_at;
+            (
+                x.min(screen.width as i32 - width as i32 - 4).max(4),
+                y.min(screen.height as i32 - height as i32 - 4).max(4),
+            )
         } else if popover {
             // Under the right-hand end of the menu bar, as Control Center
             // hangs from it.
@@ -1465,7 +1495,7 @@ impl Desk {
         // A click anywhere but on an open popover closes it. On the menu
         // bar it does nothing more, so clicking the clock again shuts
         // Control Center rather than opening it anew.
-        if pressed & 1 != 0 {
+        if pressed & 3 != 0 {
             let open: Vec<usize> = (0..self.windows.len())
                 .filter(|index| self.windows[*index].popover)
                 .collect();
@@ -1481,6 +1511,13 @@ impl Desk {
                     }
                 }
             }
+        }
+        // The right button on the bare desktop: its menu, at the pointer.
+        if pressed & 2 != 0 && self.covered().is_none() && self.on_desktop(scene) {
+            self.menu_at = self.at;
+            println!("input      : right click on the desktop at ({}, {})", self.at.0, self.at.1);
+            launch(launcher::MENU);
+            return;
         }
         // The dock first: it is above every window.
         if pressed & 1 != 0 {
@@ -1996,20 +2033,7 @@ impl Desk {
                     self.zoom(scene, index, now);
                 }
             }
-            Shortcut::Lock => {
-                let answer = crate::ipc::call(
-                    crate::LAUNCHER_ENDPOINT,
-                    crate::ipc::Message {
-                        label: launcher::LAUNCH,
-                        words: [launcher::LOCK, 0, 0, 0],
-                    },
-                    None,
-                    None,
-                );
-                if answer.is_err() {
-                    println!("desktop    : no launcher to lock the screen with");
-                }
-            }
+            Shortcut::Lock => launch(launcher::LOCK),
             Shortcut::Settings => {
                 let open = self
                     .windows
@@ -2423,6 +2447,49 @@ impl Desk {
         core::mem::take(&mut self.closed)
     }
 
+    /// Whether the pointer is on the bare desktop: no window under it (the
+    /// wallpaper is a layer too, so "nothing" is not the test), nor the
+    /// dock, nor a notification.
+    fn on_desktop<const N: usize>(&self, scene: &Scene<N>) -> bool {
+        if self.under(scene).is_ok() {
+            return false;
+        }
+        let pointer = self.pointer.unwrap_or([LayerId::NONE; 2]);
+        let Some(top) = scene
+            .layers_at(self.at.0, self.at.1)
+            .find(|id| !pointer.contains(id))
+        else {
+            return true;
+        };
+        let on_dock = self.dock.as_ref().is_some_and(|dock| dock.layers().any(|id| id == top));
+        let on_banner = self.banner.as_ref().is_some_and(|banner| banner.contains(top));
+        !on_dock && !on_banner
+    }
+
+    /// Tell a popover under the pointer where on it the pointer is, so a
+    /// menu can light the item under it. Only popovers hear of it: they
+    /// are small, and there is at most one.
+    fn hover_popover<const N: usize>(&mut self, scene: &Scene<N>) {
+        let over = match self.under(scene) {
+            Ok((index, Part::Body)) if self.windows[index].popover => {
+                let managed = &self.windows[index];
+                Some((managed.window, self.at.0 - managed.at.0, self.at.1 - managed.at.1))
+            }
+            _ => None,
+        };
+        if over == self.hovered_at {
+            return;
+        }
+        // Off it: told once, with a place on no item.
+        if let (None, Some((window, ..))) = (over, self.hovered_at) {
+            crate::windows::push(window, window::HOVER, [-1i64 as u64, -1i64 as u64, 0, 0]);
+        }
+        if let Some((window, x, y)) = over {
+            crate::windows::push(window, window::HOVER, [x as i64 as u64, y as i64 as u64, 0, 0]);
+        }
+        self.hovered_at = over;
+    }
+
     /// Tell the dock which icon, if any, the pointer is over.
     fn dock_hover<const N: usize>(&mut self, scene: &mut Scene<N>, now: u64) {
         // The dock is out of sight under a cover; whatever the pointer is
@@ -2615,6 +2682,7 @@ impl Desk {
         }
         self.hover(scene);
         self.dock_hover(scene, now);
+        self.hover_popover(scene);
 
         let pressed = buttons & !self.buttons;
         let released = self.buttons & !buttons;
