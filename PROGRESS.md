@@ -1226,3 +1226,35 @@ The short version, for reading first. The numbered log below has the detail.
   looks right, so the ring 3 driver decodes kind 9 fine.
 - Not done yet: making the icons grow under the pointer. That is next.
 - Full suite PASSes on both GPUs; input-test 170 / 0 and 177 / 0.
+
+## 51. Dock magnification
+
+- With the pointer on a dock icon, the icon grows from the dock's floor
+  to `magnify` percent of its size (140 by default, so 48 → 67 px).
+  Its neighbours get half of that growth, the next ones out 15%. The
+  row spreads out from the hovered icon's middle and the pane widens to
+  fit, on SNAPPY springs. The running dots stay under their icons and
+  the name pill rides above the grown icon.
+- Choice: the row spreads around the hovered icon's middle, not around
+  the screen's centre. The grown icon then always contains where the
+  pointer found it, so growing cannot push it out from under the
+  pointer and flicker at an edge. Hover stays per icon (the gaps
+  between icons are not magnified), unlike macOS's continuous
+  pointer-x curve; it is simpler and stable.
+- New theme key `magnify`: `on` (140), `off` (100), or 100-200. It is
+  packed in bits 48..55 of theme word 3. Breeze and Plain leave it off
+  (Plasma's panel does not magnify). It is also off when animation
+  speed is 0, where icons just lift as before. Settings has no control
+  for it yet; it can be set in desktop.conf. README table and the
+  shipped desktop.conf document it. Theme unit test
+  `magnify_takes_a_word_or_a_percentage`.
+- The launch bounce now lands where the icon rests in the current
+  layout (grown, if hovered).
+- New scored `magnify-test`: hovers Terminal, checks the log line
+  "Terminal grows to 67 px", screenshots, then clicks: it still starts.
+  build/progress-51-magnify.png shows it.
+- Known look issue: the glyphs are 48 px stencils stretched bilinearly,
+  so at 140% they are a little soft. Fix later: draw the stencils at
+  the largest size and scale them down instead.
+- Full suite PASSes on both GPUs (34 checks each, 68 lines); input-test
+  170 / 0 default and 177 / 0 virtio; `./corrode test` passes.

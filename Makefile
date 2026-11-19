@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -877,6 +877,26 @@ dock-test: iso
 	    && echo "dock-test: the dock started a terminal                    PASS" \
 	    || echo "dock-test: the dock started a terminal                    FAIL"
 	@test -s build/dock.ppm && pnmtopng build/dock.ppm > build/dock.png 2>/dev/null && rm -f build/dock.ppm && echo "wrote build/dock.png" || true
+
+# Boot and rest the pointer on the dock's Terminal icon: it grows, its
+# neighbours a little, the dock widens, and a click on it still starts a
+# terminal. build/magnify.png shows it grown.
+magnify-test: iso
+	@rm -f build/magnify.ppm build/magnify.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 1.2; \
+	   echo "screendump build/magnify.ppm"; sleep 1; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^dock " build/serial.log | grep -v PASS || echo "magnify-test: nothing from the dock"
+	@grep -q "dock       : Terminal grows to 67 px" build/serial.log \
+	    && echo "magnify-test: the icon under the pointer grows            PASS" \
+	    || echo "magnify-test: the icon under the pointer grows            FAIL"
+	@grep -q "dock       : started Terminal" build/serial.log \
+	    && echo "magnify-test: and a click on it still starts it           PASS" \
+	    || echo "magnify-test: and a click on it still starts it           FAIL"
+	@test -s build/magnify.ppm && pnmtopng build/magnify.ppm > build/magnify.png 2>/dev/null && rm -f build/magnify.ppm && echo "wrote build/magnify.png" || true
 
 # Boot, open two terminals from the panel's button, close the one on top
 # with its title bar's close button and the other by typing exit. Both

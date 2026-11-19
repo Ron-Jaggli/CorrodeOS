@@ -77,6 +77,9 @@ pub struct Theme {
     pub dock_size: u8,
     /// Whether dock icons jump when they start something.
     pub bounce: bool,
+    /// How big a dock icon grows under the pointer, in percent of its
+    /// size: 100 for not at all, up to 200.
+    pub magnify: u8,
     pub shadows: bool,
     /// Animation speed as a percentage: 100 normal, 0 no animation.
     pub speed: u8,
@@ -117,6 +120,7 @@ pub const CORRODE: Theme = Theme {
     dock: true,
     dock_size: 48,
     bounce: true,
+    magnify: 140,
     shadows: true,
     speed: 100,
     utc_offset: 0,
@@ -156,6 +160,8 @@ pub const BREEZE: Theme = Theme {
     ],
     frost: 140,
     bounce: false,
+    // Plasma's panel does not magnify.
+    magnify: 100,
     ..CORRODE
 };
 
@@ -177,6 +183,7 @@ pub const PLAIN: Theme = Theme {
     glass: GlassMode::Off,
     shadows: false,
     bounce: false,
+    magnify: 100,
     speed: 0,
     wallpaper: Wallpaper::Gradient,
     wallpaper_colors: [
@@ -307,6 +314,12 @@ impl Theme {
                 Some(b) => self.bounce = b,
                 None => return false,
             },
+            // on, off, or how big in percent.
+            "magnify" => match (on(), number(200)) {
+                (Some(b), _) => self.magnify = if b { CORRODE.magnify } else { 100 },
+                (None, Some(n)) => self.magnify = n.max(100),
+                (None, None) => return false,
+            },
             "shadows" => match on() {
                 Some(b) => self.shadows = b,
                 None => return false,
@@ -397,7 +410,8 @@ impl Theme {
             rgb(self.wallpaper_colors[0]) | rgb(self.wallpaper_colors[1]) << 24,
             rgb(self.wallpaper_colors[2])
                 | (self.utc_offset as u16 as u64) << 24
-                | (!self.clock_24h as u64) << 40,
+                | (!self.clock_24h as u64) << 40
+                | (self.magnify as u64) << 48,
         ]
     }
 
@@ -438,6 +452,7 @@ impl Theme {
             wallpaper_colors: [rgb(words[2]), rgb(words[2] >> 24), rgb(words[3])],
             utc_offset: (words[3] >> 24) as u16 as i16,
             clock_24h: words[3] & 1 << 40 == 0,
+            magnify: ((words[3] >> 48) as u8).clamp(100, 200),
         }
     }
 }
@@ -588,6 +603,16 @@ mod tests {
         assert_eq!(offset("+15"), None);
         assert_eq!(offset("5"), None);
         assert_eq!(offset("UTC"), Some(0));
+    }
+
+    #[test]
+    fn magnify_takes_a_word_or_a_percentage() {
+        assert_eq!(Theme::parse("magnify = off\n").magnify, 100);
+        assert_eq!(Theme::parse("magnify = on\n").magnify, CORRODE.magnify);
+        assert_eq!(Theme::parse("magnify = 170\n").magnify, 170);
+        // Shrinking is not magnifying, and twice the size is plenty.
+        assert_eq!(Theme::parse("magnify = 40\n").magnify, 100);
+        assert_eq!(Theme::parse("magnify = 900\n").magnify, 200);
     }
 
     #[test]

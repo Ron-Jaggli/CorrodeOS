@@ -88,6 +88,10 @@ const LIFT: i32 = 6;
 const GAP: i32 = 10;
 const PAD: u32 = 8;
 
+/// How much of the magnification an icon gets by how far it is from the
+/// one under the pointer, in percent: all of it, half, a little.
+const FALLOFF: [u32; 3] = [100, 50, 15];
+
 struct Icon {
     tile: LayerId,
     glyph: Option<LayerId>,
@@ -97,13 +101,19 @@ struct Icon {
     running: bool,
     /// Its name above it on hover: the pill, then the text on it.
     tooltip: Option<[LayerId; 2]>,
+    /// Where the pill rests, for it to follow the icon as it grows.
+    tip_at: (i32, i32),
 }
 
 pub struct Dock {
     pane: LayerId,
+    /// The pane at rest: left, width.
+    pane_at: (i32, u32),
     icons: Vec<Icon>,
     size: u32,
     bounce: bool,
+    /// [`Theme::magnify`]: 100 when icons only lift.
+    magnify: u32,
     /// The icon the pointer is over.
     hovered: Option<usize>,
 }
@@ -274,6 +284,7 @@ impl Dock {
                     at,
                     running: false,
                     tooltip: None,
+                    tip_at: at,
                 });
                 continue;
             };
@@ -301,6 +312,9 @@ impl Dock {
             dot.opacity = Animation::rest(Fx::ZERO);
             let dot = scene.add(dot);
             let tooltip = Self::tooltip(renderer, scene, theme, index, app.title, at, size);
+            let tip_at = tooltip
+                .and_then(|[pill, _]| scene.layer(pill))
+                .map_or(at, |pill| (pill.x.target().round(), pill.y.target().round()));
             icons.push(Icon {
                 tile,
                 glyph,
@@ -308,13 +322,17 @@ impl Dock {
                 at,
                 running: false,
                 tooltip,
+                tip_at,
             });
         }
         Some(Dock {
             pane,
+            pane_at: (left, width),
             icons,
             size,
             bounce: theme.bounce && theme.speed > 0,
+            // Growing needs animating to look like anything.
+            magnify: if theme.speed > 0 { theme.magnify.clamp(100, 200) as u32 } else { 100 },
             hovered: None,
         })
     }
@@ -352,22 +370,91 @@ impl Dock {
         Some([scene.add(pill)?, scene.add(label)?])
     }
 
-    /// The pointer is over icon `over`, or none: lift it and name it, and
-    /// put the last one back.
+    /// Where every icon goes with the pointer over `over`: its left, top
+    /// and size; and the pane's left and width.
+    ///
+    /// Unmagnified, the icon under the pointer only lifts. Magnified, it and
+    /// its neighbours grow up from the dock's floor, and the row spreads out
+    /// from the hovered icon's middle, which stays put: so the icon still
+    /// covers wherever the pointer found it, and growing cannot move it out
+    /// from under the pointer.
+    fn layout(&self, over: Option<usize>) -> (Vec<(i32, i32, u32)>, (i32, u32)) {
+        let size = self.size;
+        let rest = || self.icons.iter().map(|icon| (icon.at.0, icon.at.1, size)).collect();
+        let Some(over) = over.filter(|over| *over < self.icons.len()) else {
+            return (rest(), self.pane_at);
+        };
+        if self.magnify <= 100 {
+            let mut icons: Vec<(i32, i32, u32)> = rest();
+            icons[over].1 -= LIFT;
+            return (icons, self.pane_at);
+        }
+        let grown = |index: usize| {
+            let share = FALLOFF.get(index.abs_diff(over)).copied().unwrap_or(0);
+            size + size * (self.magnify - 100) * share / 10_000
+        };
+        let floor = self.icons[over].at.1 + size as i32;
+        let mut icons: Vec<(i32, i32, u32)> = (0..self.icons.len())
+            .map(|index| (0, floor - grown(index) as i32, grown(index)))
+            .collect();
+        let middle = self.icons[over].at.0 + size as i32 / 2;
+        icons[over].0 = middle - icons[over].2 as i32 / 2;
+        for index in over + 1..icons.len() {
+            icons[index].0 = icons[index - 1].0 + (icons[index - 1].2 + PAD) as i32;
+        }
+        for index in (0..over).rev() {
+            icons[index].0 = icons[index + 1].0 - (icons[index].2 + PAD) as i32;
+        }
+        let left = icons[0].0 - PAD as i32;
+        let (last, _, last_size) = icons[icons.len() - 1];
+        let right = last + (last_size + PAD) as i32;
+        (icons, (left, (right - left) as u32))
+    }
+
+    /// The pointer is over icon `over`, or none: lift or grow it and name
+    /// it, and put the last one back.
     pub fn hover<const N: usize>(&mut self, scene: &mut Scene<N>, over: Option<usize>, now: u64) {
         if over == self.hovered {
             return;
+        }
+        let (places, (left, width)) = self.layout(over);
+        if let (Some(over), true) = (over, self.magnify > 100) {
+            if let (Some(app), Some(place)) = (APPS.get(over), places.get(over)) {
+                println!("dock       : {} grows to {} px", app.title, place.2);
+            }
+        }
+        for (icon, (x, y, size)) in self.icons.iter().zip(places) {
+            for id in [Some(icon.tile), icon.glyph].into_iter().flatten() {
+                if let Some(layer) = scene.layer_mut(id) {
+                    layer.x = layer.x.retarget(now, Fx::from_int(x), Spring::SNAPPY);
+                    layer.y = layer.y.retarget(now, Fx::from_int(y), Spring::SNAPPY);
+                    layer.width = layer.width.retarget(now, Fx::from_int(size as i32), Spring::SNAPPY);
+                    layer.height = layer.height.retarget(now, Fx::from_int(size as i32), Spring::SNAPPY);
+                }
+            }
+            // The dot stays under the icon's middle, on the floor.
+            if let Some(layer) = icon.dot.and_then(|id| scene.layer_mut(id)) {
+                let middle = x + (size - DOT) as i32 / 2;
+                layer.x = layer.x.retarget(now, Fx::from_int(middle), Spring::SNAPPY);
+            }
+            // The name rides above the icon's top, over its middle.
+            let (dx, dy) = (x + size as i32 / 2 - (icon.at.0 + self.size as i32 / 2), y - icon.at.1);
+            for (id, inset) in icon.tooltip.into_iter().flatten().zip([(0, 0), (10, 4)]) {
+                if let Some(layer) = scene.layer_mut(id) {
+                    let (x, y) = (icon.tip_at.0 + inset.0 + dx, icon.tip_at.1 + inset.1 + dy);
+                    layer.x = layer.x.retarget(now, Fx::from_int(x), Spring::SNAPPY);
+                    layer.y = layer.y.retarget(now, Fx::from_int(y), Spring::SNAPPY);
+                }
+            }
+        }
+        if let Some(layer) = scene.layer_mut(self.pane) {
+            layer.x = layer.x.retarget(now, Fx::from_int(left), Spring::SNAPPY);
+            layer.width = layer.width.retarget(now, Fx::from_int(width as i32), Spring::SNAPPY);
         }
         for (index, shown) in [(self.hovered, false), (over, true)] {
             let Some(icon) = index.and_then(|index| self.icons.get(index)) else {
                 continue;
             };
-            let y = Fx::from_int(icon.at.1 - if shown { LIFT } else { 0 });
-            for id in [Some(icon.tile), icon.glyph].into_iter().flatten() {
-                if let Some(layer) = scene.layer_mut(id) {
-                    layer.y = layer.y.retarget(now, y, Spring::SNAPPY);
-                }
-            }
             let opacity = Fx::from_int(if shown { 255 } else { 0 });
             for id in icon.tooltip.into_iter().flatten() {
                 if let Some(layer) = scene.layer_mut(id) {
@@ -469,8 +556,9 @@ impl Dock {
         };
         if self.bounce {
             let height = (self.size * 45 / 100) as i32;
-            // It lands where it rests now: lifted, if the pointer is on it.
-            let rest = icon.at.1 - if self.hovered == Some(index) { LIFT } else { 0 };
+            // It lands where it rests now: lifted or grown, if the pointer
+            // is on it.
+            let rest = self.layout(self.hovered).0.get(index).map_or(icon.at.1, |place| place.1);
             for id in [Some(icon.tile), icon.glyph].into_iter().flatten() {
                 if let Some(layer) = scene.layer_mut(id) {
                     layer.y = Animation::spring(

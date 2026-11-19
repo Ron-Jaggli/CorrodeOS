@@ -109,6 +109,7 @@ typo cannot break the desktop. The file explains every key; in short:
 | `wallpaper_colors` | three `#rrggbb` | The wallpaper's colours |
 | `dock` / `dock_size` | `on` `off` / pixels | The dock and its icon size |
 | `bounce` | `on` `off` | Dock icons jump when they start something |
+| `magnify` | `on` `off`, or `100`-`200` | How big a dock icon grows under the pointer, in percent; `on` is 140 |
 | `shadows` | `on` `off` | Window shadows |
 | `animation_speed` | percent, `0` for none | Every animation's pace |
 | `timezone` | `UTC`, `+5`, `-8`, `+05:30` | The menu bar clock's offset from the machine's (UTC) clock |
