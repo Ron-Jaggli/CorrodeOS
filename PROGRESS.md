@@ -30,22 +30,28 @@ The short version, for reading first. The numbered log below has the detail.
     shortcuts (12).
   - virtio GPU parity: glass, wallpaper (14), freeing surfaces (30) and
     resizing (31). Before 30, the 14th window under virtio failed to open.
-- **Tests:** `./corrode test` passes. 22 scripted boot tests (`close-test`
-  through `dock-menu-test`) pass on both the default GPU and
-  `GPU=virtio`. The boot self-checks give 170 PASS / 0 FAIL (default) and
-  177 / 0 (virtio). Each test writes a screenshot to `build/`. The
+- **Tests:** `./corrode test` passes. 31 scripted boot tests (`close-test`
+  through `store-test`, 40 scored checks) pass on both the default GPU and
+  `GPU=virtio`. The boot self-checks give 172 PASS / 0 FAIL (default) and
+  179 / 0 (virtio). Each test writes a screenshot to `build/`. The
   `build/progress-NN-*.png` files are the ones referred to below.
 - **Not done, on purpose:**
-  - Settings are not saved across reboots. There is no block driver,
-    and writing a disk or CMOS NVRAM from this kernel on a real machine
-    risks its disks or firmware settings. Too close to "don't touch my
-    boot setup" to do unattended (32).
+  - Settings are kept only on a virtio disk (55): `./corrode run` uses
+    build/settings.img, inside the project. Real machines' disks and
+    CMOS NVRAM are still never written; there is no AHCI/NVMe driver.
+  - Windows do not zoom in from small when they open: that needs the
+    scene to scale a window's layers as a group, which it cannot yet.
   - The lock screen has no password, as there are no accounts (28).
 - **Speed:** frame timing is in (`./corrode perf-test`). Frosted glass
   is most of a frame's cost; dragging a window now takes about 8 ms a
   frame, down from 33 (47, 48).
 - **Security:** calls that act on other apps need the shell capability,
-  held only by Settings, Control Center and the menu (46).
+  held only by Settings, Control Center and the menu (46). The desktop's
+  own window titles belong to its own programs, so no app can post a
+  notification as Settings or be taken for it by the dock (56). The disk
+  driver holds only its disk (55).
+- **Look:** dock icons magnify under the pointer, sharp at every size,
+  adjustable in Settings (50-53).
 - **Known rough edges:** listed under "Known gap" in each section. The
   main ones:
   - Control Center's notification card is sized when it opens, so later
@@ -1373,3 +1379,32 @@ This part, host-tested only:
   saving from a background task.
 - Full suite PASSes on both GPUs (80 lines, with store-test's 4 each);
   input-test 170 / 0 and 177 / 0; `./corrode test` passes.
+
+## 56. Window titles that cannot be borrowed
+
+- Closes the gap noted in 46: a window's title was whatever its program
+  asked for. A title is what the dock lights a dot for, lists in its
+  menu and quits, and what a notification is shown under, so any
+  program could post as "Settings".
+- `windows::RESERVED`: Terminal, Settings, About, Files, Control, Lock,
+  Menu, Panel, each bound to the launcher's program name for it, and
+  CorrodeOS, bound to no program. `windows::allowed_title(asked,
+  program)` gives the title asked for, cleaned to printable ASCII as
+  before, unless it is reserved for another program; then the asker's
+  own program name. `windows::open` applies it with
+  `task::name_of(owner)` and logs "desktop    : task T (name) may not
+  title a window ...".
+- Choice: an impostor still gets its window, under its own name, rather
+  than a refusal, so a program that merely picked a clashing name keeps
+  working.
+- A notification from a task with no window was shown as "CorrodeOS"; it
+  is now shown under the task's program name.
+- Two new boot checks: "an app's own title is its own" and "but no app
+  may take another's, or the desktop's" (including "CorrodeO", the
+  eight bytes a nine-letter title would keep). Boot checks are now
+  172 / 0 default and 179 / 0 virtio.
+- No legitimate window was renamed anywhere in the suite: no "may not
+  title" line in any log. Full suite PASSes on both GPUs (80 lines);
+  `./corrode test` passes.
+- Not done: there is no program today that is not the desktop's own, so
+  there is no live impostor to show. The check is on the rule itself.

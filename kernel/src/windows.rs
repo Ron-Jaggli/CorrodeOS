@@ -68,7 +68,52 @@ pub fn set_screen(width: u32, height: u32) {
 
 /// Make a window for task `owner` and say its number. `None` if there is
 /// no surface left.
-pub fn open(width: u32, height: u32, flags: u64, title: u64, owner: usize) -> Option<usize> {
+/// The titles the desktop's own programs use, and the program each belongs
+/// to. A title says which app a window is: the dock lights its dot, lists
+/// it in its menu, quits it, and a notification is shown under it. So only
+/// the program the launcher started under that name may use one.
+/// `CorrodeOS` is the desktop's own, and no program's.
+const RESERVED: [(&[u8], &str); 9] = [
+    (b"Terminal", "terminal"),
+    (b"Settings", "settings"),
+    (b"About", "about"),
+    (b"Files", "files"),
+    (b"Control", "control"),
+    (b"Lock", "lock"),
+    (b"Menu", "menu"),
+    (b"Panel", "panel"),
+    (b"CorrodeOS", ""),
+];
+
+/// The title a task called `program` gets when it asks for `asked`: what it
+/// asked for, cleaned to printable ASCII, unless that is another program's,
+/// in which case its own name.
+pub fn allowed_title(asked: u64, program: &str) -> [u8; 8] {
+    let cleaned = title_bytes_cleaned(asked);
+    let length = cleaned.iter().position(|byte| *byte == 0).unwrap_or(8);
+    // Compared whole: "CorrodeOS" is nine letters, so its first eight are
+    // what an eight-byte title would hold.
+    let taken = RESERVED.iter().find(|(title, _)| {
+        let title = &title[..title.len().min(8)];
+        title == &cleaned[..length]
+    });
+    match taken {
+        Some((_, owner)) if *owner != program => {
+            let mut own = [0u8; 8];
+            for (slot, byte) in own.iter_mut().zip(program.bytes().filter(|byte| (b' '..=b'~').contains(byte))) {
+                *slot = byte;
+            }
+            own
+        }
+        _ => cleaned,
+    }
+}
+
+fn title_bytes_cleaned(title: u64) -> [u8; 8] {
+    title.to_le_bytes().map(|byte| if (b' '..=b'~').contains(&byte) { byte } else { 0 })
+}
+
+pub fn open(width: u32, height: u32, flags: u64, asked_title: u64, owner: usize) -> Option<usize> {
     let docked = flags & window::DOCKED != 0;
     let translucent = flags & window::TRANSLUCENT != 0;
     let cover = flags & window::COVER != 0 && !docked;
@@ -96,6 +141,15 @@ pub fn open(width: u32, height: u32, flags: u64, title: u64, owner: usize) -> Op
     } else {
         0
     };
+    let program = task::name_of(owner).unwrap_or("");
+    let title = allowed_title(asked_title, program);
+    if title != title_bytes_cleaned(asked_title) {
+        crate::println!(
+            "desktop    : task {owner} ({program}) may not title a window {:?}; it is {:?}",
+            core::str::from_utf8(&title_bytes_cleaned(asked_title)).unwrap_or("").trim_end_matches('\0'),
+            core::str::from_utf8(&title).unwrap_or("").trim_end_matches('\0'),
+        );
+    }
     let surface = surface::create_with_room(width, height, room)?;
     let index = without_interrupts(|| {
         let mut table = TABLE.lock();
@@ -110,9 +164,7 @@ pub fn open(width: u32, height: u32, flags: u64, title: u64, owner: usize) -> Op
             cover,
             menu,
             // Printable ASCII only: a title is drawn, never interpreted.
-            title: title
-                .to_le_bytes()
-                .map(|byte| if (b' '..=b'~').contains(&byte) { byte } else { 0 }),
+            title,
             subtitle: [0; 24],
             owner,
             events: VecDeque::new(),

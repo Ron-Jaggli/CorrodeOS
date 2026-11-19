@@ -2118,8 +2118,12 @@ fn serve(shell: bool) {
         // its next frame.
         // A notification, filed under the sender's window title.
         if received.message.label == window::NOTIFY {
-            let from = windows::title_of_owner(received.from)
-                .unwrap_or_else(|| alloc::string::String::from("CorrodeOS"));
+            // Under the caller's window's title, which `windows::open` has
+            // already kept from being another app's; a caller with no window
+            // is named by its program, never as the desktop itself.
+            let from = windows::title_of_owner(received.from).unwrap_or_else(|| {
+                alloc::string::String::from(task::name_of(received.from).unwrap_or("A program"))
+            });
             notify::post(from, notify::unpack(words));
             let _ = ipc::reply(
                 SERVICE_REPLY_SLOT,
@@ -2418,6 +2422,23 @@ fn start_desktop() {
         && memory::allocate(BOOT_POOL, 1, BOOT_POOL_SPARE) == Ok(4096)
         && memory::allocate(WINDOWS_ENDPOINT, 1, BOOT_POOL_SPARE + 1) == Err(CapError::WrongType);
     desktop_check("a pool gives what it has and no more", pool_rules);
+    // Titles say which app a window is, so the desktop's own are its own.
+    let word = |text: &[u8]| {
+        let mut bytes = [0u8; 8];
+        bytes[..text.len()].copy_from_slice(text);
+        u64::from_le_bytes(bytes)
+    };
+    desktop_check(
+        "an app's own title is its own",
+        windows::allowed_title(word(b"Settings"), "settings") == *b"Settings"
+            && windows::allowed_title(word(b"Notes"), "fault") == *b"Notes\0\0\0",
+    );
+    desktop_check(
+        "but no app may take another's, or the desktop's",
+        windows::allowed_title(word(b"Settings"), "terminal") == *b"terminal"
+            && windows::allowed_title(word(b"Files"), "fault") == *b"fault\0\0\0"
+            && windows::allowed_title(word(b"CorrodeO"), "settings") == *b"settings",
+    );
 
     let server = task::spawn("windows", window_server);
     let shell = task::spawn("shell", shell_server);
