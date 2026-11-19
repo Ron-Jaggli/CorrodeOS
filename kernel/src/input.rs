@@ -633,6 +633,8 @@ pub struct Desk {
     switcher: Option<crate::switcher::Switcher>,
     /// Alt+Space's search field, while it is up.
     spotlight: Option<crate::spotlight::Spotlight>,
+    /// A file search asked Files to show, for when its window opens.
+    reveal: Option<[u64; 4]>,
     /// Window ids, the one most recently in front first: the switcher's
     /// order.
     recent: Vec<usize>,
@@ -757,6 +759,7 @@ impl Desk {
             wanted: None,
             switcher: None,
             spotlight: None,
+            reveal: None,
             recent: Vec::new(),
         };
         let src = Rect::new(0, LINE_ROW as i32, 1, line_height);
@@ -1147,7 +1150,12 @@ impl Desk {
                 }
             }
         }
+        let is_files = !docked && managed.name == "Files";
         self.windows.push(managed);
+        if let (true, Some(words)) = (is_files, self.reveal) {
+            self.reveal = None;
+            crate::windows::push(window, window::REVEAL, words);
+        }
         if docked {
             self.announced = None;
             if let Some((unix, at)) = crate::rtc::anchor() {
@@ -1593,6 +1601,38 @@ impl Desk {
         }
     }
 
+    /// Show the file at `path` in Files: told to its window if it is open,
+    /// or kept for the window of a Files started for it.
+    fn reveal_file<const N: usize>(&mut self, scene: &mut Scene<N>, path: &str, now: u64) {
+        let bytes = path.as_bytes();
+        if bytes.len() > 32 {
+            println!("desktop    : {} is too long a path to send", path);
+            return;
+        }
+        let mut words = [0u64; 4];
+        for (index, byte) in bytes.iter().enumerate() {
+            words[index / 8] |= (*byte as u64) << (index % 8 * 8);
+        }
+        let open = self
+            .windows
+            .iter()
+            .rposition(|managed| !managed.docked && managed.name == "Files");
+        match (open, &self.dock) {
+            (Some(index), _) => {
+                crate::windows::push(self.windows[index].window, window::REVEAL, words);
+                self.restore(scene, index, now);
+            }
+            (None, Some(dock)) => match dock.find("Files") {
+                Some(app) => {
+                    self.reveal = Some(words);
+                    dock.launch(app, scene, now);
+                }
+                None => println!("desktop    : no Files to show {} in", path),
+            },
+            (None, None) => println!("desktop    : no dock to start Files from"),
+        }
+    }
+
     /// A key pressed while search is up.
     fn search_key<R: Renderer, const N: usize>(
         &mut self,
@@ -1616,9 +1656,17 @@ impl Desk {
                 if let Some(spotlight) = self.spotlight.take() {
                     spotlight.close(scene);
                 }
-                let (Some(app), Some(dock)) = (picked, &self.dock) else {
-                    println!("desktop    : nothing matches {:?}", query);
-                    return;
+                let (app, dock) = match (picked, &self.dock) {
+                    (Some(crate::spotlight::Hit::App(app)), Some(dock)) => (app, dock),
+                    (Some(crate::spotlight::Hit::File(path)), _) => {
+                        println!("desktop    : search {:?} shows {}", query, path);
+                        self.reveal_file(scene, &path, now);
+                        return;
+                    }
+                    _ => {
+                        println!("desktop    : nothing matches {:?}", query);
+                        return;
+                    }
                 };
                 let title = dock.title(app);
                 println!("desktop    : search {:?} opens {}", query, title);

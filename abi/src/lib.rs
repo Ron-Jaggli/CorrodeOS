@@ -245,6 +245,9 @@ pub mod window {
     /// The wheel turned over a window: word 0 is notches, toward the person
     /// positive, as i64; words 1 and 2 where the pointer is in the window.
     pub const SCROLL: u64 = 71;
+    /// To Files: show this file. The path is the four words' 32 bytes,
+    /// little-endian, NUL-padded; a longer path is not sent.
+    pub const REVEAL: u64 = 72;
 
     /// Most a window may be, either way.
     pub const MAX_WIDTH: u32 = 1920;

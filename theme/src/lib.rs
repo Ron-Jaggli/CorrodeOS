@@ -502,33 +502,52 @@ pub fn color(text: &str) -> Option<Color> {
 /// Paths are compared without a leading `./` or `/`. Nothing allocated: the
 /// kernel reads its theme with this before anything else is running.
 pub fn find_in_tar<'a>(archive: &'a [u8], path: &str) -> Option<&'a [u8]> {
-    const BLOCK: usize = 512;
     let want = path.trim_start_matches("./").trim_start_matches('/');
-    let mut at = 0;
-    while at + BLOCK <= archive.len() {
-        let header = &archive[at..at + BLOCK];
-        if header.iter().all(|b| *b == 0) {
-            return None;
+    tar_files(archive).find(|(name, _)| *name == want).map(|(_, data)| data)
+}
+
+/// Every regular file in a ustar archive: its path, without a leading `./`
+/// or `/`, and its contents. Stops at the end, or at anything malformed.
+///
+/// A long path keeps its start in the prefix field; nothing in `root/`
+/// needs it, so such a file is listed by the rest of its name.
+pub fn tar_files(archive: &[u8]) -> TarFiles<'_> {
+    TarFiles { archive, at: 0 }
+}
+
+pub struct TarFiles<'a> {
+    archive: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Iterator for TarFiles<'a> {
+    type Item = (&'a str, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        const BLOCK: usize = 512;
+        loop {
+            let archive = self.archive;
+            let header = archive.get(self.at..self.at + BLOCK)?;
+            if header.iter().all(|b| *b == 0) {
+                return None;
+            }
+            let field = |range: core::ops::Range<usize>| {
+                let bytes = &header[range];
+                let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+                core::str::from_utf8(&bytes[..end]).ok()
+            };
+            let size = field(124..136)
+                .and_then(|text| usize::from_str_radix(text.trim(), 8).ok())?;
+            let start = self.at + BLOCK;
+            let end = start.checked_add(size)?;
+            let name = field(0..100)?;
+            self.at = start + size.div_ceil(BLOCK) * BLOCK;
+            if matches!(header[156], b'0' | 0) {
+                let name = name.trim_start_matches("./").trim_start_matches('/');
+                return Some((name, archive.get(start..end)?));
+            }
         }
-        let field = |range: core::ops::Range<usize>| {
-            let bytes = &header[range];
-            let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
-            core::str::from_utf8(&bytes[..end]).ok()
-        };
-        let size = field(124..136)
-            .and_then(|text| usize::from_str_radix(text.trim(), 8).ok())?;
-        let start = at + BLOCK;
-        let end = start.checked_add(size)?;
-        let name = field(0..100)?;
-        let name = name.trim_start_matches("./").trim_start_matches('/');
-        // A long path keeps its start in the prefix field; desktop.conf's
-        // does not need it, and nor does anything else asked for here.
-        if name == want && matches!(header[156], b'0' | 0) {
-            return archive.get(start..end);
-        }
-        at = start + size.div_ceil(BLOCK) * BLOCK;
     }
-    None
 }
 
 #[cfg(test)]
@@ -616,5 +635,12 @@ mod tests {
         assert_eq!(find_in_tar(&archive, "/etc/desktop.conf"), Some(&b"glass = off\n"[..]));
         assert_eq!(find_in_tar(&archive, "etc/missing"), None);
         assert_eq!(find_in_tar(&archive[..100], "README"), None);
+    }
+
+    #[test]
+    fn every_file_in_an_archive_is_listed() {
+        let archive = tar(&[("./README", b"hi"), ("./etc/motd", b"hello")]);
+        let names: Vec<&str> = tar_files(&archive).map(|(name, _)| name).collect();
+        assert_eq!(names, ["README", "etc/motd"]);
     }
 }

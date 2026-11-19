@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -354,6 +354,23 @@ search-test: iso
 	    && echo "search-test: Alt+Space, s, Return opened Settings    PASS" \
 	    || echo "search-test: Alt+Space, s, Return opened Settings    FAIL"
 	@test -s build/search.ppm && pnmtopng build/search.ppm > build/search.png 2>/dev/null && rm -f build/search.ppm && echo "wrote build/search.png" || true
+
+# Alt+Space, type "mot" and press Return: Files opens on /etc with motd
+# picked and previewed, in build/reveal.png.
+reveal-test: iso
+	@rm -f build/reveal.ppm build/reveal.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "sendkey alt-spc"; sleep 0.8; \
+	   for key in m o t; do echo "sendkey $$key"; sleep 0.4; done; \
+	   echo "sendkey ret"; sleep 2.5; \
+	   echo "screendump build/reveal.ppm"; sleep 1.5; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^desktop .*search|^files " build/serial.log || echo "reveal-test: no search"
+	@grep -q "^files      : showing /etc/motd" build/serial.log \
+	    && echo "reveal-test: search found motd and Files showed it   PASS" \
+	    || echo "reveal-test: search found motd and Files showed it   FAIL"
+	@test -s build/reveal.ppm && pnmtopng build/reveal.ppm > build/reveal.png 2>/dev/null && rm -f build/reveal.ppm && echo "wrote build/reveal.png" || true
 
 # Open a terminal from the dock and drag its bottom-right corner 200 by 100
 # pixels bigger, in four steps; then drag its top-left corner 60 by 40

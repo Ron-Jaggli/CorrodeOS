@@ -537,3 +537,29 @@ Choices made without asking are marked **Choice:**.
   - The pick highlight is a plain rectangle; the atlas has no room left
     for a wide rounded stencil.
 - Screenshot: `build/progress-22-search.png`.
+
+## 25. Search finds files
+
+- Once something is typed, Alt+Space search also lists files from the root
+  filesystem whose names contain it, after the matching programs. Names
+  that start with the query come first, and at most four files are shown.
+  Each row has a document icon and reads like "motd   /etc": the name,
+  then the folder.
+- Return on a file shows it in Files: the folder opens and the file is
+  picked, so its preview shows.
+  - If Files is open, its window gets a new `window::REVEAL` event (the
+    path packed into the four words, at most 32 bytes) and comes forward.
+  - If not, Files is started from the dock, and the event is sent as its
+    window opens.
+- `corrode-theme` gained `tar_files`, an allocation-free iterator over a
+  ustar archive's files; `find_in_tar` is now built on it. Host-tested.
+- `corrode-ui` has `Event::Reveal`; Files has `Browser::reveal`.
+- New `./corrode reveal-test`: Alt+Space, type "mot", Return. Files logs
+  "showing /etc/motd". PASS, on virtio too. search-test still PASSes and
+  its screenshot now shows two apps and four files. All tests PASS;
+  170 / 0.
+- Known gaps:
+  - Paths longer than 32 bytes can't be revealed; the log says so.
+  - Files are matched by name only, not by contents.
+- Screenshots: `build/progress-23-search-files.png`,
+  `build/progress-24-reveal.png`.

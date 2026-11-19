@@ -317,6 +317,20 @@ impl Browser {
         }
     }
 
+    /// Show the file at `path`: open its folder and select it.
+    fn reveal(&mut self, path: &str) {
+        if self.fs.get(path).is_none() {
+            println!("no {path} to show");
+            return;
+        }
+        let parent = parent_of(path);
+        self.open(&parent);
+        if let Some(index) = self.entries.iter().position(|entry| entry == path) {
+            self.select(index);
+            println!("showing {path}");
+        }
+    }
+
     /// How many entries the list has room for.
     fn rows(&self) -> usize {
         ((self.window.height as i32 - TOOLBAR - 8) / ROW).max(1) as usize
@@ -459,6 +473,12 @@ fn main() {
                 }
             }
             Event::Scroll { notches, x, .. } => browser.scroll(notches, x),
+            Event::Reveal(path) => {
+                let end = path.iter().position(|b| *b == 0).unwrap_or(path.len());
+                if let Ok(path) = core::str::from_utf8(&path[..end]) {
+                    browser.reveal(path);
+                }
+            }
             Event::Button { x, y, buttons } if buttons & 1 != 0 => browser.click(x, y),
             Event::Key {
                 key, pressed: true, ..

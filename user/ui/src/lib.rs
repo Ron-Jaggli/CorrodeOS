@@ -87,6 +87,8 @@ pub enum Event {
     /// The wheel turned `notches` (toward the person positive) with the
     /// pointer at `x`, `y` in the window.
     Scroll { notches: i32, x: i32, y: i32 },
+    /// To Files, from search: show the file at this path.
+    Reveal([u8; 32]),
     /// The deadline came before anything else did.
     Timeout,
 }
@@ -284,6 +286,13 @@ impl Window {
                 x: words[1] as i64 as i32,
                 y: words[2] as i64 as i32,
             },
+            window::REVEAL => {
+                let mut path = [0u8; 32];
+                for (chunk, word) in path.chunks_mut(8).zip(words) {
+                    chunk.copy_from_slice(&word.to_le_bytes());
+                }
+                Event::Reveal(path)
+            }
             window::CLOCK => Event::Clock {
                 unix: words[0] as i64,
                 at: words[1],
