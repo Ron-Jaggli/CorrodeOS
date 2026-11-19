@@ -608,7 +608,12 @@ impl SoftwareRenderer {
         let scale = if frosted { 2 } else { 1 };
         let (sw, sh) = (bw.div_ceil(scale), bh.div_ceil(scale));
         let area = sw * sh;
-        let needed = if frosted { 2 * area } else { area } + sw.max(sh);
+        let blur_line = if frosted {
+            glass::blur_scratch(sw, sh, frost_radius.max(fill_radius) as usize / scale)
+        } else {
+            sw.max(sh)
+        };
+        let needed = if frosted { 2 * area } else { area } + blur_line;
 
         let shape = (
             rect.width as i64 * Q8,
@@ -660,7 +665,7 @@ impl SoftwareRenderer {
         // with each radius halved for the half-size backdrop.
         if frosted {
             let (fill, rest) = rest.split_at_mut(area);
-            let line = &mut rest[..sw.max(sh)];
+            let line = &mut rest[..blur_line];
             fill.copy_from_slice(backdrop);
             for _ in 0..3 {
                 glass::box_blur(backdrop, sw, sh, frost_radius as usize / scale, line);

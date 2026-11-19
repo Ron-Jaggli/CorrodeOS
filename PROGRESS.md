@@ -45,8 +45,9 @@ The short version, for reading first. The numbered log below has the detail.
     there are no accounts and no secret storage. It keeps a passer-by
     out, not someone holding the disk.
 - **Speed:** frame timing is in (`./corrode perf-test`). Frosted glass
-  is most of a frame's cost; dragging a window now takes about 8 ms a
-  frame, down from 33 (47, 48).
+  is most of a frame's cost; dragging a window now takes about 7.5 ms a
+  frame, down from 33 (47, 48, 49, 60). The likely next big lever, the
+  kernel's disabled SSE, is yours to decide (49).
 - **Security:** calls that act on other apps need the shell capability,
   held only by Settings, Control Center and the menu (46). The desktop's
   own window titles belong to its own programs, so no app can post a
@@ -1484,3 +1485,39 @@ This part, host-tested only:
 - Closes the gap from 58.
 - Full suite PASSes on both GPUs (94 lines); input-test 172 / 0 and
   179 / 0; `./corrode test` passes.
+
+## 60. A faster box blur, exactly the same pixels
+
+- `glass::box_blur` rewritten:
+  - Down the columns is done a row at a time, with a running sum for
+    every column, so memory is read in order. A row is overwritten
+    before the rows above it are done with, so the last `radius + 1`
+    original rows are kept in a ring.
+  - Red and blue are summed together in one word (16 bits each), with
+    green on its own: two adds a pixel, not three. That holds up to
+    `MAX_BLUR_RADIUS` = 128; larger radii are clamped (the desktop uses
+    at most about 11 at half size).
+  - Dividing by the span is a multiply by a 32-bit reciprocal, exact for
+    every sum a box can make (n ≤ 255 · span).
+- `glass::blur_scratch(w, h, radius)` says how much line buffer it needs
+  now (longer side + (radius + 3) rows), and the software renderer
+  reserves that.
+- New test `the_fast_blur_is_the_plain_one_exactly`: the old blur kept as
+  a reference in the tests, compared over noise images (1x1, 1x9, 9x1,
+  37x23, 23x37, 64x3) and radii 1, 2, 3, 7, 10, 40 and 128. Equal every
+  time. The reciprocal is also checked against `/` for every span up to
+  257 at every sum up to 255 · span.
+- Timings:
+
+  | Frosted glass | Before | After |
+  |---|---|---|
+  | `glass-bench`, one 600x40 pane | 3.1 ms | 2.2 ms (blur 2.1 → 1.2 ms) |
+  | In the kernel, dragging a window | 7.6–9.6 ms a frame | 6.8–8.8 ms a frame |
+  | In the kernel, Control Center open | 18.5 ms a frame | 16.3 ms a frame |
+
+  The kernel's gain is smaller. The likely reason, not confirmed, is the
+  one noted in 49: it is built without SSE, so per-pixel shading
+  outweighs the blur there.
+- The pixels are identical, so no screenshot can change. Full suite
+  PASSes on both GPUs (94 lines); input-test 172 / 0 and 179 / 0;
+  `./corrode test` passes.

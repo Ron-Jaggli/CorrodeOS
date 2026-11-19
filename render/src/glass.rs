@@ -361,53 +361,116 @@ pub fn tint(rgb: [u32; 3], glass: &Glass) -> [u32; 3] {
     [0, 1, 2].map(|i| (colour[i] * amount + rgb[i] * (255 - amount)) / 255)
 }
 
+/// The widest box [`box_blur`] takes: red and blue are summed together in
+/// one word, sixteen bits each, which holds `255 * (2 * radius + 1)`.
+pub const MAX_BLUR_RADIUS: usize = 128;
+
+/// How much `line` [`box_blur`] needs, for an image `width` by `height`
+/// blurred at up to `radius`.
+pub fn blur_scratch(width: usize, height: usize, radius: usize) -> usize {
+    let radius = radius.min(MAX_BLUR_RADIUS);
+    width.max(height) + (radius + 1) * width + 2 * width
+}
+
+/// `n / d` for the sums a box makes, by multiplying: `reciprocal(d)` once,
+/// then `divide(n, that)`. Exact for every `n` up to `255 * d`, as
+/// `n * (m * d - 2^32) < 2^32` there, with `m * d - 2^32 < d`.
+fn reciprocal(d: u32) -> u64 {
+    (1u64 << 32).div_ceil(d as u64)
+}
+
+fn divide(n: u32, reciprocal: u64) -> u32 {
+    ((n as u64 * reciprocal) >> 32) as u32
+}
+
+/// Red and blue of a pixel, apart enough to add up in one word; green.
+fn split(pixel: u32) -> (u32, u32) {
+    (pixel & 0x00ff_00ff, (pixel >> 8) & 0xff)
+}
+
+/// A pixel from the sums of `span` of them.
+fn mean((red_blue, green): (u32, u32), reciprocal: u64) -> u32 {
+    divide(red_blue >> 16, reciprocal) << 16
+        | divide(green, reciprocal) << 8
+        | divide(red_blue & 0xffff, reciprocal)
+}
+
 /// Box-blur `pixels`, `width` by `height` of `0x00RRGGBB`, in place:
 /// across each row and then down each column, each a running sum over
-/// `2 * radius + 1` pixels with the edges repeated. `line` is somewhere to
-/// keep one row or column while it is rewritten, and must be at least as
-/// long as the longer side.
+/// `2 * radius + 1` pixels with the edges repeated. `line` is scratch, at
+/// least [`blur_scratch`] long. A radius over [`MAX_BLUR_RADIUS`] is taken
+/// as that.
+///
+/// Down the columns is done a row at a time, with a running sum for every
+/// column, so memory is read in order rather than a pixel a row apart. A
+/// row is written before the rows above it are done with, so the last
+/// `radius + 1` rows are kept as they were, in a ring.
 pub fn box_blur(pixels: &mut [u32], width: usize, height: usize, radius: usize, line: &mut [u32]) {
+    let radius = radius.min(MAX_BLUR_RADIUS);
     if radius == 0 || width == 0 || height == 0 {
         return;
     }
+    let inverse = reciprocal(2 * radius as u32 + 1);
+    let (row_copy, rest) = line.split_at_mut(width.max(height));
+    let (ring, rest) = rest.split_at_mut((radius + 1) * width);
+    let (red_blue, rest) = rest.split_at_mut(width);
+    let green = &mut rest[..width];
+
     for y in 0..height {
         let row = &mut pixels[y * width..(y + 1) * width];
-        line[..width].copy_from_slice(row);
-        blur_line(&line[..width], radius, |x, pixel| row[x] = pixel);
+        row_copy[..width].copy_from_slice(row);
+        blur_line(&row_copy[..width], radius, inverse, row);
     }
-    for x in 0..width {
-        for y in 0..height {
-            line[y] = pixels[y * width + x];
+
+    let row_at = |y: isize| y.clamp(0, height as isize - 1) as usize * width;
+    red_blue.fill(0);
+    green.fill(0);
+    for y in -(radius as isize)..=radius as isize {
+        let from = row_at(y);
+        for x in 0..width {
+            let (rb, g) = split(pixels[from + x]);
+            red_blue[x] += rb;
+            green[x] += g;
         }
-        blur_line(&line[..height], radius, |y, pixel| pixels[y * width + x] = pixel);
+    }
+    for y in 0..height {
+        let slot = (y % (radius + 1)) * width;
+        let at = y * width;
+        ring[slot..slot + width].copy_from_slice(&pixels[at..at + width]);
+        for x in 0..width {
+            pixels[at + x] = mean((red_blue[x], green[x]), inverse);
+        }
+        if y + 1 == height {
+            break;
+        }
+        // In: the row `radius + 1` below, not yet written. Out: the row
+        // `radius` above, as it was, from the ring.
+        let incoming = row_at(y as isize + radius as isize + 1);
+        let leaving = (y.saturating_sub(radius) % (radius + 1)) * width;
+        for x in 0..width {
+            let (in_rb, in_g) = split(pixels[incoming + x]);
+            let (out_rb, out_g) = split(ring[leaving + x]);
+            red_blue[x] = red_blue[x] + in_rb - out_rb;
+            green[x] = green[x] + in_g - out_g;
+        }
     }
 }
 
-fn blur_line(line: &[u32], radius: usize, mut put: impl FnMut(usize, u32)) {
+fn blur_line(line: &[u32], radius: usize, inverse: u64, out: &mut [u32]) {
     let last = line.len() as isize - 1;
     let at = |i: isize| line[i.clamp(0, last) as usize];
-    let span = 2 * radius as u32 + 1;
-    let mut sum = [0u32; 3];
-    let add = |sum: &mut [u32; 3], pixel: u32, sign: bool| {
-        for (channel, total) in sum.iter_mut().enumerate() {
-            let value = (pixel >> (16 - 8 * channel)) & 0xff;
-            if sign {
-                *total += value;
-            } else {
-                *total -= value;
-            }
-        }
-    };
+    let (mut red_blue, mut green) = (0u32, 0u32);
     for i in -(radius as isize)..=radius as isize {
-        add(&mut sum, at(i), true);
+        let (rb, g) = split(at(i));
+        red_blue += rb;
+        green += g;
     }
-    for i in 0..line.len() as isize {
-        put(
-            i as usize,
-            (sum[0] / span) << 16 | (sum[1] / span) << 8 | sum[2] / span,
-        );
-        add(&mut sum, at(i + radius as isize + 1), true);
-        add(&mut sum, at(i - radius as isize), false);
+    for (i, pixel) in out.iter_mut().enumerate() {
+        *pixel = mean((red_blue, green), inverse);
+        let (in_rb, in_g) = split(at(i as isize + radius as isize + 1));
+        let (out_rb, out_g) = split(at(i as isize - radius as isize));
+        red_blue = red_blue + in_rb - out_rb;
+        green = green + in_g - out_g;
     }
 }
 
@@ -429,6 +492,72 @@ mod tests {
     fn edge_displacement(distance: f64, amount: f64, inverse_height: f64) -> f64 {
         let depth = (-distance * inverse_height).clamp(0.0, 1.0);
         amount * (1.0 - ((2.0 - depth) * depth).sqrt().clamp(0.0, 1.0))
+    }
+
+    /// The blur as it was first written: a column at a time, a channel at
+    /// a time, dividing. The fast one must match it exactly.
+    fn box_blur_reference(pixels: &mut [u32], width: usize, height: usize, radius: usize) {
+        fn line_blur(line: &[u32], radius: usize, mut put: impl FnMut(usize, u32)) {
+            let last = line.len() as isize - 1;
+            let at = |i: isize| line[i.clamp(0, last) as usize];
+            let span = 2 * radius as u32 + 1;
+            let mut sum = [0u32; 3];
+            for i in -(radius as isize)..=radius as isize {
+                for (c, total) in sum.iter_mut().enumerate() {
+                    *total += (at(i) >> (16 - 8 * c)) & 0xff;
+                }
+            }
+            for i in 0..line.len() as isize {
+                put(i as usize, (sum[0] / span) << 16 | (sum[1] / span) << 8 | sum[2] / span);
+                for (c, total) in sum.iter_mut().enumerate() {
+                    *total += (at(i + radius as isize + 1) >> (16 - 8 * c)) & 0xff;
+                    *total -= (at(i - radius as isize) >> (16 - 8 * c)) & 0xff;
+                }
+            }
+        }
+        if radius == 0 || width == 0 || height == 0 {
+            return;
+        }
+        for y in 0..height {
+            let row: Vec<u32> = pixels[y * width..(y + 1) * width].to_vec();
+            line_blur(&row, radius, |x, p| pixels[y * width + x] = p);
+        }
+        for x in 0..width {
+            let column: Vec<u32> = (0..height).map(|y| pixels[y * width + x]).collect();
+            line_blur(&column, radius, |y, p| pixels[y * width + x] = p);
+        }
+    }
+
+    #[test]
+    fn the_fast_blur_is_the_plain_one_exactly() {
+        // Noise, so every sum is different; shapes from one pixel to wider
+        // than tall and taller than wide; radii from 1 to wider than the
+        // image, and the most there is.
+        let mut seed = 0x1234_5678u32;
+        let mut noise = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed & 0x00ff_ffff
+        };
+        for (width, height) in [(1, 1), (1, 9), (9, 1), (37, 23), (23, 37), (64, 3)] {
+            let image: Vec<u32> = (0..width * height).map(|_| noise()).collect();
+            for radius in [1, 2, 3, 7, 10, 40, MAX_BLUR_RADIUS] {
+                let mut fast = image.clone();
+                let mut line = vec![0u32; blur_scratch(width, height, radius)];
+                box_blur(&mut fast, width, height, radius, &mut line);
+                let mut plain = image.clone();
+                box_blur_reference(&mut plain, width, height, radius);
+                assert_eq!(fast, plain, "{width}x{height}, radius {radius}");
+            }
+        }
+        // Every divisor a box makes, at every sum it can reach.
+        for span in 1..=2 * MAX_BLUR_RADIUS as u32 + 1 {
+            let inverse = reciprocal(span);
+            for n in 0..=255 * span {
+                assert_eq!(divide(n, inverse), n / span, "{n} / {span}");
+            }
+        }
     }
 
     #[test]
@@ -517,7 +646,7 @@ mod tests {
 
     #[test]
     fn blur_keeps_flat_colour_flat_and_spreads_a_spike() {
-        let line = &mut [0u32; 16];
+        let line = &mut vec![0u32; blur_scratch(16, 8, 3)];
         let mut flat = [0x00336699u32; 16 * 8];
         box_blur(&mut flat, 16, 8, 3, line);
         assert!(flat.iter().all(|p| *p == 0x00336699));
