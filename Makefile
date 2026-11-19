@@ -485,7 +485,7 @@ snap-test: iso
 # Two notifications from the terminal, then Control Center from the clock:
 # its Notifications card lists both, newest first (build/history.png).
 history-test: iso
-	@rm -f build/history.ppm build/history.png
+	@rm -f build/history.ppm build/history.png build/history-cleared.ppm build/history-cleared.png
 	@( sleep $(SHOT_DELAY); \
 	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
@@ -493,14 +493,26 @@ history-test: iso
 	   for key in n o t i f y spc a l l spc t e s t s spc p a s s e d ret; do echo "sendkey $$key"; sleep 0.1; done; sleep 0.5; \
 	   echo "mouse_move 280 -248"; sleep 0.2; echo "mouse_move 280 -248"; sleep 0.2; echo "mouse_move 280 -248"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
-	   echo "screendump build/history.ppm"; sleep 1; echo quit ) \
+	   echo "screendump build/history.ppm"; sleep 1; \
+	   echo "mouse_move -24 178"; sleep 0.2; echo "mouse_move -24 178"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 0.8; \
+	   echo "screendump build/history-cleared.ppm"; sleep 1; \
+	   for key in right right ret; do echo "sendkey $$key"; sleep 0.4; done; sleep 0.8; echo quit ) \
 	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
 	@grep -E "^notify |recent notifications" build/serial.log || echo "history-test: nothing"
 	@grep -q "^control    : 2 recent notifications" build/serial.log \
 	    && echo "history-test: Control Center listed both notifications PASS" \
 	    || echo "history-test: Control Center listed both notifications FAIL"
+	@grep -q "^control    : cleared the notifications" build/serial.log \
+	    && grep -q "recent notifications cleared" build/serial.log \
+	    && echo "history-test: Clear emptied the list                 PASS" \
+	    || echo "history-test: Clear emptied the list                 FAIL"
+	@grep -q "^control    : Glass turned Clear" build/serial.log \
+	    && echo "history-test: the Glass tile went on to Clear        PASS" \
+	    || echo "history-test: the Glass tile went on to Clear        FAIL"
 	@test -s build/history.ppm && pnmtopng build/history.ppm > build/history.png 2>/dev/null && rm -f build/history.ppm && echo "wrote build/history.png" || true
+	@test -s build/history-cleared.ppm && pnmtopng build/history-cleared.ppm > build/history-cleared.png 2>/dev/null && rm -f build/history-cleared.ppm && echo "wrote build/history-cleared.png" || true
 
 # Control Center from the keyboard: the clock opens it, arrows walk to
 # the 24-Hour tile (build/keys.png), Return flips it, Escape closes.

@@ -43,10 +43,10 @@ The short version, for reading first. The numbered log below has the detail.
   - The lock screen has no password, as there are no accounts (28).
 - **Known rough edges:** listed under "Known gap" in each section. The
   main ones:
-  - Control Center reads the notification list once, when it opens.
-  - The dock menu has no list of an app's open windows.
-  - Glass in Control Center toggles only Off/Regular (Clear is in
-    Settings).
+  - The dock menu has no list of an app's open windows. All of an app's
+    windows share its title, so the list would say "Terminal" twice.
+  - Control Center's notification card is sized when it opens, so later
+    arrivals replace the oldest rather than adding rows (39).
 - **Branch:** everything is on `desktop-glass` (37 commits on top of
   `secure-core/reserve`). Nothing was committed to `main`, and nothing
   outside the project was changed apart from installing podman (Setup).
@@ -940,3 +940,22 @@ The short version, for reading first. The numbered log below has the detail.
     programs Settings, About, Files, Control Center, lock and menu.
 - No code changed. `./corrode test` passes, menu-test PASSes, and
   input-test is 170 / 0.
+
+## 39. Control Center: Clear, a live list, and Clear glass
+
+- The Glass tile cycles Off → Regular → Clear (it was Off/Regular), and
+  its label names the mode.
+- The Notifications card has a Clear button. It sends `window::HISTORY`
+  part 2, which `notify::clear()` handles, and the card says "Nothing
+  new". The card now fills the rest of the popover, so it doesn't leave
+  a hole when the list shrinks.
+- While open, Control Center fetches the list again every 20 s, so new
+  notifications appear and "now" becomes "1m ago". It keeps the number
+  of rows it opened with.
+- Choice: no list of open windows in the dock menu. Every window of an
+  app has the app's title, so it would add nothing yet.
+- history-test now also clicks Clear and moves the keyboard to Glass and
+  presses Return ("Glass turned Clear"); `build/history-cleared.png`.
+  Full suite PASSes on both GPUs (25 checks each); input-test is
+  170 / 0 default, 177 / 0 virtio.
+- Screenshot: `build/progress-38-cleared.png`.

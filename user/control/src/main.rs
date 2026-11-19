@@ -49,12 +49,44 @@ fn ago(seconds: u64) -> alloc::string::String {
 }
 
 /// The card of recent notifications, under the swatches.
+/// What a tile says under its name. Glass has three ways to be.
+fn state_of(tile: &Tile, theme: &Theme) -> &'static str {
+    match (tile.icon, theme.glass) {
+        (Icon::Pane, GlassMode::Regular) => "Regular",
+        (Icon::Pane, GlassMode::Clear) => "Clear",
+        (Icon::Pane, GlassMode::Off) => "Off",
+        _ => tile.states[(tile.on)(theme) as usize],
+    }
+}
+
+/// Where the notifications card starts, down from the top.
+const NOTES_TOP: i32 = HEIGHT as i32 - MARGIN + GAP;
+
+/// The Clear button on the card's heading: its left edge and width.
+fn clear_button(window: &Window) -> (i32, u32) {
+    let width = width_of("Clear", STATE) + 16;
+    (window.width as i32 - MARGIN - 8 - width as i32, width)
+}
+
+/// Whether `x`, `y` is on the Clear button.
+fn on_clear(window: &Window, x: i32, y: i32) -> bool {
+    let (left, width) = clear_button(window);
+    x >= left && x < left + width as i32 && y >= NOTES_TOP + 6 && y < NOTES_TOP + 26
+}
+
 fn notes(window: &mut Window, look: &Look, notes: &[Note]) {
-    let top = HEIGHT as i32 - MARGIN + GAP;
+    let top = NOTES_TOP;
     let width = window.width - 2 * MARGIN as u32;
-    window.rounded(MARGIN, top, width, notes_height(notes.len()) as u32, 14, look.tile);
+    // The card fills what is left: the list can shrink while it is open.
+    let card = (window.height as i32 - top - MARGIN).max(notes_height(0)) as u32;
+    window.rounded(MARGIN, top, width, card, 14, look.tile);
     window.text(MARGIN + 12, top + 9, "Notifications", LABEL, look.text);
     let right = MARGIN + width as i32 - 12;
+    if !notes.is_empty() {
+        let (left, button) = clear_button(window);
+        window.rounded(left, top + 6, button, 20, 10, look.off);
+        window.text(left + 8, top + 9, "Clear", STATE, look.text);
+    }
     if notes.is_empty() {
         window.text(MARGIN + 12, top + HEADING + 10, "Nothing new", STATE, look.secondary);
         return;
@@ -119,11 +151,13 @@ const TILES: [Tile; 8] = [
     Tile {
         label: "Glass",
         on: |theme| theme.glass != GlassMode::Off,
+        // Three ways, not two: see `state_of`.
         states: ["Off", "On"],
         flip: |theme| {
             theme.glass = match theme.glass {
                 GlassMode::Off => GlassMode::Regular,
-                _ => GlassMode::Off,
+                GlassMode::Regular => GlassMode::Clear,
+                GlassMode::Clear => GlassMode::Off,
             }
         },
         icon: Icon::Pane,
@@ -326,7 +360,7 @@ fn draw(window: &mut Window, theme: &Theme, recent: &[Note], focus: Option<usize
         let text_x = x + 10 + 32 + 10;
         let label_y = y + TILE.1 / 2 - line_height(LABEL) as i32 + 1;
         window.text(text_x, label_y, tile.label, LABEL, look.text);
-        let state = tile.states[on as usize];
+        let state = state_of(tile, theme);
         window.text(text_x, label_y + line_height(LABEL) as i32, state, STATE, look.secondary);
     }
     // The accents, on a strip of their own.
@@ -360,7 +394,7 @@ fn click(theme: &Theme, x: i32, y: i32) -> Option<Action> {
             }
             let mut changed = *theme;
             (tile.flip)(&mut changed);
-            println!("{} turned {}", tile.label, tile.states[(tile.on)(&changed) as usize]);
+            println!("{} turned {}", tile.label, state_of(tile, &changed));
             return Some(Action::Theme(changed));
         }
     }
@@ -399,6 +433,10 @@ fn main() {
         }
     };
     let mut theme = Theme::default();
+    let mut recent = recent;
+    // Room for as many as there were when it opened; new ones push the
+    // oldest off the end.
+    let room = recent.len().clamp(1, NOTES_SHOWN);
     // Nothing has the keyboard's ring until a key is pressed, as macOS
     // shows focus only to those using the keyboard.
     let mut focus: Option<usize> = None;
@@ -406,7 +444,22 @@ fn main() {
     println!("open");
 
     loop {
-        match window.wait(u64::MAX) {
+        // Every 20 s, the list again: new arrivals, and ages that move on.
+        match window.wait(corrode_rt::now_ns() + 20_000_000_000) {
+            Event::Timeout => {
+                let mut fresh = corrode_ui::notifications();
+                fresh.truncate(room);
+                recent = fresh;
+                draw(&mut window, &theme, &recent, focus);
+            }
+            Event::Button { x, y, buttons }
+                if buttons & 1 != 0 && !recent.is_empty() && on_clear(&window, x, y) =>
+            {
+                corrode_ui::clear_notifications();
+                recent.clear();
+                println!("cleared the notifications");
+                draw(&mut window, &theme, &recent, focus);
+            }
             Event::Theme(now) => {
                 theme = now;
                 draw(&mut window, &theme, &recent, focus);

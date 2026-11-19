@@ -264,7 +264,8 @@ pub mod window {
     /// Ask for a recent notification: word 0 which (0 the newest), word 1
     /// which part. Part 0 answers how many there are, the sender's title
     /// (8 bytes) and how many seconds ago it came; part 1 its text, 32
-    /// bytes. Past the last, every word is zero but the count.
+    /// bytes. Past the last, every word is zero but the count. Part 2
+    /// clears the list.
     pub const HISTORY: u64 = 74;
     /// To a popover: the pointer is over it, at x, y from its corner.
     pub const HOVER: u64 = 75;

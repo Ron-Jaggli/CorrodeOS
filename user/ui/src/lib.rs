@@ -407,6 +407,11 @@ pub fn notifications() -> alloc::vec::Vec<Note> {
     notes
 }
 
+/// Forget the recent notifications.
+pub fn clear_notifications() {
+    let _ = corrode_rt::call(app::WINDOWS, Message::new(window::HISTORY, [0, 2, 0, 0]), None);
+}
+
 /// How tall a line of `style` is.
 pub fn line_height(style: Style) -> u32 {
     corrode_text::measure("Mg", style).height

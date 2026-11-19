@@ -2115,6 +2115,10 @@ extern "C" fn window_server() {
         }
         // Control Center asking what has been said lately.
         if received.message.label == window::HISTORY {
+            if words[1] == 2 {
+                notify::clear();
+                println!("notify     : recent notifications cleared");
+            }
             let (count, entry) = notify::recent(words[0] as usize);
             let answer = match (entry, words[1]) {
                 (Some((from, _, age)), 0) => [count as u64, notify::pack(&from)[0], age, 0],

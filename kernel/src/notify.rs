@@ -55,6 +55,11 @@ pub fn recent(which: usize) -> (usize, Option<(String, String, u64)>) {
     })
 }
 
+/// Forget the recent notifications: Control Center's Clear.
+pub fn clear() {
+    without_interrupts(|| HISTORY.lock().clear());
+}
+
 /// Text into four words, little-endian, up to 32 bytes: [`unpack`]'s
 /// other half.
 pub fn pack(text: &str) -> [u64; 4] {
