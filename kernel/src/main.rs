@@ -2094,6 +2094,19 @@ extern "C" fn window_server() {
             );
             continue;
         }
+        // A program naming what its windows show, after their title.
+        if received.message.label == window::SUBTITLE {
+            let count = windows::set_subtitle(received.from, [words[0], words[1], words[2]]);
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: window::SUBTITLE,
+                    words: [count as u64, 0, 0, 0],
+                },
+                None,
+            );
+            continue;
+        }
         // The menu program asking what it was opened for.
         if received.message.label == window::CONTEXT || received.message.label == window::QUIT {
             let answer = if received.message.label == window::CONTEXT {
@@ -4641,6 +4654,11 @@ fn render_loop(renderer: &mut Screen) -> ! {
             } else {
                 println!("desktop    : the renderer cannot show window {index}");
             }
+        }
+
+        // Title bars whose program has given them something new to say.
+        for index in windows::take_retitled() {
+            desk.retitle(renderer, index, &mut *stage.scene);
         }
 
         // A new look, from Settings: a new wallpaper, and everything on it

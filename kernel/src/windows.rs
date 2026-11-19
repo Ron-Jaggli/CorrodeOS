@@ -45,6 +45,8 @@ pub struct Window {
     pub menu: bool,
     /// What its title bar says: up to eight bytes, unused ones zero.
     title: [u8; 8],
+    /// What it says after the title: the program's to set, any time.
+    subtitle: [u8; 24],
     /// The task that asked for it. When it finishes, the window goes.
     owner: usize,
     events: VecDeque<(u64, [u64; 4])>,
@@ -111,6 +113,7 @@ pub fn open(width: u32, height: u32, flags: u64, title: u64, owner: usize) -> Op
             title: title
                 .to_le_bytes()
                 .map(|byte| if (b' '..=b'~').contains(&byte) { byte } else { 0 }),
+            subtitle: [0; 24],
             owner,
             events: VecDeque::new(),
             waiter: NOBODY,
@@ -119,6 +122,58 @@ pub fn open(width: u32, height: u32, flags: u64, title: u64, owner: usize) -> Op
     });
     without_interrupts(|| NEW.lock().push(index));
     Some(index)
+}
+
+/// Windows whose subtitle changed since the painter last looked.
+static RETITLED: SpinLock<Vec<usize>> = SpinLock::new(Vec::new());
+
+/// Give every window `owner` has its subtitle, from three words of text.
+/// How many windows that was.
+pub fn set_subtitle(owner: usize, words: [u64; 3]) -> usize {
+    let mut text = [0u8; 24];
+    for (chunk, word) in text.chunks_mut(8).zip(words) {
+        chunk.copy_from_slice(&word.to_le_bytes());
+    }
+    // As a title: printable ASCII only.
+    let text = text.map(|byte| if (b' '..=b'~').contains(&byte) { byte } else { 0 });
+    let changed: Vec<usize> = without_interrupts(|| {
+        let mut table = TABLE.lock();
+        table
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, window)| window.owner == owner && !window.docked && window.subtitle != text)
+            .map(|(index, window)| {
+                window.subtitle = text;
+                index
+            })
+            .collect()
+    });
+    let count = changed.len();
+    without_interrupts(|| RETITLED.lock().extend(changed));
+    count
+}
+
+/// Windows whose subtitle changed, for the painter to draw again.
+pub fn take_retitled() -> Vec<usize> {
+    without_interrupts(|| core::mem::take(&mut *RETITLED.lock()))
+}
+
+/// What a window's title bar shows: its title, and its subtitle if it has
+/// one.
+pub fn caption(index: usize) -> alloc::string::String {
+    let mut caption = title(index);
+    let subtitle = without_interrupts(|| TABLE.lock().get(index).map(|window| window.subtitle));
+    let subtitle: alloc::string::String = subtitle
+        .unwrap_or([0; 24])
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| *byte as char)
+        .collect();
+    if !subtitle.is_empty() {
+        caption.push_str(" - ");
+        caption.push_str(&subtitle);
+    }
+    caption
 }
 
 /// Windows the painter has not placed yet.

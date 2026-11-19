@@ -174,7 +174,9 @@ Programs follow the look on their own: a window is sent `window::THEME`
 when it opens and whenever the look changes (`Event::Theme` in the `ui`
 crate). A program can change the look with `corrode_ui::set_theme`, which
 is all Settings does. `corrode_ui::notify(text)` posts a notification, and
-`corrode_ui::notifications()` reads back the recent ones. Window flags
+`corrode_ui::notifications()` reads back the recent ones. `corrode_ui::subtitle(text)`
+puts text after the window's title, as the terminal shows its folder
+("Terminal - /etc"); the dock and Quit still go by the title alone. Window flags
 choose the kind of window: `TRANSLUCENT` (glass behind the program's
 clear pixels), `RESIZABLE`, `POPOVER` (no title bar, under the menu bar,
 closed by a click elsewhere; with `MENU`, at the pointer instead) and

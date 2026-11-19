@@ -276,6 +276,9 @@ pub mod window {
     /// Close every window titled word 0 (8 bytes): Quit, from the dock.
     /// Answers how many were asked to close.
     pub const QUIT: u64 = 77;
+    /// Set what the caller's windows say after their title, as a terminal
+    /// names its folder: up to 24 bytes in words 0-2, unused ones zero.
+    pub const SUBTITLE: u64 = 78;
 
     /// Most a window may be, either way.
     pub const MAX_WIDTH: u32 = 1920;

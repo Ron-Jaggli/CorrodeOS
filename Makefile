@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -559,6 +559,24 @@ menu-test: iso
 	    || echo "menu-test: right-click menu picked, then closed      FAIL"
 	@test -s build/menu.ppm && pnmtopng build/menu.ppm > build/menu.png 2>/dev/null && rm -f build/menu.ppm && echo "wrote build/menu.png" || true
 	@test -s build/menu-after.ppm && pnmtopng build/menu-after.ppm > build/menu-after.png 2>/dev/null && rm -f build/menu-after.ppm && echo "wrote build/menu-after.png" || true
+
+# A terminal from the dock, then cd /etc: its title bar becomes
+# "Terminal - /etc" (build/title.png).
+title-test: iso
+	@rm -f build/title.ppm build/title.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 2; \
+	   for key in c d spc slash e t c ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 1.5; \
+	   echo "screendump build/title.ppm"; sleep 1; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "now says|^terminal   : \\$$ cd" build/serial.log || echo "title-test: nothing"
+	@grep -q "now says Terminal - /[[:space:]]*$$" build/serial.log \
+	    && grep -q "now says Terminal - /etc" build/serial.log \
+	    && echo "title-test: the title bar follows the terminal's folder PASS" \
+	    || echo "title-test: the title bar follows the terminal's folder FAIL"
+	@test -s build/title.ppm && pnmtopng build/title.ppm > build/title.png 2>/dev/null && rm -f build/title.ppm && echo "wrote build/title.png" || true
 
 # Two terminals from the dock, then a right click on its Terminal icon:
 # the app's menu opens above it (build/dock-menu.png); Quit Terminal

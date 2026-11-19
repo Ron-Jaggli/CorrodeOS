@@ -224,7 +224,11 @@ impl Terminal {
         println!("$ {}", line);
         self.say(&format!("{PROMPT_TEXT}{line}"), QUIET);
         let mut system = System::new(self.editor.history());
+        let folder = String::from(self.shell.cwd());
         let printed = self.shell.run(line, &self.fs, &mut system);
+        if self.shell.cwd() != folder {
+            corrode_ui::subtitle(self.shell.cwd());
+        }
         let System {
             clear, sleep, exit, ..
         } = system;
@@ -529,6 +533,7 @@ fn main() {
         fs: files(),
         back: 0,
     };
+    corrode_ui::subtitle(terminal.shell.cwd());
     terminal.say("CorrodeOS terminal", PROMPT);
     let motd = terminal.fs.get("/etc/motd").map(|motd| motd.data);
     match motd.map(String::from_utf8_lossy) {

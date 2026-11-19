@@ -959,3 +959,26 @@ The short version, for reading first. The numbered log below has the detail.
   Full suite PASSes on both GPUs (25 checks each); input-test is
   170 / 0 default, 177 / 0 virtio.
 - Screenshot: `build/progress-38-cleared.png`.
+
+## 40. Window subtitles: the terminal shows its folder
+
+- New `window::SUBTITLE` (78) / `corrode_ui::subtitle(text)`: up to 24
+  bytes, shown after the window's title as "Terminal - /etc". It applies
+  to every window of the calling task.
+- The kernel keeps the subtitle per window and queues changed windows.
+  On its next frame the desk draws the caption into a free title slot,
+  gives the old slot back, and centres the title again (`Desk::retitle`).
+  If the caption would be too long for the bar, the title alone is shown.
+- The terminal sets its folder when it opens and again whenever a
+  command changes it.
+- Choice: " - ", not macOS's em dash. The typeface is ASCII only.
+- Choice: the app's identity stays the title. The dock's running dots,
+  the menu bar's app name, notifications and Quit Terminal all still say
+  "Terminal".
+- New `./corrode title-test`: open a terminal and run `cd /etc`; the log
+  shows "now says Terminal - /" then "Terminal - /etc".
+  `build/title.png`. Full suite PASSes on both GPUs (26 checks each);
+  input-test is 170 / 0 default, 177 / 0 virtio.
+- Next it makes sense to list an app's windows by caption in its dock
+  menu, now that two terminals can be told apart.
+- Screenshot: `build/progress-40-title.png`.

@@ -1138,6 +1138,44 @@ impl Desk {
         Some((slot, extent.width))
     }
 
+    /// Draw a window's title bar text again, after its program changed its
+    /// subtitle. The new text goes in a free slot before the old one is
+    /// given back, so a full atlas keeps the old title rather than none.
+    pub fn retitle<R: Renderer, const N: usize>(&mut self, renderer: &mut R, window: usize, scene: &mut Scene<N>) {
+        let Some(index) = self.windows.iter().position(|managed| managed.window == window) else {
+            return;
+        };
+        let Some((id, old, _)) = self.windows[index].title else {
+            return;
+        };
+        let caption = crate::windows::caption(window);
+        // Too long for the bar: the title alone.
+        let fitted = self
+            .draw_title(renderer, &caption)
+            .filter(|(_, width)| *width + 2 * 80 <= self.windows[index].width)
+            .or_else(|| self.draw_title(renderer, &crate::windows::title(window)));
+        let Some((slot, width)) = fitted else {
+            return;
+        };
+        self.titles &= !(1 << old);
+        if let Some(layer) = scene.layer_mut(id) {
+            let src = Self::title_src(slot, width);
+            layer.content = corrode_render::scene::Content::Mask { src };
+            layer.width = Animation::rest(Fx::from_int(src.width as i32));
+        }
+        let managed = &mut self.windows[index];
+        managed.title = Some((id, slot, width));
+        if !managed.minimized {
+            for (id, (x, y)) in managed.places(managed.at, self.theme.buttons) {
+                if let Some(layer) = scene.layer_mut(id) {
+                    layer.x = Animation::rest(Fx::from_int(x));
+                    layer.y = Animation::rest(Fx::from_int(y));
+                }
+            }
+        }
+        println!("desktop    : window {} now says {}", window, caption);
+    }
+
     fn title_src(slot: usize, width: u32) -> Rect {
         let (slot_width, slot_height) = TITLE_SLOT;
         Rect::new(
@@ -1238,7 +1276,7 @@ impl Desk {
         let title = if !chrome {
             None
         } else {
-            self.draw_title(renderer, &name)
+            self.draw_title(renderer, &crate::windows::caption(window))
                 .and_then(|(slot, text_width)| {
                     let src = Self::title_src(slot, text_width);
                     scene

@@ -407,6 +407,21 @@ pub fn notifications() -> alloc::vec::Vec<Note> {
     notes
 }
 
+/// Say what this program's windows show, after their title: "Terminal - /etc".
+/// Up to 24 bytes; an empty one takes it away.
+pub fn subtitle(text: &str) {
+    let mut bytes = [0u8; 24];
+    for (slot, byte) in bytes.iter_mut().zip(text.bytes()) {
+        *slot = byte;
+    }
+    let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]));
+    let _ = corrode_rt::call(
+        app::WINDOWS,
+        Message::new(window::SUBTITLE, [word(0), word(8), word(16), 0]),
+        None,
+    );
+}
+
 /// Forget the recent notifications.
 pub fn clear_notifications() {
     let _ = corrode_rt::call(app::WINDOWS, Message::new(window::HISTORY, [0, 2, 0, 0]), None);
