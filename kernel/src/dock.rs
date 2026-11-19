@@ -30,6 +30,7 @@ enum Glyph {
     /// A line of text, centred.
     Text(&'static str),
     Gear,
+    Folder,
 }
 
 /// A program the dock can start.
@@ -41,7 +42,14 @@ struct App {
     glyph: Glyph,
 }
 
-const APPS: [App; 3] = [
+const APPS: [App; 4] = [
+    // First, where Finder is.
+    App {
+        title: "Files",
+        program: launcher::FILES,
+        color: Color::rgb(0x1e, 0x9b, 0xf0),
+        glyph: Glyph::Folder,
+    },
     App {
         title: "Terminal",
         program: launcher::TERMINAL,
@@ -155,6 +163,32 @@ fn gear(size: u32) -> Vec<u8> {
     coverage
 }
 
+/// A folder: a tab on top of a body, `size` pixels across.
+fn folder(size: u32) -> Vec<u8> {
+    let size = size as i64;
+    let mut coverage = alloc::vec![0u8; (size * size) as usize];
+    // In eighths of a pixel: the body, and the tab above its left end.
+    let (left, right) = (size * 8 * 22 / 100, size * 8 * 78 / 100);
+    let (top, bottom) = (size * 8 * 34 / 100, size * 8 * 72 / 100);
+    let (tab_right, tab_top) = (size * 8 * 46 / 100, size * 8 * 28 / 100);
+    for py in 0..size {
+        for px in 0..size {
+            let mut hits = 0;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let x = px * 8 + sx * 2 + 1;
+                    let y = py * 8 + sy * 2 + 1;
+                    let body = x >= left && x < right && y >= top && y < bottom;
+                    let tab = x >= left && x < tab_right && y >= tab_top && y < top;
+                    hits += (body || tab) as i64;
+                }
+            }
+            coverage[(py * size + px) as usize] = (hits * 255 / 16) as u8;
+        }
+    }
+    coverage
+}
+
 /// Text centred in a `size`-pixel square.
 fn text(size: u32, text: &str) -> Vec<u8> {
     let style = Style::px((size * 52 / 100).max(8)).weight(Weight::Bold);
@@ -252,6 +286,7 @@ impl Dock {
             let coverage = match app.glyph {
                 Glyph::Text(label) => text(size, label),
                 Glyph::Gear => gear(size),
+                Glyph::Folder => folder(size),
             };
             let glyph = renderer
                 .upload_mask(glyph_src, &coverage)

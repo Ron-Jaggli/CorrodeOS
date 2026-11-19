@@ -378,3 +378,27 @@ Choices made without asking are marked **Choice:**.
 - Known gap: no NTP, so the clock drifts with the monotonic clock over
   very long uptimes.
 - Screenshot: `build/progress-15-clock.png`.
+
+## 18. Files
+
+- `user/files`: a Finder-style browser of the root filesystem.
+  - A Places sidebar (the root, shown as "CorrodeOS", and each top-level
+    directory), a back button and the folder's name.
+  - A list with folder and document icons and sizes, folders first.
+  - A preview of the selected file: its name, its size, and its text on a
+    sheet of paper, or "Not text" for binary files.
+  - Translucent over the glass frame, resizable (zoom and edge drag lay it
+    out again), and follows the theme live.
+- Mouse: click a place, a folder (opens) or a file (preview); a second
+  click on a selected entry opens it. Keyboard: Up/Down, Return opens,
+  Backspace goes up.
+- Read-only, through the same `app::FILES` blob capability the terminal
+  holds. The launcher gives it only to the terminal and Files.
+- The dock now has Files first (a white folder on blue), where Finder sits
+  on macOS. Every dock-clicking test was re-aimed, since icons moved 28 px.
+- `./corrode files-test` opens Files from the dock, then uses the keyboard
+  to go into `/etc` and preview `desktop.conf`. PASS. All other boot
+  tests PASS; 170 PASS / 0 FAIL.
+- Known gap: no scrolling, so a folder with more entries than fit shows
+  the first screenful.
+- Screenshot: `build/progress-16-files.png`.

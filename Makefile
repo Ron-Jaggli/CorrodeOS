@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -77,7 +77,7 @@ kernel:
 # crate built for it. RUSTFLAGS in the environment replaces the ones in
 # .cargo/config.toml outright, and a separate target directory stops the two
 # sets of flags from invalidating each other's build of the crates they share.
-USER_PROGRAMS := edu fault virtio-gpu blob-reader nvidia ps2 terminal panel settings about
+USER_PROGRAMS := edu fault virtio-gpu blob-reader nvidia ps2 terminal panel settings about files
 USER_TARGET   := target/user
 USER_BIN      := $(USER_TARGET)/x86_64-unknown-none/release
 USER_RUSTFLAGS := -C relocation-model=static -C strip=debuginfo \
@@ -252,14 +252,33 @@ input-test: iso
 	@grep -E "^(input|ps2|panel|terminal) " build/serial.log || echo "input-test: nothing from the input path"
 	@test -s build/input.ppm && pnmtopng build/input.ppm > build/input.png 2>/dev/null && rm -f build/input.ppm && echo "wrote build/input.png" || true
 
+# Open Files from the dock, then work it from the keyboard: down twice to
+# etc, Return to open it, down to desktop.conf. build/files.png shows its
+# preview.
+files-test: iso
+	@rm -f build/files.ppm build/files.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -84 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 2; \
+	   for key in down down ret down; do echo "sendkey $$key"; sleep 0.6; done; \
+	   echo "mouse_move 300 -300"; sleep 1; \
+	   echo "screendump build/files.ppm"; sleep 2; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^(dock|files) " build/serial.log || echo "files-test: nothing from Files"
+	@grep -q "^files      : /etc (3 items)" build/serial.log \
+	    && echo "files-test: opened /etc from the keyboard            PASS" \
+	    || echo "files-test: opened /etc from the keyboard            FAIL"
+	@test -s build/files.ppm && pnmtopng build/files.ppm > build/files.png 2>/dev/null && rm -f build/files.ppm && echo "wrote build/files.png" || true
+
 # Open a terminal from the dock and drag its bottom-right corner 200 by
 # 100 pixels bigger, in four steps. build/resize.png shows the result.
 resize-test: iso
 	@rm -f build/resize.ppm build/resize.png
 	@( sleep $(SHOT_DELAY); \
-	   echo "mouse_move -56 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
-	   echo "mouse_move 132 -304"; sleep 0.5; echo "mouse_button 1"; sleep 0.3; \
+	   echo "mouse_move 104 -304"; sleep 0.5; echo "mouse_button 1"; sleep 0.3; \
 	   for step in 1 2 3 4; do echo "mouse_move 50 25"; sleep 0.3; done; \
 	   echo "mouse_button 0"; sleep 1; \
 	   echo "screendump build/resize.ppm"; sleep 2; echo quit ) \
@@ -277,7 +296,7 @@ resize-test: iso
 shortcut-test: iso
 	@rm -f build/shortcut.ppm build/shortcut.png
 	@( sleep $(SHOT_DELAY); \
-	   echo "mouse_move -56 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
 	   echo "mouse_move 112 0"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
@@ -298,7 +317,7 @@ shortcut-test: iso
 # surface goes to the next one.
 churn-test: iso
 	@( sleep $(SHOT_DELAY); \
-	   echo "mouse_move -56 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
 	   for round in $$(seq 20); do \
 	       echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.2; \
 	       for key in e x i t ret; do echo "sendkey $$key"; sleep 0.1; done; sleep 0.8; \
@@ -318,15 +337,15 @@ churn-test: iso
 settings-test: iso
 	@rm -f build/settings.ppm build/settings.png
 	@( sleep $(SHOT_DELAY); \
-	   echo "mouse_move 0 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_move 28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
-	   echo "mouse_move -52 -515"; sleep 0.5; \
+	   echo "mouse_move -80 -515"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
 	   echo "mouse_move -52 114"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
 	   echo "mouse_move -218 -76"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
-	   echo "mouse_move 378 477"; sleep 0.5; \
+	   echo "mouse_move 406 477"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
 	   echo "screendump build/settings.ppm"; sleep 2; echo quit ) \
 	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
@@ -343,13 +362,13 @@ settings-test: iso
 minimize-test: iso
 	@rm -f build/minimize.ppm build/minimize.png
 	@( sleep $(SHOT_DELAY); \
-	   echo "mouse_move -56 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
-	   echo "mouse_move -424 -654"; sleep 0.5; \
+	   echo "mouse_move -452 -654"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 1; \
-	   echo "mouse_move 424 654"; sleep 0.5; \
+	   echo "mouse_move 452 654"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 1; \
-	   echo "mouse_move -404 -654"; sleep 0.5; \
+	   echo "mouse_move -432 -654"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 1.5; \
 	   echo "mouse_move 300 200"; sleep 0.5; \
 	   echo "screendump build/minimize.ppm"; sleep 2; \
@@ -369,7 +388,7 @@ minimize-test: iso
 dock-test: iso
 	@rm -f build/dock.ppm build/dock.png
 	@( sleep $(SHOT_DELAY); \
-	   echo "mouse_move -56 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
 	   echo "mouse_move 56 0"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 0.3; \

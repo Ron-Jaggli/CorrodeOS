@@ -40,6 +40,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "corrode-files"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+ "corrode-shell",
+ "corrode-ui",
+]
+
+[[package]]
 name = "corrode-gfx"
 version = "0.0.1"
 dependencies = [

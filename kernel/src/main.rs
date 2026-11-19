@@ -2147,14 +2147,21 @@ extern "C" fn launcher() {
         };
         let words = received.message.words;
         let status = match (received.message.label, words[0]) {
-            (launcher::LAUNCH, program @ (launcher::TERMINAL | launcher::SETTINGS | launcher::ABOUT)) => {
+            (
+                launcher::LAUNCH,
+                program @ (launcher::TERMINAL
+                | launcher::SETTINGS
+                | launcher::ABOUT
+                | launcher::FILES),
+            ) => {
                 let name = match program {
                     launcher::TERMINAL => "terminal",
                     launcher::SETTINGS => "settings",
+                    launcher::FILES => "files",
                     _ => "about",
                 };
-                // Only the terminal reads files.
-                let files = (program == launcher::TERMINAL
+                // Only the terminal and Files read files.
+                let files = (matches!(program, launcher::TERMINAL | launcher::FILES)
                     && cap::identify(LAUNCHER_FILES_SLOT).is_ok())
                 .then_some(LAUNCHER_FILES_SLOT);
                 match start_app(name, LAUNCHER_WINDOWS_SLOT, LAUNCHER_LOG_SLOT, None, files) {

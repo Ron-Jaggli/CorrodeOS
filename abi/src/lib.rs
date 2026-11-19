@@ -257,6 +257,7 @@ pub mod launcher {
     pub const TERMINAL: u64 = 1;
     pub const SETTINGS: u64 = 2;
     pub const ABOUT: u64 = 3;
+    pub const FILES: u64 = 4;
 }
 
 /// Rights, as bits: in the low byte of what `SYS_IDENTIFY` reports, and as
