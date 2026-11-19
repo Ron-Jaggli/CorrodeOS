@@ -467,3 +467,26 @@ Choices made without asking are marked **Choice:**.
   and drops the held keys' release. The held Alt+Tab therefore comes last
   in the test, and the switch itself is checked with a plain tap.
 - Screenshot: `build/progress-19-switcher.png`.
+
+## 22. Resize from every edge
+
+- Resizable windows can now be resized from all four edges and corners.
+  - The left edge: 8 px into the window body.
+  - The top edge: the title bar's top 4 px. The rest of the bar still
+    drags the window, and the traffic lights are below that strip.
+  - The bar's top corners act as diagonal handles.
+- Dragging the left or top edge moves the window so that its right and
+  bottom edges stay put. Edge drags still respect the minimum size
+  (240x120) and the screen edges.
+- resize-test gained a second drag: the top-left corner 60x40 bigger
+  ("is now 860x480"). The screenshot shows the window grown up and left,
+  with its bottom-right corner exactly where it was. PASS; all other tests
+  PASS; 170 / 0.
+- Note for test writers: one very large `mouse_move` gets clamped on the
+  way in (one PS/2 packet holds about ±255). Split long moves into steps.
+- Known gaps:
+  - There is no resize cursor shape yet, since the pointer has one
+    stencil.
+  - Edge resizing remains software-renderer only; virtio can't show a
+    surface at a new size yet.
+- Screenshot: `build/progress-20-edges.png`.

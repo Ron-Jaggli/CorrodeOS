@@ -547,7 +547,9 @@ pub struct Desk {
     /// size were when it was picked up, and which edges move.
     sizing: Option<Sizing>,
     /// The size the pointer has dragged it to, applied once a poll.
-    wanted: Option<(usize, (u32, u32))>,
+    /// With where its right and bottom edges are to stay, when its left
+    /// or top edge is being dragged.
+    wanted: Option<(usize, (u32, u32), (Option<i32>, Option<i32>))>,
 }
 
 /// A resize by the edges, in progress.
@@ -556,13 +558,20 @@ struct Sizing {
     index: usize,
     from: (i32, i32),
     size: (u32, u32),
+    /// Which edges follow the pointer. A left or top edge moves the window
+    /// as well, so that its right or bottom edge stays where it is.
+    left: bool,
+    top: bool,
     right: bool,
     bottom: bool,
 }
 
-/// How far in from a resizable window's right and bottom edges a press
-/// picks the edge up rather than going to the program.
+/// How far in from a resizable window's edges a press picks the edge up
+/// rather than going to the program.
 const EDGE: i32 = 8;
+/// The top edge is the title bar's top few pixels: the rest of the bar
+/// drags the window.
+const TOP_EDGE: i32 = 4;
 /// The smallest a window is resized to by hand.
 const MIN_SIZE: (u32, u32) = (240, 120);
 
@@ -776,11 +785,18 @@ impl Desk {
         self.announce();
 
         // An edge dragged: once a frame, however many moves it took.
-        if let Some((index, size)) = self.wanted.take() {
+        if let Some((index, size, (right, bottom))) = self.wanted.take() {
             let current = self.windows.get(index).map(|managed| (managed.width, managed.height));
             if current.is_some_and(|current| current != size) {
                 self.resize(scene, index, size);
                 let managed = &mut self.windows[index];
+                // The far edges stay; the window moves by what it grew.
+                if let Some(right) = right {
+                    managed.at.0 = right - managed.width as i32;
+                }
+                if let Some(bottom) = bottom {
+                    managed.at.1 = bottom - (managed.bar() + managed.height) as i32;
+                }
                 // Its own size now, whatever zoom said before.
                 managed.unzoomed = None;
                 for (id, (x, y)) in managed.places(managed.at, self.theme.buttons) {
@@ -1204,25 +1220,42 @@ impl Desk {
             }
         }
 
-        // Pressed near the right or bottom edge of a resizable window: the
-        // edge is picked up, and the program hears nothing of it.
-        if let (Ok((index, Part::Body)), true) = (hit, pressed & 1 != 0) {
+        // Pressed near an edge of a resizable window: the edge is picked
+        // up, and the program hears nothing of it. The top edge is the
+        // title bar's own top, which would otherwise start a drag.
+        let edge_hit = match hit {
+            Ok((index, part @ (Part::Body | Part::Bar))) if pressed & 1 != 0 => Some((index, part)),
+            _ => None,
+        };
+        if let Some((index, part)) = edge_hit {
             let managed = &self.windows[index];
+            let (left, top) = managed.at;
             let (right, bottom) = (
-                managed.at.0 + managed.width as i32,
-                managed.at.1 + (managed.bar() + managed.height) as i32,
+                left + managed.width as i32,
+                top + (managed.bar() + managed.height) as i32,
             );
-            let edges = (self.at.0 >= right - EDGE, self.at.1 >= bottom - EDGE);
+            let near_top = part == Part::Bar && self.at.1 < top + TOP_EDGE;
+            // Along the bar, only its top edge and corners are edges.
+            let sides = part == Part::Body || near_top;
+            let edges = (
+                sides && self.at.0 < left + EDGE,
+                near_top,
+                sides && self.at.0 >= right - EDGE,
+                part == Part::Body && self.at.1 >= bottom - EDGE,
+            );
             if self.can_resize
-                && (edges.0 || edges.1)
+                && (edges.0 || edges.1 || edges.2 || edges.3)
                 && crate::windows::resizable(managed.window)
             {
+                self.drag = None;
                 self.sizing = Some(Sizing {
                     index,
                     from: self.at,
                     size: (managed.width, managed.height),
-                    right: edges.0,
-                    bottom: edges.1,
+                    left: edges.0,
+                    top: edges.1,
+                    right: edges.2,
+                    bottom: edges.3,
                 });
                 return;
             }
@@ -1814,27 +1847,31 @@ impl Desk {
             if buttons & 1 == 0 {
                 self.sizing = None;
             } else if let Some(managed) = self.windows.get(sizing.index) {
-                let grow = |on: bool, delta: i32, size: u32, least: u32, most: i32| -> u32 {
-                    if !on {
-                        return size;
-                    }
+                let grow = |delta: i32, size: u32, least: u32, most: i32| -> u32 {
                     (size as i32 + delta).clamp(least as i32, most.max(least as i32)) as u32
                 };
-                let width = grow(
-                    sizing.right,
-                    self.at.0 - sizing.from.0,
-                    sizing.size.0,
-                    MIN_SIZE.0,
-                    screen.width as i32 - managed.at.0,
-                );
-                let height = grow(
-                    sizing.bottom,
-                    self.at.1 - sizing.from.1,
-                    sizing.size.1,
-                    MIN_SIZE.1,
-                    screen.height as i32 - managed.at.1 - managed.bar() as i32,
-                );
-                self.wanted = Some((sizing.index, (width, height)));
+                let (dx, dy) = (self.at.0 - sizing.from.0, self.at.1 - sizing.from.1);
+                let right = managed.at.0 + managed.width as i32;
+                let bottom = managed.at.1 + (managed.bar() + managed.height) as i32;
+                // A left or top edge grows the window as the pointer goes
+                // away from it, up to the screen's edge.
+                let (width, anchor_x) = if sizing.left {
+                    (grow(-dx, sizing.size.0, MIN_SIZE.0, right), Some(right))
+                } else if sizing.right {
+                    (grow(dx, sizing.size.0, MIN_SIZE.0, screen.width as i32 - managed.at.0), None)
+                } else {
+                    (managed.width, None)
+                };
+                let (height, anchor_y) = if sizing.top {
+                    let most = bottom - managed.bar() as i32;
+                    (grow(-dy, sizing.size.1, MIN_SIZE.1, most), Some(bottom))
+                } else if sizing.bottom {
+                    let most = screen.height as i32 - managed.at.1 - managed.bar() as i32;
+                    (grow(dy, sizing.size.1, MIN_SIZE.1, most), None)
+                } else {
+                    (managed.height, None)
+                };
+                self.wanted = Some((sizing.index, (width, height), (anchor_x, anchor_y)));
             }
         }
         // Dragging a window by its bar: it follows the pointer, held where

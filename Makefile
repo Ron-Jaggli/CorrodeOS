@@ -317,8 +317,10 @@ switcher-test: iso
 	    || echo "switcher-test: Alt+Tab showed three and switched     FAIL"
 	@test -s build/switcher.ppm && pnmtopng build/switcher.ppm > build/switcher.png 2>/dev/null && rm -f build/switcher.ppm && echo "wrote build/switcher.png" || true
 
-# Open a terminal from the dock and drag its bottom-right corner 200 by
-# 100 pixels bigger, in four steps. build/resize.png shows the result.
+# Open a terminal from the dock and drag its bottom-right corner 200 by 100
+# pixels bigger, in four steps; then drag its top-left corner 60 by 40
+# bigger, the window moving to keep its bottom right where it is.
+# build/resize.png shows the result.
 resize-test: iso
 	@rm -f build/resize.ppm build/resize.png
 	@( sleep $(SHOT_DELAY); \
@@ -327,6 +329,9 @@ resize-test: iso
 	   echo "mouse_move 104 -304"; sleep 0.5; echo "mouse_button 1"; sleep 0.3; \
 	   for step in 1 2 3 4; do echo "mouse_move 50 25"; sleep 0.3; done; \
 	   echo "mouse_button 0"; sleep 1; \
+	   echo "mouse_move -400 -230"; sleep 0.3; echo "mouse_move -394 -233"; sleep 0.5; echo "mouse_button 1"; sleep 0.3; \
+	   for step in 1 2; do echo "mouse_move -30 -20"; sleep 0.3; done; \
+	   echo "mouse_button 0"; sleep 1; \
 	   echo "screendump build/resize.ppm"; sleep 2; echo quit ) \
 	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
@@ -334,6 +339,9 @@ resize-test: iso
 	@grep -q "is now 800x440" build/serial.log \
 	    && echo "resize-test: dragged the corner to 800x440            PASS" \
 	    || echo "resize-test: dragged the corner to 800x440            FAIL"
+	@grep -q "is now 860x480" build/serial.log \
+	    && echo "resize-test: dragged the top left to 860x480          PASS" \
+	    || echo "resize-test: dragged the top left to 860x480          FAIL"
 	@test -s build/resize.ppm && pnmtopng build/resize.ppm > build/resize.png 2>/dev/null && rm -f build/resize.ppm && echo "wrote build/resize.png" || true
 
 # Open a terminal and About from the dock, then work the windows from the
