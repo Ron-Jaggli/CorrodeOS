@@ -423,14 +423,14 @@ control-test: iso
 # lock (neither may answer), screenshot it (build/lock.png), then Return
 # unlocks. Then Alt+L again and unlock by clicking the button.
 lock-test: iso
-	@rm -f build/lock.ppm build/lock.png
+	@rm -f build/lock.ppm build/lock.png build/lock-fade.ppm build/lock-fade.png
 	@( sleep $(SHOT_DELAY); \
 	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
 	   echo "sendkey alt-l"; sleep 1.5; \
 	   echo "sendkey alt-tab"; sleep 0.3; echo "sendkey alt-spc"; sleep 0.3; echo "sendkey x"; sleep 0.8; \
 	   echo "screendump build/lock.ppm"; sleep 1; \
-	   echo "sendkey ret"; sleep 1.2; \
+	   echo "sendkey ret"; sleep 0.06; echo "screendump build/lock-fade.ppm"; sleep 1.2; \
 	   echo "sendkey alt-l"; sleep 1.5; \
 	   echo "mouse_move 0 -60"; sleep 0.4; \
 	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.2; echo quit ) \
@@ -443,6 +443,7 @@ lock-test: iso
 	    && echo "lock-test: locked twice, shortcuts held off, unlocked twice PASS" \
 	    || echo "lock-test: locked twice, shortcuts held off, unlocked twice FAIL"
 	@test -s build/lock.ppm && pnmtopng build/lock.ppm > build/lock.png 2>/dev/null && rm -f build/lock.ppm && echo "wrote build/lock.png" || true
+	@test -s build/lock-fade.ppm && pnmtopng build/lock-fade.ppm > build/lock-fade.png 2>/dev/null && rm -f build/lock-fade.ppm && echo "wrote build/lock-fade.png" || true
 
 # Open a terminal from the dock and drag its bottom-right corner 200 by 100
 # pixels bigger, in four steps; then drag its top-left corner 60 by 40

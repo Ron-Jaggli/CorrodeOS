@@ -654,3 +654,27 @@ Choices made without asking are marked **Choice:**.
   - The dock still notices the pointer under the cover (unseen).
 - Screenshots: `build/progress-27-lock.png`,
   `build/progress-27-control.png`.
+
+## 29. Windows fade out; the dock rests under a cover
+
+- Closed windows fade out over 180 ms (scaled by the theme's motion speed;
+  instant with motion off) instead of vanishing.
+  - Their layers move to a `fading` list, and the surface and title slot
+    are only given back once the fade ends, so nothing new is drawn into
+    a slot still on screen.
+  - Docked windows still go at once.
+  - A fading cover stays above the menu bar and dock, so the lock screen
+    dissolves into the desktop instead of sinking under them.
+  - Choice: `Ease::Out` (fast start). With `Ease::In`, a 180 ms fade looks
+    like no fade at all for its first half.
+- Checked with a temporary 2 s fade: `build/progress-28-fade.png` is the
+  lock screen part-way through dissolving (the build ships 180 ms).
+  lock-test also takes `build/lock-fade.png` just after Return.
+- The dock no longer lifts or labels icons for a pointer moving under the
+  lock screen.
+- Tests: all PASS (170 / 0). minimize-test failed once and passed on a
+  rerun (a timing flake when the terminal starts slowly).
+- Found, not new: `GPU=virtio ./corrode churn-test` closes only 13 of 20.
+  It does the same without this change: under virtio the terminal can
+  take longer than the test's 1.2 s to open, so some `exit` keystrokes
+  reach the desktop instead. Default-GPU churn-test PASSes.

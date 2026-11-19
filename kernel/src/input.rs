@@ -343,6 +343,18 @@ fn resize_arrow(cursor: Cursor, grow: i32) -> Vec<u8> {
     coverage
 }
 
+/// How long a closed window takes to fade out.
+const CLOSING_MS: u32 = 180;
+
+/// A window gone from the desk but still fading off the screen.
+struct Fading {
+    layers: Vec<LayerId>,
+    surface: usize,
+    slot: Option<usize>,
+    until: u64,
+    on_top: bool,
+}
+
 /// Where a popover's top edge hangs: just under the menu bar.
 const POPOVER_TOP: i32 = 28 + 6;
 
@@ -661,6 +673,10 @@ pub struct Desk {
     placed: i32,
     /// The surfaces of windows that have gone, for the painter to retire.
     closed: Vec<usize>,
+    /// Windows gone but still fading out: their layers, surface and title
+    /// slot, when the fade ends, and whether it stays above everything (a
+    /// cover does, so the lock screen does not sink under the dock).
+    fading: Vec<Fading>,
     /// What docked windows were last told has the keyboard.
     announced: Option<String>,
     /// Whether the renderer can be shown a surface again at a new size.
@@ -763,6 +779,7 @@ impl Desk {
             drag: None,
             placed: 0,
             closed: Vec::new(),
+            fading: Vec::new(),
             announced: None,
             can_resize: false,
             resized: Vec::new(),
@@ -831,7 +848,7 @@ impl Desk {
         now: u64,
     ) {
         self.restack(scene);
-        self.forget_abandoned(scene);
+        self.forget_abandoned(scene, now);
         self.notifications(renderer, scene, now);
 
         // What programs have drawn since the last frame.
@@ -1369,7 +1386,12 @@ impl Desk {
                 scene.raise(id);
             }
         }
-        // A cover goes over everything but the pointer.
+        // A cover goes over everything but the pointer, fading or not.
+        for fading in self.fading.iter().filter(|fading| fading.on_top) {
+            for id in &fading.layers {
+                scene.raise(*id);
+            }
+        }
         for managed in self.windows.iter().filter(|managed| managed.cover) {
             for id in managed.layers() {
                 scene.raise(id);
@@ -1620,7 +1642,24 @@ impl Desk {
 
     /// Take away the windows whose programs have finished: exited, perhaps
     /// because their close button was clicked, or stopped for a fault.
-    fn forget_abandoned<const N: usize>(&mut self, scene: &mut Scene<N>) {
+    fn forget_abandoned<const N: usize>(&mut self, scene: &mut Scene<N>, now: u64) {
+        // Fades that have run their course.
+        let mut kept = Vec::new();
+        for fading in core::mem::take(&mut self.fading) {
+            if now < fading.until {
+                kept.push(fading);
+                continue;
+            }
+            for id in fading.layers {
+                scene.remove(id);
+            }
+            if let Some(slot) = fading.slot {
+                self.titles &= !(1 << slot);
+            }
+            self.closed.push(fading.surface);
+        }
+        self.fading = kept;
+
         let mut index = 0;
         while index < self.windows.len() {
             if !crate::windows::abandoned(self.windows[index].window) {
@@ -1628,19 +1667,30 @@ impl Desk {
                 continue;
             }
             let managed = self.windows.remove(index);
-            for id in managed.layers() {
-                scene.remove(id);
+            // A window fades out where it was; a docked one just goes.
+            let ms = if managed.docked { 0 } else { self.theme.ms(CLOSING_MS) };
+            let layers: Vec<LayerId> = managed.layers().collect();
+            if ms > 0 {
+                for id in &layers {
+                    if let Some(layer) = scene.layer_mut(*id) {
+                        let from = layer.opacity.sample(now).value;
+                        layer.opacity = Animation::ease(now, ms, from, Fx::ZERO, Ease::Out);
+                    }
+                }
             }
-            if let Some((_, slot, _)) = managed.title {
-                self.titles &= !(1 << slot);
-            }
+            self.fading.push(Fading {
+                layers,
+                surface: managed.surface,
+                slot: managed.title.map(|(_, slot, _)| slot),
+                until: now + ms as u64 * 1_000_000,
+                on_top: managed.cover,
+            });
             println!("desktop    : window {} closed", managed.window);
             self.recent.retain(|recent| *recent != managed.window);
             // The switcher's list is out of date: put it away.
             if let Some(switcher) = self.switcher.take() {
                 switcher.close(scene);
             }
-            self.closed.push(managed.surface);
             self.show_running(scene);
             // Indices past this one have moved down by one.
             let shift = |at: usize| match at.cmp(&index) {
@@ -2203,6 +2253,15 @@ impl Desk {
 
     /// Tell the dock which icon, if any, the pointer is over.
     fn dock_hover<const N: usize>(&mut self, scene: &mut Scene<N>, now: u64) {
+        // The dock is out of sight under a cover; whatever the pointer is
+        // "over" there is the cover. (The top-layer check below sees that
+        // too, but a cover that is still fading in may not be on top yet.)
+        if self.covered().is_some() {
+            if let Some(dock) = &mut self.dock {
+                dock.hover(scene, None, now);
+            }
+            return;
+        }
         let pointer = self.pointer.unwrap_or([LayerId::NONE; 2]);
         let top = scene
             .layers_at(self.at.0, self.at.1)
