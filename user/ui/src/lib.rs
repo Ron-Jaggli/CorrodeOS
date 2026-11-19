@@ -14,6 +14,7 @@ use alloc::vec;
 use corrode_rt::abi::{app, window};
 use corrode_rt::{Message, Result};
 pub use corrode_text::{Style, Weight};
+pub use corrode_theme::Theme;
 
 /// A colour, as a window stores it.
 pub type Rgb = u32;
@@ -22,6 +23,11 @@ pub type Rgb = u32;
 const fn div255(x: u32) -> u32 {
     let t = x + 128;
     (t + (t >> 8)) >> 8
+}
+
+/// A theme colour as a window stores it.
+pub fn rgb(color: corrode_theme::Color) -> Rgb {
+    (color.r as u32) << 16 | (color.g as u32) << 8 | color.b as u32
 }
 
 /// A pixel that is not there, in a translucent window: whatever is behind
@@ -65,6 +71,8 @@ pub enum Event {
     Focus(bool),
     /// The close button on the title bar was clicked.
     Close,
+    /// The desktop's look: when the window opens, and when it changes.
+    Theme(Theme),
     /// The deadline came before anything else did.
     Timeout,
 }
@@ -209,6 +217,7 @@ impl Window {
             },
             window::FOCUS => Event::Focus(words[0] != 0),
             window::CLOSE => Event::Close,
+            window::THEME => Event::Theme(Theme::from_words(words)),
             _ => Event::Timeout,
         }
     }

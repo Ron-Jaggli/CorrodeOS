@@ -20,6 +20,7 @@ mod input;
 mod ipc;
 mod irq;
 mod limine;
+mod look;
 mod memory;
 mod mm;
 mod modules;
@@ -4323,6 +4324,7 @@ impl Window {
 /// things are at the current nanosecond, and writes only the pixels that
 /// answer changed.
 fn render_loop(renderer: &mut Screen) -> ! {
+    look::load();
     let Some(mut stage) = Stage::new(renderer, time::now_ns()) else {
         println!("scene      : no room for the boot screen's layers");
         idle_loop()

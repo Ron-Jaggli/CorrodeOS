@@ -14,6 +14,7 @@ members = [
     "heap",
     "line",
     "shell",
+    "theme",
     "user/rt",
     "user/edu",
     "user/fault",

@@ -52,3 +52,20 @@ Choices made without asking are marked **Choice:**.
 - Screenshot: `build/progress-1-glass.png`. Glass renders with its rim; the
   boot screen behind is flat dark, so refraction is hard to see until there
   is a wallpaper.
+
+## 3. desktop.conf and presets
+
+- New crate `theme/` (host-tested, 7 tests): parses `key = value` lines,
+  presets first, unknown keys and bad values skipped line by line. Packs
+  a whole theme into four IPC words and back losslessly.
+- `root/etc/desktop.conf` is the one file to edit, commented throughout.
+  Presets: `corrode` (default: dark glass, rust accent, macOS traffic
+  lights, Plasma-ish panel), `tahoe`, `tahoe-light`, `breeze` (buttons on
+  the right, ribbon wallpaper), `crystal` (Clear glass, strong refraction),
+  `plain` (no glass, shadows or animation).
+- The kernel reads it at boot from root.tar (`kernel/src/look.rs`) and
+  keeps the current theme. Every window is sent a `window::THEME` event
+  when it opens; the panel recolours itself from it.
+- **Choice:** a `#` only starts a comment at the start of a line or after
+  whitespace when followed by whitespace, so `accent = #e2643a` works.
+- Boot: `theme : read /etc/desktop.conf`, 170 checks PASS, 0 FAIL.

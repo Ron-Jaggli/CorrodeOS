@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 corrode-rt = { path = "../rt" }
 corrode-text = { path = "../../text" }
+corrode-theme = { path = "../../theme" }

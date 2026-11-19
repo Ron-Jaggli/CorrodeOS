@@ -8,6 +8,10 @@
 //! The clock is why `SYS_WAIT` takes a deadline. The panel waits for a click
 //! or for the next whole second, whichever comes first, and is not
 //! scheduled at all in between.
+//!
+//! It is drawn over the desktop's glass: where it draws nothing, the glass
+//! shows. Its colours come from the theme, which it is told when its window
+//! opens and again whenever the theme changes.
 
 #![no_std]
 #![no_main]
@@ -18,7 +22,7 @@ use alloc::format;
 
 use corrode_rt::abi::{app, launcher, window as flags};
 use corrode_rt::{println, Message};
-use corrode_ui::{line_height, width_of, Event, Rgb, Style, Weight, Window, CLEAR};
+use corrode_ui::{line_height, rgb, width_of, Event, Rgb, Style, Theme, Weight, Window, CLEAR};
 
 corrode_rt::entry!(main);
 
@@ -26,39 +30,51 @@ const HEIGHT: u32 = 32;
 const NAME: Style = Style::px(16).weight(Weight::Bold);
 const LABEL: Style = Style::px(14);
 
-/// The panel is drawn over the desktop's glass: where it draws nothing,
-/// the glass shows.
-const BACKGROUND: Rgb = CLEAR;
-const NAME_COLOR: Rgb = 0x00f0_8a4c;
-const TEXT: Rgb = 0x00f4_f1ec;
-/// A pale wash over the glass, mostly see-through: the top byte is how
-/// transparent.
-const BUTTON: Rgb = 0xd8ff_ffff;
-const BUTTON_PRESSED: Rgb = 0x60e0_6a2c;
-
 /// The Terminal button.
 const BUTTON_AT: (i32, i32, u32, u32) = (132, 5, 92, 22);
 
-fn button(window: &mut Window, pressed: bool) {
+/// The colours the theme gives the panel.
+struct Look {
+    text: Rgb,
+    name: Rgb,
+    /// A wash over the glass, mostly see-through: the top byte is how
+    /// transparent.
+    button: Rgb,
+    pressed: Rgb,
+}
+
+impl Look {
+    fn of(theme: &Theme) -> Self {
+        let accent = rgb(theme.accent);
+        Look {
+            text: rgb(theme.text()),
+            name: accent,
+            button: if theme.dark { 0xd8ff_ffff } else { 0xe000_0000 },
+            pressed: 0x6000_0000 | accent,
+        }
+    }
+}
+
+fn button(window: &mut Window, look: &Look, pressed: bool) {
     let (x, y, width, height) = BUTTON_AT;
-    // Cleared first: the wash is see-through, so it would otherwise
-    // pile up on what was there.
-    window.fill(x, y, width, height, BACKGROUND);
+    // Cleared first: the wash is see-through, so it would otherwise pile up
+    // on what was there.
+    window.fill(x, y, width, height, CLEAR);
     window.fill(
         x,
         y,
         width,
         height,
-        if pressed { BUTTON_PRESSED } else { BUTTON },
+        if pressed { look.pressed } else { look.button },
     );
     let text_x = x + (width - width_of("Terminal", LABEL)) as i32 / 2;
     let text_y = y + (height as i32 - line_height(LABEL) as i32) / 2;
-    window.text(text_x, text_y, "Terminal", LABEL, TEXT);
+    window.text(text_x, text_y, "Terminal", LABEL, look.text);
     window.commit(x, y, width, height);
 }
 
 /// Draw the uptime at the right-hand end, and say when it next changes.
-fn clock(window: &mut Window) -> u64 {
+fn clock(window: &mut Window, look: &Look) -> u64 {
     let now = corrode_rt::now_ns();
     let seconds = now / 1_000_000_000;
     let text = format!(
@@ -70,11 +86,21 @@ fn clock(window: &mut Window) -> u64 {
     // Room for the widest the text gets, cleared each time.
     let room = width_of("up 00:00:00", LABEL) + 16;
     let x = window.width as i32 - room as i32 - 8;
-    window.fill(x, 0, room, HEIGHT, BACKGROUND);
+    window.fill(x, 0, room, HEIGHT, CLEAR);
     let y = (HEIGHT as i32 - line_height(LABEL) as i32) / 2;
-    window.text(x + 8, y, &text, LABEL, TEXT);
+    window.text(x + 8, y, &text, LABEL, look.text);
     window.commit(x, 0, room, HEIGHT);
     (seconds + 1) * 1_000_000_000
+}
+
+/// Everything, from nothing.
+fn draw(window: &mut Window, look: &Look) -> u64 {
+    window.fill(0, 0, window.width, window.height, CLEAR);
+    let y = (HEIGHT as i32 - line_height(NAME) as i32) / 2;
+    window.text(14, y, "CorrodeOS", NAME, look.name);
+    window.commit_all();
+    button(window, look, false);
+    clock(window, look)
 }
 
 fn inside(x: i32, y: i32) -> bool {
@@ -96,20 +122,20 @@ fn main() {
             corrode_rt::exit();
         }
     };
-    window.fill(0, 0, window.width, window.height, BACKGROUND);
-    let y = (HEIGHT as i32 - line_height(NAME) as i32) / 2;
-    window.text(14, y, "CorrodeOS", NAME, NAME_COLOR);
-    window.commit_all();
-    button(&mut window, false);
-    let mut next = clock(&mut window);
+    let mut look = Look::of(&Theme::default());
+    let mut next = draw(&mut window, &look);
     println!("up, {} pixels wide", window.width);
 
     loop {
         match window.wait(next) {
-            Event::Timeout => next = clock(&mut window),
+            Event::Timeout => next = clock(&mut window, &look),
+            Event::Theme(theme) => {
+                look = Look::of(&theme);
+                next = draw(&mut window, &look);
+            }
             Event::Button { x, y, buttons } if inside(x, y) => {
                 let down = buttons & 1 != 0;
-                button(&mut window, down);
+                button(&mut window, &look, down);
                 if down {
                     let answer = corrode_rt::call(
                         app::LAUNCHER,

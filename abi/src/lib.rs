@@ -219,6 +219,9 @@ pub mod window {
     /// that wants to go should exit; its window goes with it. One that
     /// ignores this keeps its window.
     pub const CLOSE: u64 = 65;
+    /// The desktop's look, in the four words `corrode-theme` packs it
+    /// into. Sent when a window opens and whenever the look changes.
+    pub const THEME: u64 = 66;
 
     /// Most a window may be, either way.
     pub const MAX_WIDTH: u32 = 1024;

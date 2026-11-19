@@ -18,7 +18,6 @@ use alloc::vec::Vec;
 
 use corrode_abi::{ps2, window};
 use corrode_render::anim::{Animation, Ease, Fx};
-use corrode_render::glass::Glass;
 use corrode_render::scene::{Layer, LayerId, Scene};
 use corrode_render::{Color, Rect, Renderer};
 use corrode_text::{Coverage, Style};
@@ -243,15 +242,21 @@ const BAR_IDLE: Color = Color::rgb(0x3a, 0x3d, 0x45);
 const CLOSE_SIZE: u32 = 12;
 const CLOSE_COLOR: Color = Color::rgb(0xf2, 0xee, 0xe8);
 
-/// The glass the desktop's own panes are made of.
-const PANE: Glass = Glass {
-    radius: 0,
-    ..Glass::regular(true)
-};
-/// The dock: a pane floating above the bottom edge.
-const DOCK_WIDTH: u32 = 360;
-const DOCK_HEIGHT: u32 = 64;
+/// The dock floats this far above the bottom edge, with this much around
+/// its icons.
 const DOCK_GAP: i32 = 10;
+const DOCK_PAD: u32 = 8;
+/// Icons in the dock, for now.
+const DOCK_ICONS: u32 = 4;
+
+/// A pane of the desktop's material at `rect`: glass, or a solid colour
+/// where the theme has glass off.
+fn pane(rect: Rect, radius: u16, theme: &corrode_theme::Theme) -> Layer {
+    match theme.pane(radius) {
+        Some(glass) => Layer::glass(rect, glass),
+        None => Layer::solid(rect, theme.surface()),
+    }
+}
 
 /// The close button's cross, as coverage out of 255: both diagonals, a
 /// pixel and three quarters thick, sampled four by four per pixel.
@@ -370,18 +375,27 @@ impl Desk {
             .upload_mask(CLOSE_SRC, &cross())
             .is_ok();
 
-        let dock = scene.add(Layer::glass(
-            Rect::new(
-                (screen.width as i32 - DOCK_WIDTH as i32) / 2,
-                screen.height as i32 - DOCK_HEIGHT as i32 - DOCK_GAP,
-                DOCK_WIDTH,
-                DOCK_HEIGHT,
-            ),
-            Glass {
-                radius: 22,
-                ..PANE
-            },
-        ));
+        let theme = crate::look::current();
+        let size = theme.dock_size as u32;
+        let (dock_width, dock_height) = (
+            DOCK_ICONS * (size + DOCK_PAD) + DOCK_PAD,
+            size + 2 * DOCK_PAD,
+        );
+        let dock = theme
+            .dock
+            .then(|| {
+                scene.add(pane(
+                    Rect::new(
+                        (screen.width as i32 - dock_width as i32) / 2,
+                        screen.height as i32 - dock_height as i32 - DOCK_GAP,
+                        dock_width,
+                        dock_height,
+                    ),
+                    (dock_height / 2 - 4) as u16,
+                    &theme,
+                ))
+            })
+            .flatten();
 
         let line_height = corrode_text::measure("> ", LINE_STYLE).height;
         let mut desk = Self {
@@ -547,8 +561,9 @@ impl Desk {
         let translucent = crate::windows::translucent(window);
         // A docked window is a pane of glass with the program's pixels
         // over it; transparent ones let the glass through.
+        let theme = crate::look::current();
         let pane = docked
-            .then(|| scene.add(Layer::glass(Rect::new(at.0, at.1, width, height), PANE)))
+            .then(|| scene.add(pane(Rect::new(at.0, at.1, width, height), 0, &theme)))
             .flatten();
         let make = if translucent {
             Layer::translucent_surface
@@ -589,6 +604,7 @@ impl Desk {
             width,
             docked,
         });
+        crate::windows::push(window, window::THEME, theme.to_words());
         if !docked {
             self.set_focus(scene, Some(self.windows.len() - 1));
         }
