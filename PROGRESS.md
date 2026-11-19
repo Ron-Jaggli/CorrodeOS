@@ -1015,3 +1015,16 @@ The short version, for reading first. The numbered log below has the detail.
   both GPUs (28 checks each); input-test is 170 / 0 default, 177 / 0
   virtio.
 - Screenshot: `build/progress-42-files-title.png`.
+
+## 43. Double-click a title bar to zoom
+
+- A second press on the same window's title bar within 400 ms and 4 px
+  of the first zooms it, or unzooms it, as the green button does, and
+  starts no drag. `DOUBLE_CLICK_NS` and `Desk::bar_click`.
+- Choice: zoom, macOS's default for this. Minimize is the other option
+  macOS offers; there is no setting for it yet.
+- New `./corrode double-click-test`: two clicks 0.8 s apart do nothing,
+  then a quick pair zooms exactly once (`build/double-click.png`). Full
+  suite PASSes on both GPUs (29 checks each); input-test is 170 / 0
+  default, 177 / 0 virtio.
+- Screenshot: `build/progress-43-double-click.png`.

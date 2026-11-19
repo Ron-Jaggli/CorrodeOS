@@ -433,6 +433,9 @@ const GLYPH_COLOR: Color = Color::rgb(0x4d, 0x1f, 0x10);
 /// two across. The dock keeps its icons in the right half.
 const TITLE_ROW: u32 = ATLAS_ROW + 64;
 const TITLE_SLOT: (u32, u32) = (256, 22);
+
+/// How soon a second click must follow the first to count as a double one.
+const DOUBLE_CLICK_NS: u64 = 400_000_000;
 const TITLE_SLOTS: usize = 2 * ((512 - TITLE_ROW) / TITLE_SLOT.1) as usize;
 const TITLE_STYLE: Style = Style::px(14).weight(corrode_text::Weight::Bold);
 
@@ -706,6 +709,9 @@ pub struct Desk {
     menu_at: (i32, i32),
     /// The menu goes above `menu_at`, centred on it: a dock icon's menu.
     menu_above: bool,
+    /// The last press on a title bar: which window, when, and where, so a
+    /// second one soon after on the same spot zooms it.
+    bar_click: Option<(usize, u64, (i32, i32))>,
     /// Where a popover was last told the pointer is, so it is told once.
     hovered_at: Option<(usize, i32, i32)>,
     /// Windows placed so far, for staggering the next one.
@@ -821,6 +827,7 @@ impl Desk {
             unsnap: false,
             menu_at: (0, 0),
             menu_above: false,
+            bar_click: None,
             hovered_at: None,
             placed: 0,
             closed: Vec::new(),
@@ -1650,7 +1657,21 @@ impl Desk {
                         }
                         Part::Light(Button::Minimize) => self.minimize(scene, index, now),
                         Part::Light(Button::Zoom) => self.zoom(scene, index, now),
+                        // A double click on the bar zooms, as on macOS.
+                        Part::Bar
+                            if self.bar_click.is_some_and(|(window, at, (x, y))| {
+                                window == self.windows[index].window
+                                    && now.saturating_sub(at) < DOUBLE_CLICK_NS
+                                    && (self.at.0 - x).abs() <= 4
+                                    && (self.at.1 - y).abs() <= 4
+                            }) =>
+                        {
+                            self.bar_click = None;
+                            println!("desktop    : double click on a title bar");
+                            self.zoom(scene, index, now);
+                        }
                         Part::Bar => {
+                            self.bar_click = Some((self.windows[index].window, now, self.at));
                             let (x, y) = self.windows[index].at;
                             self.drag = Some((index, self.at.0 - x, self.at.1 - y));
                             self.drag_from = (x, y);

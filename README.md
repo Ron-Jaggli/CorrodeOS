@@ -146,7 +146,8 @@ Shortcuts use Alt where macOS uses Cmd:
 to resize it. Drag it to the left or right edge of the screen to snap it to
 that half, or to the top to fill the screen; a glass preview shows where it
 will land. Dragging a snapped window away gives it back its size, and the
-green zoom button puts it back where it was.
+green zoom button puts it back where it was. Double-click a title bar to zoom, as the
+green button does.
 
 **Control Center.** Click the clock at the right of the menu bar. Tiles
 for Dark Mode, Glass, the dock, shadows, motion and the 24-hour clock, the

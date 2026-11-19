@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -562,6 +562,28 @@ menu-test: iso
 	    || echo "menu-test: right-click menu picked, then closed      FAIL"
 	@test -s build/menu.ppm && pnmtopng build/menu.ppm > build/menu.png 2>/dev/null && rm -f build/menu.ppm && echo "wrote build/menu.png" || true
 	@test -s build/menu-after.ppm && pnmtopng build/menu-after.ppm > build/menu-after.png 2>/dev/null && rm -f build/menu-after.ppm && echo "wrote build/menu-after.png" || true
+
+# A terminal from the dock; two slow clicks on its title bar do nothing,
+# then a double click zooms it (build/double-click.png).
+double-click-test: iso
+	@rm -f build/double-click.ppm build/double-click.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 2; \
+	   for step in 1 2 3; do echo "mouse_move -31 -218"; sleep 0.2; done; echo "mouse_move -1 -1"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.05; echo "mouse_button 0"; sleep 0.8; \
+	   echo "mouse_button 1"; sleep 0.05; echo "mouse_button 0"; sleep 1; \
+	   echo "mouse_button 1"; sleep 0.05; echo "mouse_button 0"; sleep 0.1; \
+	   echo "mouse_button 1"; sleep 0.05; echo "mouse_button 0"; sleep 1.5; \
+	   echo "screendump build/double-click.ppm"; sleep 1; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "on a title bar|double click|zoomed" build/serial.log || echo "double-click-test: nothing"
+	@test "$$(grep -c 'double click on a title bar' build/serial.log)" -eq 1 \
+	    && test "$$(grep -c 'desktop    : window .* zoomed' build/serial.log)" -eq 1 \
+	    && echo "double-click-test: only the quick pair zoomed     PASS" \
+	    || echo "double-click-test: only the quick pair zoomed     FAIL"
+	@test -s build/double-click.ppm && pnmtopng build/double-click.ppm > build/double-click.png 2>/dev/null && rm -f build/double-click.ppm && echo "wrote build/double-click.png" || true
 
 # A terminal from the dock, then cd /etc: its title bar becomes
 # "Terminal - /etc" (build/title.png).
