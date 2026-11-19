@@ -29,6 +29,7 @@ const IMAGE: u8 = 5;
 const SCISSOR: u8 = 6;
 const GLASS: u8 = 7;
 const SHADOW: u8 = 8;
+const SCALED_MASK: u8 = 9;
 
 /// Bits of a glass record's flags byte, and of an image's.
 const REGULAR: u8 = 1 << 0;
@@ -71,6 +72,9 @@ pub fn get_rect(bytes: &[u8; RECT]) -> Rect {
 ///   24..32  x, y of where it goes     (mask and image)
 ///   24..26  corner radius             (glass)
 ///   24..26  corner radius             (shadow)
+///   8..24   rectangle it fills        (scaled mask)
+///   24..32  source block, x y w h as four u16 (scaled mask: the atlas is
+///           far smaller than 65536 a side)
 ///   26      frost (glass), blur (shadow)
 /// ```
 pub fn encode(command: &Command, out: &mut [u8; RECORD]) {
@@ -122,6 +126,24 @@ pub fn encode(command: &Command, out: &mut [u8; RECORD]) {
             out[7] = *alpha;
             rect(out, src);
             position(out, *x, *y);
+        }
+        Command::ScaledMask {
+            rect: r,
+            src,
+            color: c,
+            alpha,
+        } => {
+            out[0] = SCALED_MASK;
+            color(out, c);
+            out[7] = *alpha;
+            rect(out, r);
+            // Out-of-range parts are clamped, not wrapped: the renderer clips
+            // to the atlas anyway.
+            let small = |value: i64| (value.clamp(0, u16::MAX as i64) as u16).to_le_bytes();
+            out[24..26].copy_from_slice(&small(src.x as i64));
+            out[26..28].copy_from_slice(&small(src.y as i64));
+            out[28..30].copy_from_slice(&small(src.width as i64));
+            out[30..32].copy_from_slice(&small(src.height as i64));
         }
         Command::Image {
             x,
@@ -190,6 +212,20 @@ pub fn decode(bytes: &[u8; RECORD]) -> Option<Command> {
         CLEAR => Command::Clear { color },
         FILL_RECT => Command::FillRect { rect, color },
         BLEND_RECT => Command::BlendRect { rect, color, alpha },
+        SCALED_MASK => {
+            let small = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+            Command::ScaledMask {
+                rect,
+                src: Rect::new(
+                    small(24) as i32,
+                    small(26) as i32,
+                    small(28) as u32,
+                    small(30) as u32,
+                ),
+                color,
+                alpha,
+            }
+        }
         MASK => Command::Mask {
             x,
             y,
@@ -270,6 +306,12 @@ mod tests {
                 color,
                 alpha: 255,
             },
+            Command::ScaledMask {
+                rect: Rect::new(-3, 700, 96, 72),
+                src: Rect::new(400, 300, 48, 36),
+                color,
+                alpha: 200,
+            },
             Command::Image {
                 x: 976,
                 y: 48,
@@ -319,7 +361,8 @@ mod tests {
 
     #[test]
     fn a_record_that_is_not_a_command_is_refused() {
-        for kind in [0u8, 9, 0x80, 0xff] {
+        // The first kind past the last there is, and some far off.
+        for kind in [0u8, SCALED_MASK + 1, 0x80, 0xff] {
             let mut bytes = [0x5a; RECORD];
             bytes[0] = kind;
             assert!(decode(&bytes).is_none());

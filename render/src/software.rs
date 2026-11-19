@@ -293,6 +293,66 @@ impl SoftwareRenderer {
         }
     }
 
+    /// [`Command::ScaledMask`]: each pixel of `rect` reads the block between
+    /// its four nearest atlas pixels, so the stencil stays smooth however it
+    /// is stretched.
+    fn scaled_mask(&mut self, rect: Rect, src: Rect, color: Color, alpha: u8, scissor: Option<Rect>) {
+        let Some(atlas) = &self.atlas else {
+            return;
+        };
+        let Some(inside) = src.intersect(&Rect::new(0, 0, atlas.width, atlas.height)) else {
+            return;
+        };
+        if rect.is_empty() {
+            return;
+        }
+        let Some((x0, y0, x1, y1)) = self.clip(rect, scissor) else {
+            return;
+        };
+        // Where a target pixel's centre falls in the block, in 256ths of an
+        // atlas pixel, less a half so that 0 is the first pixel's centre;
+        // and the two pixels either side of it, and how far between.
+        let axis = |offset: i64, target: u32, source: u32| {
+            let at = ((2 * offset + 1) * source as i64 * 128 / target as i64 - 128).max(0);
+            let near = ((at >> 8) as u32).min(source - 1);
+            (near, (near + 1).min(source - 1), (at & 255) as u32)
+        };
+        let packed = self.info.format.pack(color);
+        let stride = atlas.width as usize;
+        for row_y in y0..y1 {
+            let (top, bottom, fy) = axis(row_y as i64 - rect.y as i64, rect.height, inside.height);
+            let (top, bottom) = (
+                (inside.y as u32 + top) as usize * stride,
+                (inside.y as u32 + bottom) as usize * stride,
+            );
+            // SAFETY: `clip` returned bounds already intersected with the
+            // surface.
+            let row = unsafe { self.target_row(x0, row_y) };
+            for x in x0..x1 {
+                let (left, right, fx) = axis(x as i64 - rect.x as i64, rect.width, inside.width);
+                let (left, right) = ((inside.x as u32 + left) as usize, (inside.x as u32 + right) as usize);
+                let [a, b, c, d] = [top + left, top + right, bottom + left, bottom + right]
+                    .map(|at| atlas.data[at] as u32);
+                let upper = a * (256 - fx) + b * fx;
+                let lower = c * (256 - fx) + d * fx;
+                let covered = (upper * (256 - fy) + lower * fy) >> 16;
+                let pixel_alpha = crate::blend::div255(covered * alpha as u32) as u8;
+                // SAFETY: `x` is inside the clipped bounds, on this row.
+                let pixel = unsafe { row.add((x - x0) as usize) };
+                match pixel_alpha {
+                    0 => {}
+                    // SAFETY: as above.
+                    255 => unsafe { pixel.write_unaligned(packed) },
+                    partial => {
+                        let blend = Blend::new(&self.info.format, color, partial);
+                        // SAFETY: as above.
+                        unsafe { pixel.write_unaligned(blend.over(pixel.read_unaligned())) };
+                    }
+                }
+            }
+        }
+    }
+
     fn mask(
         &mut self,
         (x, y): (i32, i32),
@@ -780,6 +840,12 @@ impl Renderer for SoftwareRenderer {
                     color,
                     alpha,
                 } => self.mask((x, y), src, color, alpha, scissor),
+                Command::ScaledMask {
+                    rect,
+                    src,
+                    color,
+                    alpha,
+                } => self.scaled_mask(rect, src, color, alpha, scissor),
                 Command::Image {
                     x,
                     y,
@@ -1034,6 +1100,49 @@ mod tests {
             .unwrap();
         submit(&mut renderer, commands);
         pixels
+    }
+
+    #[test]
+    fn a_scaled_mask_at_its_own_size_is_a_mask() {
+        let src = Rect::new(0, 0, 4, 4);
+        let plain = stencilled(&[Command::Mask {
+            x: 2,
+            y: 1,
+            src,
+            color: Color::WHITE,
+            alpha: 255,
+        }]);
+        let scaled = stencilled(&[Command::ScaledMask {
+            rect: Rect::new(2, 1, 4, 4),
+            src,
+            color: Color::WHITE,
+            alpha: 255,
+        }]);
+        assert_eq!(plain, scaled);
+    }
+
+    #[test]
+    fn a_scaled_mask_fills_its_rect_and_stays_smooth() {
+        // The atlas's last pixel, 255, over the whole surface.
+        let full = stencilled(&[Command::ScaledMask {
+            rect: Rect::new(0, 0, SIDE, SIDE),
+            src: Rect::new(3, 3, 1, 1),
+            color: Color::WHITE,
+            alpha: 255,
+        }]);
+        assert!(full.iter().all(|pixel| *pixel == 0x00ff_ffff));
+
+        // The first row, 0 16 32 48, twice as wide: never darker to the
+        // right, and its ends where the row's are.
+        let wide = stencilled(&[Command::ScaledMask {
+            rect: Rect::new(0, 0, SIDE, 1),
+            src: Rect::new(0, 0, 4, 1),
+            color: Color::WHITE,
+            alpha: 255,
+        }]);
+        let row: std::vec::Vec<u32> = wide[..SIDE as usize].iter().map(|pixel| pixel & 0xff).collect();
+        assert!(row.windows(2).all(|pair| pair[0] <= pair[1]), "{row:?}");
+        assert_eq!((row[0], row[SIDE as usize - 1]), (0, 48));
     }
 
     #[test]

@@ -53,6 +53,10 @@ const BATCH: usize = 16;
 pub enum Content {
     /// The whole rectangle.
     Solid,
+    /// A block of the mask atlas stretched over the layer's rectangle, so
+    /// animating the layer's size grows or shrinks it rather than wiping
+    /// it. See [`Command::ScaledMask`].
+    ScaledMask { src: Rect },
     /// A block of the mask atlas, its top-left corner at the layer's. The
     /// layer's rectangle crops it, so animating the width wipes it in.
     Mask { src: Rect },
@@ -117,6 +121,14 @@ impl Layer {
     pub const fn mask(x: i32, y: i32, src: Rect, color: Color) -> Self {
         let mut layer = Self::solid(Rect::new(x, y, src.width, src.height), color);
         layer.content = Content::Mask { src };
+        layer
+    }
+
+    /// As [`Layer::mask`], but stretched to the layer's size as that
+    /// changes, rather than cropped by it.
+    pub const fn scaled_mask(x: i32, y: i32, src: Rect, color: Color) -> Self {
+        let mut layer = Self::solid(Rect::new(x, y, src.width, src.height), color);
+        layer.content = Content::ScaledMask { src };
         layer
     }
 
@@ -255,7 +267,10 @@ impl Shown {
                     radius,
                     ..
                 } => !translucent && radius == 0,
-                Content::Mask { .. } | Content::Glass(_) | Content::Shadow { .. } => false,
+                Content::Mask { .. }
+                | Content::ScaledMask { .. }
+                | Content::Glass(_)
+                | Content::Shadow { .. } => false,
             }
     }
 
@@ -601,6 +616,12 @@ impl<const N: usize> Scene<N> {
                 },
                 (Content::Solid, alpha) => Command::BlendRect {
                     rect: shown.rect,
+                    color: shown.color,
+                    alpha,
+                },
+                (Content::ScaledMask { src }, alpha) => Command::ScaledMask {
+                    rect: shown.rect,
+                    src,
                     color: shown.color,
                     alpha,
                 },

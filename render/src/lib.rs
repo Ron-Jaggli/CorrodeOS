@@ -186,6 +186,18 @@ pub enum Command {
     /// into video memory that read is the expensive part, which is one of the
     /// two reasons a back buffer exists.
     BlendRect { rect: Rect, color: Color, alpha: u8 },
+    /// [`Command::Mask`], stretched: the block `src` of the atlas drawn to
+    /// fill `rect`, read between its pixels so it stays smooth. For icons
+    /// that grow, as the dock's do under the pointer.
+    ///
+    /// A `src` reaching outside the atlas is clipped to it, and what is
+    /// left is stretched over `rect`.
+    ScaledMask {
+        rect: Rect,
+        src: Rect,
+        color: Color,
+        alpha: u8,
+    },
     /// Put a colour through a stencil: a block of the mask atlas, where each
     /// byte says how much of its pixel to cover.
     ///

@@ -262,7 +262,7 @@ impl Dock {
         for (index, app) in APPS.iter().enumerate() {
             let at = (left + (PAD + index as u32 * (size + PAD)) as i32, top + PAD as i32);
             let Some(tile) = stencils
-                .then(|| scene.add(Layer::mask(at.0, at.1, tile_src, app.color)))
+                .then(|| scene.add(Layer::scaled_mask(at.0, at.1, tile_src, app.color)))
                 .flatten()
             else {
                 // Without stencils, a plain square says as much.
@@ -291,7 +291,7 @@ impl Dock {
             let glyph = renderer
                 .upload_mask(glyph_src, &coverage)
                 .ok()
-                .and_then(|_| scene.add(Layer::mask(at.0, at.1, glyph_src, Color::WHITE)));
+                .and_then(|_| scene.add(Layer::scaled_mask(at.0, at.1, glyph_src, Color::WHITE)));
             let mut dot = Layer::mask(
                 at.0 + (size - DOT) as i32 / 2,
                 top + height as i32 - DOT as i32 - 1,

@@ -1202,3 +1202,27 @@ The short version, for reading first. The numbered log below has the detail.
   lever for everything the software renderer draws.
 - Full suite PASSes on both GPUs (32 checks each); input-test is
   170 / 0 default, 177 / 0 virtio; `./corrode test` passes.
+
+## 50. Scaled stencils in the renderer (the start of dock magnification)
+
+- New `Command::ScaledMask { rect, src, color, alpha }`: a block of the
+  mask atlas stretched over `rect`, reading between the four nearest
+  atlas pixels (bilinear, 8-bit fractions) so it stays smooth. A `src`
+  that reaches outside the atlas is clipped first, as with `Mask`.
+- New `Content::ScaledMask { src }` and `Layer::scaled_mask`: the stencil
+  follows the layer's size instead of being cropped by it. `Mask` keeps
+  its cropping, because the title and label wipe-in animations depend
+  on it. Scaling is opt-in, not a change to `Mask`.
+- New wire kind 9. The source rectangle is packed as four u16 in bytes
+  24..32, since the atlas is far smaller than 65536 a side. The test
+  of refused unknown records used 9 as its unknown kind, so it now
+  uses `SCALED_MASK + 1`.
+- Tests: a scaled mask at its own size equals `Mask` exactly; a 1-pixel
+  source fills the whole surface; a 4-pixel row stretched to 4x is
+  monotonic and keeps its end values. The round-trip test covers the
+  new record.
+- The dock's tiles and glyphs now use it. At rest, 1321 dock pixels
+  differ from before, all by at most 1/255. The virtio dock screenshot
+  looks right, so the ring 3 driver decodes kind 9 fine.
+- Not done yet: making the icons grow under the pointer. That is next.
+- Full suite PASSes on both GPUs; input-test 170 / 0 and 177 / 0.
