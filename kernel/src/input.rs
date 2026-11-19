@@ -43,7 +43,12 @@ pub enum Event {
         modifiers: u8,
     },
     /// The mouse moved, or its buttons changed.
-    Pointer { dx: i32, dy: i32, buttons: u8 },
+    Pointer {
+        dx: i32,
+        dy: i32,
+        buttons: u8,
+        wheel: i32,
+    },
 }
 
 /// Events waiting for the painter.
@@ -63,11 +68,17 @@ impl Queue {
         // know where the mouse is, not every step it took to get there. A
         // queue full of a fast mouse would otherwise drop key presses.
         if let (
-            Event::Pointer { dx, dy, buttons },
+            Event::Pointer {
+                dx,
+                dy,
+                buttons,
+                wheel,
+            },
             Some(Some(Event::Pointer {
                 dx: last_x,
                 dy: last_y,
                 buttons: last_buttons,
+                wheel: last_wheel,
             })),
         ) = (event, self.last_mut().map(|last| *last))
         {
@@ -77,6 +88,7 @@ impl Queue {
                         dx: last_x.saturating_add(dx),
                         dy: last_y.saturating_add(dy),
                         buttons,
+                        wheel: last_wheel.saturating_add(wheel),
                     });
                 }
                 return;
@@ -146,6 +158,7 @@ fn decode(message: &ipc::Message) -> Option<Event> {
             dx: (words[0] as i64).clamp(-256, 255) as i32,
             dy: (words[1] as i64).clamp(-256, 255) as i32,
             buttons: (words[2] & 0x07) as u8,
+            wheel: (words[3] as i64).clamp(-8, 7) as i32,
         }),
         _ => None,
     }
@@ -713,8 +726,16 @@ impl Desk {
                         }
                     }
                 },
-                Event::Pointer { dx, dy, buttons } => {
+                Event::Pointer {
+                    dx,
+                    dy,
+                    buttons,
+                    wheel,
+                } => {
                     self.pointer(scene, now, dx, dy, buttons);
+                    if wheel != 0 {
+                        self.scroll(scene, wheel);
+                    }
                     self.restack(scene);
                 }
             }
@@ -1187,6 +1208,27 @@ impl Desk {
                 ],
             );
         }
+    }
+
+    /// The wheel turned: tell the window under the pointer, wherever on it
+    /// the pointer is, as macOS scrolls what is under the pointer and not
+    /// what has focus.
+    fn scroll<const N: usize>(&mut self, scene: &Scene<N>, notches: i32) {
+        let Ok((index, Part::Body)) = self.under(scene) else {
+            return;
+        };
+        let managed = &self.windows[index];
+        let (x, y) = (managed.at.0, managed.at.1 + managed.bar() as i32);
+        crate::windows::push(
+            managed.window,
+            window::SCROLL,
+            [
+                notches as i64 as u64,
+                (self.at.0 - x) as u64,
+                (self.at.1 - y) as u64,
+                0,
+            ],
+        );
     }
 
     /// Show the glyphs on the buttons of the window the pointer is over the

@@ -254,14 +254,15 @@ input-test: iso
 
 # Open Files from the dock, then work it from the keyboard: down twice to
 # etc, Return to open it, down to desktop.conf. build/files.png shows its
-# preview.
+# preview, scrolled down nine lines by three turns of the wheel.
 files-test: iso
 	@rm -f build/files.ppm build/files.png
 	@( sleep $(SHOT_DELAY); \
 	   echo "mouse_move -84 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 2; \
 	   for key in down down ret down; do echo "sendkey $$key"; sleep 0.6; done; \
-	   echo "mouse_move 300 -300"; sleep 1; \
+	   echo "mouse_move 150 -300"; sleep 0.5; \
+	   for n in 1 2 3; do echo "mouse_move 0 0 -1"; sleep 0.4; done; \
 	   echo "screendump build/files.ppm"; sleep 2; echo quit ) \
 	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true

@@ -242,6 +242,9 @@ pub mod window {
     /// at the monotonic nanosecond in word 1; the time after that is that
     /// plus how far the monotonic clock has run.
     pub const CLOCK: u64 = 70;
+    /// The wheel turned over a window: word 0 is notches, toward the person
+    /// positive, as i64; words 1 and 2 where the pointer is in the window.
+    pub const SCROLL: u64 = 71;
 
     /// Most a window may be, either way.
     pub const MAX_WIDTH: u32 = 1920;

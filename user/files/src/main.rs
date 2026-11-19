@@ -80,6 +80,10 @@ struct Browser {
     entries: Vec<String>,
     /// Which of `entries` is selected.
     selected: Option<usize>,
+    /// The first of `entries` the list shows, scrolled.
+    top: usize,
+    /// The first line of the selected file the preview shows, scrolled.
+    preview_top: usize,
     /// The sidebar's places: the root, then each directory in it.
     places: Vec<String>,
 }
@@ -142,6 +146,8 @@ impl Browser {
         folders.extend(files);
         self.entries = folders;
         self.selected = None;
+        self.top = 0;
+        self.preview_top = 0;
         println!("{} ({} items)", self.cwd, self.entries.len());
     }
 
@@ -168,6 +174,7 @@ impl Browser {
         let look = Look::of(&self.theme);
         let (width, height) = (self.window.width, self.window.height);
         let list = self.list_width();
+        let rows = self.rows();
         let window = &mut self.window;
         window.fill(0, 0, width, height, CLEAR);
         window.fill(0, 0, width, height, look.background);
@@ -196,9 +203,9 @@ impl Browser {
         window.text(left + 48, 13, here, TITLE, look.text);
 
         // The list.
-        let rows = ((height as i32 - TOOLBAR - 8) / ROW).max(0) as usize;
-        for (index, path) in self.entries.iter().take(rows).enumerate() {
-            let y = TOOLBAR + 4 + index as i32 * ROW;
+        let top = self.top;
+        for (index, path) in self.entries.iter().enumerate().skip(top).take(rows) {
+            let y = TOOLBAR + 4 + (index - top) as i32 * ROW;
             if self.selected == Some(index) {
                 window.rounded(left + 6, y, list as u32 - 12, ROW as u32 - 2, 6, look.selected);
             }
@@ -220,6 +227,7 @@ impl Browser {
             window.text(left + 40, text_y, &label, LABEL, look.text);
             window.text(left + list - size_width - 12, text_y, &size_text, LABEL, look.secondary);
         }
+        scroller(window, left + list - 5, TOOLBAR + 4, height as i32 - TOOLBAR - 8, top, rows, self.entries.len(), &look);
         if self.entries.is_empty() {
             window.text(left + 40, TOOLBAR + 12, "Empty folder", LABEL, look.secondary);
         }
@@ -245,14 +253,19 @@ impl Browser {
                         let sheet = height as i32 - y - 12;
                         window.rounded(x - 4, y, room + 8, sheet.max(0) as u32, 6, look.paper);
                         let mut line_y = y + 8;
-                        for line in text.lines() {
+                        let step = line_height(LABEL) as i32 + 2;
+                        let fits = ((sheet - 14) / step).max(1) as usize;
+                        let total = text.lines().count();
+                        self.preview_top = self.preview_top.min(total.saturating_sub(fits));
+                        for line in text.lines().skip(self.preview_top) {
                             if line_y + line_height(LABEL) as i32 > y + sheet - 6 {
                                 break;
                             }
                             let shown = fit(line, LABEL, room - 8);
                             window.text(x + 4, line_y, &shown, LABEL, 0x2a2a_2e);
-                            line_y += line_height(LABEL) as i32 + 2;
+                            line_y += step;
                         }
+                        scroller(window, x + room as i32 - 1, y + 4, sheet - 8, self.preview_top, fits, total, &look);
                     }
                     Err(_) => {
                         window.text(x, y, "Not text: no preview", LABEL, look.secondary);
@@ -291,11 +304,12 @@ impl Browser {
             let Ok(index) = usize::try_from(index) else {
                 return;
             };
+            let index = index + self.top;
             if index < self.entries.len() {
                 // A second click on a selected folder opens it, as a
                 // double click would.
                 let again = self.selected == Some(index);
-                self.selected = Some(index);
+                self.select(index);
                 if again || self.is_dir(&self.entries[index]) {
                     self.activate();
                 }
@@ -303,15 +317,48 @@ impl Browser {
         }
     }
 
+    /// How many entries the list has room for.
+    fn rows(&self) -> usize {
+        ((self.window.height as i32 - TOOLBAR - 8) / ROW).max(1) as usize
+    }
+
+    /// Select an entry, scrolling the list to show it.
+    fn select(&mut self, index: usize) {
+        if self.selected != Some(index) {
+            self.preview_top = 0;
+        }
+        self.selected = Some(index);
+        let rows = self.rows();
+        if index < self.top {
+            self.top = index;
+        } else if index >= self.top + rows {
+            self.top = index + 1 - rows;
+        }
+    }
+
+    /// The wheel turned with the pointer at `x`: the list or the preview
+    /// under it scrolls, three lines a notch, as macOS's does.
+    fn scroll(&mut self, notches: i32, x: i32) {
+        if x < SIDEBAR {
+            return;
+        }
+        let by = |at: usize| (at as i64 + notches as i64 * 3).max(0) as usize;
+        if x < SIDEBAR + self.list_width() {
+            let most = self.entries.len().saturating_sub(self.rows());
+            self.top = by(self.top).min(most);
+        } else {
+            // Clamped to the text when it is next drawn.
+            self.preview_top = by(self.preview_top);
+        }
+    }
+
     fn key(&mut self, key: u8) {
         let count = self.entries.len();
         match key {
             KEY_DOWN if count > 0 => {
-                self.selected = Some(self.selected.map_or(0, |index| (index + 1).min(count - 1)))
+                self.select(self.selected.map_or(0, |index| (index + 1).min(count - 1)))
             }
-            KEY_UP if count > 0 => {
-                self.selected = Some(self.selected.map_or(0, |index| index.saturating_sub(1)))
-            }
+            KEY_UP if count > 0 => self.select(self.selected.map_or(0, |index| index.saturating_sub(1))),
             KEY_ENTER => self.activate(),
             KEY_BACKSPACE if self.cwd != "/" => {
                 let up = parent_of(&self.cwd);
@@ -320,6 +367,21 @@ impl Browser {
             _ => {}
         }
     }
+}
+
+/// macOS's overlay scroller: a thin pill along `x`, from `y` for `length`
+/// pixels, showing which `shown` of `total` rows from `top` are in view.
+/// Nothing when everything fits.
+#[allow(clippy::too_many_arguments)]
+fn scroller(window: &mut Window, x: i32, y: i32, length: i32, top: usize, shown: usize, total: usize, look: &Look) {
+    if total <= shown || length <= 0 {
+        return;
+    }
+    let thumb = (length as i64 * shown as i64 / total as i64).max(20) as i32;
+    let travel = length - thumb;
+    let most = (total - shown) as i64;
+    let at = y + (travel as i64 * top.min(total - shown) as i64 / most) as i32;
+    window.rounded(x, at, 4, thumb as u32, 2, 0x8000_0000 | look.secondary);
 }
 
 /// A folder icon, `size` wide, with its top left at `x`, `y`.
@@ -381,6 +443,8 @@ fn main() {
         cwd: String::new(),
         entries: Vec::new(),
         selected: None,
+        top: 0,
+        preview_top: 0,
         places,
     };
     browser.open("/");
@@ -389,7 +453,12 @@ fn main() {
     loop {
         match browser.window.wait(u64::MAX) {
             Event::Theme(theme) => browser.theme = theme,
-            Event::Resize { .. } => {}
+            Event::Resize { .. } => {
+                if let Some(index) = browser.selected {
+                    browser.select(index);
+                }
+            }
+            Event::Scroll { notches, x, .. } => browser.scroll(notches, x),
             Event::Button { x, y, buttons } if buttons & 1 != 0 => browser.click(x, y),
             Event::Key {
                 key, pressed: true, ..

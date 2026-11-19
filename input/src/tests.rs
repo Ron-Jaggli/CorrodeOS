@@ -138,7 +138,8 @@ fn a_mouse_packet_is_three_bytes() {
         [MouseEvent {
             dx: 5,
             dy: -3,
-            buttons: 1
+            buttons: 1,
+            wheel: 0
         }]
     );
     // Left 2, down 7: both signs set, nine-bit two's complement.
@@ -147,7 +148,8 @@ fn a_mouse_packet_is_three_bytes() {
         [MouseEvent {
             dx: -2,
             dy: 7,
-            buttons: 0
+            buttons: 0,
+            wheel: 0
         }]
     );
     // The extremes.
@@ -162,7 +164,8 @@ fn an_overflowed_packet_keeps_its_buttons_and_loses_its_motion() {
         [MouseEvent {
             dx: 0,
             dy: 0,
-            buttons: 2
+            buttons: 2,
+            wheel: 0
         }]
     );
 }
@@ -173,4 +176,15 @@ fn a_mouse_stream_joined_in_the_middle_finds_its_packets() {
     let got = moved(&[0x00, 0x07, 0x08, 1, 0, 0x0c, 2, 0]);
     assert_eq!(got.len(), 2);
     assert_eq!((got[0].dx, got[1].dx, got[1].buttons), (1, 2, 4));
+}
+
+#[test]
+fn a_wheel_mouse_packet_is_four_bytes() {
+    let mut mouse = Mouse::with_wheel();
+    let got: Vec<MouseEvent> = [0x08, 1, 0, 0x01, 0x08, 0, 0, 0x0f]
+        .iter()
+        .filter_map(|byte| mouse.feed(*byte))
+        .collect();
+    assert_eq!(got.len(), 2);
+    assert_eq!((got[0].dx, got[0].wheel, got[1].wheel), (1, 1, -1));
 }

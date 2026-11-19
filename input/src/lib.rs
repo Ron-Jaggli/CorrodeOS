@@ -233,20 +233,34 @@ pub struct MouseEvent {
     pub dy: i16,
     /// Bit 0 left, bit 1 right, bit 2 middle: held, not clicked.
     pub buttons: u8,
+    /// Wheel notches: toward the person (scrolling down) is positive.
+    pub wheel: i8,
 }
 
-/// The standard three-byte PS/2 mouse packet, a byte at a time.
+/// The standard three-byte PS/2 mouse packet, a byte at a time -- or the
+/// IntelliMouse's four, whose last byte is the wheel.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Mouse {
-    bytes: [u8; 3],
+    bytes: [u8; 4],
     have: usize,
+    wheel: bool,
 }
 
 impl Mouse {
     pub const fn new() -> Self {
         Self {
-            bytes: [0; 3],
+            bytes: [0; 4],
             have: 0,
+            wheel: false,
+        }
+    }
+
+    /// A mouse that has been switched into IntelliMouse mode: four bytes a
+    /// packet.
+    pub const fn with_wheel() -> Self {
+        Self {
+            wheel: true,
+            ..Self::new()
         }
     }
 
@@ -262,12 +276,15 @@ impl Mouse {
         }
         self.bytes[self.have] = byte;
         self.have += 1;
-        if self.have < 3 {
+        if self.have < if self.wheel { 4 } else { 3 } {
             return None;
         }
         self.have = 0;
 
-        let [flags, x, y] = self.bytes;
+        let [flags, x, y, z] = self.bytes;
+        // Four bits, two's complement; the mouse counts away from the person
+        // as negative already.
+        let wheel = if self.wheel { ((z << 4) as i8) >> 4 } else { 0 };
         // A movement too large for nine bits is reported as overflowed, and
         // the number that came with it is meaningless. Keep the buttons.
         let overflow = flags & 0xc0 != 0;
@@ -284,6 +301,7 @@ impl Mouse {
             dx: signed(x, flags & 0x10 != 0),
             dy: -signed(y, flags & 0x20 != 0),
             buttons: flags & 0x07,
+            wheel,
         })
     }
 }

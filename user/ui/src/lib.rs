@@ -84,6 +84,9 @@ pub enum Event {
     /// To docked windows: the wall clock read `unix` seconds since 1970 UTC
     /// when the monotonic clock read `at` nanoseconds.
     Clock { unix: i64, at: u64 },
+    /// The wheel turned `notches` (toward the person positive) with the
+    /// pointer at `x`, `y` in the window.
+    Scroll { notches: i32, x: i32, y: i32 },
     /// The deadline came before anything else did.
     Timeout,
 }
@@ -276,6 +279,11 @@ impl Window {
             window::CLOSE => Event::Close,
             window::THEME => Event::Theme(Theme::from_words(words)),
             window::ACTIVE => Event::Active(words[0].to_le_bytes()),
+            window::SCROLL => Event::Scroll {
+                notches: words[0] as i64 as i32,
+                x: words[1] as i64 as i32,
+                y: words[2] as i64 as i32,
+            },
             window::CLOCK => Event::Clock {
                 unix: words[0] as i64,
                 at: words[1],

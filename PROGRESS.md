@@ -402,3 +402,27 @@ Choices made without asking are marked **Choice:**.
 - Known gap: no scrolling, so a folder with more entries than fit shows
   the first screenful.
 - Screenshot: `build/progress-16-files.png`.
+
+## 19. Mouse wheel and scrolling in Files
+
+- The PS/2 driver now does the IntelliMouse knock (sample rates 200, 100,
+  80, then GET_ID == 3). A mouse that answers sends four-byte packets with
+  the wheel in the fourth byte. The log says "mouse up with a wheel"; a
+  plain mouse still works as before. `corrode-input` decodes both packet
+  sizes, with a host test.
+- The kernel carries wheel notches with pointer events and sums them when
+  moves coalesce. A new `window::SCROLL` event goes to the window *under*
+  the pointer, not the focused one, as on macOS. `corrode-ui` exposes it
+  as `Event::Scroll { notches, x, y }`.
+- Files scrolls three lines a notch: the list or the text preview,
+  whichever is under the pointer. Arrow keys keep the selection in view,
+  and a resize keeps it in view too. A thin overlay scroller, macOS style,
+  appears only when there is more than fits.
+- files-test now turns the wheel three notches over the desktop.conf
+  preview. The screenshot shows it nine lines down with the thumb moved.
+  All boot tests PASS; 170 / 0, virtio 0 FAIL.
+- Note for test writers: QEMU's monitor `mouse_move 0 0 1` is wheel
+  *up*; use `-1` to scroll down.
+- Known gap: the terminal has no scrollback yet, so the wheel does
+  nothing there.
+- Screenshot: `build/progress-17-scroll.png`.
