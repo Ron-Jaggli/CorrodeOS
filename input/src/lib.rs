@@ -42,10 +42,12 @@ impl Key {
     pub const RIGHT_ALT: Key = Key(0x80 | 0x38);
     pub const HOME: Key = Key(0x80 | 0x47);
     pub const UP: Key = Key(0x80 | 0x48);
+    pub const PAGE_UP: Key = Key(0x80 | 0x49);
     pub const LEFT: Key = Key(0x80 | 0x4b);
     pub const RIGHT: Key = Key(0x80 | 0x4d);
     pub const END: Key = Key(0x80 | 0x4f);
     pub const DOWN: Key = Key(0x80 | 0x50);
+    pub const PAGE_DOWN: Key = Key(0x80 | 0x51);
     pub const DELETE: Key = Key(0x80 | 0x53);
 }
 

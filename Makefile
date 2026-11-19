@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -271,6 +271,26 @@ files-test: iso
 	    && echo "files-test: opened /etc from the keyboard            PASS" \
 	    || echo "files-test: opened /etc from the keyboard            FAIL"
 	@test -s build/files.ppm && pnmtopng build/files.ppm > build/files.png 2>/dev/null && rm -f build/files.ppm && echo "wrote build/files.png" || true
+
+# Open a terminal from the dock, fill it with help twice, then turn the
+# wheel back four notches. build/scrollback.png shows older output with a
+# scroller.
+scrollback-test: iso
+	@rm -f build/scrollback.ppm build/scrollback.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
+	   for round in 1 2; do for key in h e l p ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 0.5; done; \
+	   echo "mouse_move 0 -420"; sleep 0.5; \
+	   for n in 1 2 3 4; do echo "mouse_move 0 0 1"; sleep 0.3; done; sleep 0.5; \
+	   echo "screendump build/scrollback.ppm"; sleep 2; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^terminal .*lines back" build/serial.log || echo "scrollback-test: the terminal never scrolled"
+	@grep -q "^terminal   : 12 lines back" build/serial.log \
+	    && echo "scrollback-test: the wheel scrolled the terminal back  PASS" \
+	    || echo "scrollback-test: the wheel scrolled the terminal back  FAIL"
+	@test -s build/scrollback.ppm && pnmtopng build/scrollback.ppm > build/scrollback.png 2>/dev/null && rm -f build/scrollback.ppm && echo "wrote build/scrollback.png" || true
 
 # Open a terminal from the dock and drag its bottom-right corner 200 by
 # 100 pixels bigger, in four steps. build/resize.png shows the result.

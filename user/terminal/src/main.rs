@@ -25,7 +25,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use corrode_input::Key;
+use corrode_input::{modifier, Key};
 use corrode_line::{Editor, Outcome};
 use corrode_rt::abi::{app, kind, rights, window};
 use corrode_rt::println;
@@ -85,6 +85,9 @@ struct Terminal {
     queued: Vec<String>,
     shell: Shell,
     fs: Fs<'static>,
+    /// How many lines back from the newest the view is scrolled: 0 follows
+    /// the output.
+    back: usize,
 }
 
 impl Terminal {
@@ -110,19 +113,44 @@ impl Terminal {
         }
     }
 
+    /// Rows of output above the prompt.
+    fn shown(&self) -> usize {
+        let rows = ((self.window.height as i32 - 2 * MARGIN) / self.line_height as i32).max(1);
+        rows as usize - 1
+    }
+
+    /// Scroll back by `by` lines (forward for negative), within what is
+    /// kept.
+    fn scroll(&mut self, by: i64) {
+        let most = self.lines.len().saturating_sub(self.shown());
+        self.back = (self.back as i64 + by).clamp(0, most as i64) as usize;
+        println!("{} lines back", self.back);
+    }
+
     fn draw(&mut self) {
         let (width, height) = (self.window.width, self.window.height);
         self.window.fill(0, 0, width, height, BACKGROUND);
-        let rows = ((height as i32 - 2 * MARGIN) / self.line_height as i32).max(1) as usize;
 
-        // The prompt is the last row; the newest lines fill the rest.
-        let shown = rows - 1;
-        let first = self.lines.len().saturating_sub(shown);
+        // The prompt is the last row; the newest lines fill the rest, or
+        // older ones when scrolled back.
+        let shown = self.shown();
+        self.back = self.back.min(self.lines.len().saturating_sub(shown));
+        let last = self.lines.len() - self.back;
+        let first = last.saturating_sub(shown);
         let mut y = MARGIN;
-        for index in first..self.lines.len() {
+        for index in first..last {
             let (text, color) = &self.lines[index];
             self.window.text(MARGIN, y, text, STYLE, *color);
             y += self.line_height as i32;
+        }
+        // While scrolled back, a thin scroller says where, as macOS's
+        // overlay one does.
+        if self.back > 0 {
+            let total = self.lines.len();
+            let length = height as i32 - 2 * MARGIN;
+            let thumb = (length as i64 * shown as i64 / total as i64).max(20) as i32;
+            let at = MARGIN + ((length - thumb) as i64 * first as i64 / (total - shown) as i64) as i32;
+            self.window.rounded(width as i32 - 7, at, 4, thumb as u32, 2, 0x8080_8088);
         }
         // A command is running: no prompt until it is done.
         if self.busy_until.is_some() {
@@ -150,6 +178,16 @@ impl Terminal {
     }
 
     fn key(&mut self, key: Key, text: Option<char>, modifiers: u8) {
+        // Shift+Page Up and Down page through what has scrolled away; any
+        // other key brings the prompt back into view first.
+        if modifiers & modifier::SHIFT != 0 && matches!(key, Key::PAGE_UP | Key::PAGE_DOWN) {
+            let page = self.shown().saturating_sub(1).max(1) as i64;
+            self.scroll(if key == Key::PAGE_UP { page } else { -page });
+            return;
+        }
+        if !is_modifier(key) {
+            self.back = 0;
+        }
         match self.editor.key(key, text, modifiers) {
             Outcome::Submit(line) if self.busy_until.is_some() => self.queued.push(line),
             Outcome::Submit(line) => self.run(&line),
@@ -308,6 +346,19 @@ impl Host for System<'_> {
 
 /// Go, and take the window with us: the window manager drops a window
 /// whose program has finished.
+fn is_modifier(key: Key) -> bool {
+    matches!(
+        key,
+        Key::LEFT_SHIFT
+            | Key::RIGHT_SHIFT
+            | Key::LEFT_CTRL
+            | Key::RIGHT_CTRL
+            | Key::LEFT_ALT
+            | Key::RIGHT_ALT
+            | Key::CAPS_LOCK
+    )
+}
+
 fn close() -> ! {
     println!("closed");
     corrode_rt::exit();
@@ -463,6 +514,7 @@ fn main() {
         queued: Vec::new(),
         shell: Shell::new(),
         fs: files(),
+        back: 0,
     };
     terminal.say("CorrodeOS terminal", PROMPT);
     let motd = terminal.fs.get("/etc/motd").map(|motd| motd.data);
@@ -489,6 +541,8 @@ fn main() {
                 modifiers,
             } => terminal.key(Key(key), text, modifiers),
             Event::Focus(focused) => terminal.focused = focused,
+            // Toward the person scrolls down, toward the newest.
+            Event::Scroll { notches, .. } => terminal.scroll(-notches as i64 * 3),
             Event::Close => close(),
             // Everything is laid out from the window's size each time.
             Event::Resize { width, height } => println!("resized to {}x{}", width, height),

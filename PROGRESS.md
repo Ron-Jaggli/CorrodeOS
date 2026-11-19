@@ -426,3 +426,18 @@ Choices made without asking are marked **Choice:**.
 - Known gap: the terminal has no scrollback yet, so the wheel does
   nothing there.
 - Screenshot: `build/progress-17-scroll.png`.
+
+## 20. Terminal scrollback
+
+- The terminal already kept its last 500 lines; now you can see them.
+  The wheel scrolls three lines a notch, and Shift+Page Up/Down page
+  through them. Pressing any key other than a modifier jumps back to
+  the prompt, as Terminal.app does.
+- While scrolled back, a thin overlay scroller on the right shows where
+  you are. New output keeps arriving underneath without yanking the view.
+- `corrode-input` gained `Key::PAGE_UP` and `Key::PAGE_DOWN`.
+- New `./corrode scrollback-test`: opens a terminal, runs `help` twice,
+  and turns the wheel back four notches. Log "12 lines back", PASS; the
+  screenshot shows older help text with the scroller. All other tests
+  PASS; 170 / 0.
+- Screenshot: `build/progress-18-scrollback.png`.
