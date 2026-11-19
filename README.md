@@ -143,6 +143,7 @@ Shortcuts use Alt where macOS uses Cmd:
 | **Alt+L** | Lock the screen |
 | **Alt+Left** / **Alt+Right** / **Alt+Up** | Snap the window in front to the left or right half, or fill the screen |
 | **Alt+Down** | Put a snapped or zoomed window back |
+| **Alt+D** | Show the desktop: every window away, and again to bring them back |
 
 **Windows.** Drag a title bar to move a window, and its edges or corners
 to resize it. Drag it to the left or right edge of the screen to snap it to

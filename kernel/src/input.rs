@@ -516,6 +516,9 @@ enum Shortcut {
     Snap(Snap),
     /// Alt+Down: a snapped or zoomed window back where it was.
     Unsnap,
+    /// Alt+D: every window out of the way, and again to bring them back,
+    /// as Plasma's Peek at Desktop and macOS's Show Desktop do.
+    ShowDesktop,
 }
 
 impl Shortcut {
@@ -531,6 +534,7 @@ impl Shortcut {
             0xcd => Shortcut::Snap(Snap::Right),
             0xc8 => Shortcut::Snap(Snap::Fill),
             0xd0 => Shortcut::Unsnap,
+            0x20 => Shortcut::ShowDesktop,
             _ => return None,
         })
     }
@@ -721,6 +725,8 @@ pub struct Desk {
     /// The last press on a title bar: which window, when, and where, so a
     /// second one soon after on the same spot zooms it.
     bar_click: Option<(usize, u64, (i32, i32))>,
+    /// The windows Show Desktop put away, by id, to bring back.
+    desktop_shown: Vec<usize>,
     /// Where a popover was last told the pointer is, so it is told once.
     hovered_at: Option<(usize, i32, i32)>,
     /// Windows placed so far, for staggering the next one.
@@ -837,6 +843,7 @@ impl Desk {
             menu_at: (0, 0),
             menu_above: false,
             bar_click: None,
+            desktop_shown: Vec::new(),
             hovered_at: None,
             placed: 0,
             closed: Vec::new(),
@@ -2141,6 +2148,32 @@ impl Desk {
                     println!("desktop    : window {} snapped {:?}", managed.window, snap);
                     self.resize(scene, index, (rect.width, rect.height - BAR));
                     self.move_to(scene, index, (rect.x, rect.y), now);
+                }
+            }
+            Shortcut::ShowDesktop => {
+                let open: Vec<usize> = (0..self.windows.len())
+                    .filter(|index| {
+                        let managed = &self.windows[*index];
+                        !managed.docked && !managed.popover && !managed.cover && !managed.minimized
+                    })
+                    .collect();
+                if !open.is_empty() {
+                    self.desktop_shown = open.iter().map(|index| self.windows[*index].window).collect();
+                    for index in open {
+                        self.minimize(scene, index, now);
+                    }
+                    println!("desktop    : showing the desktop, {} window(s) put away", self.desktop_shown.len());
+                } else {
+                    let back = core::mem::take(&mut self.desktop_shown);
+                    // In the order they stood, so the one on top ends on top.
+                    let mut count = 0;
+                    for window in back {
+                        if let Some(index) = self.windows.iter().position(|managed| managed.window == window) {
+                            self.restore(scene, index, now);
+                            count += 1;
+                        }
+                    }
+                    println!("desktop    : {} window(s) back from the desktop", count);
                 }
             }
             Shortcut::Unsnap => {

@@ -1038,10 +1038,25 @@ The short version, for reading first. The numbered log below has the detail.
 - Snapping again from a snapped window keeps the place it had before
   the first snap, so Alt+Down after Left then Right still goes all the
   way back.
-- Choice: Alt rather than Plasma's Meta, to match the other shortcuts;
-  PS/2 set 1 passes the Windows key, but QEMU's sendkey and many
-  keyboards' layouts make Alt the safer one. Popovers are not snapped.
+- Choice: Alt rather than Plasma's Meta, to match every other shortcut
+  here (all Alt). Meta was not tried. Popovers are not snapped.
 - New `./corrode tile-test`: Left, Right, Up, Down; the last size is the
   terminal's own 600x340 (`build/tile.png`). Full suite PASSes on both
   GPUs (30 checks each); input-test is 170 / 0 default, 177 / 0 virtio.
 - Screenshot: `build/progress-44-tile.png`.
+
+## 45. Show Desktop (Alt+D)
+
+- Alt+D minimizes every open window (not the panel, popovers or the lock
+  screen), as Plasma's Peek at Desktop and macOS's Show Desktop do. It
+  remembers them by id, and Alt+D with nothing open brings them back in
+  the order they stood.
+- Known gap: if a window is opened after Alt+D, the next Alt+D puts that
+  one away rather than bringing the others back. Plasma does the same.
+- Not done: dock magnification. The renderer's `Mask` command copies a
+  stencil 1:1 in both backends; scaling needs a new command in the
+  software renderer and in the virtio driver.
+- New `./corrode show-desktop-test`: a terminal and Files, Alt+D twice
+  (`build/show-desktop.png`). Full suite PASSes on both GPUs (31 checks
+  each); input-test is 170 / 0 default, 177 / 0 virtio.
+- Screenshot: `build/progress-45-show-desktop.png`.
