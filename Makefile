@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -897,6 +897,28 @@ magnify-test: iso
 	    && echo "magnify-test: and a click on it still starts it           PASS" \
 	    || echo "magnify-test: and a click on it still starts it           FAIL"
 	@test -s build/magnify.ppm && pnmtopng build/magnify.ppm > build/magnify.png 2>/dev/null && rm -f build/magnify.ppm && echo "wrote build/magnify.png" || true
+
+# Open Settings from the dock, set Magnify to Large, then rest on the dock's
+# Terminal icon: it grows to 170% now, 81 px. build/magnify-large.png.
+magnify-setting-test: iso
+	@rm -f build/magnify-large.ppm build/magnify-large.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move 28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
+	   echo "mouse_move -29 -250"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
+	   echo "mouse_move -27 250"; sleep 1.2; \
+	   echo "screendump build/magnify-large.ppm"; sleep 1; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^(dock|theme) " build/serial.log | grep -v PASS || echo "magnify-setting-test: nothing from the desktop"
+	@grep -q "^theme      : changed" build/serial.log \
+	    && echo "magnify-setting-test: Settings changed the look         PASS" \
+	    || echo "magnify-setting-test: Settings changed the look         FAIL"
+	@grep -q "dock       : Terminal grows to 81 px" build/serial.log \
+	    && echo "magnify-setting-test: and the dock now grows to 170%     PASS" \
+	    || echo "magnify-setting-test: and the dock now grows to 170%     FAIL"
+	@test -s build/magnify-large.ppm && pnmtopng build/magnify-large.ppm > build/magnify-large.png 2>/dev/null && rm -f build/magnify-large.ppm && echo "wrote build/magnify-large.png" || true
 
 # Boot, open two terminals from the panel's button, close the one on top
 # with its title bar's close button and the other by typing exit. Both

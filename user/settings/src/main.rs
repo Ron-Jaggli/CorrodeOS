@@ -64,7 +64,11 @@ const fn on_off(value: bool) -> Option<usize> {
     Some(if value { 0 } else { 1 })
 }
 
-const ROWS: [Row; 11] = [
+/// How big a dock icon grows under the pointer at each of Magnify's
+/// segments, in percent. Medium is what the presets that magnify use.
+const MAGNIFY: [u8; 4] = [100, 120, 140, 170];
+
+const ROWS: [Row; 12] = [
     Row {
         label: "Preset",
         control: Control::Choice {
@@ -148,6 +152,14 @@ const ROWS: [Row; 11] = [
             options: &["Show", "Hide"],
             get: |theme| on_off(theme.dock),
             set: |theme, index| theme.dock = index == 0,
+        },
+    },
+    Row {
+        label: "Magnify",
+        control: Control::Choice {
+            options: &["Off", "Small", "Medium", "Large"],
+            get: |theme| MAGNIFY.iter().position(|m| *m == theme.magnify),
+            set: |theme, index| theme.magnify = MAGNIFY[index],
         },
     },
     Row {

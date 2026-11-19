@@ -1281,3 +1281,25 @@ The short version, for reading first. The numbered log below has the detail.
   (build/progress-52-sharp-magnify.png against progress-51-magnify.png).
 - Full suite PASSes on both GPUs (68 lines); input-test 170 / 0 and
   177 / 0; `./corrode test` passes.
+
+## 53. Magnify in Settings
+
+- New Settings row "Magnify", under Dock: Off / Small / Medium / Large
+  = 100 / 120 / 140 / 170 percent. Medium is what the presets that
+  magnify use, so the default theme still matches the Corrode preset.
+  A value set in desktop.conf that is not one of the four shows no
+  segment lit, as Corners does.
+- The window is one row (38 px) taller. Alone it opens at y = 90 and now
+  ends at about 658, still clear of the dock. Rows below Dock moved
+  down. No test clicked those rows (settings-test clicks only above
+  Dock), and the suite agrees.
+- Changing it rebuilds the dock (as any theme change does), so the big
+  stencils are drawn again at the new size and stay sharp (81 px at
+  Large, five across = 405 px of the 1024-wide atlas row).
+- New scored `magnify-setting-test`: opens Settings from the dock, picks
+  Large, rests on Terminal, expects "Terminal grows to 81 px".
+  My first try clicked at y = 544 assuming the window opens at 126 (it
+  does only when a terminal is already open) and turned Shadows off
+  instead; the screenshot showed it, and the test now clicks (639, 508).
+- Full suite PASSes on both GPUs (72 lines); input-test 170 / 0 and
+  177 / 0; `./corrode test` passes.
