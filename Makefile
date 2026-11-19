@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -291,6 +291,31 @@ scrollback-test: iso
 	    && echo "scrollback-test: the wheel scrolled the terminal back  PASS" \
 	    || echo "scrollback-test: the wheel scrolled the terminal back  FAIL"
 	@test -s build/scrollback.ppm && pnmtopng build/scrollback.ppm > build/scrollback.png 2>/dev/null && rm -f build/scrollback.ppm && echo "wrote build/scrollback.png" || true
+
+# Open Files, Terminal and Settings from the dock, then Alt+Tab twice. The
+# first is a plain tap: letting go of Alt at once brings Terminal -- the
+# window behind Settings -- to the front. The second is held, and
+# build/switcher.png shows the panel mid-hold. (QEMU sends no keys at all
+# after one held with `sendkey ... HOLD`, so the held one comes last.)
+switcher-test: iso
+	@rm -f build/switcher.ppm build/switcher.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -84 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   for step in 1 2; do echo "mouse_move 56 0"; sleep 0.3; \
+	     echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; done; \
+	   echo "mouse_move 300 -300"; sleep 0.5; \
+	   echo "sendkey alt-tab"; sleep 1; \
+	   echo "sendkey alt-tab 3000"; sleep 5; \
+	   echo "screendump build/switcher.ppm"; sleep 1.5; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^desktop .*switch" build/serial.log || echo "switcher-test: no switcher"
+	@grep -q "^desktop    : switched to window 2" build/serial.log \
+	    && test "$$(grep -c '^desktop    : switcher up, 3 windows' build/serial.log)" = 2 \
+	    && echo "switcher-test: Alt+Tab showed three and switched     PASS" \
+	    || echo "switcher-test: Alt+Tab showed three and switched     FAIL"
+	@test -s build/switcher.ppm && pnmtopng build/switcher.ppm > build/switcher.png 2>/dev/null && rm -f build/switcher.ppm && echo "wrote build/switcher.png" || true
 
 # Open a terminal from the dock and drag its bottom-right corner 200 by
 # 100 pixels bigger, in four steps. build/resize.png shows the result.

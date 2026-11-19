@@ -129,8 +129,10 @@ and in Settings' preset row. Wallpapers are integer-only functions in
 fixed-point port of the optics of [Glass-HQ's liquid glass](https://liquid-glass.glassapp.dev)
 (MIT). `./corrode test` checks all three on the build host.
 
-Keyboard shortcuts use Alt where macOS uses Cmd: **Alt+Tab** switches
-windows (and brings back minimized ones), **Alt+Q**, **Alt+W** or
+Keyboard shortcuts use Alt where macOS uses Cmd: **Alt+Tab** shows the
+window switcher (keep Alt held and press Tab again to move along, Shift+Tab
+to go back, Escape to cancel; letting go of Alt switches, and brings back
+a minimized window), **Alt+Q**, **Alt+W** or
 **Alt+F4** closes the one in front, **Alt+M** minimizes, **Alt+Z** zooms, and
 **Alt+,** opens Settings.
 

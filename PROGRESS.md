@@ -441,3 +441,29 @@ Choices made without asking are marked **Choice:**.
   screenshot shows older help text with the scroller. All other tests
   PASS; 170 / 0.
 - Screenshot: `build/progress-18-scrollback.png`.
+
+## 21. Alt+Tab window switcher
+
+- `kernel/src/switcher.rs`: macOS's Cmd+Tab panel. Alt+Tab puts a glass
+  panel in the middle of the screen with an icon per window, most recently
+  in front first. The front window always leads and minimized windows come
+  last. The next window is picked, with a soft highlight and its title
+  underneath.
+  - Tab (Alt held) moves along with a spring and Shift+Tab goes back.
+  - Releasing Alt brings the pick forward, restoring it if minimized.
+  - Escape cancels.
+  - A window closing while the panel is up puts it away.
+- Icons are the dock's own stencils (new `Dock::stencils`); the label is
+  the window's own title stencil. The only new stencil is the rounded
+  highlight, at atlas row 408 in the right half.
+- With a single window, Alt+Tab still brings it forward with no panel.
+  The old cycle-by-index shortcut is gone.
+- New `./corrode switcher-test`: three windows from the dock. A quick
+  Alt+Tab switches to Terminal ("switched to window 2"), then a held one
+  is screenshotted mid-hold. PASS, and on virtio too. shortcut-test still
+  PASSes; it needed minimized-last ordering to bring the minimized window
+  back. All tests PASS; 170 / 0.
+- **QEMU quirk:** after `sendkey KEYS HOLD_MS`, QEMU delivers no more keys
+  and drops the held keys' release. The held Alt+Tab therefore comes last
+  in the test, and the switch itself is checked with a plain tap.
+- Screenshot: `build/progress-19-switcher.png`.

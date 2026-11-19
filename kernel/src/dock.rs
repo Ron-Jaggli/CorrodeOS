@@ -400,6 +400,24 @@ impl Dock {
             .position(|icon| icon.tile == id || icon.glyph == Some(id))
     }
 
+    /// Icon `index`'s stencils, for the switcher to show it too: the tile,
+    /// its glyph and the tile's colour. None if the dock fell back to plain
+    /// squares, or there is no such icon.
+    pub fn stencils(&self, index: usize) -> Option<(Rect, Option<Rect>, Color)> {
+        let (icon, app) = (self.icons.get(index)?, APPS.get(index)?);
+        icon.dot?;
+        let size = self.size;
+        let tile = Rect::new(ATLAS_X, ATLAS_Y, size, size);
+        let glyph = icon
+            .glyph
+            .map(|_| Rect::new(ATLAS_X + (index as i32 + 1) * size as i32, ATLAS_Y, size, size));
+        Some((tile, glyph, app.color))
+    }
+
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
     /// What icon `index`'s program titles its windows.
     pub fn title(&self, index: usize) -> &'static str {
         APPS.get(index).map_or("", |app| app.title)

@@ -341,12 +341,17 @@ fn stencil(kind: Option<Button>) -> Vec<u8> {
 
 /// The Alt key: what Cmd is on macOS, and what Plasma's shortcuts use.
 const ALT: u8 = 1 << 2;
+const SHIFT: u8 = 1 << 0;
+/// Scancodes the switcher listens for.
+const KEY_TAB: u8 = 0x0f;
+const KEY_ESCAPE: u8 = 0x01;
+const KEY_LEFT_ALT: u8 = 0x38;
+const KEY_RIGHT_ALT: u8 = 0x80 | 0x38;
 
 /// What the desktop does with Alt and a key, whatever window is in front.
+/// The desktop's Alt shortcuts. Alt+Tab is the switcher's, not here.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Shortcut {
-    /// Alt+Tab: the next window to the front, back from the dock if need be.
-    Next,
     /// Alt+Q, Alt+W, Alt+F4: ask the window in front to close.
     Close,
     /// Alt+M.
@@ -361,7 +366,6 @@ impl Shortcut {
     /// By scancode, set 1.
     fn of(key: u8) -> Option<Shortcut> {
         Some(match key {
-            0x0f => Shortcut::Next,
             0x10 | 0x11 | 0x3e => Shortcut::Close,
             0x32 => Shortcut::Minimize,
             0x2c => Shortcut::Zoom,
@@ -518,6 +522,11 @@ pub struct Desk {
     titles: u64,
     /// Along the bottom of the screen.
     dock: Option<crate::dock::Dock>,
+    /// The Alt+Tab panel, while Alt is held.
+    switcher: Option<crate::switcher::Switcher>,
+    /// Window ids, the one most recently in front first: the switcher's
+    /// order.
+    recent: Vec<usize>,
     theme: Theme,
     windows: Vec<Managed>,
     /// Which of `windows` has the keyboard.
@@ -616,6 +625,8 @@ impl Desk {
             resized: Vec::new(),
             sizing: None,
             wanted: None,
+            switcher: None,
+            recent: Vec::new(),
         };
         let src = Rect::new(0, LINE_ROW as i32, 1, line_height);
         let y = screen.height as i32 - 40 - line_height as i32;
@@ -691,6 +702,25 @@ impl Desk {
                         self.show_pointer(scene, now);
                     }
                 }
+                // While the switcher is up, it has the keyboard: Tab moves
+                // the pick, letting go of Alt takes it, Escape takes none.
+                Event::Key {
+                    key,
+                    pressed,
+                    modifiers,
+                    ..
+                } if self.switcher.is_some() => match (key, pressed) {
+                    (KEY_TAB, true) => self.switch(renderer, scene, modifiers & SHIFT != 0, now),
+                    (KEY_LEFT_ALT | KEY_RIGHT_ALT, false) => self.end_switch(scene, true, now),
+                    (KEY_ESCAPE, true) => self.end_switch(scene, false, now),
+                    _ => {}
+                },
+                Event::Key {
+                    key: KEY_TAB,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers & ALT != 0 => self.switch(renderer, scene, modifiers & SHIFT != 0, now),
                 // The desktop's own shortcuts come first, and go no further.
                 Event::Key {
                     key,
@@ -1024,6 +1054,11 @@ impl Desk {
                 continue;
             };
             crate::windows::push(managed.window, window::FOCUS, [gained as u64, 0, 0, 0]);
+            if gained && !managed.docked {
+                let id = managed.window;
+                self.recent.retain(|recent| *recent != id);
+                self.recent.insert(0, id);
+            }
             if gained {
                 let ids: Vec<LayerId> = managed.layers().collect();
                 for id in ids {
@@ -1056,6 +1091,12 @@ impl Desk {
         }
         for glyph in self.glyphs.iter().flatten() {
             scene.raise(*glyph);
+        }
+        if let Some(switcher) = &self.switcher {
+            let ids: Vec<LayerId> = switcher.layers().collect();
+            for id in ids {
+                scene.raise(id);
+            }
         }
         if let Some([below, above]) = self.pointer {
             scene.raise(below);
@@ -1292,6 +1333,11 @@ impl Desk {
                 self.titles &= !(1 << slot);
             }
             println!("desktop    : window {} closed", managed.window);
+            self.recent.retain(|recent| *recent != managed.window);
+            // The switcher's list is out of date: put it away.
+            if let Some(switcher) = self.switcher.take() {
+                switcher.close(scene);
+            }
             self.closed.push(managed.surface);
             self.show_running(scene);
             // Indices past this one have moved down by one.
@@ -1308,6 +1354,92 @@ impl Desk {
         }
     }
 
+    /// Alt+Tab: put the switcher up with the window behind the front one
+    /// picked, or, if it is up, pick the next one (`back`: the one before).
+    fn switch<R: Renderer, const N: usize>(
+        &mut self,
+        renderer: &mut R,
+        scene: &mut Scene<N>,
+        back: bool,
+        now: u64,
+    ) {
+        if let Some(switcher) = &mut self.switcher {
+            switcher.step(scene, back, now);
+            return;
+        }
+        // Most recently in front first, then any never in front.
+        let mut order: Vec<usize> = self
+            .recent
+            .iter()
+            .filter_map(|id| self.windows.iter().position(|managed| managed.window == *id))
+            .filter(|index| !self.windows[*index].docked)
+            .collect();
+        for (index, managed) in self.windows.iter().enumerate() {
+            if !managed.docked && !order.contains(&index) {
+                order.push(index);
+            }
+        }
+        // The window in front first, whatever happened since it came there,
+        // and minimized ones last, as macOS orders them.
+        if let Some(front) = self.focus.filter(|front| order.contains(front)) {
+            order.retain(|index| *index != front);
+            order.insert(0, front);
+        }
+        let windows = &self.windows;
+        order.sort_by_key(|index| windows[*index].minimized);
+        if order.len() < 2 {
+            // Nothing to choose between: a lone window comes forward.
+            if let Some(&index) = order.first() {
+                self.restore(scene, index, now);
+            }
+            return;
+        }
+        let size = self.dock.as_ref().map_or(48, |dock| dock.size());
+        let entries = order
+            .iter()
+            .map(|&index| {
+                let managed = &self.windows[index];
+                crate::switcher::Entry {
+                    window: managed.window,
+                    icon: self.dock.as_ref().and_then(|dock| {
+                        dock.find(&managed.name).and_then(|app| dock.stencils(app))
+                    }),
+                    title: managed.title.and_then(|(id, _, _)| match scene.layer(id)?.content {
+                        corrode_render::scene::Content::Mask { src } => Some(src),
+                        _ => None,
+                    }),
+                }
+            })
+            .collect();
+        let picked = if back { order.len() - 1 } else { 1 };
+        self.switcher =
+            crate::switcher::Switcher::open(renderer, scene, &self.theme, size, entries, picked, now);
+        match &self.switcher {
+            Some(_) => println!("desktop    : switcher up, {} windows", order.len()),
+            // No room in the scene for it: just go to the pick.
+            None => self.restore(scene, order[picked], now),
+        }
+    }
+
+    /// Alt let go (`take`) or Escape: put the switcher away, and bring the
+    /// picked window forward if taken.
+    fn end_switch<const N: usize>(&mut self, scene: &mut Scene<N>, take: bool, now: u64) {
+        let Some(switcher) = self.switcher.take() else {
+            return;
+        };
+        let picked = switcher.picked();
+        switcher.close(scene);
+        if !take {
+            println!("desktop    : switcher put away");
+            return;
+        }
+        let index = picked.and_then(|id| self.windows.iter().position(|managed| managed.window == id));
+        if let Some(index) = index {
+            println!("desktop    : switched to window {}", self.windows[index].window);
+            self.restore(scene, index, now);
+        }
+    }
+
     /// Do what a shortcut says.
     fn shortcut<const N: usize>(&mut self, scene: &mut Scene<N>, shortcut: Shortcut, now: u64) {
         println!("input      : shortcut {:?}", shortcut);
@@ -1315,16 +1447,6 @@ impl Desk {
             .focus
             .filter(|index| self.windows.get(*index).is_some_and(|managed| !managed.docked));
         match shortcut {
-            Shortcut::Next => {
-                let count = self.windows.len();
-                let start = front.map_or(0, |index| index + 1);
-                let next = (0..count)
-                    .map(|step| (start + step) % count)
-                    .find(|index| !self.windows[*index].docked && Some(*index) != front);
-                if let Some(index) = next {
-                    self.restore(scene, index, now);
-                }
-            }
             Shortcut::Close => {
                 if let Some(index) = front {
                     crate::windows::push(self.windows[index].window, window::CLOSE, [0; 4]);
