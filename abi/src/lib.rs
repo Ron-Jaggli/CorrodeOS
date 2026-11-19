@@ -472,6 +472,9 @@ pub mod gpu {
     /// Paint the wallpaper of the theme in the four words, and show it as
     /// the renderer's last surface. Needs [`SCRATCH`].
     pub const WALLPAPER: u64 = 6;
+    /// Stop showing surface word 0 and let go of its capability: its
+    /// window has closed, and the kernel will retire it.
+    pub const FORGET: u64 = 7;
 
     /// The PCI identity of a modern virtio GPU.
     pub const VIRTIO_VENDOR: u16 = 0x1af4;

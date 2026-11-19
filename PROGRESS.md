@@ -678,3 +678,25 @@ Choices made without asking are marked **Choice:**.
   It does the same without this change: under virtio the terminal can
   take longer than the test's 1.2 s to open, so some `exit` keystrokes
   reach the desktop instead. Default-GPU churn-test PASSes.
+
+## 30. virtio: closed windows give their surfaces back
+
+- The churn-test failure under `GPU=virtio` (section 29) was not timing.
+  After 13 windows, `terminal: no window: NoSpace`. The cause:
+  - the remote renderer's `forget_surface` always said no, so under
+    virtio no closed window's surface was ever retired;
+  - the driver also kept every surface capability in a new slot, for
+    good.
+- Fix:
+  - New `gpu::FORGET` (7): the kernel asks the driver to detach the
+    surface and drop its capability, then retires the surface as the
+    software renderer path always did.
+  - The driver tracks which slot holds which surface (`Held`, as many as
+    the renderer shows) and reuses free slots.
+  - A retired surface keeps its frames and its fixed address, so when it
+    is handed out again the driver maps the same pages afresh.
+- `GPU=virtio ./corrode churn-test`: 20 opened, 20 closed, PASS (it was
+  13). Every test PASSes on the default GPU (170 / 0). Under virtio,
+  input-test gives 177 / 0, and everything passes except the known
+  resize-only gaps: resize-test, and minimize-test's zoom-size check
+  (sections 13 and 22).

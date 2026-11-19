@@ -3460,15 +3460,15 @@ impl Screen {
         }
     }
 
-    /// Stop showing surface `index`, so it can be retired. False where it
-    /// cannot be: the remote renderer's driver keeps what it was shown.
+    /// Stop showing surface `index`, so it can be retired. False if the
+    /// remote renderer's driver did not answer, and it is kept.
     fn forget_surface(&mut self, index: usize) -> bool {
         match self {
             Screen::Software(renderer) => {
                 renderer.detach_surface(index as u32);
                 true
             }
-            Screen::Remote(_) => false,
+            Screen::Remote(renderer) => renderer.forget_surface(index as u32).is_ok(),
         }
     }
 
