@@ -4501,7 +4501,9 @@ fn render_loop(renderer: &mut Screen) -> ! {
     }
     let mut retire_at = Some(desktop_at + fade as u64 * 1_000_000);
     let mut desk = input::Desk::new(renderer, &mut *stage.scene);
-    desk.allow_resize(matches!(renderer, Screen::Software(_)));
+    // Both renderers can be shown a surface again at a new size: the
+    // remote one's driver maps it afresh.
+    desk.allow_resize(true);
     {
         let screen = stage.scene.screen();
         windows::set_screen(screen.width, screen.height);

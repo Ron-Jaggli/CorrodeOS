@@ -664,7 +664,14 @@ fn serve(
                 )
             }
             .map_err(|_| Error::Invalid)?;
-            surfaces.slots[held] = Some(words[0] as u32);
+            // Sent again, resized: the new capability maps the same pages
+            // at the new size, and the old one is no longer needed.
+            let surface = words[0] as u32;
+            if let Some(old) = surfaces.slots.iter().position(|slot| *slot == Some(surface)) {
+                let _ = corrode_rt::delete(gpu::SURFACES + old);
+                surfaces.slots[old] = None;
+            }
+            surfaces.slots[held] = Some(surface);
             Ok([0; 4])
         }
 

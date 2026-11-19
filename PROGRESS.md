@@ -700,3 +700,20 @@ Choices made without asking are marked **Choice:**.
   input-test gives 177 / 0, and everything passes except the known
   resize-only gaps: resize-test, and minimize-test's zoom-size check
   (sections 13 and 22).
+
+## 31. Resizing under virtio
+
+- Edge dragging and zoom-to-fill now work under `GPU=virtio` too; the
+  gap noted in sections 13, 22 and 23 is closed.
+- How: a resized surface is sent to the driver again with
+  `gpu::SURFACE`, as the software path already did.
+  - A surface keeps its pages and its address, so the driver's
+    `map_surface` maps it afresh at the new size.
+  - The driver now drops the older capability for that surface, so
+    repeated resizes don't use up slots.
+  - The kernel calls `desk.allow_resize(true)` for both renderers.
+- Tests: the whole suite (17 boot tests) PASSes on both the default GPU
+  and virtio. The first time all of them pass on both.
+  input-test: 170 / 0 default, 177 / 0 virtio.
+- Screenshot: `build/progress-30-virtio-resize.png` (virtio, after the
+  top-left drag to 860x480).
