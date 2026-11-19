@@ -480,6 +480,8 @@ pub struct Desk {
     drag: Option<(usize, i32, i32)>,
     /// Windows placed so far, for staggering the next one.
     placed: i32,
+    /// The surfaces of windows that have gone, for the painter to retire.
+    closed: Vec<usize>,
 }
 
 impl Desk {
@@ -535,6 +537,7 @@ impl Desk {
             focus: None,
             drag: None,
             placed: 0,
+            closed: Vec::new(),
         };
         let src = Rect::new(0, LINE_ROW as i32, 1, line_height);
         let y = screen.height as i32 - 40 - line_height as i32;
@@ -1091,6 +1094,7 @@ impl Desk {
                 self.titles &= !(1 << slot);
             }
             println!("desktop    : window {} closed", managed.window);
+            self.closed.push(managed.surface);
             self.show_running(scene);
             // Indices past this one have moved down by one.
             let shift = |at: usize| match at.cmp(&index) {
@@ -1289,6 +1293,11 @@ impl Desk {
         self.dock = crate::dock::Dock::new(renderer, scene, &theme);
         self.show_running(scene);
         self.restack(scene);
+    }
+
+    /// The surfaces of the windows that have gone since the last call.
+    pub fn take_closed(&mut self) -> Vec<usize> {
+        core::mem::take(&mut self.closed)
     }
 
     /// Take the glyphs off the buttons: the next hover puts them back

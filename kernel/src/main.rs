@@ -3411,6 +3411,18 @@ impl Screen {
         }
     }
 
+    /// Stop showing surface `index`, so it can be retired. False where it
+    /// cannot be: the remote renderer's driver keeps what it was shown.
+    fn forget_surface(&mut self, index: usize) -> bool {
+        match self {
+            Screen::Software(renderer) => {
+                renderer.detach_surface(index as u32);
+                true
+            }
+            Screen::Remote(_) => false,
+        }
+    }
+
     /// Paint `theme`'s wallpaper and show it to the renderer as surface
     /// [`surface::WALLPAPER`]. False where there is nowhere to paint it: the
     /// remote renderer has only programs' surfaces, so under it the desktop
@@ -4537,6 +4549,17 @@ fn render_loop(renderer: &mut Screen) -> ! {
 
         // What the keyboard and mouse have done since the last look.
         desk.poll(renderer, &mut *stage.scene, now);
+
+        // Closed windows' surfaces, freed for the next window. Their layers
+        // left the scene this poll and are painted away below; the renderer
+        // forgets them now, so it never reads them again. Under the remote
+        // renderer the driver holds them mapped, so they stay as they are.
+        for closed in desk.take_closed() {
+            if renderer.forget_surface(closed) {
+                let _ = cap::delete(WINDOW_SURFACES + closed);
+                surface::retire(closed);
+            }
+        }
 
         let result = frame(&mut stage, renderer, now);
         wakeups += 1;

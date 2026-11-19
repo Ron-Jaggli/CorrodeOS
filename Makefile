@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -251,6 +251,25 @@ input-test: iso
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
 	@grep -E "^(input|ps2|panel|terminal) " build/serial.log || echo "input-test: nothing from the input path"
 	@test -s build/input.ppm && pnmtopng build/input.ppm > build/input.png 2>/dev/null && rm -f build/input.ppm && echo "wrote build/input.png" || true
+
+# Open a terminal from the dock and type exit in it, twenty times: more
+# windows than there are surfaces, so it passes only if a closed window's
+# surface goes to the next one.
+churn-test: iso
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -56 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   for round in $$(seq 20); do \
+	       echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.2; \
+	       for key in e x i t ret; do echo "sendkey $$key"; sleep 0.1; done; sleep 0.8; \
+	   done; \
+	   echo "screendump build/churn.ppm"; sleep 2; echo quit ) \
+	  | timeout --foreground 150 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@echo "churn-test: $$(grep -c 'dock       : started Terminal' build/serial.log) started, $$(grep -c 'desktop    : window .* closed' build/serial.log) closed"
+	@test "$$(grep -c 'desktop    : window .* closed' build/serial.log)" = 20 \
+	    && echo "churn-test: twenty windows opened and closed           PASS" \
+	    || echo "churn-test: twenty windows opened and closed           FAIL"
+	@test -s build/churn.ppm && pnmtopng build/churn.ppm > build/churn.png 2>/dev/null && rm -f build/churn.ppm && echo "wrote build/churn.png" || true
 
 # Open Settings from the dock and change the look three times while it runs:
 # Light, the Dunes wallpaper, a blue accent. build/settings.png shows the

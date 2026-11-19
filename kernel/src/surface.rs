@@ -25,7 +25,9 @@
 //!
 //! # What is not here yet
 //!
-//! Surfaces are created by the kernel at boot and never destroyed. A client
+//! Surfaces are never destroyed: the frame allocator has no way to take a
+//! frame back. A window that closes retires its surface instead, and the
+//! next window that fits in it gets it, wiped. A client
 //! draws into the same memory the compositor reads, so a repaint can catch a
 //! frame half drawn; the cure is two buffers and a swap on commit.
 
@@ -67,6 +69,8 @@ struct Surface {
     frames: Vec<u64>,
     /// What the client has committed since the compositor last asked.
     redrawn: Rect,
+    /// Its window is gone: free for the next window that fits.
+    retired: bool,
 }
 
 /// Every surface there is, by number. The number is also what the renderer
@@ -106,6 +110,10 @@ pub fn create(width: u32, height: u32) -> Option<usize> {
     }
     let pages = bytes.div_ceil(PAGE) as usize;
 
+    if let Some(index) = reuse(width, height, pages) {
+        return Some(index);
+    }
+
     // Checked up front, as for the back buffer: running out half way would
     // strand the frames already taken.
     let (free, _) = frame::stats();
@@ -125,6 +133,7 @@ pub fn create(width: u32, height: u32) -> Option<usize> {
             height,
             frames: Vec::new(),
             redrawn: NOWHERE,
+            retired: false,
         });
         Some(index)
     })?;
@@ -157,6 +166,43 @@ pub fn create(width: u32, height: u32) -> Option<usize> {
 
     with(index, |surface| surface.frames = frames)?;
     Some(index)
+}
+
+/// Give a window a retired surface with room for `pages`, wiped, if there
+/// is one.
+fn reuse(width: u32, height: u32, pages: usize) -> Option<usize> {
+    // Claimed under the lock, wiped after: nobody can reach a claimed
+    // surface until it is returned from here.
+    let (index, frames) = without_interrupts(|| {
+        let mut table = TABLE.lock();
+        let (index, surface) = table.iter_mut().enumerate().find_map(|(index, slot)| {
+            slot.as_mut()
+                .filter(|surface| surface.retired && surface.frames.len() >= pages)
+                .map(|surface| (index, surface))
+        })?;
+        surface.retired = false;
+        surface.width = width;
+        surface.height = height;
+        surface.redrawn = NOWHERE;
+        Some((index, surface.frames.clone()))
+    })?;
+    // The last program's pixels are not the next one's business, nor are
+    // they to show for a frame in its window.
+    paging::with_kernel_mapper(|mapper| {
+        for frame in &frames {
+            // SAFETY: the frame is this surface's, which nothing else uses:
+            // its last client has finished, and the renderer was told to
+            // forget it before it was retired.
+            unsafe { mapper.zero_frame(*frame) };
+        }
+    });
+    Some(index)
+}
+
+/// Free surface `index` for the next window that fits: its window is gone,
+/// its client has finished, and the renderer no longer shows it.
+pub fn retire(index: usize) {
+    with(index, |surface| surface.retired = true);
 }
 
 /// Where the kernel reads a surface, and its size in pixels: what the

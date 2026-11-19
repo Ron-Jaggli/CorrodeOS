@@ -213,3 +213,27 @@ Choices made without asking are marked **Choice:**.
   corners. Screenshot: `build/progress-8-breeze.png`. Then restored the
   default `desktop.conf`.
 - **The original backlog is done.** Next steps, chosen by me, are below.
+
+## 10. Closed windows give their surface back
+
+- Problem: there are 15 window surfaces and none was ever freed, so about
+  the 15th window of a session could not open.
+- The frame allocator has no `free`, so a closed window's surface is
+  *retired* rather than freed, and the next window that fits takes it
+  over. Its frames are wiped first, so nothing of the last program shows.
+- The painter retires a surface only after:
+  - its program has finished (the dead task never runs again, so its old
+    mapping of those frames is harmless);
+  - the window's layers have left the scene;
+  - the software renderer has detached it;
+  - bootstrap's capability to it has been deleted, so the number can be
+    issued again.
+- `./corrode churn-test` opens a terminal from the dock and types `exit`,
+  20 times. 20 started, 20 closed, PASS. Every other boot test PASS;
+  170 PASS / 0 FAIL.
+- Known gap: under `GPU=virtio` the driver keeps every surface it was
+  shown mapped, so surfaces are not retired there. Windows still run out
+  after about 14.
+- Known gap: each program start still uses up frames for its address
+  space and stacks, which are never freed (no frame free in the kernel).
+  Fine for hundreds of launches, not for ever.
