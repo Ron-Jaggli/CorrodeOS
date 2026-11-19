@@ -292,6 +292,14 @@ pub mod window {
     /// The answer to a call the window server's own endpoint does not take:
     /// one only the shell endpoint does, from a program that lacks it.
     pub const DENIED: u64 = 81;
+    /// A call, from the lock screen and only it -- from anyone else the
+    /// answer is always no -- is this the passcode? Word 0 is up to
+    /// eight ASCII digits, little-endian, NUL-padded. Word 1 is 1 to ask
+    /// only whether there is a passcode at all, which costs no try. The
+    /// answer's word 0 is 1 for yes (or for no passcode set) and 0 for no;
+    /// word 1 is how many seconds until another try is taken, after too
+    /// many wrong ones.
+    pub const UNLOCK: u64 = 82;
     /// The calls only the shell endpoint takes.
     pub const SHELL_ONLY: [u64; 6] = [SET_THEME, QUIT, LIST, RAISE, HISTORY, CONTEXT];
 

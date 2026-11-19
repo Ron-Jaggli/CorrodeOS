@@ -30,8 +30,8 @@ The short version, for reading first. The numbered log below has the detail.
     shortcuts (12).
   - virtio GPU parity: glass, wallpaper (14), freeing surfaces (30) and
     resizing (31). Before 30, the 14th window under virtio failed to open.
-- **Tests:** `./corrode test` passes. 31 scripted boot tests (`close-test`
-  through `store-test`, 40 scored checks) pass on both the default GPU and
+- **Tests:** `./corrode test` passes. 32 scripted boot tests (`close-test`
+  through `passcode-test`, 44 scored checks) pass on both the default GPU and
   `GPU=virtio`. The boot self-checks give 172 PASS / 0 FAIL (default) and
   179 / 0 (virtio). Each test writes a screenshot to `build/`. The
   `build/progress-NN-*.png` files are the ones referred to below.
@@ -41,7 +41,9 @@ The short version, for reading first. The numbered log below has the detail.
     CMOS NVRAM are still never written; there is no AHCI/NVMe driver.
   - Windows do not zoom in from small when they open: that needs the
     scene to scale a window's layers as a group, which it cannot yet.
-  - The lock screen has no password, as there are no accounts (28).
+  - The lock screen's passcode (57) is in desktop.conf in the clear:
+    there are no accounts and no secret storage. It keeps a passer-by
+    out, not someone holding the disk.
 - **Speed:** frame timing is in (`./corrode perf-test`). Frosted glass
   is most of a frame's cost; dragging a window now takes about 8 ms a
   frame, down from 33 (47, 48).
@@ -1408,3 +1410,35 @@ This part, host-tested only:
   `./corrode test` passes.
 - Not done: there is no program today that is not the desktop's own, so
   there is no live impostor to show. The check is on the rule itself.
+
+## 57. A passcode for the lock screen
+
+- `passcode = 4 to 8 digits` in desktop.conf. `corrode_theme::passcode`
+  parses it (host test: 4-8 digits only, last line wins, and the theme
+  ignores it). Choice: it is not a `Theme` field. A theme is sent to
+  every program and kept on the settings disk, and a passcode should be
+  neither. The kernel keeps it in `look::PASSCODE` and nowhere else.
+- New call `window::UNLOCK` (82). The lock app puts the typed digits to
+  the desktop, which answers yes or no; word 1 = 1 asks only whether a
+  passcode is set, which costs no try. The comparison looks at every
+  byte whatever the first difference. After three wrong tries in a row,
+  no try is taken for 30 s (the answer says how long).
+- Only the task named `lock` may try: from anyone else the answer is
+  always no and the kernel logs it. Otherwise any app could guess the
+  passcode, or use up the tries and keep the person out.
+- Lock screen: without a passcode, unchanged (Return or the button). With
+  one, the button reads "Enter passcode", digits show as dots (drawn
+  circles, as the font is ASCII-only), Backspace removes one, Return or
+  the button tries it; "Wrong passcode" or "Too many tries - wait N s"
+  shows under it.
+- New scored `passcode-test`. It builds its own build/passcode.iso from
+  the normal ISO tree with `passcode = 2468` appended to a copy of
+  desktop.conf; the real ISO and root/ are untouched. Checks: the
+  passcode is read; four wrong codes refused; the right one unlocks
+  exactly once; after three wrong in a row even the right one is told
+  to wait. build/passcode-dots.png shows two dots, build/passcode.png
+  "Too many tries - wait 29 s".
+- The shipped desktop.conf documents it, commented out; README has the
+  key, and says plainly that the file is readable by anyone with the ISO.
+- Full suite PASSes on both GPUs (88 lines); input-test 172 / 0 and
+  179 / 0; `./corrode test` passes; lock-test (no passcode) unchanged.

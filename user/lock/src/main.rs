@@ -2,9 +2,11 @@
 //! the middle, as macOS's and Plasma's are.
 //!
 //! It opens a cover window, which the desktop puts above everything and
-//! gives every key and click, so nothing behind it can be used. Return or a
-//! click on the unlock button takes it away. There are no accounts, so
-//! there is no password -- this keeps the screen out of view, not safe.
+//! gives every key and click, so nothing behind it can be used. Without a
+//! passcode, Return or a click on the unlock button takes it away. With
+//! one (`passcode =` in /etc/desktop.conf), the digits typed are put to the
+//! desktop, which alone knows the passcode, and only a yes unlocks; after
+//! three wrong tries the desktop takes no more for half a minute.
 
 #![no_std]
 #![no_main]
@@ -25,12 +27,20 @@ const NAME: Style = Style::px(16).weight(Weight::Bold);
 const HINT: Style = Style::px(13);
 const AVATAR: u32 = 64;
 const BUTTON: (u32, u32) = (220, 32);
-/// Return, by scancode.
+/// Return and Backspace, by scancode.
 const KEY_ENTER: u8 = 0x1c;
+const KEY_BACKSPACE: u8 = 0x0e;
+const MOST_DIGITS: usize = 8;
+const DOT: u32 = 10;
 
 struct Clock {
     anchor: Option<(i64, u64)>,
     theme: Theme,
+    /// Whether a passcode is asked for, what has been typed of it, and what
+    /// the last try said.
+    passcode: bool,
+    typed: alloc::string::String,
+    said: Option<alloc::string::String>,
 }
 
 /// The date and the time, apart; and when the minute next turns.
@@ -91,9 +101,50 @@ fn draw(window: &mut Window, clock: &Clock) -> u64 {
 
     window.rounded(bx, by, BUTTON.0, BUTTON.1, BUTTON.1 / 2, soft);
     let hy = by + (BUTTON.1 as i32 - line_height(HINT) as i32) / 2;
-    centre(window, hy, "Press Return to unlock", HINT, text);
+    if !clock.passcode {
+        centre(window, hy, "Press Return to unlock", HINT, text);
+    } else if clock.typed.is_empty() {
+        centre(window, hy, "Enter passcode", HINT, text);
+    } else {
+        // A dot for each digit, never the digit.
+        let count = clock.typed.len() as u32;
+        let span = count * DOT + (count - 1) * DOT;
+        let mut x = bx + (BUTTON.0 - span) as i32 / 2;
+        let y = by + (BUTTON.1 - DOT) as i32 / 2;
+        for _ in 0..count {
+            window.rounded(x, y, DOT, DOT, DOT / 2, text);
+            x += 2 * DOT as i32;
+        }
+    }
+    if let Some(said) = &clock.said {
+        centre(window, by + BUTTON.1 as i32 + 14, said, HINT, text);
+    }
     window.commit_all();
     next
+}
+
+/// Return, or the button: unlock if nothing is asked, or put what was typed
+/// to the desktop.
+fn submit(clock: &mut Clock) {
+    if !clock.passcode {
+        unlock();
+    }
+    if clock.typed.is_empty() {
+        return;
+    }
+    let answer = corrode_ui::try_passcode(&clock.typed);
+    clock.typed.clear();
+    clock.said = Some(match answer {
+        Ok(true) => unlock(),
+        Ok(false) => {
+            println!("wrong passcode");
+            alloc::string::String::from("Wrong passcode")
+        }
+        Err(seconds) => {
+            println!("too many tries: {seconds} s to wait");
+            format!("Too many tries - wait {seconds} s")
+        }
+    });
 }
 
 fn unlock() -> ! {
@@ -117,6 +168,9 @@ fn main() {
     let mut clock = Clock {
         anchor: None,
         theme: Theme::default(),
+        passcode: corrode_ui::passcode_needed(),
+        typed: alloc::string::String::new(),
+        said: None,
     };
     let mut next = draw(&mut window, &clock);
     println!("locked, {}x{}", window.width, window.height);
@@ -136,11 +190,32 @@ fn main() {
                 key: KEY_ENTER,
                 pressed: true,
                 ..
-            } => unlock(),
+            } => {
+                submit(&mut clock);
+                next = draw(&mut window, &clock);
+            }
+            Event::Key {
+                key: KEY_BACKSPACE,
+                pressed: true,
+                ..
+            } if clock.passcode => {
+                clock.typed.pop();
+                next = draw(&mut window, &clock);
+            }
+            Event::Key {
+                text: Some(digit @ '0'..='9'),
+                pressed: true,
+                ..
+            } if clock.passcode && clock.typed.len() < MOST_DIGITS => {
+                clock.typed.push(digit);
+                clock.said = None;
+                next = draw(&mut window, &clock);
+            }
             Event::Button { x, y, buttons } if buttons & 1 != 0 => {
                 let (bx, by) = button(&window);
                 if x >= bx && x < bx + BUTTON.0 as i32 && y >= by && y < by + BUTTON.1 as i32 {
-                    unlock();
+                    submit(&mut clock);
+                    next = draw(&mut window, &clock);
                 }
             }
             _ => {}

@@ -67,7 +67,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -962,6 +962,56 @@ store-test: iso
 	    && echo "store-test: the driver holds only its device           PASS" \
 	    || echo "store-test: the driver holds only its device           FAIL"
 	@test -s build/store.ppm && pnmtopng build/store.ppm > build/store.png 2>/dev/null && rm -f build/store.ppm && echo "wrote build/store.png" || true
+
+# The lock screen with a passcode. A copy of the ISO whose desktop.conf
+# has `passcode = 2468` (build/passcode.iso; the real one is untouched).
+# Lock with Alt+L; a wrong code is refused, the right one unlocks. Lock
+# again: three wrong in a row and even the right one is refused for a
+# while. build/passcode-dots.png shows two digits typed, build/passcode.png
+# the wait.
+PASS_ISO := build/passcode.iso
+passcode-test: iso
+	@rm -rf build/pass_root build/pass_iso_root $(PASS_ISO) build/passcode.ppm build/passcode.png build/passcode-dots.ppm build/passcode-dots.png
+	@cp -r root build/pass_root && printf '\npasscode = 2468\n' >> build/pass_root/etc/desktop.conf
+	@cp -r $(ISO_ROOT) build/pass_iso_root
+	@tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
+	    --mtime=@0 --mode=u+rw,go+r,go-w -C build/pass_root -cf build/pass_iso_root/boot/files/root.tar .
+	@xorriso -as mkisofs -quiet -R -r -J \
+	    -b boot/limine/limine-bios-cd.bin \
+	    -no-emul-boot -boot-load-size 4 -boot-info-table \
+	    --efi-boot boot/limine/limine-uefi-cd.bin \
+	    -efi-boot-part --efi-boot-image \
+	    --protective-msdos-label \
+	    build/pass_iso_root -o $(PASS_ISO) && $(LIMINE_DIR)/limine bios-install $(PASS_ISO) > /dev/null
+	@( sleep $(SHOT_DELAY); \
+	   echo "sendkey alt-l"; sleep 1.5; \
+	   echo "sendkey ret"; sleep 0.3; \
+	   for key in 1 1 1 1 ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 0.5; \
+	   echo "sendkey 2"; sleep 0.15; echo "sendkey 4"; sleep 0.5; \
+	   echo "screendump build/passcode-dots.ppm"; sleep 1; \
+	   echo "sendkey backspace"; sleep 0.15; echo "sendkey backspace"; sleep 0.15; \
+	   for key in 2 4 6 8 ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 1.5; \
+	   echo "sendkey alt-l"; sleep 1.5; \
+	   for round in 1 2 3; do for key in 1 1 1 1 ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 0.3; done; \
+	   for key in 2 4 6 8 ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 0.8; \
+	   echo "screendump build/passcode.ppm"; sleep 1; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(subst $(ISO),$(PASS_ISO),$(QEMU_COMMON)) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^lock |passcode" build/serial.log || echo "passcode-test: no lock screen"
+	@grep -q "^theme      : read /etc/desktop.conf, with a lock screen passcode" build/serial.log \
+	    && echo "passcode-test: the passcode is read                     PASS" \
+	    || echo "passcode-test: the passcode is read                     FAIL"
+	@test "$$(grep -c '^lock       : wrong passcode' build/serial.log)" = 4 \
+	    && echo "passcode-test: four wrong codes are refused             PASS" \
+	    || echo "passcode-test: four wrong codes are refused             FAIL"
+	@test "$$(grep -c '^lock       : unlocked' build/serial.log)" = 1 \
+	    && echo "passcode-test: the right one unlocks, once              PASS" \
+	    || echo "passcode-test: the right one unlocks, once              FAIL"
+	@grep -q "^lock       : too many tries" build/serial.log \
+	    && echo "passcode-test: after three wrong, even it must wait     PASS" \
+	    || echo "passcode-test: after three wrong, even it must wait     FAIL"
+	@test -s build/passcode-dots.ppm && pnmtopng build/passcode-dots.ppm > build/passcode-dots.png 2>/dev/null && rm -f build/passcode-dots.ppm || true
+	@test -s build/passcode.ppm && pnmtopng build/passcode.ppm > build/passcode.png 2>/dev/null && rm -f build/passcode.ppm && echo "wrote build/passcode.png" || true
 
 # Boot, open two terminals from the panel's button, close the one on top
 # with its title bar's close button and the other by typing exit. Both

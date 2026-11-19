@@ -117,6 +117,7 @@ typo cannot break the desktop. The file explains every key; in short:
 | `animation_speed` | percent, `0` for none | Every animation's pace |
 | `timezone` | `UTC`, `+5`, `-8`, `+05:30` | The menu bar clock's offset from the machine's (UTC) clock |
 | `clock` | `24h` `12h` | The menu bar clock's hours |
+| `passcode` | 4 to 8 digits | The lock screen (Alt+L) asks for it. Only the desktop sees it; three wrong tries in a row and it waits 30 s. Anyone with the ISO can read it, so it keeps a passer-by out, not a thief |
 
 A preset plus a line or two is usually all you need:
 

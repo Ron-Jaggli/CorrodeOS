@@ -557,6 +557,28 @@ pub fn color(text: &str) -> Option<Color> {
     Some(Color::rgb(byte(0)?, byte(2)?, byte(4)?))
 }
 
+/// The lock screen's passcode, from a config file's `passcode = ` line: 4
+/// to 8 digits, as ASCII, NUL-padded. `None` if there is no such line, or
+/// it is not 4 to 8 digits (a passcode that cannot be typed on the lock
+/// screen's keys would lock the screen for good).
+///
+/// It is not part of [`Theme`]: a theme goes to every program, and to the
+/// disk, and a passcode should do neither.
+pub fn passcode(text: &str) -> Option<[u8; 8]> {
+    let value = text
+        .lines()
+        .filter_map(|line| uncommented(line).trim().split_once('='))
+        .filter(|(key, _)| key.trim() == "passcode")
+        .map(|(_, value)| value.trim())
+        .last()?;
+    if !(4..=8).contains(&value.len()) || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let mut code = [0u8; 8];
+    code[..value.len()].copy_from_slice(value.as_bytes());
+    Some(code)
+}
+
 /// The contents of the file at `path` in a ustar archive, if it is there.
 /// Paths are compared without a leading `./` or `/`. Nothing allocated: the
 /// kernel reads its theme with this before anything else is running.
@@ -666,6 +688,19 @@ mod tests {
         }
         assert_eq!(Theme::from_record(&[0u8; 512]), None);
         assert_eq!(Theme::from_record(&[0u8; 10]), None);
+    }
+
+    #[test]
+    fn a_passcode_is_four_to_eight_digits() {
+        assert_eq!(passcode("passcode = 1234\n"), Some(*b"1234\0\0\0\0"));
+        assert_eq!(passcode("# lock\npasscode=87654321 # mine\n"), Some(*b"87654321"));
+        // The last one wins, as for every other key.
+        assert_eq!(passcode("passcode = 1111\npasscode = 2222\n"), Some(*b"2222\0\0\0\0"));
+        for bad in ["", "passcode = 123", "passcode = 123456789", "passcode = 12a4", "passcode ="] {
+            assert_eq!(passcode(bad), None, "{bad:?}");
+        }
+        // And the theme does not take it as anything.
+        assert_eq!(Theme::parse("passcode = 1234\n"), Theme::default());
     }
 
     #[test]

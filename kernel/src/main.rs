@@ -2117,6 +2117,36 @@ fn serve(shell: bool) {
         // A new look for the desktop: kept, and picked up by the painter on
         // its next frame.
         // A notification, filed under the sender's window title.
+        if received.message.label == window::UNLOCK {
+            // Only the lock screen may try: anyone else could guess, or use
+            // up the tries and keep the person out.
+            let from_lock = task::name_of(received.from) == Some("lock");
+            let answer = if !from_lock {
+                println!("desktop    : task {} is not the lock screen; no passcode tries", received.from);
+                [0, 0, 0, 0]
+            } else if words[1] == 1 {
+                [!look::has_passcode() as u64, 0, 0, 0]
+            } else {
+                match look::try_passcode(words[0].to_le_bytes(), time::now_ns()) {
+                    Ok(right) => {
+                        if !right {
+                            println!("desktop    : a wrong passcode from task {}", received.from);
+                        }
+                        [right as u64, 0, 0, 0]
+                    }
+                    Err(wait) => [0, wait, 0, 0],
+                }
+            };
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: window::UNLOCK,
+                    words: answer,
+                },
+                None,
+            );
+            continue;
+        }
         if received.message.label == window::NOTIFY {
             // Under the caller's window's title, which `windows::open` has
             // already kept from being another app's; a caller with no window

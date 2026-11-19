@@ -472,6 +472,27 @@ pub fn clear_notifications() {
     let _ = corrode_rt::call(app::SHELL, Message::new(window::HISTORY, [0, 2, 0, 0]), None);
 }
 
+/// Whether the lock screen has to ask for a passcode.
+pub fn passcode_needed() -> bool {
+    corrode_rt::call(app::WINDOWS, Message::new(window::UNLOCK, [0, 1, 0, 0]), None)
+        .is_ok_and(|answer| answer.message.words[0] == 0)
+}
+
+/// Is `code` the passcode? `Ok(true)` or `Ok(false)`, or `Err(seconds)`
+/// to wait after too many wrong tries.
+pub fn try_passcode(code: &str) -> core::result::Result<bool, u64> {
+    let mut bytes = [0u8; 8];
+    for (slot, byte) in bytes.iter_mut().zip(code.bytes()) {
+        *slot = byte;
+    }
+    let word = u64::from_le_bytes(bytes);
+    match corrode_rt::call(app::WINDOWS, Message::new(window::UNLOCK, [word, 0, 0, 0]), None) {
+        Ok(answer) if answer.message.words[1] > 0 => Err(answer.message.words[1]),
+        Ok(answer) => Ok(answer.message.words[0] == 1),
+        Err(_) => Ok(false),
+    }
+}
+
 /// How tall a line of `style` is.
 pub fn line_height(style: Style) -> u32 {
     corrode_text::measure("Mg", style).height
