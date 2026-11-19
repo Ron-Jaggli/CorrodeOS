@@ -482,6 +482,8 @@ pub struct Desk {
     placed: i32,
     /// The surfaces of windows that have gone, for the painter to retire.
     closed: Vec<usize>,
+    /// What docked windows were last told has the keyboard.
+    announced: Option<String>,
 }
 
 impl Desk {
@@ -538,6 +540,7 @@ impl Desk {
             drag: None,
             placed: 0,
             closed: Vec::new(),
+            announced: None,
         };
         let src = Rect::new(0, LINE_ROW as i32, 1, line_height);
         let y = screen.height as i32 - 40 - line_height as i32;
@@ -646,6 +649,32 @@ impl Desk {
         if typed {
             self.redraw_line(renderer, scene);
         }
+        self.announce();
+    }
+
+    /// Tell docked windows -- the menu bar -- which app is in front, when
+    /// that has changed since they were last told.
+    fn announce(&mut self) {
+        let front = self
+            .focus
+            .and_then(|index| self.windows.get(index))
+            .map(|managed| managed.name.clone())
+            .unwrap_or_default();
+        if self.announced.as_ref() == Some(&front) {
+            return;
+        }
+        let mut title = [0u8; 8];
+        for (slot, byte) in title.iter_mut().zip(front.bytes()) {
+            *slot = byte;
+        }
+        for managed in self.windows.iter().filter(|managed| managed.docked) {
+            crate::windows::push(
+                managed.window,
+                window::ACTIVE,
+                [u64::from_le_bytes(title), 0, 0, 0],
+            );
+        }
+        self.announced = Some(front);
     }
 
     /// A character typed. True if the line changed.
@@ -807,6 +836,9 @@ impl Desk {
             }
         }
         self.windows.push(managed);
+        if docked {
+            self.announced = None;
+        }
         self.show_running(scene);
         crate::windows::push(window, window::THEME, theme.to_words());
         let index = self.windows.len() - 1;

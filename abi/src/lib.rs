@@ -227,6 +227,10 @@ pub mod window {
     /// words as [`THEME`]. Every window is told, and the desktop restyles
     /// itself. Answered with word 0 zero.
     pub const SET_THEME: u64 = 67;
+    /// To docked windows: the window with the keyboard is now the one
+    /// titled word 0 (its eight ASCII bytes, little-endian), or none if 0.
+    /// What the menu bar shows as the app in front.
+    pub const ACTIVE: u64 = 68;
 
     /// Most a window may be, either way.
     pub const MAX_WIDTH: u32 = 1024;

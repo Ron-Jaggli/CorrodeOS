@@ -237,3 +237,17 @@ Choices made without asking are marked **Choice:**.
 - Known gap: each program start still uses up frames for its address
   space and stacks, which are never freed (no frame free in the kernel).
   Fine for hundreds of launches, not for ever.
+
+## 11. The menu bar names the app in front
+
+- New `window::ACTIVE` event for docked windows: the title of the window
+  with the keyboard, or none. The desk checks once per poll whether it
+  changed, and re-sends when a new docked window turns up.
+- The panel shows the name in bold after its Terminal button, as macOS's
+  menu bar shows the frontmost app. It clears when nothing has focus (a
+  click on the desktop, or the window minimized or closed).
+- **Choice:** the Terminal button stays where it was, so existing click
+  tests keep their coordinates. The name goes after it, not before as on
+  macOS.
+- Boot tests all PASS; 170 PASS / 0 FAIL.
+- Screenshot: `build/progress-9-menubar.png` ("About" in the bar).

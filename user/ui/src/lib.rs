@@ -75,6 +75,9 @@ pub enum Event {
     Close,
     /// The desktop's look: when the window opens, and when it changes.
     Theme(Theme),
+    /// To docked windows: the title of the window with the keyboard, empty
+    /// if none has it.
+    Active([u8; 8]),
     /// The deadline came before anything else did.
     Timeout,
 }
@@ -265,6 +268,7 @@ impl Window {
             window::FOCUS => Event::Focus(words[0] != 0),
             window::CLOSE => Event::Close,
             window::THEME => Event::Theme(Theme::from_words(words)),
+            window::ACTIVE => Event::Active(words[0].to_le_bytes()),
             _ => Event::Timeout,
         }
     }

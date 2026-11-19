@@ -1,5 +1,6 @@
 //! The panel: a bar along the top of the screen with the system's name, a
-//! button that starts a terminal, and how long the machine has been up.
+//! button that starts a terminal, the app in front -- in bold, as macOS's
+//! menu bar has it -- and how long the machine has been up.
 //!
 //! It holds one thing the other programs do not: an endpoint to the
 //! launcher. That is the whole of its power to start programs, and it can
@@ -93,13 +94,27 @@ fn clock(window: &mut Window, look: &Look) -> u64 {
     (seconds + 1) * 1_000_000_000
 }
 
+/// Where the app in front is named: after the button, up to the middle.
+const FRONT_AT: i32 = 240;
+const FRONT: Style = Style::px(14).weight(Weight::Bold);
+
+/// Name the app in front, or nobody.
+fn front(window: &mut Window, look: &Look, name: &str) {
+    let room = window.width / 2 - FRONT_AT as u32;
+    window.fill(FRONT_AT, 0, room, HEIGHT, CLEAR);
+    let y = (HEIGHT as i32 - line_height(FRONT) as i32) / 2;
+    window.text(FRONT_AT, y, name, FRONT, look.text);
+    window.commit(FRONT_AT, 0, room, HEIGHT);
+}
+
 /// Everything, from nothing.
-fn draw(window: &mut Window, look: &Look) -> u64 {
+fn draw(window: &mut Window, look: &Look, name: &str) -> u64 {
     window.fill(0, 0, window.width, window.height, CLEAR);
     let y = (HEIGHT as i32 - line_height(NAME) as i32) / 2;
     window.text(14, y, "CorrodeOS", NAME, look.name);
     window.commit_all();
     button(window, look, false);
+    front(window, look, name);
     clock(window, look)
 }
 
@@ -123,7 +138,8 @@ fn main() {
         }
     };
     let mut look = Look::of(&Theme::default());
-    let mut next = draw(&mut window, &look);
+    let mut name = alloc::string::String::new();
+    let mut next = draw(&mut window, &look, &name);
     println!("up, {} pixels wide", window.width);
 
     loop {
@@ -131,7 +147,15 @@ fn main() {
             Event::Timeout => next = clock(&mut window, &look),
             Event::Theme(theme) => {
                 look = Look::of(&theme);
-                next = draw(&mut window, &look);
+                next = draw(&mut window, &look, &name);
+            }
+            Event::Active(title) => {
+                name = title
+                    .iter()
+                    .take_while(|byte| **byte != 0)
+                    .map(|byte| *byte as char)
+                    .collect();
+                front(&mut window, &look, &name);
             }
             Event::Button { x, y, buttons } if inside(x, y) => {
                 let down = buttons & 1 != 0;
