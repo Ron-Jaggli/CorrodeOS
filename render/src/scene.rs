@@ -69,7 +69,13 @@ pub enum Content {
         width: u32,
         height: u32,
         translucent: bool,
+        /// Its lower corners are rounded to this.
+        radius: u8,
     },
+    /// The shadow of a rounded rectangle of corner `radius`, spreading
+    /// `blur` pixels outside it: the layer's rectangle is the shadow's
+    /// whole extent, the shape inset from it by `blur`.
+    Shadow { radius: u16, blur: u8 },
     /// A pane of glass the size of the layer, over whatever is under it.
     /// The layer's colour is not used; the pane's tint is.
     Glass(Glass),
@@ -123,6 +129,7 @@ impl Layer {
             width,
             height,
             translucent: false,
+            radius: 0,
         };
         layer
     }
@@ -136,7 +143,20 @@ impl Layer {
             width,
             height,
             translucent: true,
+            radius: 0,
         };
+        layer
+    }
+
+    /// The shadow of a `width` by `height` shape with corners of `radius`,
+    /// whose top left is at `x`, `y`, spreading `blur` pixels around it.
+    pub const fn shadow(x: i32, y: i32, width: u32, height: u32, radius: u16, blur: u8) -> Self {
+        let b = blur as i32;
+        let mut layer = Self::solid(
+            Rect::new(x - b, y - b, width + 2 * blur as u32, height + 2 * blur as u32),
+            Color::BLACK,
+        );
+        layer.content = Content::Shadow { radius, blur };
         layer
     }
 
@@ -230,8 +250,12 @@ impl Shown {
         self.alpha == 255
             && match self.content {
                 Content::Solid => true,
-                Content::Surface { translucent, .. } => !translucent,
-                Content::Mask { .. } | Content::Glass(_) => false,
+                Content::Surface {
+                    translucent,
+                    radius,
+                    ..
+                } => !translucent && radius == 0,
+                Content::Mask { .. } | Content::Glass(_) | Content::Shadow { .. } => false,
             }
     }
 
@@ -596,7 +620,10 @@ impl<const N: usize> Scene<N> {
                 },
                 (
                     Content::Surface {
-                        id, translucent, ..
+                        id,
+                        translucent,
+                        radius,
+                        ..
                     },
                     alpha,
                 ) => Command::Image {
@@ -606,6 +633,18 @@ impl<const N: usize> Scene<N> {
                     surface: id,
                     alpha,
                     translucent,
+                    radius,
+                },
+                (Content::Shadow { radius, blur }, alpha) => Command::Shadow {
+                    rect: Rect::new(
+                        shown.rect.x + blur as i32,
+                        shown.rect.y + blur as i32,
+                        shown.rect.width.saturating_sub(2 * blur as u32),
+                        shown.rect.height.saturating_sub(2 * blur as u32),
+                    ),
+                    radius,
+                    blur,
+                    alpha,
                 },
                 (Content::Glass(glass), alpha) => Command::Glass {
                     rect: shown.rect,
@@ -849,6 +888,7 @@ mod tests {
                 surface,
                 alpha,
                 translucent: false,
+                radius: 0,
             } => Some((x, y, src, surface, alpha)),
             _ => None,
         });
@@ -1194,6 +1234,7 @@ mod tests {
                             width: WINDOW.0,
                             height: WINDOW.1,
                             translucent: false,
+                            radius: 0,
                         };
                     }
                     ids.extend(scene.add(layer));

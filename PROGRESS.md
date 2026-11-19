@@ -92,3 +92,27 @@ Choices made without asking are marked **Choice:**.
 - Known gap: under `GPU=virtio` there is no wallpaper (the remote renderer
   only has programs' surfaces); the plain background shows instead.
 - Screenshot: `build/progress-3-wallpaper.png`.
+
+## 5. Window chrome
+
+- Every window is now: a soft shadow, a glass frame behind the title bar
+  and body (rounded to `corner_radius`, tinted with the accent while it has
+  the keyboard), macOS's three traffic lights, a centred bold title, and
+  the program's pixels with their lower corners rounded to match.
+- Unfocused windows get grey lights, a dimmer title and a lighter shadow.
+- Hovering the lights shows x / - / + glyphs on them, macOS-style; one
+  shared set of glyph layers moves to whichever window is hovered.
+- `buttons = right` (the `breeze` preset) puts them on the right, Plasma's
+  order: minimize, zoom, close.
+- A program names its window in `OPEN`'s fourth word (8 ASCII bytes);
+  `Window::open_titled` in the ui crate. The terminal is "Terminal".
+- Renderer: `Command::Shadow` (rounded-rect falloff, cut out where the
+  window is, so glass is never darkened) and a lower-corner radius on
+  `Command::Image`.
+- The red light is the close button now; `close-test` aims at it. PASS.
+- **Choice:** the title bar is 28 px, lights 12 px, 20 px apart, per the
+  macOS metrics in the apple-design reference.
+- Known gap: minimize and zoom do nothing yet (next item).
+- Known gap: the shadow has no drop. It is cut out by its own shape, so
+  dropping it would leave an unshaded strip under the window.
+- Screenshot: `build/progress-4-chrome.png`.

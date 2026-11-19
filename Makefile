@@ -261,9 +261,9 @@ close-test: iso
 	   echo "mouse_move -230 -190"; sleep 0.2; echo "mouse_move -230 -190"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
 	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
-	   echo "mouse_move 569 117"; sleep 0.5; \
+	   echo "mouse_move 0 120"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 1.5; \
-	   echo "mouse_move -349 163"; sleep 0.5; \
+	   echo "mouse_move 220 160"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 0.5; \
 	   for key in e x i t ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 1.5; \
 	   echo "screendump build/close.ppm"; sleep 2; echo quit ) \

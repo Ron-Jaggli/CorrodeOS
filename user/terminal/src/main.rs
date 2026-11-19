@@ -446,7 +446,7 @@ fn main() {
         println!("no memory for a heap");
         corrode_rt::exit();
     }
-    let window = match Window::open(WIDTH, HEIGHT, false) {
+    let window = match Window::open_titled(WIDTH, HEIGHT, 0, "Terminal") {
         Ok(window) => window,
         Err(error) => {
             println!("no window: {:?}", error);

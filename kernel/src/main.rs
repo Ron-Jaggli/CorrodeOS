@@ -2075,6 +2075,7 @@ extern "C" fn window_server() {
                     size(words[0]),
                     size(words[1]),
                     words[2],
+                    words[3],
                     received.from,
                 )
             })
@@ -4492,7 +4493,7 @@ fn render_loop(renderer: &mut Screen) -> ! {
                 continue;
             };
             if renderer.show_surface(surface, WINDOW_SURFACES + surface) {
-                desk.manage(index, &mut *stage.scene, now);
+                desk.manage(renderer, index, &mut *stage.scene, now);
             } else {
                 println!("desktop    : the renderer cannot show window {index}");
             }

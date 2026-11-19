@@ -97,6 +97,16 @@ impl Window {
     /// As [`Window::open`], with the flags `window::OPEN` takes: docked,
     /// translucent.
     pub fn open_with(width: u32, height: u32, flags: u64) -> Result<Window> {
+        Self::open_titled(width, height, flags, "")
+    }
+
+    /// As [`Window::open_with`], with a title for the window's title bar:
+    /// its first eight ASCII characters.
+    pub fn open_titled(width: u32, height: u32, flags: u64, title: &str) -> Result<Window> {
+        let mut name = [0u8; 8];
+        for (slot, byte) in name.iter_mut().zip(title.bytes().filter(u8::is_ascii)) {
+            *slot = byte;
+        }
         let answer = corrode_rt::call(
             app::WINDOWS,
             Message::new(
@@ -105,7 +115,7 @@ impl Window {
                     width as u64,
                     height as u64,
                     flags,
-                    0,
+                    u64::from_le_bytes(name),
                 ],
             ),
             Some(app::WINDOW),

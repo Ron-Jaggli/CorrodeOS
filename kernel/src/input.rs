@@ -8,8 +8,9 @@
 //!
 //! The painter's half lives here too, as [`Desk`]: a pointer that follows the
 //! mouse and stays on top, and the window manager. A program's window gets a
-//! title bar; clicking a window gives it the keyboard and brings it to the
-//! front, and dragging its bar moves it. Keys go to the window with the
+//! frame of glass with a title bar, macOS's three buttons and a shadow;
+//! clicking a window gives it the keyboard and brings it to the front, and
+//! dragging its bar moves it. Keys go to the window with the
 //! keyboard, or, when none has it, to a line of typed text on the boot
 //! screen.
 
@@ -21,6 +22,7 @@ use corrode_render::anim::{Animation, Ease, Fx};
 use corrode_render::scene::{Layer, LayerId, Scene};
 use corrode_render::{Color, Rect, Renderer};
 use corrode_text::{Coverage, Style};
+use corrode_theme::{Buttons, Theme};
 
 use crate::arch::x86_64::without_interrupts;
 use crate::cap::CapPtr;
@@ -178,13 +180,6 @@ fn drain() -> Vec<Event> {
 pub const ATLAS_ROW: u32 = 256;
 /// The pointer's box, with room around the arrow for its outline.
 const POINTER_SIZE: (u32, u32) = (16, 22);
-/// The close button's cross, to the right of the pointer's two stencils.
-const CLOSE_SRC: Rect = Rect::new(
-    2 * POINTER_SIZE.0 as i32,
-    ATLAS_ROW as i32,
-    CLOSE_SIZE,
-    CLOSE_SIZE,
-);
 /// The typed line's block: the atlas's whole width, enough rows for the
 /// style below.
 const LINE_ROW: u32 = ATLAS_ROW + 32;
@@ -233,14 +228,57 @@ fn arrow(grow: i32) -> Vec<u8> {
     coverage
 }
 
+
 /// Height of a window's title bar.
-const BAR: u32 = 22;
-const BAR_FOCUSED: Color = Color::rgb(0xb7, 0x41, 0x0e);
-const BAR_IDLE: Color = Color::rgb(0x3a, 0x3d, 0x45);
-/// The close button: a cross at the right of the bar, kept in the atlas
-/// beside the pointer.
-const CLOSE_SIZE: u32 = 12;
-const CLOSE_COLOR: Color = Color::rgb(0xf2, 0xee, 0xe8);
+const BAR: u32 = 28;
+
+/// The window buttons: a dot each, in the order a title bar shows them.
+const LIGHT: u32 = 12;
+/// Centre to centre.
+const LIGHT_STEP: i32 = 20;
+/// From the bar's nearer end to the nearest dot's edge.
+const LIGHT_INSET: i32 = 14;
+
+/// What each button does, and its colour, macOS's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Button {
+    Close,
+    Minimize,
+    Zoom,
+}
+
+impl Button {
+    const fn color(self) -> Color {
+        match self {
+            Button::Close => Color::rgb(0xff, 0x5f, 0x57),
+            Button::Minimize => Color::rgb(0xfe, 0xbc, 0x2e),
+            Button::Zoom => Color::rgb(0x28, 0xc8, 0x40),
+        }
+    }
+}
+
+/// Where each button's stencil is in the atlas: to the right of the
+/// pointer's two, the dot and then the glyph drawn over it on hover.
+const DOT_SRC: Rect = Rect::new(2 * POINTER_SIZE.0 as i32, ATLAS_ROW as i32, LIGHT, LIGHT);
+const GLYPH_SRC: [Rect; 3] = [
+    Rect::new(2 * POINTER_SIZE.0 as i32 + LIGHT as i32, ATLAS_ROW as i32, LIGHT, LIGHT),
+    Rect::new(2 * POINTER_SIZE.0 as i32 + 2 * LIGHT as i32, ATLAS_ROW as i32, LIGHT, LIGHT),
+    Rect::new(2 * POINTER_SIZE.0 as i32 + 3 * LIGHT as i32, ATLAS_ROW as i32, LIGHT, LIGHT),
+];
+const GLYPH_COLOR: Color = Color::rgb(0x4d, 0x1f, 0x10);
+
+/// Title text: slots in the atlas below the typed line, four across.
+const TITLE_ROW: u32 = ATLAS_ROW + 64;
+const TITLE_SLOT: (u32, u32) = (256, 22);
+const TITLE_SLOTS: usize = 4 * ((512 - TITLE_ROW) / TITLE_SLOT.1) as usize;
+const TITLE_STYLE: Style = Style::px(14).weight(corrode_text::Weight::Bold);
+
+/// How far a window's shadow spreads, and how far down it falls. The
+/// shadow is cut out where its shape is, so a drop would leave an unshaded
+/// strip under the window; it stays put until shadows can be cut by the
+/// window rather than by themselves.
+const SHADOW_BLUR: u8 = 26;
+const SHADOW_DROP: i32 = 0;
 
 /// The dock floats this far above the bottom edge, with this much around
 /// its icons.
@@ -249,33 +287,33 @@ const DOCK_PAD: u32 = 8;
 /// Icons in the dock, for now.
 const DOCK_ICONS: u32 = 4;
 
-/// A pane of the desktop's material at `rect`: glass, or a solid colour
-/// where the theme has glass off.
-fn pane(rect: Rect, radius: u16, theme: &corrode_theme::Theme) -> Layer {
-    match theme.pane(radius) {
-        Some(glass) => Layer::glass(rect, glass),
-        None => Layer::solid(rect, theme.surface()),
-    }
-}
-
-/// The close button's cross, as coverage out of 255: both diagonals, a
-/// pixel and three quarters thick, sampled four by four per pixel.
-fn cross() -> Vec<u8> {
-    let size = CLOSE_SIZE as i32;
+/// One of the window buttons' stencils, as coverage out of 255: a disc,
+/// or the glyph drawn over it -- a cross, a bar, a plus -- each sampled
+/// four by four per pixel.
+fn stencil(kind: Option<Button>) -> Vec<u8> {
+    let size = LIGHT as i32;
     let mut coverage = alloc::vec![0u8; (size * size) as usize];
-    // In eighths of a pixel, so every sample is a whole number.
-    let (low, high) = (2 * 8, (size - 2) * 8);
+    // In eighths of a pixel, from the centre.
+    let half = size * 4;
+    let inside = |x: i32, y: i32| -> bool {
+        let (dx, dy) = (x - half, y - half);
+        match kind {
+            None => dx * dx + dy * dy <= (half - 2) * (half - 2),
+            Some(Button::Close) => {
+                dx.abs() <= 22 && dy.abs() <= 22 && ((dx - dy).abs() <= 7 || (dx + dy).abs() <= 7)
+            }
+            Some(Button::Minimize) => dx.abs() <= 24 && dy.abs() <= 5,
+            Some(Button::Zoom) => {
+                (dx.abs() <= 24 && dy.abs() <= 5) || (dy.abs() <= 24 && dx.abs() <= 5)
+            }
+        }
+    };
     for py in 0..size {
         for px in 0..size {
             let mut hits = 0;
             for sy in 0..4 {
                 for sx in 0..4 {
-                    let (x, y) = (px * 8 + sx * 2 + 1, py * 8 + sy * 2 + 1);
-                    let inside = (low..=high).contains(&x) && (low..=high).contains(&y);
-                    // Ten eighths along an axis is about seven across a
-                    // diagonal: half the stroke.
-                    let on_line = (x - y).abs() <= 10 || (x + y - size * 8).abs() <= 10;
-                    hits += (inside && on_line) as i32;
+                    hits += inside(px * 8 + sx * 2 + 1, py * 8 + sy * 2 + 1) as i32;
                 }
             }
             coverage[(py * size + px) as usize] = (hits * 255 / 16) as u8;
@@ -284,40 +322,120 @@ fn cross() -> Vec<u8> {
     coverage
 }
 
-/// A program's window, as the painter keeps it.
+/// A pane of the desktop's material at `rect`: glass, or a solid colour
+/// where the theme has glass off.
+fn pane(rect: Rect, radius: u16, theme: &Theme) -> Layer {
+    match theme.pane(radius) {
+        Some(glass) => Layer::glass(rect, glass),
+        None => Layer::solid(rect, theme.surface()),
+    }
+}
+
+/// A window, as the painter keeps it.
 struct Managed {
     window: usize,
     surface: usize,
-    /// The title bar, which a docked window does not have.
-    bar: Option<LayerId>,
-    /// The close button on the bar.
-    close: Option<LayerId>,
-    /// A pane of glass behind the window, for a docked one.
-    pane: Option<LayerId>,
-    body: LayerId,
-    /// Where the window's top left is -- its bar's, if it has one.
+    docked: bool,
+    /// Where the window's top left is -- its title bar's, if it has one.
     at: (i32, i32),
     width: u32,
-    docked: bool,
+    height: u32,
+    /// Under everything else of it.
+    shadow: Option<LayerId>,
+    /// The glass behind the title bar and the body: the whole window.
+    frame: Option<LayerId>,
+    /// The buttons, in the order they sit along the bar.
+    lights: [Option<(Button, LayerId)>; 3],
+    /// The title, its slot in the atlas, and how wide it came out.
+    title: Option<(LayerId, usize, u32)>,
+    body: LayerId,
+}
+
+/// What part of a window a layer is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Part {
+    Shadow,
+    /// The title bar: the frame, or the title on it.
+    Bar,
+    Light(Button),
+    Body,
 }
 
 impl Managed {
-    fn body_at(&self) -> (i32, i32) {
-        let bar = if self.bar.is_some() { BAR as i32 } else { 0 };
-        (self.at.0, self.at.1 + bar)
+    fn bar(&self) -> u32 {
+        if self.docked {
+            0
+        } else {
+            BAR
+        }
     }
 
-    /// Where the close button goes, for a window whose bar is at `at`.
-    fn close_at(at: (i32, i32), width: u32) -> (i32, i32) {
-        let inset = ((BAR - CLOSE_SIZE) / 2) as i32;
-        (at.0 + width as i32 - CLOSE_SIZE as i32 - inset, at.1 + inset)
-    }
-
-    /// Every layer the window is drawn with, bottom first.
-    fn layers(&self) -> impl Iterator<Item = LayerId> {
-        [self.pane, self.bar, self.close, Some(self.body)]
+    /// Every layer of the window, bottom first.
+    fn layers(&self) -> impl Iterator<Item = LayerId> + '_ {
+        self.shadow
             .into_iter()
-            .flatten()
+            .chain(self.frame)
+            .chain(self.lights.iter().flatten().map(|(_, id)| *id))
+            .chain(self.title.map(|(id, ..)| id))
+            .chain(Some(self.body))
+    }
+
+    /// Which part of the window `id` is, if it is any.
+    fn part(&self, id: LayerId) -> Option<Part> {
+        if self.shadow == Some(id) {
+            Some(Part::Shadow)
+        } else if self.body == id {
+            Some(Part::Body)
+        } else if self.frame == Some(id) || self.title.is_some_and(|(title, ..)| title == id) {
+            Some(Part::Bar)
+        } else {
+            self.lights
+                .iter()
+                .flatten()
+                .find(|(_, light)| *light == id)
+                .map(|(button, _)| Part::Light(*button))
+        }
+    }
+
+    /// Where the `index`th button along the bar goes, for a window at `at`.
+    fn light_at(&self, at: (i32, i32), index: usize, buttons: Buttons) -> (i32, i32) {
+        let y = at.1 + (BAR - LIGHT) as i32 / 2;
+        let x = match buttons {
+            Buttons::Left => at.0 + LIGHT_INSET + index as i32 * LIGHT_STEP,
+            Buttons::Right => {
+                at.0 + self.width as i32 - LIGHT_INSET - LIGHT as i32 - (2 - index as i32) * LIGHT_STEP
+            }
+        };
+        (x, y)
+    }
+
+    /// Every layer and where its top left goes, for a window at `at`.
+    fn places(&self, at: (i32, i32), buttons: Buttons) -> Vec<(LayerId, (i32, i32))> {
+        let mut places = Vec::new();
+        let blur = SHADOW_BLUR as i32;
+        if let Some(shadow) = self.shadow {
+            places.push((shadow, (at.0 - blur, at.1 - blur + SHADOW_DROP)));
+        }
+        if let Some(frame) = self.frame {
+            places.push((frame, at));
+        }
+        for (index, light) in self.lights.iter().enumerate() {
+            if let Some((_, id)) = light {
+                places.push((*id, self.light_at(at, index, buttons)));
+            }
+        }
+        if let Some((title, _, width)) = self.title {
+            let height = corrode_text::measure("Ag", TITLE_STYLE).height;
+            places.push((
+                title,
+                (
+                    at.0 + (self.width as i32 - width as i32) / 2,
+                    at.1 + (BAR as i32 - height as i32) / 2,
+                ),
+            ));
+        }
+        places.push((self.body, (at.0, at.1 + self.bar() as i32)));
+        places
     }
 }
 
@@ -326,10 +444,6 @@ impl Managed {
 pub struct Desk {
     /// Outline below, fill above, moving together.
     pointer: Option<[LayerId; 2]>,
-    /// Whether the close button's cross made it into the atlas.
-    cross: bool,
-    /// The dock's pane, along the bottom of the screen.
-    dock: Option<LayerId>,
     at: (i32, i32),
     buttons: u8,
     line: Option<LayerId>,
@@ -337,6 +451,18 @@ pub struct Desk {
     line_height: u32,
     /// Whether the first movement has been reported.
     moved: bool,
+    /// Whether the buttons' stencils made it into the atlas.
+    stencils: bool,
+    /// The glyphs shown over the buttons of the window the pointer is over:
+    /// one set, moved to wherever it is wanted.
+    glyphs: [Option<LayerId>; 3],
+    /// Which window's buttons they are over now.
+    hovering: Option<usize>,
+    /// Title slots in the atlas in use, one bit each.
+    titles: u64,
+    /// The dock's pane, along the bottom of the screen.
+    dock: Option<LayerId>,
+    theme: Theme,
     windows: Vec<Managed>,
     /// Which of `windows` has the keyboard.
     focus: Option<usize>,
@@ -371,9 +497,11 @@ impl Desk {
             }
         }
 
-        let cross = renderer
-            .upload_mask(CLOSE_SRC, &cross())
-            .is_ok();
+        let stencils = renderer.upload_mask(DOT_SRC, &stencil(None)).is_ok()
+            && [Button::Close, Button::Minimize, Button::Zoom]
+                .iter()
+                .zip(GLYPH_SRC)
+                .all(|(button, src)| renderer.upload_mask(src, &stencil(Some(*button))).is_ok());
 
         let theme = crate::look::current();
         let size = theme.dock_size as u32;
@@ -400,14 +528,18 @@ impl Desk {
         let line_height = corrode_text::measure("> ", LINE_STYLE).height;
         let mut desk = Self {
             pointer,
-            cross,
-            dock,
             at: (screen.width as i32 / 2, screen.height as i32 / 2),
             buttons: 0,
             line: None,
             typed: String::new(),
             line_height,
             moved: false,
+            stencils,
+            glyphs: [None; 3],
+            hovering: None,
+            titles: 0,
+            dock,
+            theme,
             windows: Vec::new(),
             focus: None,
             drag: None,
@@ -539,13 +671,49 @@ impl Desk {
         }
     }
 
-    /// Give the painter a window the server has made: a place, a bar, and
-    /// the keyboard. It rises into place and fades in, like everything
-    /// else that arrives.
-    pub fn manage<const N: usize>(&mut self, window: usize, scene: &mut Scene<N>, now: u64) {
+    /// Draw a window's title into a free slot of the atlas. The slot, and
+    /// how wide the title came out.
+    fn draw_title<R: Renderer>(&mut self, renderer: &mut R, title: &str) -> Option<(usize, u32)> {
+        if title.is_empty() {
+            return None;
+        }
+        let slot = (0..TITLE_SLOTS).find(|slot| self.titles & 1 << slot == 0)?;
+        let (width, height) = TITLE_SLOT;
+        let extent = corrode_text::measure(title, TITLE_STYLE);
+        if extent.width > width || extent.height > height {
+            return None;
+        }
+        let mut coverage = alloc::vec![0u8; (width * height) as usize];
+        corrode_text::draw(title, TITLE_STYLE, &mut Coverage::new(&mut coverage, width as usize));
+        renderer.upload_mask(Self::title_src(slot, width), &coverage).ok()?;
+        self.titles |= 1 << slot;
+        Some((slot, extent.width))
+    }
+
+    fn title_src(slot: usize, width: u32) -> Rect {
+        let (slot_width, slot_height) = TITLE_SLOT;
+        Rect::new(
+            (slot % 4) as i32 * slot_width as i32,
+            TITLE_ROW as i32 + (slot / 4) as i32 * slot_height as i32,
+            width.min(slot_width),
+            slot_height,
+        )
+    }
+
+    /// Give the painter a window the server has made: a place, a frame of
+    /// glass with buttons and a title, a shadow, and the keyboard. It rises
+    /// into place and fades in, like everything else that arrives.
+    pub fn manage<R: Renderer, const N: usize>(
+        &mut self,
+        renderer: &mut R,
+        window: usize,
+        scene: &mut Scene<N>,
+        now: u64,
+    ) {
         let Some((surface, width, height, docked)) = crate::windows::shape(window) else {
             return;
         };
+        let theme = self.theme;
         let at = if docked {
             (0, 0)
         } else {
@@ -553,68 +721,139 @@ impl Desk {
             self.placed += 1;
             (120 + 40 * step, 90 + 36 * step)
         };
-        let bar = (!docked)
-            .then(|| scene.add(Layer::solid(Rect::new(at.0, at.1, width, BAR), BAR_IDLE)))
-            .flatten();
-        let close = (bar.is_some() && self.cross)
+        let radius = if docked { 0 } else { theme.radius as u16 };
+        let translucent = crate::windows::translucent(window);
+
+        // Bottom first, so each lands above the last.
+        let shadow = (!docked && theme.shadows)
             .then(|| {
-                let (x, y) = Managed::close_at(at, width);
-                scene.add(Layer::mask(x, y, CLOSE_SRC, CLOSE_COLOR))
+                scene.add(Layer::shadow(0, 0, width, height + BAR, radius, SHADOW_BLUR))
             })
             .flatten();
-        let mut managed_body_y = at.1;
-        if bar.is_some() {
-            managed_body_y += BAR as i32;
+        let frame_height = height + if docked { 0 } else { BAR };
+        let frame = scene.add(pane(Rect::new(0, 0, width, frame_height), radius, &theme));
+        let mut lights = [None; 3];
+        if !docked && self.stencils {
+            let order = match theme.buttons {
+                Buttons::Left => [Button::Close, Button::Minimize, Button::Zoom],
+                Buttons::Right => [Button::Minimize, Button::Zoom, Button::Close],
+            };
+            for (slot, button) in lights.iter_mut().zip(order) {
+                *slot = scene
+                    .add(Layer::mask(0, 0, DOT_SRC, button.color()))
+                    .map(|id| (button, id));
+            }
         }
-        let translucent = crate::windows::translucent(window);
-        // A docked window is a pane of glass with the program's pixels
-        // over it; transparent ones let the glass through.
-        let theme = crate::look::current();
-        let pane = docked
-            .then(|| scene.add(pane(Rect::new(at.0, at.1, width, height), 0, &theme)))
-            .flatten();
-        let make = if translucent {
-            Layer::translucent_surface
+        let title = if docked {
+            None
         } else {
-            Layer::surface
+            self.draw_title(renderer, &crate::windows::title(window))
+                .and_then(|(slot, text_width)| {
+                    let src = Self::title_src(slot, text_width);
+                    scene
+                        .add(Layer::mask(0, 0, src, theme.text()))
+                        .map(|id| (id, slot, text_width))
+                })
         };
-        let Some(body) = scene.add(make(at.0, managed_body_y, surface as u32, width, height)) else {
+        let mut body = if translucent {
+            Layer::translucent_surface(0, 0, surface as u32, width, height)
+        } else {
+            Layer::surface(0, 0, surface as u32, width, height)
+        };
+        if let corrode_render::scene::Content::Surface { radius: corner, .. } = &mut body.content {
+            *corner = radius.min(255) as u8;
+        }
+        let Some(body) = scene.add(body) else {
             println!("desktop    : no room in the scene for another window");
-            for id in [bar, close, pane].into_iter().flatten() {
+            for id in shadow
+                .into_iter()
+                .chain(frame)
+                .chain(lights.iter().flatten().map(|(_, id)| *id))
+                .chain(title.map(|(id, ..)| id))
+            {
                 scene.remove(id);
+            }
+            if let Some((_, slot, _)) = title {
+                self.titles &= !(1 << slot);
             }
             return;
         };
-        if !docked {
-            for id in [bar, close, Some(body)].into_iter().flatten() {
-                if let Some(layer) = scene.layer_mut(id) {
-                    let rest = layer.y.sample(now).value;
+
+        let managed = Managed {
+            window,
+            surface,
+            docked,
+            at,
+            width,
+            height,
+            shadow,
+            frame,
+            lights,
+            title,
+            body,
+        };
+        let rise = theme.ms(250);
+        for (id, (x, y)) in managed.places(at, theme.buttons) {
+            if let Some(layer) = scene.layer_mut(id) {
+                layer.x = Animation::rest(Fx::from_int(x));
+                layer.y = Animation::rest(Fx::from_int(y));
+                if !docked && rise > 0 {
                     layer.opacity =
-                        Animation::ease(now, 250, Fx::ZERO, Fx::from_int(255), Ease::Out);
+                        Animation::ease(now, rise, Fx::ZERO, Fx::from_int(255), Ease::Out);
                     layer.y = Animation::spring(
                         now,
-                        Fx::from_int(rest.round() + 24),
-                        rest,
+                        Fx::from_int(y + 24),
+                        Fx::from_int(y),
                         corrode_render::anim::Velocity::ZERO,
                         corrode_render::anim::Spring::SMOOTH,
                     );
                 }
             }
         }
-        self.windows.push(Managed {
-            window,
-            surface,
-            bar,
-            close,
-            pane,
-            body,
-            at,
-            width,
-            docked,
-        });
+        self.windows.push(managed);
         crate::windows::push(window, window::THEME, theme.to_words());
+        let index = self.windows.len() - 1;
+        self.paint_focus(scene, index, false);
         if !docked {
-            self.set_focus(scene, Some(self.windows.len() - 1));
+            self.set_focus(scene, Some(index));
+        }
+    }
+
+    /// Show window `index` as having the keyboard or not: a tint of the
+    /// accent in its glass, coloured buttons, a bright title and a deeper
+    /// shadow -- or a plain pane, grey buttons, a dim title, a light shadow.
+    fn paint_focus<const N: usize>(&self, scene: &mut Scene<N>, index: usize, focused: bool) {
+        let Some(managed) = self.windows.get(index) else {
+            return;
+        };
+        if managed.docked {
+            return;
+        }
+        let theme = &self.theme;
+        if let Some(layer) = managed.frame.and_then(|id| scene.layer_mut(id)) {
+            if let corrode_render::scene::Content::Glass(glass) = &mut layer.content {
+                glass.tint = theme.accent;
+                glass.tint_amount = if focused { 40 } else { theme.tint_amount };
+                if !focused && theme.tint_amount > 0 {
+                    glass.tint = theme.tint;
+                }
+            }
+        }
+        let idle = if theme.dark {
+            Color::rgb(0x55, 0x56, 0x5c)
+        } else {
+            Color::rgb(0xc8, 0xc8, 0xcc)
+        };
+        for (button, id) in managed.lights.iter().flatten() {
+            if let Some(layer) = scene.layer_mut(*id) {
+                layer.color = if focused { button.color() } else { idle };
+            }
+        }
+        if let Some(layer) = managed.title.and_then(|(id, ..)| scene.layer_mut(id)) {
+            layer.opacity = Animation::rest(Fx::from_int(if focused { 255 } else { 140 }));
+        }
+        if let Some(layer) = managed.shadow.and_then(|id| scene.layer_mut(id)) {
+            layer.opacity = Animation::rest(Fx::from_int(if focused { 120 } else { 70 }));
         }
     }
 
@@ -625,24 +864,27 @@ impl Desk {
             return;
         }
         for (which, gained) in [(self.focus, false), (index, true)] {
-            let Some(managed) = which.and_then(|which| self.windows.get(which)) else {
+            let Some(which) = which else {
+                continue;
+            };
+            let Some(managed) = self.windows.get(which) else {
                 continue;
             };
             crate::windows::push(managed.window, window::FOCUS, [gained as u64, 0, 0, 0]);
-            if let Some(layer) = managed.bar.and_then(|bar| scene.layer_mut(bar)) {
-                layer.color = if gained { BAR_FOCUSED } else { BAR_IDLE };
-            }
             if gained {
-                for id in managed.layers() {
+                let ids: Vec<LayerId> = managed.layers().collect();
+                for id in ids {
                     scene.raise(id);
                 }
             }
+            self.paint_focus(scene, which, gained);
         }
         self.focus = index;
         self.restack(scene);
     }
 
-    /// Docked windows above every other window, and the pointer above all.
+    /// The dock and docked windows above every other window, the button
+    /// glyphs above them, and the pointer above all.
     fn restack<const N: usize>(&self, scene: &mut Scene<N>) {
         let wanted = self.pointer.map(|layers| layers[1]);
         if wanted.is_some() && scene.top() == wanted {
@@ -656,29 +898,48 @@ impl Desk {
                 scene.raise(id);
             }
         }
+        for glyph in self.glyphs.iter().flatten() {
+            scene.raise(*glyph);
+        }
         if let Some([below, above]) = self.pointer {
             scene.raise(below);
             scene.raise(above);
         }
     }
 
-    /// A button went down or up. What is under the pointer decides what it
-    /// means: a bar is picked up, a window body is given the keyboard and
-    /// told, and anything else takes the keyboard away from every window.
-    fn click<const N: usize>(&mut self, scene: &mut Scene<N>, buttons: u8, pressed: u8) {
-        // The pointer is always on top and always under itself, so it is
-        // looked past.
+    /// What is under the pointer: the window and which part of it, looking
+    /// past the pointer, the glyphs and shadows, which are never what was
+    /// meant. `Err` with whether anything else at all is there.
+    fn under<const N: usize>(&self, scene: &Scene<N>) -> Result<(usize, Part), bool> {
         let pointer = self.pointer.unwrap_or([LayerId::NONE; 2]);
-        let under = scene
-            .layers_at(self.at.0, self.at.1)
-            .find(|id| !pointer.contains(id));
-        let hit = under.and_then(|id| {
-            self.windows
+        let mut any = false;
+        for id in scene.layers_at(self.at.0, self.at.1) {
+            if pointer.contains(&id) || self.glyphs.contains(&Some(id)) {
+                continue;
+            }
+            let found = self
+                .windows
                 .iter()
-                .position(|managed| managed.layers().any(|layer| layer == id))
-                .map(|index| (index, id != self.windows[index].body))
-        });
-        let on_close = hit.is_some_and(|(index, _)| under == self.windows[index].close);
+                .enumerate()
+                .find_map(|(index, managed)| managed.part(id).map(|part| (index, part)));
+            match found {
+                Some((_, Part::Shadow)) => continue,
+                Some(hit) => return Ok(hit),
+                None => {
+                    any = true;
+                    break;
+                }
+            }
+        }
+        Err(any)
+    }
+
+    /// A button went down or up. What is under the pointer decides what it
+    /// means: a bar is picked up, a window button pressed, a window body
+    /// given the keyboard and told, and anything else takes the keyboard
+    /// away from every window.
+    fn click<const N: usize>(&mut self, scene: &mut Scene<N>, buttons: u8, pressed: u8) {
+        let hit = self.under(scene);
 
         if pressed & 1 != 0 {
             println!(
@@ -686,35 +947,42 @@ impl Desk {
                 self.at.0,
                 self.at.1,
                 match hit {
-                    Some(_) if on_close => "a close button",
-                    Some((_, true)) => "a title bar",
-                    Some(_) => "a window",
-                    None if under.is_some() => "a layer",
-                    None => "the background",
+                    Ok((_, Part::Light(Button::Close))) => "a close button",
+                    Ok((_, Part::Light(Button::Minimize))) => "a minimize button",
+                    Ok((_, Part::Light(Button::Zoom))) => "a zoom button",
+                    Ok((_, Part::Bar)) => "a title bar",
+                    Ok(_) => "a window",
+                    Err(true) => "a layer",
+                    Err(false) => "the background",
                 }
             );
             match hit {
-                Some((index, on_bar)) => {
+                Ok((index, part)) => {
                     if !self.windows[index].docked {
                         self.set_focus(scene, Some(index));
                     }
-                    if on_close {
-                        // Asked, not done: the window goes when its
-                        // program does.
-                        crate::windows::push(self.windows[index].window, window::CLOSE, [0; 4]);
-                    } else if on_bar {
-                        let (x, y) = self.windows[index].at;
-                        self.drag = Some((index, self.at.0 - x, self.at.1 - y));
+                    match part {
+                        // Asked, not done: the window goes when its program
+                        // does.
+                        Part::Light(Button::Close) => {
+                            crate::windows::push(self.windows[index].window, window::CLOSE, [0; 4])
+                        }
+                        Part::Light(_) => {}
+                        Part::Bar => {
+                            let (x, y) = self.windows[index].at;
+                            self.drag = Some((index, self.at.0 - x, self.at.1 - y));
+                        }
+                        Part::Body | Part::Shadow => {}
                     }
                 }
-                None => self.set_focus(scene, None),
+                Err(_) => self.set_focus(scene, None),
             }
         }
 
         // A click on a window's body is the program's to interpret.
-        if let Some((index, false)) = hit {
+        if let Ok((index, Part::Body)) = hit {
             let managed = &self.windows[index];
-            let (x, y) = managed.body_at();
+            let (x, y) = (managed.at.0, managed.at.1 + managed.bar() as i32);
             crate::windows::push(
                 managed.window,
                 window::BUTTON,
@@ -726,6 +994,50 @@ impl Desk {
                 ],
             );
         }
+    }
+
+    /// Show the glyphs on the buttons of the window the pointer is over the
+    /// buttons of, as macOS does: the dots say nothing until you reach for
+    /// them.
+    fn hover<const N: usize>(&mut self, scene: &mut Scene<N>) {
+        let over = match self.under(scene) {
+            Ok((index, Part::Light(_))) => Some(index),
+            _ => None,
+        };
+        if over == self.hovering {
+            return;
+        }
+        self.hovering = over;
+        let theme = self.theme;
+        for (slot, src) in GLYPH_SRC.iter().enumerate() {
+            let button = [Button::Close, Button::Minimize, Button::Zoom][slot];
+            let place = over.and_then(|index| {
+                let managed = &self.windows[index];
+                let position = managed.lights.iter().position(|light| {
+                    light.is_some_and(|(which, _)| which == button)
+                })?;
+                Some(managed.light_at(managed.at, position, theme.buttons))
+            });
+            match (place, self.glyphs[slot]) {
+                (Some((x, y)), Some(id)) => {
+                    if let Some(layer) = scene.layer_mut(id) {
+                        layer.x = Animation::rest(Fx::from_int(x));
+                        layer.y = Animation::rest(Fx::from_int(y));
+                        layer.opacity = Animation::rest(Fx::from_int(255));
+                    }
+                }
+                (Some((x, y)), None) => {
+                    self.glyphs[slot] = scene.add(Layer::mask(x, y, *src, GLYPH_COLOR));
+                }
+                (None, Some(id)) => {
+                    if let Some(layer) = scene.layer_mut(id) {
+                        layer.opacity = Animation::rest(Fx::ZERO);
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+        self.restack(scene);
     }
 
     /// Take away the windows whose programs have finished: exited, perhaps
@@ -741,6 +1053,9 @@ impl Desk {
             for id in managed.layers() {
                 scene.remove(id);
             }
+            if let Some((_, slot, _)) = managed.title {
+                self.titles &= !(1 << slot);
+            }
             println!("desktop    : window {} closed", managed.window);
             // Indices past this one have moved down by one.
             let shift = |at: usize| match at.cmp(&index) {
@@ -752,6 +1067,12 @@ impl Desk {
             self.drag = self
                 .drag
                 .and_then(|(at, x, y)| shift(at).map(|at| (at, x, y)));
+            self.hovering = None;
+            for glyph in self.glyphs.iter().flatten() {
+                if let Some(layer) = scene.layer_mut(*glyph) {
+                    layer.opacity = Animation::rest(Fx::ZERO);
+                }
+            }
         }
     }
 
@@ -805,21 +1126,18 @@ impl Desk {
                 self.drag = None;
             } else if let Some(managed) = self.windows.get_mut(index) {
                 managed.at = (self.at.0 - grab_x, (self.at.1 - grab_y).max(0));
-                let (x, y) = managed.at;
-                let (body_x, body_y) = managed.body_at();
-                let width = managed.width;
-                for (id, (x, y)) in [
-                    (managed.bar, (x, y)),
-                    (managed.close, Managed::close_at((x, y), width)),
-                    (Some(managed.body), (body_x, body_y)),
-                ] {
-                    if let Some(layer) = id.and_then(|id| scene.layer_mut(id)) {
+                let managed = &self.windows[index];
+                for (id, (x, y)) in managed.places(managed.at, self.theme.buttons) {
+                    if let Some(layer) = scene.layer_mut(id) {
                         layer.x = Animation::rest(Fx::from_int(x));
                         layer.y = Animation::rest(Fx::from_int(y));
                     }
                 }
+                // The glyphs go with the buttons they are on.
+                self.hovering = None;
             }
         }
+        self.hover(scene);
 
         let pressed = buttons & !self.buttons;
         let released = self.buttons & !buttons;

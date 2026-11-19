@@ -39,6 +39,8 @@ pub struct Window {
     pub height: u32,
     pub docked: bool,
     pub translucent: bool,
+    /// What its title bar says: up to eight bytes, unused ones zero.
+    title: [u8; 8],
     /// The task that asked for it. When it finishes, the window goes.
     owner: usize,
     events: VecDeque<(u64, [u64; 4])>,
@@ -60,7 +62,7 @@ pub fn set_screen(width: u32, height: u32) {
 
 /// Make a window for task `owner` and say its number. `None` if there is
 /// no surface left.
-pub fn open(width: u32, height: u32, flags: u64, owner: usize) -> Option<usize> {
+pub fn open(width: u32, height: u32, flags: u64, title: u64, owner: usize) -> Option<usize> {
     let docked = flags & window::DOCKED != 0;
     let translucent = flags & window::TRANSLUCENT != 0;
     let (width, height) = if docked {
@@ -80,6 +82,10 @@ pub fn open(width: u32, height: u32, flags: u64, owner: usize) -> Option<usize> 
             height,
             docked,
             translucent,
+            // Printable ASCII only: a title is drawn, never interpreted.
+            title: title
+                .to_le_bytes()
+                .map(|byte| if (b' '..=b'~').contains(&byte) { byte } else { 0 }),
             owner,
             events: VecDeque::new(),
             waiter: NOBODY,
@@ -102,6 +108,17 @@ pub fn shape(index: usize) -> Option<(usize, u32, u32, bool)> {
         let window = table.get(index)?;
         Some((window.surface, window.width, window.height, window.docked))
     })
+}
+
+/// What a window's title bar says.
+pub fn title(index: usize) -> alloc::string::String {
+    let title = without_interrupts(|| TABLE.lock().get(index).map(|window| window.title));
+    title
+        .unwrap_or_default()
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| *byte as char)
+        .collect()
 }
 
 /// Whether a window's pixels say how transparent they are.

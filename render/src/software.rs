@@ -362,6 +362,7 @@ impl SoftwareRenderer {
         surface: u32,
         alpha: u8,
         translucent: bool,
+        radius: u8,
         scissor: Option<Rect>,
     ) {
         if alpha == 0 {
@@ -403,8 +404,13 @@ impl SoftwareRenderer {
             // SAFETY: `clip` returned bounds already intersected with the
             // target.
             let row = unsafe { self.target_row(x0, row_y) };
+            // Rows the lower corners cut into, measured on the image as a
+            // whole, wherever the clip has put this row.
+            let (full_w, full_h) = (inside.width as i64 * Q8, inside.height as i64 * Q8);
+            let corner_row = radius > 0 && row_y as i64 >= top + inside.height as i64 - radius as i64;
+            let ly = (row_y as i64 - top) * Q8 + Q8 / 2;
 
-            if alpha == 255 && same_layout && !translucent {
+            if alpha == 255 && same_layout && !translucent && !corner_row {
                 // SAFETY: both spans are `width` pixels inside their buffers,
                 // and `attach_surface` was promised they do not overlap.
                 unsafe {
@@ -424,10 +430,15 @@ impl SoftwareRenderer {
                     let color = Color::rgb((pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8);
                     // An opaque surface's top byte is whatever the client
                     // left there, and means nothing.
-                    let alpha = match translucent {
+                    let mut alpha = match translucent {
                         true => crate::blend::div255((255 - (pixel >> 24)) * alpha as u32) as u8,
                         false => alpha,
                     };
+                    if corner_row {
+                        let lx = (x0 as i64 + offset as i64 - left) * Q8 + Q8 / 2;
+                        let field = glass::field(lx, ly, full_w, full_h, radius as i64 * Q8);
+                        alpha = crate::blend::div255(glass::coverage(&field) * alpha as u32) as u8;
+                    }
                     let target = row.add(offset);
                     match alpha {
                         0 => {}
@@ -436,6 +447,55 @@ impl SoftwareRenderer {
                             Blend::new(&format, color, alpha).over(target.read_unaligned()),
                         ),
                     }
+                }
+            }
+        }
+    }
+
+    /// The soft shadow around a rounded rectangle; see [`Command::Shadow`].
+    fn shadow(&mut self, rect: Rect, radius: u16, blur: u8, alpha: u8, scissor: Option<Rect>) {
+        if alpha == 0 || rect.is_empty() {
+            return;
+        }
+        let blur = blur.max(1) as i32;
+        let reach = Rect::new(
+            rect.x.saturating_sub(blur),
+            rect.y.saturating_sub(blur),
+            rect.width.saturating_add(2 * blur as u32),
+            rect.height.saturating_add(2 * blur as u32),
+        );
+        let Some((x0, y0, x1, y1)) = self.clip(reach, scissor) else {
+            return;
+        };
+        let format = self.info.format;
+        let (width, height) = (rect.width as i64 * Q8, rect.height as i64 * Q8);
+        let radius = radius as i64 * Q8;
+        let spread = blur as i64 * Q8;
+        for y in y0..y1 {
+            // SAFETY: `clip` returned bounds already intersected with the
+            // surface.
+            let row = unsafe { self.target_row(x0, y) };
+            let ly = (y as i64 - rect.y as i64) * Q8 + Q8 / 2;
+            for x in x0..x1 {
+                let lx = (x as i64 - rect.x as i64) * Q8 + Q8 / 2;
+                let distance = glass::field(lx, ly, width, height, radius).distance;
+                if distance <= 0 || distance >= spread {
+                    continue;
+                }
+                // Smoothstep from the edge out: a Gaussian's look, for the
+                // price of a square.
+                let t = 4096 - distance * 4096 / spread;
+                let fall = t * t / 4096 * (3 * 4096 - 2 * t) / 4096;
+                let dark = (fall * alpha as i64 / 4096) as u8;
+                if dark == 0 {
+                    continue;
+                }
+                // SAFETY: `x` is inside the clipped bounds, on this row.
+                unsafe {
+                    let pixel = row.add((x - x0) as usize);
+                    pixel.write_unaligned(
+                        Blend::new(&format, Color::BLACK, dark).over(pixel.read_unaligned()),
+                    );
                 }
             }
         }
@@ -655,7 +715,14 @@ impl Renderer for SoftwareRenderer {
                     surface,
                     alpha,
                     translucent,
-                } => self.image((x, y), src, surface, alpha, translucent, scissor),
+                    radius,
+                } => self.image((x, y), src, surface, alpha, translucent, radius, scissor),
+                Command::Shadow {
+                    rect,
+                    radius,
+                    blur,
+                    alpha,
+                } => self.shadow(rect, radius, blur, alpha, scissor),
                 Command::Scissor { rect } => scissor = Some(rect),
                 Command::Glass { rect, glass, alpha } => self.glass(rect, &glass, alpha, scissor),
             }
@@ -1034,6 +1101,7 @@ mod tests {
             surface: 3,
             alpha,
             translucent: false,
+            radius: 0,
         }
     }
 
@@ -1082,6 +1150,7 @@ mod tests {
             surface: 3,
             alpha: 255,
             translucent: false,
+            radius: 0,
         }]);
         assert_eq!(pixels[0], GREY);
         assert_eq!(pixels[(SIDE + 2) as usize], picture[0]);
@@ -1135,6 +1204,7 @@ mod tests {
             surface: 0,
             alpha: 255,
             translucent: false,
+            radius: 0,
         };
         // SAFETY: as in `pictured`; each surface is 2 * 2 pixels of its own.
         unsafe {

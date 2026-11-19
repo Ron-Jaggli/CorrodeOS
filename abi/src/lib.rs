@@ -195,7 +195,8 @@ pub mod app {
 /// The window server: one call to open a window, and the events a window
 /// then receives.
 pub mod window {
-    /// A call: open a window `word 0` by `word 1` pixels. Word 2 is 1 for a
+    /// A call: open a window `word 0` by `word 1` pixels, titled with the
+    /// up to eight ASCII bytes of word 3, little-endian. Word 2 is 1 for a
     /// panel docked along the top of the screen -- as wide as the screen,
     /// whatever was asked, with no title bar and never covered. The answer
     /// carries the window's capability and says its size in words 0 and 1.

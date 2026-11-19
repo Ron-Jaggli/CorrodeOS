@@ -227,6 +227,19 @@ pub enum Command {
         surface: u32,
         alpha: u8,
         translucent: bool,
+        /// Round the lower two corners to this radius. A window's body sits
+        /// under its title bar, so only its bottom corners are its own.
+        radius: u8,
+    },
+    /// The soft shadow of a rounded rectangle: `rect` is the shape, and the
+    /// shadow spreads `blur` pixels beyond it, at most `alpha` dark. Nothing
+    /// is drawn inside the shape itself, so a shadow never darkens a
+    /// translucent window it is under.
+    Shadow {
+        rect: Rect,
+        radius: u16,
+        blur: u8,
+        alpha: u8,
     },
     /// A pane of liquid glass over whatever is already inside `rect`: see
     /// [`glass`]. Like [`Command::BlendRect`] it reads the target, and
