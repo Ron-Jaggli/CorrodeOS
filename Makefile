@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test
+.PHONY: input-test terminal-test close-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -251,6 +251,29 @@ input-test: iso
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
 	@grep -E "^(input|ps2|panel|terminal) " build/serial.log || echo "input-test: nothing from the input path"
 	@test -s build/input.ppm && pnmtopng build/input.ppm > build/input.png 2>/dev/null && rm -f build/input.ppm && echo "wrote build/input.png" || true
+
+# Boot, open two terminals from the panel's button, close the one on top
+# with its title bar's close button and the other by typing exit. Both
+# windows should go; build/close.png shows the desktop they leave.
+close-test: iso
+	@rm -f build/close.ppm build/close.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -230 -190"; sleep 0.2; echo "mouse_move -230 -190"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
+	   echo "mouse_move 569 117"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 1.5; \
+	   echo "mouse_move -349 163"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 0.5; \
+	   for key in e x i t ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 1.5; \
+	   echo "screendump build/close.ppm"; sleep 2; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^(input|panel|terminal|desktop) " build/serial.log || echo "close-test: nothing from the desktop"
+	@test "$$(grep -c 'window .* closed' build/serial.log)" = 2 \
+	    && echo "close-test: both windows closed                             PASS" \
+	    || echo "close-test: both windows closed                             FAIL"
+	@test -s build/close.ppm && pnmtopng build/close.ppm > build/close.png 2>/dev/null && rm -f build/close.ppm && echo "wrote build/close.png" || true
 
 # Boot, open the terminal from the panel's button (the moves add up to the
 # button from where the pointer starts), and use its prompt: Tab to

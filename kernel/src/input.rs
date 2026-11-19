@@ -178,6 +178,13 @@ fn drain() -> Vec<Event> {
 pub const ATLAS_ROW: u32 = 256;
 /// The pointer's box, with room around the arrow for its outline.
 const POINTER_SIZE: (u32, u32) = (16, 22);
+/// The close button's cross, to the right of the pointer's two stencils.
+const CLOSE_SRC: Rect = Rect::new(
+    2 * POINTER_SIZE.0 as i32,
+    ATLAS_ROW as i32,
+    CLOSE_SIZE,
+    CLOSE_SIZE,
+);
 /// The typed line's block: the atlas's whole width, enough rows for the
 /// style below.
 const LINE_ROW: u32 = ATLAS_ROW + 32;
@@ -230,6 +237,36 @@ fn arrow(grow: i32) -> Vec<u8> {
 const BAR: u32 = 22;
 const BAR_FOCUSED: Color = Color::rgb(0xb7, 0x41, 0x0e);
 const BAR_IDLE: Color = Color::rgb(0x3a, 0x3d, 0x45);
+/// The close button: a cross at the right of the bar, kept in the atlas
+/// beside the pointer.
+const CLOSE_SIZE: u32 = 12;
+const CLOSE_COLOR: Color = Color::rgb(0xf2, 0xee, 0xe8);
+
+/// The close button's cross, as coverage out of 255: both diagonals, a
+/// pixel and three quarters thick, sampled four by four per pixel.
+fn cross() -> Vec<u8> {
+    let size = CLOSE_SIZE as i32;
+    let mut coverage = alloc::vec![0u8; (size * size) as usize];
+    // In eighths of a pixel, so every sample is a whole number.
+    let (low, high) = (2 * 8, (size - 2) * 8);
+    for py in 0..size {
+        for px in 0..size {
+            let mut hits = 0;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let (x, y) = (px * 8 + sx * 2 + 1, py * 8 + sy * 2 + 1);
+                    let inside = (low..=high).contains(&x) && (low..=high).contains(&y);
+                    // Ten eighths along an axis is about seven across a
+                    // diagonal: half the stroke.
+                    let on_line = (x - y).abs() <= 10 || (x + y - size * 8).abs() <= 10;
+                    hits += (inside && on_line) as i32;
+                }
+            }
+            coverage[(py * size + px) as usize] = (hits * 255 / 16) as u8;
+        }
+    }
+    coverage
+}
 
 /// A program's window, as the painter keeps it.
 struct Managed {
@@ -237,9 +274,12 @@ struct Managed {
     surface: usize,
     /// The title bar, which a docked window does not have.
     bar: Option<LayerId>,
+    /// The close button on the bar.
+    close: Option<LayerId>,
     body: LayerId,
     /// Where the window's top left is -- its bar's, if it has one.
     at: (i32, i32),
+    width: u32,
     docked: bool,
 }
 
@@ -248,6 +288,17 @@ impl Managed {
         let bar = if self.bar.is_some() { BAR as i32 } else { 0 };
         (self.at.0, self.at.1 + bar)
     }
+
+    /// Where the close button goes, for a window whose bar is at `at`.
+    fn close_at(at: (i32, i32), width: u32) -> (i32, i32) {
+        let inset = ((BAR - CLOSE_SIZE) / 2) as i32;
+        (at.0 + width as i32 - CLOSE_SIZE as i32 - inset, at.1 + inset)
+    }
+
+    /// Every layer the window is drawn with, bottom first.
+    fn layers(&self) -> impl Iterator<Item = LayerId> {
+        [self.bar, self.close, Some(self.body)].into_iter().flatten()
+    }
 }
 
 /// The keyboard and mouse, as the scene shows them, and the windows they
@@ -255,6 +306,8 @@ impl Managed {
 pub struct Desk {
     /// Outline below, fill above, moving together.
     pointer: Option<[LayerId; 2]>,
+    /// Whether the close button's cross made it into the atlas.
+    cross: bool,
     at: (i32, i32),
     buttons: u8,
     line: Option<LayerId>,
@@ -296,9 +349,14 @@ impl Desk {
             }
         }
 
+        let cross = renderer
+            .upload_mask(CLOSE_SRC, &cross())
+            .is_ok();
+
         let line_height = corrode_text::measure("> ", LINE_STYLE).height;
         let mut desk = Self {
             pointer,
+            cross,
             at: (screen.width as i32 / 2, screen.height as i32 / 2),
             buttons: 0,
             line: None,
@@ -357,6 +415,7 @@ impl Desk {
         now: u64,
     ) {
         self.restack(scene);
+        self.forget_abandoned(scene);
 
         // What programs have drawn since the last frame.
         for managed in &self.windows {
@@ -444,6 +503,12 @@ impl Desk {
         let bar = (!docked)
             .then(|| scene.add(Layer::solid(Rect::new(at.0, at.1, width, BAR), BAR_IDLE)))
             .flatten();
+        let close = (bar.is_some() && self.cross)
+            .then(|| {
+                let (x, y) = Managed::close_at(at, width);
+                scene.add(Layer::mask(x, y, CLOSE_SRC, CLOSE_COLOR))
+            })
+            .flatten();
         let mut managed_body_y = at.1;
         if bar.is_some() {
             managed_body_y += BAR as i32;
@@ -456,10 +521,13 @@ impl Desk {
             height,
         )) else {
             println!("desktop    : no room in the scene for another window");
+            for id in [bar, close].into_iter().flatten() {
+                scene.remove(id);
+            }
             return;
         };
         if !docked {
-            for id in [bar, Some(body)].into_iter().flatten() {
+            for id in [bar, close, Some(body)].into_iter().flatten() {
                 if let Some(layer) = scene.layer_mut(id) {
                     let rest = layer.y.sample(now).value;
                     layer.opacity =
@@ -478,8 +546,10 @@ impl Desk {
             window,
             surface,
             bar,
+            close,
             body,
             at,
+            width,
             docked,
         });
         if !docked {
@@ -502,7 +572,7 @@ impl Desk {
                 layer.color = if gained { BAR_FOCUSED } else { BAR_IDLE };
             }
             if gained {
-                for id in [managed.bar, Some(managed.body)].into_iter().flatten() {
+                for id in managed.layers() {
                     scene.raise(id);
                 }
             }
@@ -539,9 +609,10 @@ impl Desk {
         let hit = under.and_then(|id| {
             self.windows
                 .iter()
-                .position(|managed| managed.body == id || managed.bar == Some(id))
-                .map(|index| (index, self.windows[index].bar == Some(id)))
+                .position(|managed| managed.layers().any(|layer| layer == id))
+                .map(|index| (index, id != self.windows[index].body))
         });
+        let on_close = hit.is_some_and(|(index, _)| under == self.windows[index].close);
 
         if pressed & 1 != 0 {
             println!(
@@ -549,6 +620,7 @@ impl Desk {
                 self.at.0,
                 self.at.1,
                 match hit {
+                    Some(_) if on_close => "a close button",
                     Some((_, true)) => "a title bar",
                     Some(_) => "a window",
                     None if under.is_some() => "a layer",
@@ -560,7 +632,11 @@ impl Desk {
                     if !self.windows[index].docked {
                         self.set_focus(scene, Some(index));
                     }
-                    if on_bar {
+                    if on_close {
+                        // Asked, not done: the window goes when its
+                        // program does.
+                        crate::windows::push(self.windows[index].window, window::CLOSE, [0; 4]);
+                    } else if on_bar {
                         let (x, y) = self.windows[index].at;
                         self.drag = Some((index, self.at.0 - x, self.at.1 - y));
                     }
@@ -583,6 +659,33 @@ impl Desk {
                     0,
                 ],
             );
+        }
+    }
+
+    /// Take away the windows whose programs have finished: exited, perhaps
+    /// because their close button was clicked, or stopped for a fault.
+    fn forget_abandoned<const N: usize>(&mut self, scene: &mut Scene<N>) {
+        let mut index = 0;
+        while index < self.windows.len() {
+            if !crate::windows::abandoned(self.windows[index].window) {
+                index += 1;
+                continue;
+            }
+            let managed = self.windows.remove(index);
+            for id in managed.layers() {
+                scene.remove(id);
+            }
+            println!("desktop    : window {} closed", managed.window);
+            // Indices past this one have moved down by one.
+            let shift = |at: usize| match at.cmp(&index) {
+                core::cmp::Ordering::Less => Some(at),
+                core::cmp::Ordering::Equal => None,
+                core::cmp::Ordering::Greater => Some(at - 1),
+            };
+            self.focus = self.focus.and_then(shift);
+            self.drag = self
+                .drag
+                .and_then(|(at, x, y)| shift(at).map(|at| (at, x, y)));
         }
     }
 
@@ -638,8 +741,10 @@ impl Desk {
                 managed.at = (self.at.0 - grab_x, (self.at.1 - grab_y).max(0));
                 let (x, y) = managed.at;
                 let (body_x, body_y) = managed.body_at();
+                let width = managed.width;
                 for (id, (x, y)) in [
                     (managed.bar, (x, y)),
+                    (managed.close, Managed::close_at((x, y), width)),
                     (Some(managed.body), (body_x, body_y)),
                 ] {
                     if let Some(layer) = id.and_then(|id| scene.layer_mut(id)) {

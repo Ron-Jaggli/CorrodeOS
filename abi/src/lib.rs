@@ -210,6 +210,10 @@ pub mod window {
     pub const BUTTON: u64 = 63;
     /// The window gained the keyboard (word 0 is 1) or lost it (0).
     pub const FOCUS: u64 = 64;
+    /// The close button on the window's title bar was clicked. A program
+    /// that wants to go should exit; its window goes with it. One that
+    /// ignores this keeps its window.
+    pub const CLOSE: u64 = 65;
 
     /// Most a window may be, either way.
     pub const MAX_WIDTH: u32 = 1024;

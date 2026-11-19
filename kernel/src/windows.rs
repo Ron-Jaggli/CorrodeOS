@@ -38,6 +38,8 @@ pub struct Window {
     pub width: u32,
     pub height: u32,
     pub docked: bool,
+    /// The task that asked for it. When it finishes, the window goes.
+    owner: usize,
     events: VecDeque<(u64, [u64; 4])>,
     waiter: usize,
 }
@@ -55,8 +57,9 @@ pub fn set_screen(width: u32, height: u32) {
     SCREEN[1].store(height, Ordering::Relaxed);
 }
 
-/// Make a window and say its number. `None` if there is no surface left.
-pub fn open(width: u32, height: u32, docked: bool) -> Option<usize> {
+/// Make a window for task `owner` and say its number. `None` if there is
+/// no surface left.
+pub fn open(width: u32, height: u32, docked: bool, owner: usize) -> Option<usize> {
     let (width, height) = if docked {
         (SCREEN[0].load(Ordering::Relaxed), height.clamp(16, 64))
     } else {
@@ -73,6 +76,7 @@ pub fn open(width: u32, height: u32, docked: bool) -> Option<usize> {
             width,
             height,
             docked,
+            owner,
             events: VecDeque::new(),
             waiter: NOBODY,
         });
@@ -94,6 +98,16 @@ pub fn shape(index: usize) -> Option<(usize, u32, u32, bool)> {
         let window = table.get(index)?;
         Some((window.surface, window.width, window.height, window.docked))
     })
+}
+
+/// Whether the program a window was opened for has finished -- exited or
+/// been stopped for a fault -- so nobody will draw in it again.
+///
+/// The surface is not given back: its frames are still mapped in the
+/// finished task, and nothing reclaims those yet.
+pub fn abandoned(index: usize) -> bool {
+    let owner = without_interrupts(|| TABLE.lock().get(index).map(|window| window.owner));
+    owner.is_some_and(|owner| task::state_of(owner) == Some(State::Finished))
 }
 
 /// Give a window an event, and wake its program if it is waiting.

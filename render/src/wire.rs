@@ -13,6 +13,7 @@
 //! taken as whatever number it is -- a rectangle anywhere at all is a
 //! rectangle the renderer clips, which it does for every command already.
 
+use crate::glass::{Glass, Material};
 use crate::{Color, Command, Rect};
 
 /// Bytes per command.
@@ -26,6 +27,13 @@ const BLEND_RECT: u8 = 3;
 const MASK: u8 = 4;
 const IMAGE: u8 = 5;
 const SCISSOR: u8 = 6;
+const GLASS: u8 = 7;
+
+/// Bits of a glass record's flags byte, and of an image's.
+const REGULAR: u8 = 1 << 0;
+const DARK: u8 = 1 << 1;
+const RIM: u8 = 1 << 2;
+const TRANSLUCENT: u8 = 1 << 0;
 
 /// Write a rectangle as four little-endian words: x, y, width, height.
 pub fn put_rect(rect: &Rect, out: &mut [u8; RECT]) {
@@ -50,11 +58,17 @@ pub fn get_rect(bytes: &[u8; RECT]) -> Rect {
 ///
 /// ```text
 ///   0       kind
-///   1..4    colour, r g b             (or, for an image, nothing)
-///   4..8    surface number            (image only)
-///   7       alpha                     (blend, mask, image)
+///   1..4    colour, r g b             (the tint, for glass; nothing, for an image)
+///   4..6    surface number            (image)
+///   6       flags: translucent        (image)
+///   4       flags: regular, dark, rim (glass)
+///   5       refraction                (glass)
+///   6       tint amount               (glass)
+///   7       alpha                     (blend, mask, image, glass)
 ///   8..24   rectangle                 (the source block, for mask and image)
 ///   24..32  x, y of where it goes     (mask and image)
+///   24..26  corner radius             (glass)
+///   26      frost                     (glass)
 /// ```
 pub fn encode(command: &Command, out: &mut [u8; RECORD]) {
     *out = [0; RECORD];
@@ -112,9 +126,11 @@ pub fn encode(command: &Command, out: &mut [u8; RECORD]) {
             src,
             surface,
             alpha,
+            translucent,
         } => {
             out[0] = IMAGE;
-            out[4..7].copy_from_slice(&surface.to_le_bytes()[..3]);
+            out[4..6].copy_from_slice(&surface.to_le_bytes()[..2]);
+            out[6] = if *translucent { TRANSLUCENT } else { 0 };
             out[7] = *alpha;
             rect(out, src);
             position(out, *x, *y);
@@ -122,6 +138,23 @@ pub fn encode(command: &Command, out: &mut [u8; RECORD]) {
         Command::Scissor { rect: r } => {
             out[0] = SCISSOR;
             rect(out, r);
+        }
+        Command::Glass {
+            rect: r,
+            glass,
+            alpha,
+        } => {
+            out[0] = GLASS;
+            color(out, &glass.tint);
+            out[4] = if glass.material == Material::Regular { REGULAR } else { 0 }
+                | if glass.dark { DARK } else { 0 }
+                | if glass.rim { RIM } else { 0 };
+            out[5] = glass.refraction;
+            out[6] = glass.tint_amount;
+            out[7] = *alpha;
+            rect(out, r);
+            out[24..26].copy_from_slice(&glass.radius.to_le_bytes());
+            out[26] = glass.frost;
         }
     }
 }
@@ -151,12 +184,30 @@ pub fn decode(bytes: &[u8; RECORD]) -> Option<Command> {
             x,
             y,
             src: rect,
-            // Three bytes: more surfaces than any renderer has, and the
-            // fourth is where alpha lives.
-            surface: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], 0]),
+            // Two bytes: more surfaces than any renderer has.
+            surface: u32::from_le_bytes([bytes[4], bytes[5], 0, 0]),
             alpha,
+            translucent: bytes[6] & TRANSLUCENT != 0,
         },
         SCISSOR => Command::Scissor { rect },
+        GLASS => Command::Glass {
+            rect,
+            glass: Glass {
+                material: if bytes[4] & REGULAR != 0 {
+                    Material::Regular
+                } else {
+                    Material::Clear
+                },
+                dark: bytes[4] & DARK != 0,
+                rim: bytes[4] & RIM != 0,
+                radius: u16::from_le_bytes([bytes[24], bytes[25]]),
+                refraction: bytes[5],
+                frost: bytes[26],
+                tint: color,
+                tint_amount: bytes[6],
+            },
+            alpha,
+        },
         _ => return None,
     })
 }
@@ -201,8 +252,25 @@ mod tests {
                 src: Rect::new(0, 0, 256, 192),
                 surface: 7,
                 alpha: 1,
+                translucent: true,
             },
             Command::Scissor { rect },
+            Command::Glass {
+                rect,
+                glass: crate::glass::Glass {
+                    tint: color,
+                    tint_amount: 90,
+                    radius: 999,
+                    frost: 40,
+                    ..crate::glass::Glass::regular(true)
+                },
+                alpha: 200,
+            },
+            Command::Glass {
+                rect,
+                glass: crate::glass::Glass::clear(false),
+                alpha: 255,
+            },
         ];
         for command in commands {
             let back = round_trip(command).expect("decodes");
@@ -220,7 +288,7 @@ mod tests {
 
     #[test]
     fn a_record_that_is_not_a_command_is_refused() {
-        for kind in [0u8, 7, 0x80, 0xff] {
+        for kind in [0u8, 8, 0x80, 0xff] {
             let mut bytes = [0x5a; RECORD];
             bytes[0] = kind;
             assert!(decode(&bytes).is_none());

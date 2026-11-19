@@ -31,7 +31,8 @@
 
 use crate::blend::Blend;
 use crate::damage::Damage;
-use crate::{Color, Command, CommandList, Rect, Renderer, SurfaceInfo};
+use crate::glass::{self, Glass, Material, Q8};
+use crate::{Color, Command, CommandList, PixelFormat, Rect, Renderer, SurfaceInfo};
 
 #[derive(Debug)]
 pub enum Error {
@@ -72,6 +73,8 @@ pub struct SoftwareRenderer {
     back: Option<*mut u8>,
     atlas: Option<Atlas>,
     surfaces: [Option<Pixels>; SURFACES],
+    /// Where [`Command::Glass`] copies and blurs its backdrop.
+    scratch: Option<&'static mut [u32]>,
     info: SurfaceInfo,
 }
 
@@ -102,6 +105,7 @@ impl SoftwareRenderer {
             back: None,
             atlas: None,
             surfaces: [None; SURFACES],
+            scratch: None,
             info,
         })
     }
@@ -139,6 +143,14 @@ impl SoftwareRenderer {
             width,
             height: height.min(u32::MAX as u64) as u32,
         });
+    }
+
+    /// Give the renderer memory for glass to work in. A pane needs three
+    /// times the pixels of its rectangle grown by its reach, and a line more;
+    /// one that does not fit, or any pane with none attached, is drawn as a
+    /// plain veil instead.
+    pub fn attach_glass_scratch(&mut self, data: &'static mut [u32]) {
+        self.scratch = Some(data);
     }
 
     /// Show the renderer a block of pixels to draw [`Command::Image`] from,
@@ -349,6 +361,7 @@ impl SoftwareRenderer {
         src: Rect,
         surface: u32,
         alpha: u8,
+        translucent: bool,
         scissor: Option<Rect>,
     ) {
         if alpha == 0 {
@@ -391,7 +404,7 @@ impl SoftwareRenderer {
             // target.
             let row = unsafe { self.target_row(x0, row_y) };
 
-            if alpha == 255 && same_layout {
+            if alpha == 255 && same_layout && !translucent {
                 // SAFETY: both spans are `width` pixels inside their buffers,
                 // and `attach_surface` was promised they do not overlap.
                 unsafe {
@@ -409,11 +422,176 @@ impl SoftwareRenderer {
                 unsafe {
                     let pixel = source.add(offset).read_volatile();
                     let color = Color::rgb((pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8);
+                    // An opaque surface's top byte is whatever the client
+                    // left there, and means nothing.
+                    let alpha = match translucent {
+                        true => crate::blend::div255((255 - (pixel >> 24)) * alpha as u32) as u8,
+                        false => alpha,
+                    };
                     let target = row.add(offset);
-                    target.write_unaligned(match alpha {
+                    match alpha {
+                        0 => {}
+                        255 => target.write_unaligned(format.pack(color)),
+                        _ => target.write_unaligned(
+                            Blend::new(&format, color, alpha).over(target.read_unaligned()),
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A pane of glass over what is already in `rect`. See [`glass`].
+    fn glass(&mut self, rect: Rect, pane: &Glass, alpha: u8, scissor: Option<Rect>) {
+        if alpha == 0 || rect.is_empty() {
+            return;
+        }
+        let Some((x0, y0, x1, y1)) = self.clip(rect, scissor) else {
+            return;
+        };
+        // What it reads: as far around the pane as the blur reaches,
+        // whatever the scissor, since that much was promised painted.
+        let reach = pane.reach().min(4096) as i32;
+        let around = Rect::new(
+            rect.x.saturating_sub(reach),
+            rect.y.saturating_sub(reach),
+            rect.width.saturating_add(2 * reach as u32),
+            rect.height.saturating_add(2 * reach as u32),
+        );
+        let Some((bx0, by0, bx1, by1)) = self.clip(around, None) else {
+            return;
+        };
+        let (bw, bh) = ((bx1 - bx0) as usize, (by1 - by0) as usize);
+        let area = bw * bh;
+        let needed = 3 * area + bw.max(bh);
+        let format = self.info.format;
+
+        let shape = (
+            rect.width as i64 * Q8,
+            rect.height as i64 * Q8,
+            pane.radius as i64 * Q8,
+        );
+        let mut scratch = self.scratch.take();
+        let Some(buffers) = scratch.as_deref_mut().filter(|data| data.len() >= needed) else {
+            self.scratch = scratch;
+            return self.veil(rect, shape, pane, alpha, (x0, y0, x1, y1));
+        };
+        let (source, rest) = buffers.split_at_mut(area);
+        let (frost, rest) = rest.split_at_mut(area);
+        let (fill, rest) = rest.split_at_mut(area);
+        let line = &mut rest[..bw.max(bh)];
+
+        for y in 0..bh {
+            // SAFETY: `clip` kept the backdrop on the surface.
+            let row = unsafe { self.target_row(bx0, by0 + y as u32) };
+            for x in 0..bw {
+                // SAFETY: `x < bw` keeps the pixel on this row.
+                let pixel = unsafe { row.add(x).read_unaligned() };
+                source[y * bw + x] = unpack(&format, pixel);
+            }
+        }
+
+        // Frost: three boxes for each Gaussian, then the veil between them.
+        let (frost_radius, fill_radius) = pane.blur_radii();
+        let backdrop: &[u32] = if frost_radius + fill_radius > 0 {
+            frost.copy_from_slice(source);
+            fill.copy_from_slice(source);
+            for _ in 0..3 {
+                glass::box_blur(frost, bw, bh, frost_radius as usize, line);
+                glass::box_blur(fill, bw, bh, fill_radius as usize, line);
+            }
+            let veil = pane.fill_opacity();
+            for (frosted, filled) in frost.iter_mut().zip(fill.iter()) {
+                let (a, b) = (glass::channels(*frosted), glass::channels(*filled));
+                *frosted = glass::pack([0, 1, 2].map(|i| {
+                    let blend = if pane.dark { a[i].min(b[i]) } else { a[i].max(b[i]) };
+                    (blend * veil + a[i] * (255 - veil)) / 255
+                }));
+            }
+            frost
+        } else {
+            source
+        };
+
+        let tone = pane.tone();
+        let chroma = pane.chroma();
+        let (width, height, radius) = shape;
+        for y in y0..y1 {
+            // SAFETY: `clip` returned bounds already intersected with the
+            // surface.
+            let row = unsafe { self.target_row(x0, y) };
+            let ly = (y as i64 - rect.y as i64) * Q8 + Q8 / 2;
+            for x in x0..x1 {
+                let lx = (x as i64 - rect.x as i64) * Q8 + Q8 / 2;
+                let field = glass::field(lx, ly, width, height, radius);
+                let covered = glass::coverage(&field);
+                if covered == 0 {
+                    continue;
+                }
+                let lens = field.distance > -glass::BEZEL * Q8;
+                let (dx, dy) = match lens && pane.refraction > 0 {
+                    true => glass::displacement(&field, pane.refraction),
+                    false => (0, 0),
+                };
+                let sx = (x as i64 + (dx + Q8 / 2).div_euclid(Q8)).clamp(bx0 as i64, bx1 as i64 - 1);
+                let sy = (y as i64 + (dy + Q8 / 2).div_euclid(Q8)).clamp(by0 as i64, by1 as i64 - 1);
+                let seen = backdrop[(sy as usize - by0 as usize) * bw + (sx as usize - bx0 as usize)];
+
+                let mut rgb = glass::channels(seen).map(|c| tone[c as usize] as u32);
+                rgb = glass::saturate(rgb, chroma);
+                rgb = glass::tint(rgb, pane);
+                if pane.rim && field.distance > -5 * Q8 {
+                    let (light, opacity) = glass::rim(&field, pane.dark);
+                    rgb = rgb.map(|c| (c * (255 - opacity) / 255 + light).min(255));
+                }
+                let color = Color::rgb(rgb[0] as u8, rgb[1] as u8, rgb[2] as u8);
+                let alpha = crate::blend::div255(covered * alpha as u32) as u8;
+                // SAFETY: `x` is inside the clipped bounds, on this row.
+                unsafe {
+                    let pixel = row.add((x - x0) as usize);
+                    pixel.write_unaligned(match alpha {
                         255 => format.pack(color),
-                        _ => Blend::new(&format, color, alpha).over(target.read_unaligned()),
+                        _ => Blend::new(&format, color, alpha).over(pixel.read_unaligned()),
                     });
+                }
+            }
+        }
+        self.scratch = scratch;
+    }
+
+    /// Glass with nowhere to work: the material's colour, laid over the
+    /// pane's shape with no blur and no lens.
+    fn veil(
+        &mut self,
+        rect: Rect,
+        (width, height, radius): (i64, i64, i64),
+        pane: &Glass,
+        alpha: u8,
+        (x0, y0, x1, y1): (u32, u32, u32, u32),
+    ) {
+        let (color, opacity) = match (pane.material, pane.dark) {
+            (Material::Regular, false) => (Color::rgb(0xf4, 0xf4, 0xf6), 200),
+            (Material::Regular, true) => (Color::rgb(0x26, 0x27, 0x2c), 210),
+            (Material::Clear, false) => (Color::rgb(0xff, 0xff, 0xff), 60),
+            (Material::Clear, true) => (Color::rgb(0x30, 0x30, 0x34), 90),
+        };
+        let format = self.info.format;
+        for y in y0..y1 {
+            // SAFETY: `clip` returned bounds already intersected with the
+            // surface.
+            let row = unsafe { self.target_row(x0, y) };
+            let ly = (y as i64 - rect.y as i64) * Q8 + Q8 / 2;
+            for x in x0..x1 {
+                let lx = (x as i64 - rect.x as i64) * Q8 + Q8 / 2;
+                let covered = glass::coverage(&glass::field(lx, ly, width, height, radius));
+                let alpha = crate::blend::div255(covered * opacity * alpha as u32 / 255) as u8;
+                if alpha == 0 {
+                    continue;
+                }
+                // SAFETY: `x` is inside the clipped bounds, on this row.
+                unsafe {
+                    let pixel = row.add((x - x0) as usize);
+                    pixel.write_unaligned(Blend::new(&format, color, alpha).over(pixel.read_unaligned()));
                 }
             }
         }
@@ -426,6 +604,25 @@ impl SoftwareRenderer {
             scissor,
         );
     }
+}
+
+/// A pixel in the target's layout as `0x00RRGGBB`.
+fn unpack(format: &PixelFormat, pixel: u32) -> u32 {
+    if *format == PixelFormat::XRGB8888 {
+        return pixel & 0x00ff_ffff;
+    }
+    let channel = |shift: u8, size: u8| {
+        let size = size.clamp(1, 8);
+        let value = (pixel >> shift) & ((1 << size) - 1);
+        if size == 8 {
+            return value;
+        }
+        // Widened to eight bits with the top bits repeated, so full is 255.
+        (value << (8 - size)) | (value >> (size - (8 - size).min(size)))
+    };
+    channel(format.red_shift, format.red_mask_size) << 16
+        | channel(format.green_shift, format.green_mask_size) << 8
+        | channel(format.blue_shift, format.blue_mask_size)
 }
 
 impl Renderer for SoftwareRenderer {
@@ -457,8 +654,10 @@ impl Renderer for SoftwareRenderer {
                     src,
                     surface,
                     alpha,
-                } => self.image((x, y), src, surface, alpha, scissor),
+                    translucent,
+                } => self.image((x, y), src, surface, alpha, translucent, scissor),
                 Command::Scissor { rect } => scissor = Some(rect),
+                Command::Glass { rect, glass, alpha } => self.glass(rect, &glass, alpha, scissor),
             }
         }
         Ok(())
@@ -834,6 +1033,7 @@ mod tests {
             src: Rect::new(0, 0, PICTURE, PICTURE),
             surface: 3,
             alpha,
+            translucent: false,
         }
     }
 
@@ -881,6 +1081,7 @@ mod tests {
             src: Rect::new(-2, -1, 40, 40),
             surface: 3,
             alpha: 255,
+            translucent: false,
         }]);
         assert_eq!(pixels[0], GREY);
         assert_eq!(pixels[(SIDE + 2) as usize], picture[0]);
@@ -933,6 +1134,7 @@ mod tests {
             src: Rect::new(0, 0, 2, 2),
             surface: 0,
             alpha: 255,
+            translucent: false,
         };
         // SAFETY: as in `pictured`; each surface is 2 * 2 pixels of its own.
         unsafe {

@@ -33,9 +33,16 @@
 //! them is the one thing that makes the glass stale without any formula
 //! having moved, so it has to be said: [`Scene::damage`]. The scene decides
 //! where the pixels go and when; it never looks at them.
+//!
+//! Or a pane of [`glass`](crate::glass), which shows what is under it, bent
+//! and frosted. A pane reads the pixels around it as well as under it, so
+//! when anything near one is repainted, all of it is, together with as far
+//! around it as it reads -- in one rectangle, so it never reads its own
+//! last frame.
 
 use crate::anim::{Animation, Fx};
 use crate::damage::Damage;
+use crate::glass::Glass;
 use crate::{Color, Command, CommandList, Rect, Renderer, SurfaceInfo};
 
 /// Commands recorded before a batch is submitted and recording starts again.
@@ -55,8 +62,17 @@ pub enum Content {
     /// the layer the surface does not cover. The layer's colour is not used.
     ///
     /// The layer must not outlast the surface: the scene takes it that an
-    /// opaque one hides what is under it.
-    Surface { id: u32, width: u32, height: u32 },
+    /// opaque one hides what is under it -- unless it is `translucent`, and
+    /// the top byte of each pixel says how transparent it is.
+    Surface {
+        id: u32,
+        width: u32,
+        height: u32,
+        translucent: bool,
+    },
+    /// A pane of glass the size of the layer, over whatever is under it.
+    /// The layer's colour is not used; the pane's tint is.
+    Glass(Glass),
 }
 
 /// One rectangle of colour, in motion or not.
@@ -102,7 +118,32 @@ impl Layer {
     /// corner at `x`, `y`.
     pub const fn surface(x: i32, y: i32, id: u32, width: u32, height: u32) -> Self {
         let mut layer = Self::solid(Rect::new(x, y, width, height), Color::BLACK);
-        layer.content = Content::Surface { id, width, height };
+        layer.content = Content::Surface {
+            id,
+            width,
+            height,
+            translucent: false,
+        };
+        layer
+    }
+
+    /// As [`Layer::surface`], for a surface whose pixels say how transparent
+    /// they are.
+    pub const fn translucent_surface(x: i32, y: i32, id: u32, width: u32, height: u32) -> Self {
+        let mut layer = Self::surface(x, y, id, width, height);
+        layer.content = Content::Surface {
+            id,
+            width,
+            height,
+            translucent: true,
+        };
+        layer
+    }
+
+    /// A pane of `glass` covering `rect`.
+    pub const fn glass(rect: Rect, glass: Glass) -> Self {
+        let mut layer = Self::solid(rect, Color::BLACK);
+        layer.content = Content::Glass(glass);
         layer
     }
 
@@ -186,7 +227,29 @@ impl Shown {
     /// else. A mask never is: it has holes by design. A surface is, because
     /// its pixels carry no transparency of their own.
     fn opaque(&self) -> bool {
-        self.alpha == 255 && !matches!(self.content, Content::Mask { .. })
+        self.alpha == 255
+            && match self.content {
+                Content::Solid => true,
+                Content::Surface { translucent, .. } => !translucent,
+                Content::Mask { .. } | Content::Glass(_) => false,
+            }
+    }
+
+    /// For a pane of glass that is showing, everything it reads.
+    fn glass_reach(&self) -> Option<Rect> {
+        let Content::Glass(glass) = self.content else {
+            return None;
+        };
+        if self.alpha == 0 || self.rect.is_empty() {
+            return None;
+        }
+        let reach = glass.reach() as i32;
+        Some(Rect::new(
+            self.rect.x.saturating_sub(reach),
+            self.rect.y.saturating_sub(reach),
+            self.rect.width.saturating_add(2 * reach as u32),
+            self.rect.height.saturating_add(2 * reach as u32),
+        ))
     }
 }
 
@@ -388,6 +451,30 @@ impl<const N: usize> Scene<N> {
             *shown = now_shown;
         }
 
+        // A pane touched by damage is repainted whole, with everything it
+        // reads. Growing the damage can touch another pane, so round again
+        // until nothing grows; each round adds a pane or stops.
+        loop {
+            let mut grew = false;
+            for shown in self.shown.iter() {
+                let Some(reach) = shown.glass_reach() else {
+                    continue;
+                };
+                let Some(reach) = reach.intersect(&self.screen) else {
+                    continue;
+                };
+                let touched = damage.rects().iter().any(|rect| rect.intersect(&reach).is_some());
+                let inside = damage.rects().iter().any(|rect| rect.contains(&reach));
+                if touched && !inside {
+                    damage.add(reach);
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+
         if damage.is_empty() {
             return Ok(Painted::default());
         }
@@ -457,11 +544,22 @@ impl<const N: usize> Scene<N> {
                     color: shown.color,
                     alpha,
                 },
-                (Content::Surface { id, .. }, alpha) => Command::Image {
+                (
+                    Content::Surface {
+                        id, translucent, ..
+                    },
+                    alpha,
+                ) => Command::Image {
                     x: shown.rect.x,
                     y: shown.rect.y,
                     src: Rect::new(0, 0, shown.rect.width, shown.rect.height),
                     surface: id,
+                    alpha,
+                    translucent,
+                },
+                (Content::Glass(glass), alpha) => Command::Glass {
+                    rect: shown.rect,
+                    glass,
                     alpha,
                 },
             };
@@ -678,6 +776,7 @@ mod tests {
                 src,
                 surface,
                 alpha,
+                translucent: false,
             } => Some((x, y, src, surface, alpha)),
             _ => None,
         });
@@ -1022,6 +1121,7 @@ mod tests {
                             id: random.below(2) as u32,
                             width: WINDOW.0,
                             height: WINDOW.1,
+                            translucent: false,
                         };
                     }
                     ids.extend(scene.add(layer));

@@ -60,7 +60,7 @@ const SLOTS: usize = 16;
 
 /// The terminal's own commands, how to call them, and what they do. The
 /// shell lists them in `help` after its own.
-const COMMANDS: [About; 8] = [
+const COMMANDS: [About; 9] = [
     ("clear", "", "start with an empty window (or Ctrl+L)"),
     ("history", "", "the lines typed so far"),
     ("uptime", "", "time since the machine started"),
@@ -69,6 +69,7 @@ const COMMANDS: [About; 8] = [
     ("sleep", "SECONDS", "wait; Ctrl+C to stop early"),
     ("caps", "", "the capabilities this terminal holds"),
     ("about", "", "what this is"),
+    ("exit", "", "close this terminal"),
 ];
 
 struct Terminal {
@@ -185,7 +186,12 @@ impl Terminal {
         self.say(&format!("{PROMPT_TEXT}{line}"), QUIET);
         let mut system = System::new(self.editor.history());
         let printed = self.shell.run(line, &self.fs, &mut system);
-        let System { clear, sleep, .. } = system;
+        let System {
+            clear, sleep, exit, ..
+        } = system;
+        if exit {
+            close();
+        }
         if clear {
             self.lines.clear();
         }
@@ -207,6 +213,7 @@ struct System<'a> {
     history: &'a [String],
     clear: bool,
     sleep: Option<u64>,
+    exit: bool,
 }
 
 impl<'a> System<'a> {
@@ -215,6 +222,7 @@ impl<'a> System<'a> {
             history,
             clear: false,
             sleep: None,
+            exit: false,
         }
     }
 }
@@ -279,6 +287,10 @@ impl Host for System<'_> {
                     1
                 }
             },
+            "exit" => {
+                self.exit = true;
+                0
+            }
             "caps" => {
                 caps(out);
                 0
@@ -292,6 +304,13 @@ impl Host for System<'_> {
             _ => return None,
         })
     }
+}
+
+/// Go, and take the window with us: the window manager drops a window
+/// whose program has finished.
+fn close() -> ! {
+    println!("closed");
+    corrode_rt::exit();
 }
 
 /// Every capability this terminal holds, a slot to a line.
@@ -470,6 +489,7 @@ fn main() {
                 modifiers,
             } => terminal.key(Key(key), text, modifiers),
             Event::Focus(focused) => terminal.focused = focused,
+            Event::Close => close(),
             Event::Timeout => match terminal.busy_until {
                 Some(until) if corrode_rt::now_ns() >= until => terminal.finish(),
                 _ => continue,

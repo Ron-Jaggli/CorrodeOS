@@ -24,6 +24,7 @@
 pub mod anim;
 pub mod blend;
 pub mod damage;
+pub mod glass;
 pub mod scene;
 pub mod software;
 pub mod wire;
@@ -212,11 +213,25 @@ pub enum Command {
     ///
     /// Surface pixels are `0x00RRGGBB` whatever the screen's own layout is.
     /// A client draws without knowing what it is being shown on.
+    ///
+    /// A `translucent` surface uses the top byte too, as how transparent the
+    /// pixel is: 0 opaque, as every other surface's pixels are, and 255 not
+    /// there at all. That is what lets a panel be drawn over glass.
     Image {
         x: i32,
         y: i32,
         src: Rect,
         surface: u32,
+        alpha: u8,
+        translucent: bool,
+    },
+    /// A pane of liquid glass over whatever is already inside `rect`: see
+    /// [`glass`]. Like [`Command::BlendRect`] it reads the target, and
+    /// further: up to [`glass::Glass::reach`] pixels around the rectangle,
+    /// which must be painted before it is.
+    Glass {
+        rect: Rect,
+        glass: glass::Glass,
         alpha: u8,
     },
     /// Confine every later command in this list, `Clear` included, to `rect`.

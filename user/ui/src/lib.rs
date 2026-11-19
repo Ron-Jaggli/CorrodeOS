@@ -48,6 +48,8 @@ pub enum Event {
     Button { x: i32, y: i32, buttons: u8 },
     /// The window gained or lost the keyboard.
     Focus(bool),
+    /// The close button on the title bar was clicked.
+    Close,
     /// The deadline came before anything else did.
     Timeout,
 }
@@ -185,6 +187,7 @@ impl Window {
                 buttons: words[2] as u8,
             },
             window::FOCUS => Event::Focus(words[0] != 0),
+            window::CLOSE => Event::Close,
             _ => Event::Timeout,
         }
     }

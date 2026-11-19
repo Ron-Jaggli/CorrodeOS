@@ -2069,7 +2069,14 @@ extern "C" fn window_server() {
         let words = received.message.words;
         let size = |word: u64| word.min(u32::MAX as u64) as u32;
         let opened = (received.message.label == window::OPEN)
-            .then(|| windows::open(size(words[0]), size(words[1]), words[2] == window::DOCKED))
+            .then(|| {
+                windows::open(
+                    size(words[0]),
+                    size(words[1]),
+                    words[2] == window::DOCKED,
+                    received.from,
+                )
+            })
             .flatten();
 
         let Some(index) = opened else {
