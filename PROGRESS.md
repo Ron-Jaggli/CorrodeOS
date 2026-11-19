@@ -272,3 +272,18 @@ Choices made without asking are marked **Choice:**.
 - Known gap: Alt+, needs the dock (`dock = off` means it can only focus a
   Settings window that is already open).
 - Screenshot: `build/progress-10-shortcuts.png`.
+
+## 13. Dock hover
+
+- The icon under the pointer lifts 6 px on a snappy spring, and its name
+  appears above it on a small glass pill (fades in over 120 ms), as
+  macOS's dock labels icons. A launch bounce lands at the lifted height
+  while the pointer is still on the icon.
+- Hidden tooltips are skipped by hit-testing (the scene ignores layers at
+  alpha 0), so they never swallow clicks on windows behind them.
+- **Choice:** no magnification. Mask stencils are drawn at one size and
+  the renderer has no scaling, so lift plus label gives the feedback
+  without it.
+- All boot tests PASS; 170 PASS / 0 FAIL.
+- Screenshot: `build/progress-11-dock-hover.png` (Settings hovered, and
+  dark-mode Settings open).

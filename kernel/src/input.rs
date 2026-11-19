@@ -1425,6 +1425,18 @@ impl Desk {
         core::mem::take(&mut self.closed)
     }
 
+    /// Tell the dock which icon, if any, the pointer is over.
+    fn dock_hover<const N: usize>(&mut self, scene: &mut Scene<N>, now: u64) {
+        let pointer = self.pointer.unwrap_or([LayerId::NONE; 2]);
+        let top = scene
+            .layers_at(self.at.0, self.at.1)
+            .find(|id| !pointer.contains(id));
+        if let Some(dock) = &mut self.dock {
+            let over = top.and_then(|id| dock.icon(id));
+            dock.hover(scene, over, now);
+        }
+    }
+
     /// Take the glyphs off the buttons: the next hover puts them back
     /// wherever the buttons are now.
     fn hide_glyphs<const N: usize>(&mut self, scene: &mut Scene<N>) {
@@ -1505,6 +1517,7 @@ impl Desk {
             }
         }
         self.hover(scene);
+        self.dock_hover(scene, now);
 
         let pressed = buttons & !self.buttons;
         let released = self.buttons & !buttons;

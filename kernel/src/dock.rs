@@ -9,6 +9,9 @@
 //! The icons are drawn here, once, as stencils in the mask atlas: a rounded
 //! square in the program's colour (a superellipse, as Apple's icons are)
 //! with a white glyph over it.
+//!
+//! The icon under the pointer lifts a little, and its name shows above it
+//! on a pill of glass, as macOS's dock labels its icons.
 
 use alloc::vec::Vec;
 
@@ -65,6 +68,12 @@ const APPS: [App; 3] = [
 const ATLAS_X: i32 = 512;
 const ATLAS_Y: i32 = crate::input::ATLAS_ROW as i32 + 64;
 const DOT: u32 = 5;
+/// The names' stencils, in a row below the icons'.
+const LABEL_Y: i32 = ATLAS_Y + 64;
+const LABEL_SLOT: u32 = 128;
+const LABEL: Style = Style::px(13);
+/// How far a hovered icon rises.
+const LIFT: i32 = 6;
 
 /// The dock floats this far above the bottom edge, with this much around
 /// its icons.
@@ -78,6 +87,8 @@ struct Icon {
     /// Where the icon rests.
     at: (i32, i32),
     running: bool,
+    /// Its name above it on hover: the pill, then the text on it.
+    tooltip: Option<[LayerId; 2]>,
 }
 
 pub struct Dock {
@@ -85,6 +96,8 @@ pub struct Dock {
     icons: Vec<Icon>,
     size: u32,
     bounce: bool,
+    /// The icon the pointer is over.
+    hovered: Option<usize>,
 }
 
 /// How much of each pixel of a `size`-pixel superellipse tile is covered:
@@ -226,6 +239,7 @@ impl Dock {
                     dot: None,
                     at,
                     running: false,
+                    tooltip: None,
                 });
                 continue;
             };
@@ -251,12 +265,14 @@ impl Dock {
             );
             dot.opacity = Animation::rest(Fx::ZERO);
             let dot = scene.add(dot);
+            let tooltip = Self::tooltip(renderer, scene, theme, index, app.title, at, size);
             icons.push(Icon {
                 tile,
                 glyph,
                 dot,
                 at,
                 running: false,
+                tooltip,
             });
         }
         Some(Dock {
@@ -264,7 +280,68 @@ impl Dock {
             icons,
             size,
             bounce: theme.bounce && theme.speed > 0,
+            hovered: None,
         })
+    }
+
+    /// Icon `index`'s name on a pill above it, hidden until hovered.
+    fn tooltip<R: Renderer, const N: usize>(
+        renderer: &mut R,
+        scene: &mut Scene<N>,
+        theme: &Theme,
+        index: usize,
+        name: &str,
+        at: (i32, i32),
+        size: u32,
+    ) -> Option<[LayerId; 2]> {
+        let extent = corrode_text::measure(name, LABEL);
+        if extent.width > LABEL_SLOT || extent.height > 20 {
+            return None;
+        }
+        let mut coverage = alloc::vec![0u8; extent.area()];
+        corrode_text::draw(name, LABEL, &mut Coverage::new(&mut coverage, extent.width as usize));
+        let src = Rect::new(
+            ATLAS_X + index as i32 * LABEL_SLOT as i32,
+            LABEL_Y,
+            extent.width,
+            extent.height,
+        );
+        renderer.upload_mask(src, &coverage).ok()?;
+        let (width, height) = (extent.width + 20, extent.height + 8);
+        let x = at.0 + (size as i32 - width as i32) / 2;
+        let y = at.1 - PAD as i32 - height as i32 - 10;
+        let mut pill = crate::input::pane(Rect::new(x, y, width, height), (height / 2) as u16, theme);
+        let mut label = Layer::mask(x + 10, y + 4, src, theme.text());
+        pill.opacity = Animation::rest(Fx::ZERO);
+        label.opacity = Animation::rest(Fx::ZERO);
+        Some([scene.add(pill)?, scene.add(label)?])
+    }
+
+    /// The pointer is over icon `over`, or none: lift it and name it, and
+    /// put the last one back.
+    pub fn hover<const N: usize>(&mut self, scene: &mut Scene<N>, over: Option<usize>, now: u64) {
+        if over == self.hovered {
+            return;
+        }
+        for (index, shown) in [(self.hovered, false), (over, true)] {
+            let Some(icon) = index.and_then(|index| self.icons.get(index)) else {
+                continue;
+            };
+            let y = Fx::from_int(icon.at.1 - if shown { LIFT } else { 0 });
+            for id in [Some(icon.tile), icon.glyph].into_iter().flatten() {
+                if let Some(layer) = scene.layer_mut(id) {
+                    layer.y = layer.y.retarget(now, y, Spring::SNAPPY);
+                }
+            }
+            let opacity = Fx::from_int(if shown { 255 } else { 0 });
+            for id in icon.tooltip.into_iter().flatten() {
+                if let Some(layer) = scene.layer_mut(id) {
+                    let from = layer.opacity.sample(now).value;
+                    layer.opacity = Animation::ease(now, 120, from, opacity, corrode_render::anim::Ease::Out);
+                }
+            }
+        }
+        self.hovered = over;
     }
 
     /// Every layer of the dock, bottom first.
@@ -272,7 +349,12 @@ impl Dock {
         core::iter::once(self.pane).chain(
             self.icons
                 .iter()
-                .flat_map(|icon| [Some(icon.tile), icon.glyph, icon.dot].into_iter().flatten()),
+                .flat_map(|icon| {
+                    [Some(icon.tile), icon.glyph, icon.dot]
+                        .into_iter()
+                        .flatten()
+                        .chain(icon.tooltip.into_iter().flatten())
+                }),
         )
     }
 
@@ -305,12 +387,14 @@ impl Dock {
         };
         if self.bounce {
             let height = (self.size * 45 / 100) as i32;
+            // It lands where it rests now: lifted, if the pointer is on it.
+            let rest = icon.at.1 - if self.hovered == Some(index) { LIFT } else { 0 };
             for id in [Some(icon.tile), icon.glyph].into_iter().flatten() {
                 if let Some(layer) = scene.layer_mut(id) {
                     layer.y = Animation::spring(
                         now,
-                        Fx::from_int(icon.at.1 - height),
-                        Fx::from_int(icon.at.1),
+                        Fx::from_int(rest - height),
+                        Fx::from_int(rest),
                         Velocity::ZERO,
                         Spring::BOUNCY,
                     );
