@@ -248,6 +248,10 @@ pub mod window {
     /// To Files: show this file. The path is the four words' 32 bytes,
     /// little-endian, NUL-padded; a longer path is not sent.
     pub const REVEAL: u64 = 72;
+    /// A call: show a notification saying up to 32 bytes of ASCII, the four
+    /// words little-endian and NUL-padded, under the caller's window title.
+    /// The answer's word 0 is 0.
+    pub const NOTIFY: u64 = 73;
 
     /// Most a window may be, either way.
     pub const MAX_WIDTH: u32 = 1920;

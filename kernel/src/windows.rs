@@ -132,6 +132,12 @@ pub fn title(index: usize) -> alloc::string::String {
         .collect()
 }
 
+/// The title of the first window `owner` opened, if it has one.
+pub fn title_of_owner(owner: usize) -> Option<alloc::string::String> {
+    let index = without_interrupts(|| TABLE.lock().iter().position(|window| window.owner == owner))?;
+    Some(title(index)).filter(|title| !title.is_empty())
+}
+
 /// Whether the desktop may resize a window.
 pub fn resizable(index: usize) -> bool {
     without_interrupts(|| TABLE.lock().get(index).is_some_and(|window| window.resizable))

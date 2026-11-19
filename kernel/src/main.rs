@@ -16,6 +16,8 @@ mod cap;
 mod device;
 mod dock;
 mod rtc;
+mod banner;
+mod notify;
 mod spotlight;
 mod switcher;
 #[cfg(feature = "efi-log")]
@@ -2074,6 +2076,21 @@ extern "C" fn window_server() {
         let words = received.message.words;
         // A new look for the desktop: kept, and picked up by the painter on
         // its next frame.
+        // A notification, filed under the sender's window title.
+        if received.message.label == window::NOTIFY {
+            let from = windows::title_of_owner(received.from)
+                .unwrap_or_else(|| alloc::string::String::from("CorrodeOS"));
+            notify::post(from, notify::unpack(words));
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: window::NOTIFY,
+                    words: [0; 4],
+                },
+                None,
+            );
+            continue;
+        }
         if received.message.label == window::SET_THEME {
             look::set(corrode_theme::Theme::from_words(words));
             let _ = ipc::reply(

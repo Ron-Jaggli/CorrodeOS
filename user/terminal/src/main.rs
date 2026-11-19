@@ -60,7 +60,7 @@ const SLOTS: usize = 16;
 
 /// The terminal's own commands, how to call them, and what they do. The
 /// shell lists them in `help` after its own.
-const COMMANDS: [About; 9] = [
+const COMMANDS: [About; 10] = [
     ("clear", "", "start with an empty window (or Ctrl+L)"),
     ("history", "", "the lines typed so far"),
     ("uptime", "", "time since the machine started"),
@@ -68,6 +68,7 @@ const COMMANDS: [About; 9] = [
     ("uname", "[-asrm]", "what system this is"),
     ("sleep", "SECONDS", "wait; Ctrl+C to stop early"),
     ("caps", "", "the capabilities this terminal holds"),
+    ("notify", "TEXT", "show TEXT as a notification"),
     ("about", "", "what this is"),
     ("exit", "", "close this terminal"),
 ];
@@ -332,6 +333,18 @@ impl Host for System<'_> {
             "caps" => {
                 caps(out);
                 0
+            }
+            "notify" => {
+                let text = args[1..].join(" ");
+                if text.is_empty() {
+                    out.error("notify: say what");
+                    1
+                } else if corrode_ui::notify(&text).is_err() {
+                    out.error("notify: the desktop did not answer");
+                    1
+                } else {
+                    0
+                }
             }
             "about" => {
                 out.line("CorrodeOS terminal: a ring 3 program holding a window,");

@@ -59,7 +59,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -371,6 +371,31 @@ reveal-test: iso
 	    && echo "reveal-test: search found motd and Files showed it   PASS" \
 	    || echo "reveal-test: search found motd and Files showed it   FAIL"
 	@test -s build/reveal.ppm && pnmtopng build/reveal.ppm > build/reveal.png 2>/dev/null && rm -f build/reveal.ppm && echo "wrote build/reveal.png" || true
+
+# Open a terminal from the dock and run notify twice. The first banner
+# slides in at the top right and leaves by itself after four seconds; the
+# second, in build/notify.png, is clicked away.
+notify-test: iso
+	@rm -f build/notify.ppm build/notify.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   for key in n o t i f y spc s t a r t e d ret; do echo "sendkey $$key"; sleep 0.1; done; \
+	   sleep 5.5; \
+	   for key in n o t i f y spc b u i l d spc d o n e ret; do echo "sendkey $$key"; sleep 0.1; done; \
+	   sleep 1.2; echo "screendump build/notify.ppm"; sleep 1; \
+	   echo "mouse_move 230 -350"; sleep 0.2; echo "mouse_move 200 -340"; sleep 0.3; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "^notify |notification" build/serial.log || echo "notify-test: no notification"
+	@grep -q "^notify     : Terminal: build done" build/serial.log \
+	    && grep -q "notification from Terminal shown" build/serial.log \
+	    && grep -q "notification dismissed" build/serial.log \
+	    && test "$$(grep -c 'notification gone' build/serial.log)" = 2 \
+	    && echo "notify-test: one banner timed out, one was clicked   PASS" \
+	    || echo "notify-test: one banner timed out, one was clicked   FAIL"
+	@test -s build/notify.ppm && pnmtopng build/notify.ppm > build/notify.png 2>/dev/null && rm -f build/notify.ppm && echo "wrote build/notify.png" || true
 
 # Open a terminal from the dock and drag its bottom-right corner 200 by 100
 # pixels bigger, in four steps; then drag its top-left corner 60 by 40

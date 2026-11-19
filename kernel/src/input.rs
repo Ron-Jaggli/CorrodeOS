@@ -635,6 +635,8 @@ pub struct Desk {
     spotlight: Option<crate::spotlight::Spotlight>,
     /// A file search asked Files to show, for when its window opens.
     reveal: Option<[u64; 4]>,
+    /// The notification on screen, if any.
+    banner: Option<crate::banner::Banner>,
     /// Window ids, the one most recently in front first: the switcher's
     /// order.
     recent: Vec<usize>,
@@ -760,6 +762,7 @@ impl Desk {
             switcher: None,
             spotlight: None,
             reveal: None,
+            banner: None,
             recent: Vec::new(),
         };
         let src = Rect::new(0, LINE_ROW as i32, 1, line_height);
@@ -818,6 +821,7 @@ impl Desk {
     ) {
         self.restack(scene);
         self.forget_abandoned(scene);
+        self.notifications(renderer, scene, now);
 
         // What programs have drawn since the last frame.
         for managed in &self.windows {
@@ -1012,17 +1016,23 @@ impl Desk {
     /// Draw a window's title into a free slot of the atlas. The slot, and
     /// how wide the title came out.
     fn draw_title<R: Renderer>(&mut self, renderer: &mut R, title: &str) -> Option<(usize, u32)> {
-        if title.is_empty() {
+        self.draw_text(renderer, title, TITLE_STYLE)
+    }
+
+    /// Draw `text` into a free title slot: the slot, and how wide the text
+    /// came out. None if it is empty, will not fit, or no slot is free.
+    fn draw_text<R: Renderer>(&mut self, renderer: &mut R, text: &str, style: Style) -> Option<(usize, u32)> {
+        if text.is_empty() {
             return None;
         }
         let slot = (0..TITLE_SLOTS).find(|slot| self.titles & 1 << slot == 0)?;
         let (width, height) = TITLE_SLOT;
-        let extent = corrode_text::measure(title, TITLE_STYLE);
+        let extent = corrode_text::measure(text, style);
         if extent.width > width || extent.height > height {
             return None;
         }
         let mut coverage = alloc::vec![0u8; (width * height) as usize];
-        corrode_text::draw(title, TITLE_STYLE, &mut Coverage::new(&mut coverage, width as usize));
+        corrode_text::draw(text, style, &mut Coverage::new(&mut coverage, width as usize));
         renderer.upload_mask(Self::title_src(slot, width), &coverage).ok()?;
         self.titles |= 1 << slot;
         Some((slot, extent.width))
@@ -1282,6 +1292,12 @@ impl Desk {
                 scene.raise(id);
             }
         }
+        if let Some(banner) = &self.banner {
+            let ids: Vec<LayerId> = banner.layers().collect();
+            for id in ids {
+                scene.raise(id);
+            }
+        }
         if let Some([below, above]) = self.pointer {
             scene.raise(below);
             scene.raise(above);
@@ -1326,6 +1342,15 @@ impl Desk {
             let top = scene
                 .layers_at(self.at.0, self.at.1)
                 .find(|id| !pointer.contains(id));
+            // A notification clicked goes away, and nothing under it hears.
+            if let (Some(banner), Some(top)) = (&mut self.banner, top) {
+                if banner.contains(top) {
+                    let theme = self.theme;
+                    banner.dismiss(scene, &theme, now);
+                    println!("input      : notification dismissed");
+                    return;
+                }
+            }
             if let (Some(dock), Some(top)) = (&self.dock, top) {
                 if let Some(icon) = dock.icon(top) {
                     println!("input      : click at ({}, {}) on the dock", self.at.0, self.at.1);
@@ -1598,6 +1623,64 @@ impl Desk {
             Some(_) => println!("desktop    : switcher up, {} windows", order.len()),
             // No room in the scene for it: just go to the pick.
             None => self.restore(scene, order[picked], now),
+        }
+    }
+
+    /// Notifications: take down the banner once it has gone, and put up
+    /// the next one waiting.
+    fn notifications<R: Renderer, const N: usize>(&mut self, renderer: &mut R, scene: &mut Scene<N>, now: u64) {
+        let theme = self.theme;
+        if let Some(banner) = &mut self.banner {
+            if !banner.tick(scene, &theme, now) {
+                return;
+            }
+            if let Some(banner) = self.banner.take() {
+                for slot in banner.slots {
+                    self.titles &= !(1 << slot);
+                }
+                banner.close(scene);
+                println!("desktop    : notification gone");
+            }
+        }
+        let Some((from, text)) = crate::notify::take() else {
+            return;
+        };
+        let body = Style::px(13);
+        let (Some((name_slot, name_width)), text) = (
+            self.draw_text(renderer, &from, TITLE_STYLE),
+            // Too wide for its slot: cut, a character at a time.
+            {
+                let mut text = text;
+                while !text.is_empty() && corrode_text::measure(&text, body).width > TITLE_SLOT.0 {
+                    text.pop();
+                }
+                text
+            },
+        ) else {
+            println!("desktop    : no room to show a notification");
+            return;
+        };
+        let Some((text_slot, text_width)) = self.draw_text(renderer, &text, body) else {
+            self.titles &= !(1 << name_slot);
+            println!("desktop    : no room to show a notification");
+            return;
+        };
+        let icon = self
+            .dock
+            .as_ref()
+            .and_then(|dock| dock.find(&from).and_then(|app| dock.stencils(app)));
+        let content = crate::banner::Content {
+            icon,
+            name: (Self::title_src(name_slot, TITLE_SLOT.0), name_width),
+            text: (Self::title_src(text_slot, TITLE_SLOT.0), text_width),
+            slots: [name_slot, text_slot],
+        };
+        self.banner = crate::banner::Banner::show(scene, &theme, content, now);
+        match self.banner {
+            Some(_) => println!("desktop    : notification from {} shown", from),
+            None => {
+                self.titles &= !(1 << name_slot | 1 << text_slot);
+            }
         }
     }
 

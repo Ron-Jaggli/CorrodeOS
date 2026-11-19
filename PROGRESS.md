@@ -563,3 +563,29 @@ Choices made without asking are marked **Choice:**.
   - Files are matched by name only, not by contents.
 - Screenshots: `build/progress-23-search-files.png`,
   `build/progress-24-reveal.png`.
+
+## 26. Notifications
+
+- Programs can now post notifications. `corrode_ui::notify(text)` sends
+  `window::NOTIFY` (up to 32 bytes of ASCII in the four words) to the
+  window server. The server files it in `kernel/src/notify.rs` under the
+  sender's window title, found by the task that sent it. At most 8 wait;
+  the oldest is dropped past that.
+- `kernel/src/banner.rs`: macOS-style banners.
+  - A glass pane 340x66 at the top right, under the menu bar, with the
+    sender's dock icon, its name in bold and the text below.
+  - It springs in from beyond the right edge.
+  - It eases out after four seconds, or at once when clicked; the click
+    goes no further.
+  - One shows at a time, and the next waiting one follows.
+- The text uses two of the window title slots, borrowed through a new
+  `Desk::draw_text` (draw_title is built on it) and given back when the
+  banner goes. If no slots are free, the log says so and nothing is shown.
+- The terminal gained `notify TEXT`.
+- New `./corrode notify-test`: two notifications. The first times out by
+  itself, and the second (`build/notify.png`) is clicked away. PASS, on
+  virtio too. All tests PASS; 170 / 0.
+- Known gaps:
+  - No Notification Center listing past notifications.
+  - Text longer than its slot (256 px) is cut.
+- Screenshot: `build/progress-25-notify.png`.

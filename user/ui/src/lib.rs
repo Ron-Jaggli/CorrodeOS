@@ -327,6 +327,17 @@ pub fn set_theme(theme: &Theme) -> Result<()> {
     }
 }
 
+/// Show a notification saying `text` -- its first 32 bytes -- under this
+/// program's window title.
+pub fn notify(text: &str) -> Result<()> {
+    let mut words = [0u64; 4];
+    for (index, byte) in text.bytes().take(32).enumerate() {
+        words[index / 8] |= (byte as u64) << (index % 8 * 8);
+    }
+    corrode_rt::call(app::WINDOWS, Message::new(window::NOTIFY, words), None)?;
+    Ok(())
+}
+
 /// How tall a line of `style` is.
 pub fn line_height(style: Style) -> u32 {
     corrode_text::measure("Mg", style).height

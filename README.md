@@ -138,6 +138,11 @@ a minimized window), **Alt+Q**, **Alt+W** or
 Down to pick, Return to open an app or show a file in Files, Escape to
 close).
 
+Programs can post notifications: `corrode_ui::notify("build done")` shows a
+glass banner at the top right under the program's name and dock icon, for
+four seconds or until clicked. From the terminal, `notify TEXT` does the
+same.
+
 Programs follow the look on their own: a window is sent `window::THEME`
 when it opens and whenever the look changes (`Event::Theme` in the `ui`
 crate). A program can change the look with `corrode_ui::set_theme`, which
