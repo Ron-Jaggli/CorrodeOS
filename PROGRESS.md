@@ -1747,7 +1747,7 @@ Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
 
 1. [x] Finish SSE (branch `sse`) -- section 64
 2. [x] Passcode as a salted hash (`passcode-hash`) -- section 65
-3. [ ] Secure-core capability, groundwork only (`secure-cap`)
+3. [ ] Secure-core capability, groundwork only (`secure-cap`) -- STOPPED, needs your decision (below)
 4. [ ] SSE for the glass lens (`sse-glass`)
 5. [ ] SSE for the 2x2 backdrop downscale (`sse-downscale`)
 6. [ ] Raise the 16-surface cap (`more-surfaces`)
@@ -1755,3 +1755,46 @@ Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
 8. [ ] SSE for image / alpha-blend compositing (`sse-blend`)
 9. [ ] xHCI + USB HID keyboard and mouse, QEMU only (`xhci`)
 10. [ ] Write-up: surviving-reboot key options, results table
+
+### Stopped at task 3, 2026-11-21T00:55-06:00
+
+Tasks 1 and 2 are done and committed (`sse` e6cb886, `passcode-hash`
+af76226). The loop stopped before writing any code for task 3, by its own
+rule: it needs a new ring-3 path to the secure core, and that has security
+weight. What the secure core offers today (`secure_core::crypt`) is raw
+AES-128-CTR with the caller's nonce, one key for everyone, and no
+integrity check. Handed to ring 3 as it is:
+
+- a program that reuses a nonce gives away the XOR of its two plaintexts;
+- Settings could decrypt Lock's data and the other way round;
+- nothing notices a flipped bit in what comes back.
+
+Proposed instead, for you to accept or change:
+
+1. A capability `secure::SEAL`, given by bootstrap only to Settings and
+   Lock, the way the shell capability is given (46).
+2. Two operations and no others: SEAL(data) returns nonce, ciphertext and
+   tag; UNSEAL checks the tag before it decrypts anything. The secure core
+   picks every nonce (a per-boot counter), so no caller can reuse one.
+   There is no raw CTR operation in ring 3.
+3. Each holder gets its own subkeys, derived inside the secure core from
+   the `xmm15` key and the holder's identity (one for encryption, one for
+   a CMAC tag). The key itself still never leaves the register and is
+   still made the same way. Derived keys live only in XMM scratch during a
+   request, as the round keys already do.
+4. Data goes in the IPC message, up to the mailbox's payload less 28
+   bytes (nonce and tag).
+5. A boot self-check that a program without the capability is refused,
+   one that a tampered tag is refused, and one that Lock cannot unseal
+   what Settings sealed.
+
+Questions:
+- (a) May the secure core derive per-holder subkeys from its key (3)? It
+  changes how the key is used, not how it is made or kept.
+- (b) Seal/unseal with tags and secure-core nonces (2), rather than the
+  raw crypt the task names?
+- (c) Do Settings and Lock need to be kept apart (3), or is one shared key
+  fine for now?
+- (d) Should the remaining tasks (4-10) go on without task 3? None of them
+  needs it; only the branch order does (`sse-glass` would branch off
+  `passcode-hash` instead).
