@@ -2078,6 +2078,36 @@ keep the scalar code, which also does what is left of a row.
   self-checks 181 / 0 (default) and 188 / 0 (virtio). `./corrode test`
   passes; clippy has nothing new.
 
+## 72. A USB host controller driver in ring 3
+
+`xhci`, an ordinary ring 3 program like `ps2` and `virtio-blk`, drives an
+xHCI controller; the USB keyboards and pointers on it reach the desktop in
+the same messages as the PS/2 driver's. QEMU only: `USB=1` adds
+`qemu-xhci` with `usb-kbd` and `usb-tablet` (emulated; no host device is
+ever named). Committed in steps.
+
+**Step 1: reset and rings.** `kernel/src/usb.rs` finds a controller by PCI
+class (0c/03/30), loads `xhci`, and gives it six capabilities
+(`corrode_abi::xhci`): its configuration space, BAR 0, an MSI-X line aimed
+at its CPU, 32 pages of memory, a send-only endpoint (the one the PS/2
+driver sends to) and the log; a boot check says it holds nothing else.
+Slots 92-95 in bootstrap's space, clear of the disk's and the surfaces'.
+The driver stops and resets the controller, then sets up the device
+context table, a command ring and a one-segment event ring, a page each
+(so no structure needs pages next to each other), interrupter 0
+(moderated to 1 ms), and runs it; a No-Op command must come back with
+Success. QEMU's controller: 64 slots, 8 ports, no scratchpads, 32-byte
+contexts.
+
+- **Choice:** the steps of this task are committed after `usb-test` and
+  `input-test` on both GPUs and `./corrode test`; the whole suite runs
+  before the last. Without `USB=1` the kernel says "no xHCI controller"
+  and nothing else changes.
+- **usb-test** (new, scored): driven over QMP (`-qmp stdio`), not the
+  human monitor, because QEMU 7.2's `mouse_move` is relative only and a
+  tablet takes positions; the Makefile's `qmp` turns `key`, `at X Y`,
+  `click`, `shot` and `wait` lines into QMP commands.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by

@@ -21,6 +21,7 @@ members = [
     "user/fault",
     "user/virtio-gpu",
     "user/virtio-blk",
+    "user/xhci",
     "user/blob-reader",
     "user/nvidia",
     "user/ps2",

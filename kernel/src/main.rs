@@ -47,6 +47,7 @@ mod sync;
 mod syscall;
 mod task;
 mod time;
+mod usb;
 mod windows;
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -2044,6 +2045,9 @@ fn start_input() {
         granted && cap::slots_used(driver) == Some(5),
     );
     start_all(&[receiver, Some(driver)]);
+    // USB keyboards and pointers, if there is a controller, into the same
+    // endpoint.
+    usb::start(INPUT_ENDPOINT);
 }
 
 /// Bootstrap's ends of the window server's and the launcher's endpoints,

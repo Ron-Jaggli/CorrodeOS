@@ -425,6 +425,37 @@ pub mod ps2 {
     /// The driver is up: word 0 is 1 if a keyboard answered, word 1 is 1 if a
     /// mouse did.
     pub const LABEL_READY: u64 = 52;
+    /// A pointer that knows where it is, not how far it went -- a tablet:
+    /// words 0 and 1 are the position across and down, each from 0 to
+    /// [`POINTER_AT_MAX`] for the far edge; word 2 the buttons held; word 3
+    /// the wheel, as for [`LABEL_POINTER`].
+    pub const LABEL_POINTER_AT: u64 = 53;
+    pub const POINTER_AT_MAX: u64 = 0x7fff;
+}
+
+/// The USB host controller's driver, `xhci`: an xHCI controller, the
+/// keyboards and pointers on it, and what they say passed on to the
+/// compositor in the same messages as [`ps2`]'s.
+pub mod xhci {
+    /// The controller's configuration space.
+    pub const DEVICE: usize = 0;
+    /// Its registers, BAR 0.
+    pub const BAR: usize = 1;
+    /// Its interrupt (MSI-X or MSI message 0, on interrupter 0).
+    pub const IRQ: usize = 2;
+    /// Memory for its rings, contexts and buffers: [`MEMORY_PAGES`] pages.
+    pub const MEMORY: usize = 3;
+    /// A send-only endpoint to the compositor: [`ps2`]'s labels.
+    pub const EVENTS: usize = 4;
+    /// A send-only endpoint to the log.
+    pub const LOG: usize = 5;
+
+    pub const MEMORY_PAGES: usize = 32;
+
+    /// The PCI class of an xHCI controller: serial bus, USB, xHCI.
+    pub const CLASS: u8 = 0x0c;
+    pub const SUBCLASS: u8 = 0x03;
+    pub const PROG_IF: u8 = 0x30;
 }
 
 /// The boot-time conversation between the kernel and the `edu` driver, which

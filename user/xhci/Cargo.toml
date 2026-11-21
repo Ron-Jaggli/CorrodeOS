@@ -1,0 +1,15 @@
+[package]
+name = "corrode-xhci"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "xhci"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+corrode-rt = { path = "../rt" }
+corrode-input = { path = "../../input" }

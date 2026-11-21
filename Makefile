@@ -53,12 +53,20 @@ SETTINGS_IMG := build/settings.img
 store_flags = -drive file=$(1),format=raw,if=none,id=store \
               -device virtio-blk-pci,drive=store,disable-legacy=on
 
+# USB=1: an xHCI controller with QEMU's USB keyboard and tablet on it,
+# emulated: nothing here may name a host device. QEMU hands keys to the USB
+# keyboard once it exists, and a tablet takes positions, which the PS/2
+# mouse cannot: what reaches the desktop then came through the USB driver.
+USB ?=
+usb_flags = -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0
+
 QEMU_BASE := -M $(MACHINE) -m $(MEM) -smp $(CPUS) \
              -cdrom $(ISO) -boot d \
              -net none \
              -no-reboot -no-shutdown \
              -vga $(GPU) $(ACCEL) $(QEMU_DEVICES) $(QEMU_EXTRA) \
-             $(if $(STORE),$(call store_flags,$(STORE)))
+             $(if $(STORE),$(call store_flags,$(STORE))) \
+             $(if $(USB),$(usb_flags))
 
 QEMU_COMMON := $(QEMU_BASE) -display none
 QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
@@ -67,7 +75,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test fade-test grow-test zoom-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test fade-test usb-test grow-test zoom-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -85,7 +93,7 @@ kernel:
 # crate built for it. RUSTFLAGS in the environment replaces the ones in
 # .cargo/config.toml outright, and a separate target directory stops the two
 # sets of flags from invalidating each other's build of the crates they share.
-USER_PROGRAMS := edu fault virtio-gpu virtio-blk blob-reader nvidia ps2 terminal panel settings about files control lock menu
+USER_PROGRAMS := edu fault virtio-gpu virtio-blk blob-reader nvidia ps2 xhci terminal panel settings about files control lock menu
 USER_TARGET   := target/user
 USER_BIN      := $(USER_TARGET)/x86_64-unknown-none/release
 USER_RUSTFLAGS := -C relocation-model=static -C strip=debuginfo \
@@ -965,6 +973,31 @@ surfaces-test: iso
 	    && echo "surfaces-test: Quit closed all twenty                    PASS" \
 	    || echo "surfaces-test: Quit closed all twenty                    FAIL"
 	@test -s build/surfaces.ppm && pnmtopng build/surfaces.ppm > build/surfaces.png 2>/dev/null && rm -f build/surfaces.ppm && echo "wrote build/surfaces.png" || true
+
+# USB: QEMU's xHCI controller with its keyboard and tablet (USB=1's
+# devices), driven by QMP rather than the human monitor, since only QMP can
+# send a tablet's absolute positions. `qmp` turns lines of the form
+# `key a b`, `at X Y` (pixels on the 1280x800 screen), `click`, `shot FILE`
+# and `wait S` into commands.
+qmp = { echo '{"execute":"qmp_capabilities"}'; \
+        while read -r verb a b; do case $$verb in \
+          key) for k in $$a; do echo "{\"execute\":\"send-key\",\"arguments\":{\"keys\":[$$(echo $$k | sed 's/-/ /g' | awk '{for(i=1;i<=NF;i++) printf "%s{\"type\":\"qcode\",\"data\":\"%s\"}", (i>1?",":""), $$i}')]}}"; sleep 0.15; done ;; \
+          at) echo "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"abs\",\"data\":{\"axis\":\"x\",\"value\":$$(( a * 32767 / 1279 ))}},{\"type\":\"abs\",\"data\":{\"axis\":\"y\",\"value\":$$(( b * 32767 / 799 ))}}]}}" ;; \
+          click) for down in true false; do echo "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"btn\",\"data\":{\"down\":$$down,\"button\":\"left\"}}]}}"; sleep 0.2; done ;; \
+          shot) echo "{\"execute\":\"screendump\",\"arguments\":{\"filename\":\"$$a\"}}" ;; \
+          wait) sleep $$a ;; \
+        esac; done; echo '{"execute":"quit"}'; }
+
+usb-test: iso
+	@rm -f build/usb.ppm build/usb.png
+	@( echo "wait $(SHOT_DELAY)"; echo "wait 2"; echo "shot build/usb.ppm"; echo "wait 1" ) | $(qmp) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) $(usb_flags) \
+	      -serial file:build/serial.log -qmp stdio > /dev/null 2>&1 || true
+	@grep -aE "^(usb|xhci) " build/serial.log || echo "usb-test: nothing from USB"
+	@grep -aq "^xhci       : controller up: reset, rings set, a no-op command answered" build/serial.log \
+	    && echo "usb-test: the controller is up and takes commands     PASS" \
+	    || echo "usb-test: the controller is up and takes commands     FAIL"
+	@test -s build/usb.ppm && pnmtopng build/usb.ppm > build/usb.png 2>/dev/null && rm -f build/usb.ppm && echo "wrote build/usb.png" || true
 
 # Open Settings from the dock and change the look three times while it runs:
 # Light, the Dunes wallpaper, a blue accent. build/settings.png shows the

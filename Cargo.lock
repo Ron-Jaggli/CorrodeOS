@@ -225,3 +225,11 @@ dependencies = [
  "corrode-theme",
  "corrode-virtio",
 ]
+
+[[package]]
+name = "corrode-xhci"
+version = "0.0.1"
+dependencies = [
+ "corrode-input",
+ "corrode-rt",
+]
