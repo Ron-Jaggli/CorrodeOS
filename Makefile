@@ -981,7 +981,7 @@ surfaces-test: iso
 # and `wait S` into commands.
 qmp = { echo '{"execute":"qmp_capabilities"}'; \
         while read -r verb a b; do case $$verb in \
-          key) for k in $$a; do echo "{\"execute\":\"send-key\",\"arguments\":{\"keys\":[$$(echo $$k | sed 's/-/ /g' | awk '{for(i=1;i<=NF;i++) printf "%s{\"type\":\"qcode\",\"data\":\"%s\"}", (i>1?",":""), $$i}')]}}"; sleep 0.15; done ;; \
+          key) for k in $$a $$b; do echo "{\"execute\":\"send-key\",\"arguments\":{\"keys\":[$$(echo $$k | sed 's/-/ /g' | awk '{for(i=1;i<=NF;i++) printf "%s{\"type\":\"qcode\",\"data\":\"%s\"}", (i>1?",":""), $$i}')]}}"; sleep 0.15; done ;; \
           at) echo "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"abs\",\"data\":{\"axis\":\"x\",\"value\":$$(( a * 32767 / 1279 ))}},{\"type\":\"abs\",\"data\":{\"axis\":\"y\",\"value\":$$(( b * 32767 / 799 ))}}]}}" ;; \
           click) for down in true false; do echo "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[{\"type\":\"btn\",\"data\":{\"down\":$$down,\"button\":\"left\"}}]}}"; sleep 0.2; done ;; \
           shot) echo "{\"execute\":\"screendump\",\"arguments\":{\"filename\":\"$$a\"}}" ;; \
@@ -990,7 +990,8 @@ qmp = { echo '{"execute":"qmp_capabilities"}'; \
 
 usb-test: iso
 	@rm -f build/usb.ppm build/usb.png
-	@( echo "wait $(SHOT_DELAY)"; echo "wait 2"; echo "shot build/usb.ppm"; echo "wait 1" ) | $(qmp) \
+	@( echo "wait $(SHOT_DELAY)"; echo "key $(INPUT_KEYS)"; echo "wait 1"; \
+	   echo "shot build/usb.ppm"; echo "wait 1" ) | $(qmp) \
 	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) $(usb_flags) \
 	      -serial file:build/serial.log -qmp stdio > /dev/null 2>&1 || true
 	@grep -aE "^(usb|xhci) " build/serial.log || echo "usb-test: nothing from USB"
@@ -1003,6 +1004,10 @@ usb-test: iso
 	@grep -aqE "^xhci       : port [0-9]+: .*, a HID device: " build/serial.log \
 	    && echo "usb-test: the tablet is addressed and configured      PASS" \
 	    || echo "usb-test: the tablet is addressed and configured      FAIL"
+	@grep -aqE "^xhci       : slot [0-9]+: the first report, 8 bytes" build/serial.log \
+	    && grep -aq '^input      : line "Hi there"' build/serial.log \
+	    && echo "usb-test: typing on the USB keyboard reaches the desk PASS" \
+	    || echo "usb-test: typing on the USB keyboard reaches the desk FAIL"
 	@test -s build/usb.ppm && pnmtopng build/usb.ppm > build/usb.png 2>/dev/null && rm -f build/usb.ppm && echo "wrote build/usb.png" || true
 
 # Open Settings from the dock and change the look three times while it runs:

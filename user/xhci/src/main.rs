@@ -21,10 +21,12 @@
 #![no_std]
 #![no_main]
 
+use corrode_rt::abi::ps2::LABEL_KEY;
 use corrode_rt::abi::xhci::{BAR, DEVICE, EVENTS, IRQ, LOG, MEMORY, MEMORY_PAGES};
 use corrode_rt::device::{Config, Interrupt, Mmio};
-use corrode_input::usb::{find_hid, HidInterface, BOOT, KEYBOARD, MOUSE};
-use corrode_rt::{println, Error};
+use corrode_input::usb::{find_hid, BootKeyboard, HidInterface, BOOT, KEYBOARD, MOUSE};
+use corrode_input::Keyboard;
+use corrode_rt::{println, send, Error, Message};
 
 corrode_rt::entry!(main);
 
@@ -79,6 +81,8 @@ const CMD_RUN: u32 = 1 << 0;
 const CMD_RESET: u32 = 1 << 1;
 const CMD_INTERRUPTS: u32 = 1 << 2;
 const STS_HALTED: u32 = 1 << 0;
+/// An interrupter has an event: write 1 to clear.
+const STS_INTERRUPT: u32 = 1 << 3;
 const STS_NOT_READY: u32 = 1 << 11;
 
 const PORT_CONNECTED: u32 = 1 << 0;
@@ -111,12 +115,14 @@ const TRBS: usize = PAGE / 16;
 
 /// TRB types.
 mod trb {
+    pub const NORMAL: u32 = 1;
     pub const SETUP: u32 = 2;
     pub const DATA: u32 = 3;
     pub const STATUS: u32 = 4;
     pub const LINK: u32 = 6;
     pub const ENABLE_SLOT: u32 = 9;
     pub const ADDRESS_DEVICE: u32 = 11;
+    pub const CONFIGURE_ENDPOINT: u32 = 12;
     pub const EVALUATE_CONTEXT: u32 = 13;
     pub const NO_OP_COMMAND: u32 = 23;
     pub const TRANSFER_EVENT: u32 = 32;
@@ -126,6 +132,8 @@ mod trb {
 const CYCLE: u32 = 1 << 0;
 /// In a link TRB: flip the cycle bit when following it.
 const TOGGLE_CYCLE: u32 = 1 << 1;
+/// In a transfer TRB: say so with an event if fewer bytes came than asked.
+const INTERRUPT_ON_SHORT: u32 = 1 << 2;
 const INTERRUPT_ON_COMPLETION: u32 = 1 << 5;
 /// In a setup TRB: the eight bytes of the request are the parameter itself.
 const IMMEDIATE: u32 = 1 << 6;
@@ -138,9 +146,18 @@ const GET_DESCRIPTOR: u8 = 6;
 const SET_CONFIGURATION: u8 = 9;
 const DEVICE_DESCRIPTOR: u16 = 0x0100;
 const CONFIGURATION_DESCRIPTOR: u16 = 0x0200;
+/// HID class requests (HID 1.11 7.2): which protocol, boot or report.
+const SET_PROTOCOL: u8 = 0x0b;
+const BOOT_PROTOCOL: u16 = 0;
 /// Requests' first byte: which way, whose, to what.
 const TO_DEVICE: u8 = 0x00;
 const FROM_DEVICE: u8 = 0x80;
+const CLASS_TO_INTERFACE: u8 = 0x21;
+/// Reports waiting for a device at once: each its own TRB and buffer.
+const REPORTS_QUEUED: usize = 16;
+/// The most of a report read: the most a full-speed interrupt endpoint
+/// sends in a packet.
+const MOST_REPORT: usize = 64;
 /// The most of a configuration descriptor read.
 const MOST_CONFIG: usize = 1024;
 
@@ -304,6 +321,24 @@ struct Device {
     max_packet: u16,
 }
 
+/// A device being read: its interrupt endpoint's ring, and what makes
+/// sense of its reports.
+struct Input {
+    device: Device,
+    /// The endpoint's device context index: its doorbell target.
+    target: usize,
+    ring: Ring,
+    reader: Reader,
+    /// Whether a report has come yet: the first is logged.
+    heard: bool,
+}
+
+enum Reader {
+    /// Boot reports, said as set-1 scancodes to the same decoder the PS/2
+    /// driver uses.
+    Keyboard(BootKeyboard, Keyboard),
+}
+
 /// Port speeds, as PORTSC and the slot context give them.
 const LOW_SPEED: u32 = 2;
 const HIGH_SPEED: u32 = 3;
@@ -448,6 +483,11 @@ impl Controller {
     fn address(&mut self, port: usize, speed: u32, page: usize) -> Option<Device> {
         let enabled = self.must("Enable Slot", Trb { control: trb::ENABLE_SLOT << 10, ..Trb::default() })?;
         let slot = enabled.slot();
+        // The context table has room for the slots enabled, and no more.
+        if !(1..=MOST_DEVICES).contains(&slot) {
+            println!("Enable Slot gave slot {slot}, which was never enabled");
+            return None;
+        }
         for offset in [page::INPUT, page::OUTPUT, page::BUFFERS] {
             self.pages.zero(page + offset);
         }
@@ -625,6 +665,146 @@ impl Controller {
         );
         Some((device, hid))
     }
+
+    /// Set up the device's interrupt IN endpoint (Configure Endpoint,
+    /// 4.6.6) and queue reads on it.
+    fn start(&mut self, mut device: Device, hid: &HidInterface, reader: Reader) -> Option<Input> {
+        if hid.subclass == BOOT {
+            // The boot protocol's reports are the same on every device;
+            // the report protocol's are whatever the device likes.
+            self.control(
+                &mut device,
+                CLASS_TO_INTERFACE,
+                SET_PROTOCOL,
+                BOOT_PROTOCOL,
+                hid.interface as u16,
+                0,
+            )?;
+        }
+        // An IN endpoint's context index is twice its number, plus one.
+        let target = hid.endpoint as usize * 2 + 1;
+        let ring = Ring::new(&self.pages, device.page + page::INTERRUPT);
+        let input = device.page + page::INPUT;
+        self.pages.zero(input);
+        // Add the slot context, whose last entry is now this endpoint, and
+        // the endpoint's.
+        self.pages.write32(input, 4, 1 | 1 << target);
+        self.pages.write32(input, self.context, device.speed << 20 | (target as u32) << 27);
+        self.pages.write32(input, self.context + 4, ((device.port + 1) as u32) << 16);
+        // How often: a power of two of 125 us. At high speed and above the
+        // descriptor gives that power, plus one; below, milliseconds.
+        let interval = if device.speed >= HIGH_SPEED {
+            hid.interval.clamp(1, 16) as u32 - 1
+        } else {
+            (hid.interval.max(1) as u32 * 8).ilog2().clamp(3, 10)
+        };
+        let packet = (hid.max_packet as usize).min(MOST_REPORT) as u32;
+        let at = (1 + target) * self.context;
+        self.pages.write32(input, at, interval << 16);
+        // Three errors; an interrupt IN endpoint (type 7).
+        self.pages.write32(input, at + 4, 3 << 1 | 7 << 3 | packet << 16);
+        self.pages.write64(input, at + 8, ring.start(&self.pages));
+        // Average TRB length and most bytes an interval: one packet.
+        self.pages.write32(input, at + 16, packet | packet << 16);
+        self.must(
+            "Configure Endpoint",
+            Trb {
+                parameter: self.pages.physical(input, 0),
+                status: 0,
+                control: trb::CONFIGURE_ENDPOINT << 10 | (device.slot as u32) << 24,
+            },
+        )?;
+        let mut input = Input {
+            device,
+            target,
+            ring,
+            reader,
+            heard: false,
+        };
+        for index in 0..REPORTS_QUEUED {
+            let buffer = self.pages.physical(input.device.page + page::BUFFERS, page::REPORTS + index * MOST_REPORT);
+            self.read_report(&mut input, buffer, packet);
+        }
+        self.ring(input.device.slot, input.target as u32);
+        Some(input)
+    }
+
+    /// Queue one read of a report into `buffer`.
+    fn read_report(&mut self, input: &mut Input, buffer: u64, len: u32) {
+        input.ring.push(
+            &self.pages,
+            Trb {
+                parameter: buffer,
+                status: len,
+                control: trb::NORMAL << 10 | INTERRUPT_ON_SHORT | INTERRUPT_ON_COMPLETION,
+            },
+        );
+    }
+
+    /// A report came in, or a read failed: make sense of it, and read again
+    /// into the same buffer.
+    fn transfer(&mut self, inputs: &mut [Option<Input>], event: &Trb) {
+        let slot = event.slot();
+        let target = ((event.control >> 16) & 0x1f) as usize;
+        let Some(input) = inputs
+            .iter_mut()
+            .flatten()
+            .find(|input| input.device.slot == slot && input.target == target)
+        else {
+            return;
+        };
+        if !matches!(event.code(), SUCCESS | SHORT_PACKET) {
+            // A stalled or broken endpoint stays stopped: nothing more is
+            // queued on it, and the device falls silent.
+            println!("slot {slot}: a report failed: code {}", event.code());
+            return;
+        }
+        // The TRB the event is about still says which buffer it filled.
+        let ring = self.pages.physical(input.ring.page, 0);
+        let Some(index) = event.parameter.checked_sub(ring).map(|at| at as usize / 16).filter(|i| *i < TRBS) else {
+            return;
+        };
+        let read = self.pages.trb(input.ring.page, index);
+        let buffers = self.pages.physical(input.device.page + page::BUFFERS, 0);
+        let Some(offset) = read
+            .parameter
+            .checked_sub(buffers)
+            .map(|offset| offset as usize)
+            .filter(|offset| (page::REPORTS..PAGE).contains(offset) && offset % MOST_REPORT == 0)
+        else {
+            return;
+        };
+        let asked = read.status & 0x1ffff;
+        let len = asked.saturating_sub(event.status & 0xff_ffff) as usize;
+        if !input.heard {
+            input.heard = true;
+            println!("slot {slot}: the first report, {len} bytes");
+        }
+        let mut report = [0u8; MOST_REPORT];
+        for (at, byte) in report[..len.min(MOST_REPORT)].iter_mut().enumerate() {
+            *byte = self.pages.read8(input.device.page + page::BUFFERS, offset + at);
+        }
+        match &mut input.reader {
+            Reader::Keyboard(boot, keyboard) => boot.report(&report[..len], &mut |byte| {
+                if let Some(event) = keyboard.feed(byte) {
+                    let _ = send(
+                        EVENTS,
+                        Message::new(
+                            LABEL_KEY,
+                            [
+                                event.key.0 as u64,
+                                event.pressed as u64,
+                                event.text.map_or(0, |c| c as u64),
+                                keyboard.modifiers() as u64,
+                            ],
+                        ),
+                    );
+                }
+            }),
+        }
+        self.read_report(input, read.parameter, asked);
+        self.ring(input.device.slot, input.target as u32);
+    }
 }
 
 /// Wait up to `ms` for `done` to say so.
@@ -755,34 +935,50 @@ fn main() {
         None => println!("a no-op command was never answered"),
     }
 
-    // Every port with something on it, until there are no more pages.
+    // Every port with something on it, until there are no more pages. A
+    // device that was given a slot keeps its pages even if it is then left
+    // alone, since the controller may still write its context.
+    let mut inputs: [Option<Input>; MOST_DEVICES] = [const { None }; MOST_DEVICES];
+    let mut used = 0;
     let mut found = 0;
     for port in 0..controller.ports {
-        if found == MOST_DEVICES {
+        if used == MOST_DEVICES {
             break;
         }
         let Some(speed) = controller.reset_port(port) else {
             continue;
         };
-        let page = page::DEVICES + found * page::PER_DEVICE;
-        if controller.enumerate(port, speed, page).is_some() {
+        let page = page::DEVICES + used * page::PER_DEVICE;
+        used += 1;
+        let Some((device, hid)) = controller.enumerate(port, speed, page) else {
+            continue;
+        };
+        let reader = match (hid.subclass, hid.protocol) {
+            (BOOT, KEYBOARD) => Reader::Keyboard(BootKeyboard::new(), Keyboard::new()),
+            _ => continue,
+        };
+        if let Some(input) = controller.start(device, &hid, reader) {
+            println!("slot {}: reading reports", input.device.slot);
+            inputs[found] = Some(input);
             found += 1;
         }
     }
     println!("{found} USB input devices");
 
-    let _ = EVENTS;
     let irq = Interrupt(IRQ);
     loop {
         if irq.wait().is_err() {
             println!("cannot wait for the interrupt; stopping");
             corrode_rt::exit();
         }
+        controller.set_op32(USBSTS, STS_INTERRUPT);
         controller
             .registers
             .write32(controller.runtime + IMAN, IMAN_PENDING | IMAN_ENABLE);
         while let Some(event) = controller.next_event() {
-            let _ = event;
+            if event.kind() == trb::TRANSFER_EVENT {
+                controller.transfer(&mut inputs, &event);
+            }
         }
     }
 }

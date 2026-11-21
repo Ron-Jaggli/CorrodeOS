@@ -2113,6 +2113,18 @@ output contexts, control and interrupt rings, buffers. On QEMU the
 keyboard (boot, protocol 1) and the tablet (report protocol) both come up
 at high speed on ports 5 and 6; `usb-test` checks both.
 
+**Step 3: the keyboard.** A boot keyboard is put in the boot protocol
+(SET_PROTOCOL), its interrupt IN endpoint added with Configure Endpoint
+(interval from bInterval: a power of two of 125 us at high speed,
+milliseconds below), and sixteen reads queued, each its own Normal TRB and
+64-byte buffer. A transfer event names the TRB, which still names its
+buffer; the report is read, the TRB queued again on the same buffer.
+`BootKeyboard` turns the report into set-1 bytes and the PS/2 driver's
+`Keyboard` decoder turns those into the same `LABEL_KEY` messages, so the
+desktop cannot tell the buses apart. `usb-test` types `Hi there` over QMP
+and checks the kernel's `line "Hi there"` along with the driver's first
+8-byte report (QEMU gives keys to the USB keyboard once it exists).
+
 - **Choice:** devices are found once, at start; a device plugged in later
   is not (no hot-plug), and at most four are looked after (the pages).
 - **Choice:** the steps of this task are committed after `usb-test` and
