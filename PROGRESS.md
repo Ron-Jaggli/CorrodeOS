@@ -1817,6 +1817,59 @@ This part, host-tested only:
   the new code (run with lints capped at warn, since render and theme
   already stop `make clippy` before it reaches the kernel).
 
+## 67. SSE for the glass lens
+
+- Measured first, in the kernel (a temporary in-kernel bench, removed
+  after; one 600x40 pane, 50 times): Regular took 1343 us -- the 2x2
+  downscale 356, the blur 347, the frost/fill mix 121, the lens 517.
+  Clear took 327 us, the lens 263 of it.
+- Three loops in `render/src/sse.rs`, each one whole asm block, XMM
+  clobbers cfg'd as in 64, with the scalar code kept for what they do not
+  cover:
+  - `veil_mix`: frost behind its veil, four pixels at a time (pmaxub /
+    pminub, the division by 255 as `* 0x8081 >> 23`).
+  - `quarter_bilinear`: the half-size backdrop read back between four
+    pixels. Every weight there is 0, 1/4 or 3/4, so the sums fit sixteen
+    bits and are exactly the 256ths formula's.
+  - `lens_row`: the lens's last steps, two pixels at a time: saturation
+    (luma by pmaddwd, /1000 by pmuludq, toward-zero /4096), the rim,
+    coverage times alpha, and the blend over the screen as `Blend` does.
+- The lens loop is now two passes a row: the geometry, the displaced
+  read and the tone table one pixel at a time (a gather and a lookup,
+  which SSE2 has no instructions for), then `lens_row`.
+- **Choice:** `lens_row` only for the screen's own layout (XRGB8888) and
+  untinted glass; another layout or a tint takes the old per-pixel path
+  unchanged. The desktop's panes are untinted unless a theme sets one.
+- **Choice:** two row buffers more in the glass scratch (`needed` grows by
+  two rows of the drawn width). Both scratches the system attaches have
+  3 screens + 4096 pixels, so no pane that fit before falls back to the
+  plain veil.
+- Pixel-exact: host tests compare whole panes (8 kinds of glass incl.
+  tinted, 3 places incl. clipped and odd widths, 3 alphas, a backdrop
+  with the top byte set) drawn with SSE and with it forced off; and
+  `lens_row`, `veil_mix` and `quarter_bilinear` against the one-pixel
+  formulas over random and edge inputs; and the two multiply-divisions
+  for every input they can see. Breaking one shift in `lens_row` on
+  purpose fails three tests. In the kernel the bench's checksum was the
+  same before and after.
+- After, in the kernel: Regular 1077 us (mix 17, lens 359), Clear 311
+  (lens 247). What is left of the lens is the per-pixel geometry --
+  mostly the corners' integer square roots -- which SSE2 does not help.
+- perf-test, draw ms a frame, two runs, against 64:
+
+  | Scene                         | 64          | 67          |
+  |-------------------------------|-------------|-------------|
+  | Dragging, Regular glass       | 4.6–5.4     | 4.1–4.7     |
+  | Control Center open, Regular  | 10.1–11.2   | 8.9–10.0    |
+  | Dragging, Clear               | 2.50–2.55   | 2.47–2.57   |
+  | Control Center open, Clear    | 6.13–6.59   | 6.18–6.49   |
+  | Dragging, glass Off           | 1.88–2.01   | 1.89–2.00   |
+
+  Clear and Off are the same within run-to-run noise.
+- Every scored boot-test check PASSes on both GPUs (51 each); boot
+  self-checks 181 / 0 (default) and 188 / 0 (virtio). `./corrode test`
+  passes, the 5 new tests among them; clippy has nothing new.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -1827,7 +1880,7 @@ copied below so a later pass can read them here.
 1. [x] SSE (branch `sse`) -- section 64
 2. [x] Passcode as a salted hash (`passcode-hash`) -- section 65
 3. [x] Secure-core sealing (`secure-cap`) -- section 66
-4. [ ] SSE for the glass lens loops in render/src/software.rs; pixel-exact host tests vs scalar; perf-test before/after (`sse-glass` off `secure-cap`)
+4. [x] (section 67) SSE for the glass lens loops in render/src/software.rs; pixel-exact host tests vs scalar; perf-test before/after (`sse-glass` off `secure-cap`)
 5. [ ] SSE in the 2x2 backdrop downscale (frosted path); pixel-exact; perf-test (`sse-downscale`)
 6. [ ] Raise the 16-surface cap (SURFACES) and what in the kernel and virtio driver assumes it; boot test opening >15 windows and closing them, both GPUs (`more-surfaces`)
 7. [ ] Fix section 63's gap: fading windows show the frame's lower rim through their body; screenshot-based boot check (`fade-rim`)

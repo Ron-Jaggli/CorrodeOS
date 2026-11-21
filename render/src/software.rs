@@ -84,6 +84,23 @@ pub struct SoftwareRenderer {
 // concurrent *shared* use is still prevented by `submit` requiring `&mut self`.
 unsafe impl Send for SoftwareRenderer {}
 
+#[cfg(test)]
+std::thread_local! {
+    /// For the tests: draw glass one pixel at a time, as with no SSE2.
+    static SCALAR_ONLY: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Whether glass must be drawn without SSE2: only ever, in tests, to check
+/// the two ways come out the same.
+#[cfg(test)]
+fn scalar_only() -> bool {
+    SCALAR_ONLY.with(|only| only.get())
+}
+#[cfg(not(test))]
+fn scalar_only() -> bool {
+    false
+}
+
 /// What a pane's lens and rim make of one point of it.
 #[derive(Clone, Copy)]
 struct Shade {
@@ -709,9 +726,11 @@ impl SoftwareRenderer {
         } else {
             sw.max(sh)
         };
-        // After the blur, what the lens makes of each column's sides.
+        // After the blur, what the lens makes of each column's sides, and a
+        // row of what it sees and how, for the last steps to take together.
         let columns = 2 * (x1 - x0) as usize;
-        let needed = area + if frosted { area + blur_line } else { blur_line }.max(columns);
+        let lens_rows = 2 * (x1 - x0) as usize;
+        let needed = area + if frosted { area + blur_line } else { blur_line }.max(columns + lens_rows);
 
         let shape = (
             rect.width as i64 * Q8,
@@ -799,7 +818,19 @@ impl SoftwareRenderer {
                 glass::box_blur(fill, sw, sh, fill_radius as usize / scale, line);
             }
             let veil = pane.fill_opacity();
-            for (frosted, filled) in backdrop.iter_mut().zip(fill.iter()) {
+            // Four at a time where SSE2 can, the rest one by one.
+            #[cfg(target_arch = "x86_64")]
+            let mixed = {
+                let groups = if scalar_only() { 0 } else { area / 4 };
+                // SAFETY: `backdrop` and `fill` are `area` pixels each.
+                unsafe {
+                    crate::sse::veil_mix(backdrop.as_mut_ptr(), fill.as_ptr(), groups, veil as u8, pane.dark)
+                };
+                groups * 4
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let mixed = 0;
+            for (frosted, filled) in backdrop[mixed..].iter_mut().zip(fill[mixed..].iter()) {
                 let (a, b) = (glass::channels(*frosted), glass::channels(*filled));
                 *frosted = glass::pack([0, 1, 2].map(|i| {
                     let blend = if pane.dark { a[i].min(b[i]) } else { a[i].max(b[i]) };
@@ -823,13 +854,19 @@ impl SoftwareRenderer {
             };
             let (x0, x1, fx) = axis(x, sw);
             let (y0, y1, fy) = axis(y, sh);
-            let [a, b, c, d] = [
+            let corners = [
                 backdrop[y0 * sw + x0],
                 backdrop[y0 * sw + x1],
                 backdrop[y1 * sw + x0],
                 backdrop[y1 * sw + x1],
-            ]
-            .map(glass::channels);
+            ];
+            // Every weight is a whole quarter (0, 64 or 192 256ths), so the
+            // sums fit sixteen bits and SSE2 can take all channels at once.
+            #[cfg(target_arch = "x86_64")]
+            if !scalar_only() {
+                return crate::sse::quarter_bilinear(corners, fx as usize / 64, fy as usize / 64);
+            }
+            let [a, b, c, d] = corners.map(glass::channels);
             glass::pack([0, 1, 2].map(|i| {
                 let top = a[i] * (256 - fx) + b[i] * fx;
                 let bottom = c[i] * (256 - fx) + d[i] * fx;
@@ -864,7 +901,8 @@ impl SoftwareRenderer {
         // Beside the left and right sides that is the same all down a
         // column, and beside the top and bottom all along a row
         // (`glass::part`): found once for each, not for every pixel.
-        let columns = &mut rest[..columns];
+        let (columns, lens_rows) = rest[..columns + lens_rows].split_at_mut(columns);
+        let (toned, shades) = lens_rows.split_at_mut((x1 - x0) as usize);
         for x in x0..x1 {
             let lx = (x as i64 - rect.x as i64) * Q8 + Q8 / 2;
             let at = (x - x0) as usize * 2;
@@ -873,6 +911,41 @@ impl SoftwareRenderer {
             columns[at + 1] = side.dx as i32 as u32;
         }
         let columns: &[u32] = columns;
+        // The last steps -- saturation, the rim, and the blend over what is
+        // there -- for a pixel the lens has already toned. One at a time;
+        // `sse::lens_row` does the same two at a time.
+        let finish = |seen: u32, shade: u32, pixel: *mut u32| {
+            let covered = shade & 0xff;
+            if covered == 0 {
+                return;
+            }
+            let (light, opacity) = ((shade >> 8) & 0xff, shade >> 16);
+            let mut rgb = glass::saturate(glass::channels(seen), chroma);
+            rgb = glass::tint(rgb, pane);
+            if opacity | light != 0 {
+                rgb = rgb.map(|c| (c * (255 - opacity) / 255 + light).min(255));
+            }
+            let color = Color::rgb(rgb[0] as u8, rgb[1] as u8, rgb[2] as u8);
+            let alpha = crate::blend::div255(covered * alpha as u32) as u8;
+            // SAFETY: the caller's pixel, inside the clipped bounds.
+            unsafe {
+                pixel.write_unaligned(match alpha {
+                    255 => format.pack(color),
+                    _ => Blend::new(&format, color, alpha).over(pixel.read_unaligned()),
+                });
+            }
+        };
+        // Two at a time for the screen's own layout, untinted: what the
+        // compositor draws every frame. Anything else, one at a time.
+        #[cfg(target_arch = "x86_64")]
+        let paired = (!scalar_only()
+            && format == PixelFormat::XRGB8888
+            && pane.tint_amount == 0
+            && (0..=i16::MAX as i64).contains(&chroma))
+            .then_some(crate::sse::Lens {
+                chroma: (chroma != glass::ONE).then_some(chroma as i16),
+                alpha,
+            });
         for y in y0..y1 {
             // SAFETY: `clip` returned bounds already intersected with the
             // surface.
@@ -880,12 +953,13 @@ impl SoftwareRenderer {
             let ly = (y as i64 - rect.y as i64) * Q8 + Q8 / 2;
             let end = shade(&glass::field(width / 2, ly, width, height, radius));
             for x in x0..x1 {
+                let i = (x - x0) as usize;
                 let lx = (x as i64 - rect.x as i64) * Q8 + Q8 / 2;
                 let at = match glass::part(lx, ly, width, height, radius) {
                     glass::Part::Corner => shade(&glass::field(lx, ly, width, height, radius)),
                     glass::Part::End => end,
                     glass::Part::Side => {
-                        let (packed, dx) = (columns[(x - x0) as usize * 2], columns[(x - x0) as usize * 2 + 1]);
+                        let (packed, dx) = (columns[i * 2], columns[i * 2 + 1]);
                         Shade {
                             covered: packed & 0xff,
                             dx: dx as i32 as i64,
@@ -895,30 +969,28 @@ impl SoftwareRenderer {
                         }
                     }
                 };
-                let covered = at.covered;
-                if covered == 0 {
+                if at.covered == 0 {
+                    shades[i] = 0;
+                    toned[i] = 0;
                     continue;
                 }
                 let sx = (x as i64 + at.dx).clamp(bx0 as i64, bx1 as i64 - 1);
                 let sy = (y as i64 + at.dy).clamp(by0 as i64, by1 as i64 - 1);
                 let seen = seen_at(sx as usize - bx0 as usize, sy as usize - by0 as usize);
-
-                let mut rgb = glass::channels(seen).map(|c| tone[c as usize] as u32);
-                rgb = glass::saturate(rgb, chroma);
-                rgb = glass::tint(rgb, pane);
-                if at.opacity | at.light != 0 {
-                    rgb = rgb.map(|c| (c * (255 - at.opacity) / 255 + at.light).min(255));
-                }
-                let color = Color::rgb(rgb[0] as u8, rgb[1] as u8, rgb[2] as u8);
-                let alpha = crate::blend::div255(covered * alpha as u32) as u8;
-                // SAFETY: `x` is inside the clipped bounds, on this row.
-                unsafe {
-                    let pixel = row.add((x - x0) as usize);
-                    pixel.write_unaligned(match alpha {
-                        255 => format.pack(color),
-                        _ => Blend::new(&format, color, alpha).over(pixel.read_unaligned()),
-                    });
-                }
+                toned[i] = glass::pack(glass::channels(seen).map(|c| tone[c as usize] as u32));
+                shades[i] = at.covered | at.light << 8 | at.opacity << 16;
+            }
+            let mut done = 0;
+            #[cfg(target_arch = "x86_64")]
+            if let Some(lens) = paired {
+                let pairs = toned.len() / 2;
+                // SAFETY: `toned`, `shades` and the row are `x1 - x0` pixels.
+                unsafe { crate::sse::lens_row(toned.as_ptr(), shades.as_ptr(), row, pairs, lens) };
+                done = 2 * pairs;
+            }
+            for i in done..toned.len() {
+                // SAFETY: `i < x1 - x0` keeps it on this row.
+                finish(toned[i], shades[i], unsafe { row.add(i) });
             }
         }
         self.scratch = scratch;
@@ -1743,6 +1815,206 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Every pane, through SSE2 and one pixel at a time: the same pixels.
+    #[test]
+    fn glass_with_sse_matches_glass_without() {
+        use crate::glass::Glass;
+        let (width, height) = (331u32, 157u32);
+        let backdrop: std::vec::Vec<u32> = (0..width * height)
+            .map(|index| {
+                let (x, y) = (index % width, index / width);
+                // Detail, and the byte above blue set here and there, as a
+                // screen may leave it.
+                let top = if (x + y) % 7 == 0 { 0xab00_0000 } else { 0 };
+                top | (x * 255 / width) << 16 | (y * 255 / height) << 8 | ((x ^ y) & 0x3f) * 4
+            })
+            .collect();
+        let info = SurfaceInfo {
+            width,
+            height,
+            pitch: width * 4,
+            format: PixelFormat::XRGB8888,
+        };
+        let draw = |scalar: bool, rect: Rect, glass: Glass, alpha: u8| {
+            SCALAR_ONLY.with(|only| only.set(scalar));
+            let mut pixels = backdrop.clone();
+            // SAFETY: `pixels` outlives the renderer and is `width * height`.
+            let mut renderer = unsafe { SoftwareRenderer::new(pixels.as_mut_ptr().cast(), info) }.unwrap();
+            renderer.attach_glass_scratch(Box::leak(std::vec![0u32; 1 << 20].into_boxed_slice()));
+            submit(&mut renderer, &[Command::Glass { rect, glass, alpha }]);
+            SCALAR_ONLY.with(|only| only.set(false));
+            pixels
+        };
+        let tinted = Glass {
+            tint: Color::rgb(0x30, 0x90, 0xe0),
+            tint_amount: 120,
+            ..Glass::regular(false)
+        };
+        let panes = [
+            Glass::regular(true),
+            Glass::regular(false),
+            Glass::clear(true),
+            Glass::clear(false),
+            Glass { rim: false, ..Glass::regular(false) },
+            Glass { refraction: 0, ..Glass::clear(true) },
+            Glass { frost: 0, ..Glass::regular(true) },
+            tinted,
+        ];
+        let rects = [Rect::new(20, 15, 200, 80), Rect::new(-9, 101, 77, 63), Rect::new(250, 3, 81, 33)];
+        for glass in panes {
+            for rect in rects {
+                for alpha in [255, 200, 1] {
+                    let sse = draw(false, rect, glass, alpha);
+                    let one = draw(true, rect, glass, alpha);
+                    if let Some(at) = (0..sse.len()).find(|&at| sse[at] != one[at]) {
+                        panic!(
+                            "{glass:?} {rect:?} alpha {alpha}: ({}, {}) is {:08x}, not {:08x}",
+                            at as u32 % width,
+                            at as u32 / width,
+                            sse[at],
+                            one[at]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The lens's last steps two at a time against one at a time, over
+    /// every kind of input, many times.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn lens_row_matches_one_pixel_at_a_time() {
+        use crate::glass::{self, Glass};
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u32
+        };
+        // Bytes that matter most often, mixed in with any.
+        let byte = |n: u32| match n % 5 {
+            0 => 0,
+            1 => 255,
+            _ => n >> 8 & 0xff,
+        };
+        let format = PixelFormat::XRGB8888;
+        for chroma in [None, Some(Glass::regular(false).chroma()), Some(Glass::regular(true).chroma())] {
+            for alpha in [255u8, 254, 200, 128, 1, 0] {
+                let n = 4096;
+                let toned: std::vec::Vec<u32> = (0..n).map(|_| next() & 0x00ff_ffff).collect();
+                let shade: std::vec::Vec<u32> =
+                    (0..n).map(|_| byte(next()) | byte(next()) << 8 | byte(next()) << 16).collect();
+                let dst: std::vec::Vec<u32> = (0..n).map(|_| next()).collect();
+                let mut sse = dst.clone();
+                let lens = crate::sse::Lens {
+                    chroma: chroma.map(|c| c as i16),
+                    alpha,
+                };
+                // SAFETY: all three are `n` pixels.
+                unsafe { crate::sse::lens_row(toned.as_ptr(), shade.as_ptr(), sse.as_mut_ptr(), n / 2, lens) };
+                for i in 0..n {
+                    let (covered, light, opacity) = (shade[i] & 0xff, (shade[i] >> 8) & 0xff, shade[i] >> 16);
+                    let mut expected = dst[i];
+                    if covered != 0 {
+                        let mut rgb = glass::channels(toned[i]);
+                        if let Some(chroma) = chroma {
+                            rgb = glass::saturate(rgb, chroma);
+                        }
+                        if opacity | light != 0 {
+                            rgb = rgb.map(|c| (c * (255 - opacity) / 255 + light).min(255));
+                        }
+                        let color = Color::rgb(rgb[0] as u8, rgb[1] as u8, rgb[2] as u8);
+                        let a = crate::blend::div255(covered * alpha as u32) as u8;
+                        expected = match a {
+                            255 => format.pack(color),
+                            _ => Blend::new(&format, color, a).over(dst[i]),
+                        };
+                    }
+                    assert_eq!(
+                        sse[i], expected,
+                        "toned {:08x} shade {:06x} dst {:08x} alpha {alpha} chroma {chroma:?}",
+                        toned[i], shade[i], dst[i]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Frost's veil four at a time against the formula, both ways round.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn veil_mix_matches_one_pixel_at_a_time() {
+        use crate::glass;
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u32 & 0x00ff_ffff
+        };
+        for dark in [false, true] {
+            for veil in [0u32, 1, 128, 166, 191, 254, 255] {
+                let frost: std::vec::Vec<u32> = (0..4096).map(|_| next()).collect();
+                let fill: std::vec::Vec<u32> = (0..4096).map(|_| next()).collect();
+                let mut sse = frost.clone();
+                // SAFETY: both are 4096 pixels.
+                unsafe { crate::sse::veil_mix(sse.as_mut_ptr(), fill.as_ptr(), 1024, veil as u8, dark) };
+                for i in 0..4096 {
+                    let (a, b) = (glass::channels(frost[i]), glass::channels(fill[i]));
+                    let expected = glass::pack([0, 1, 2].map(|c| {
+                        let blend = if dark { a[c].min(b[c]) } else { a[c].max(b[c]) };
+                        (blend * veil + a[c] * (255 - veil)) / 255
+                    }));
+                    assert_eq!(sse[i], expected, "{:06x} over {:06x}, veil {veil}, dark {dark}", frost[i], fill[i]);
+                }
+            }
+        }
+    }
+
+    /// The backdrop read between four small pixels, by quarters in SSE2,
+    /// against the general formula in 256ths, for every weight it is given.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn quarter_bilinear_matches_the_formula() {
+        use crate::glass;
+        let mut state = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u32 & 0x00ff_ffff
+        };
+        for _ in 0..20_000 {
+            let corners = [next(), next(), next(), next()];
+            for fx in [0u32, 64, 192] {
+                for fy in [0u32, 64, 192] {
+                    let [a, b, c, d] = corners.map(glass::channels);
+                    let expected = glass::pack([0, 1, 2].map(|i| {
+                        let top = a[i] * (256 - fx) + b[i] * fx;
+                        let bottom = c[i] * (256 - fx) + d[i] * fx;
+                        (top * (256 - fy) + bottom * fy) >> 16
+                    }));
+                    let got = crate::sse::quarter_bilinear(corners, fx as usize / 64, fy as usize / 64);
+                    assert_eq!(got, expected, "{corners:08x?} at {fx}, {fy}");
+                }
+            }
+        }
+    }
+
+    /// The two divisions the SSE2 loops make by multiplying, checked for
+    /// every input they can be given.
+    #[test]
+    fn sse_divisions_are_exact() {
+        for x in 0..=65535u32 {
+            assert_eq!((x * 0x8081) >> 23, x / 255, "{x} / 255");
+        }
+        for n in 0..=255_000u64 {
+            assert_eq!((n * 268_436) >> 28, n / 1000, "{n} / 1000");
         }
     }
 
