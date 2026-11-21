@@ -2258,6 +2258,66 @@ on; and the script's own output parsed.
   `./corrode test` 326 passed; clippy at 33 after replacing two `%`
   checks with `is_multiple_of`.
 
+## 75. Verdigris, phase 2: hello through kernel32
+
+`console.exe` (written by `scripts/console-exe.sh`, hand-assembled like
+hello.exe) makes no CorrodeOS system call. It imports `GetStdHandle`,
+`WriteFile` and `ExitProcess` from KERNEL32.dll by name and calls them
+through its import address table with the Windows calling convention: 32
+bytes of shadow space, the fifth argument on the stack.
+
+- **corrode-pe reads imports** inside `parse`, so every check still comes
+  before a frame: descriptors (at most 8 DLLs, 64 functions), lookup and
+  address tables, hints and names (at most 63 bytes, inside a section's
+  file bytes), ordinals refused, each address slot 8-aligned, inside a
+  section and not in code. `Pe::bind` fills the slots from a resolver;
+  anything unresolved refuses the program. `corrode_pe::exports` reads
+  the table kernel32 carries (magic `VRDGEXP1`, count, 64-byte entries).
+- **kernel32** (`verdigris/kernel32`, Rust, `extern "win64"`) is a
+  CorrodeOS ELF linked by its own script at `KERNEL32_BASE` (0x0800_0000)
+  with its export table alone in a read-only segment at that address.
+  `WriteFile` on standard output or error goes to the log endpoint, the
+  program's one capability (`verdigris::LOG`): lines end at `\n`, `\r` is
+  dropped, long lines go in 32-byte pieces. `ExitProcess` sends what is
+  waiting and exits. It is built apart from the user programs
+  (`make kernel32`, `target/verdigris`), since its linker script differs.
+- **The kernel** (`task::user::load_windows`, `task::spawn_windows`) maps
+  the PE below `KERNEL32_BASE` and kernel32 above it in one address space,
+  looks every import up in the export table, requires the address to be in
+  kernel32's code, and writes the import address table into its frames
+  before they are mapped. The table is in `.rdata`, read-only, and is never
+  made writable. `build` now takes fixups; ELF and phase-1 PE loading pass
+  none.
+- **Boot checks** (five more, ten in all): an import kernel32 lacks
+  ("GetStdHandlX") is refused; every import slot, read back through the
+  task's own page tables, holds kernel32's address for it; the program's
+  and kernel32's pages carry exactly the permissions their files ask; it
+  holds the log and nothing else; it writes and exits. The log shows
+  `console.exe: hello from kernel32, via WriteFile`.
+- **Host tests** (7 more, 18 for corrode-pe): imports read by name, bound
+  to exports, unresolved refused; ordinals, names outside or past their
+  section, unended and empty names, slots in code, unaligned, missing or
+  past the image, unterminated tables refused; 64 functions and 8 DLLs
+  allowed, one more refused; export tables that lie are not tables; 20 000
+  random corruptions of the import data never panic and never yield a
+  fixup outside the rules; the script's console.exe parses and binds.
+
+- **Choice:** kernel32 is not a PE DLL yet; it is an ELF at a fixed
+  address with an export table at its base, as DESIGN.md section 2 allows
+  until a PE-emitting Rust target is in the build image.
+- **Choice:** no new capability and no new system call. A Windows
+  program's standard output is the log endpoint it is given, the same
+  send-only right every program gets; handles are plain numbers kernel32
+  recognises.
+- **Choice:** the kernel binds imports (as it parses the PE) because the
+  PE is a boot module, as in phase 1. DESIGN.md's first open decision
+  (kernel or ring 3 parsing for the person's files) is still open.
+- Verified: the whole suite on both GPUs, 63 checks PASS on each (62
+  before, plus `pe-test`'s new line), none FAIL; boot self-checks 191/198
+  (five more), none failing, no unhandled trap; `./corrode test` 333
+  passed; clippy at 33 after two fixes in corrode-pe (`is_multiple_of`,
+  `as_chunks`), with pe-test rerun on both GPUs after them.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -2289,7 +2349,7 @@ copied below so a later pass can read them here.
       this (as a capability: a pruned view of the files) and how Windows
       paths such as C:\ map onto the view's root.
 11. [x] (section 74) Verdigris phase 1: the PE loader; a tiny hand-built PE (bytes in repo or built by a script, no Windows toolchain) that prints over a syscall; boot test on both GPUs; malformed PEs refused, not crashed on (host tests)
-12. [ ] Verdigris phase 2: smallest kernel32 subset for a console "hello" PE (GetStdHandle, WriteFile, ExitProcess) on whatever narrow capability it needs; boot test
+12. [x] (section 75) Verdigris phase 2: smallest kernel32 subset for a console "hello" PE (GetStdHandle, WriteFile, ExitProcess) on whatever narrow capability it needs; boot test
 13. [ ] Write-up: surviving-reboot key options (passcode-derived, sealed key, TPM) with trade-offs; a ring -1 hypervisor option (Rust, soft-float, own crate, signed, open source, small enough to verify); a table of every task (branch, result, perf). No code. Then stop the loop.
 
 Rules (from the prompt): every task builds, passes `./corrode test` and the

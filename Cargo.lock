@@ -87,6 +87,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "corrode-kernel32"
+version = "0.0.1"
+dependencies = [
+ "corrode-pe",
+ "corrode-rt",
+]
+
+[[package]]
 name = "corrode-line"
 version = "0.0.1"
 dependencies = [

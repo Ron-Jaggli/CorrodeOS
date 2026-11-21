@@ -32,7 +32,8 @@
 
 use corrode_abi::layout;
 use corrode_elf::{Elf, Segment};
-use corrode_pe::Pe;
+use corrode_pe::exports::Exports;
+use corrode_pe::{Fixup, Pe};
 
 use crate::mm::frame;
 use crate::mm::paging::{self, Mapper};
@@ -152,6 +153,8 @@ pub enum LoadError {
     Format(corrode_elf::Error),
     /// The file is not a Windows program this kernel will run, and why.
     Pe(corrode_pe::Error),
+    /// Verdigris's kernel32 has no export table at its base.
+    NoExports,
     /// Not enough frames for its memory or the page tables to map it.
     OutOfMemory,
 }
@@ -176,7 +179,7 @@ pub fn load(file: &[u8]) -> Result<Image, LoadError> {
     // As for an assembly program: the stack pointer a `call` would have
     // left, over a null return address. A compiled entry point expects
     // exactly that alignment.
-    build(elf.entry(), elf.segments(), 8)
+    build(elf.entry(), elf.segments(), &[], 8)
 }
 
 /// Build a fresh address space from a Windows program: a PE file, checked
@@ -190,14 +193,48 @@ pub fn load(file: &[u8]) -> Result<Image, LoadError> {
 /// from its entry point instead of exiting faults, and is stopped.
 pub fn load_pe(file: &[u8]) -> Result<Image, LoadError> {
     let pe = Pe::parse(file, layout::IMAGE_BASE..layout::IMAGE_END).map_err(LoadError::Pe)?;
-    build(pe.entry(), pe.segments(), 8 + 32)
+    build(pe.entry(), pe.segments(), &[], 8 + 32)
+}
+
+/// Build a fresh address space from a Windows program that imports from
+/// kernel32, and Verdigris's kernel32 (see `verdigris/DESIGN.md`).
+///
+/// The program must end below `KERNEL32_BASE` and kernel32, an ELF file,
+/// lie above it, so the two never share a page. kernel32's export table is
+/// at its base; every import the program names is looked up there, must
+/// name an address in kernel32's code, and is written into the program's
+/// import address table before that page is mapped -- so the table may be
+/// in read-only data, as linkers put it, and nothing is ever made writable
+/// to fill it in. An import kernel32 does not have refuses the program.
+pub fn load_windows(file: &[u8], kernel32: &[u8]) -> Result<Image, LoadError> {
+    let base = corrode_abi::verdigris::KERNEL32_BASE;
+    let pe = Pe::parse(file, layout::IMAGE_BASE..base).map_err(LoadError::Pe)?;
+    let runtime = Elf::parse(kernel32, base..layout::IMAGE_END).map_err(LoadError::Format)?;
+    let exports = runtime
+        .segments()
+        .find(|segment| segment.address == base && !segment.writable && !segment.executable)
+        .and_then(|segment| Exports::parse(segment.data))
+        .ok_or(LoadError::NoExports)?;
+    let in_code = |address: &u64| {
+        runtime.segments().any(|segment| {
+            segment.executable && (segment.address..segment.address + segment.len).contains(address)
+        })
+    };
+    let fixups = pe
+        .bind(|dll, name| exports.find(dll, name).filter(in_code))
+        .map_err(LoadError::Pe)?;
+    build(pe.entry(), pe.segments().chain(runtime.segments()), &fixups, 8 + 32)
 }
 
 /// Map checked segments into a fresh address space with a stack, the
-/// stack pointer `below` bytes under the stack's top.
+/// stack pointer `below` bytes under the stack's top. Each fixup's eight
+/// bytes are written into its page before the page is mapped; the PE
+/// reader has checked each lies inside a segment and does not straddle
+/// two pages.
 fn build<'a>(
     entry: u64,
     segments: impl Iterator<Item = Segment<'a>>,
+    fixups: &[Option<Fixup>],
     below: u64,
 ) -> Result<Image, LoadError> {
     let mut space = paging::with_kernel_mapper(|kernel| kernel.fork_kernel_half())
@@ -236,6 +273,18 @@ fn build<'a>(
                 // yet. `from - page` plus the length is at most a page,
                 // because both ends were clamped to this one.
                 unsafe { space.write_frame(frame.addr(), (from - page) as usize, source) };
+            }
+            for fixup in fixups.iter().flatten() {
+                if (page..page + PAGE - 7).contains(&fixup.address) {
+                    // SAFETY: as above; the eight bytes end inside the page.
+                    unsafe {
+                        space.write_frame(
+                            frame.addr(),
+                            (fixup.address - page) as usize,
+                            &fixup.value.to_le_bytes(),
+                        )
+                    };
+                }
             }
 
             if !space.map_4k(page, frame.addr(), flags) {

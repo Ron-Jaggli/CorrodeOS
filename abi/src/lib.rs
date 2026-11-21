@@ -433,6 +433,16 @@ pub mod ps2 {
     pub const POINTER_AT_MAX: u64 = 0x7fff;
 }
 
+/// Verdigris: Windows programs (see `verdigris/DESIGN.md`).
+pub mod verdigris {
+    /// Where Verdigris's kernel32 is linked, with its export table at this
+    /// very address. A Windows program's image must end below it.
+    pub const KERNEL32_BASE: u64 = 0x0800_0000;
+    /// A Windows program's one capability: the log, where its standard
+    /// output and error go.
+    pub const LOG: usize = 0;
+}
+
 /// The USB host controller's driver, `xhci`: an xHCI controller, the
 /// keyboards and pointers on it, and what they say passed on to the
 /// compositor in the same messages as [`ps2`]'s.

@@ -23,6 +23,7 @@ members = [
     "user/virtio-gpu",
     "user/virtio-blk",
     "user/xhci",
+    "verdigris/kernel32",
     "user/blob-reader",
     "user/nvidia",
     "user/ps2",

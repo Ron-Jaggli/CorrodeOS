@@ -375,6 +375,14 @@ pub fn spawn_pe(name: &'static str, file: &[u8]) -> Result<usize, user::LoadErro
     spawn_inner(name, image.entry, Some(image), next_cpu()).ok_or(user::LoadError::OutOfMemory)
 }
 
+/// Create a ring 3 task from a Windows program that imports from kernel32,
+/// with Verdigris's kernel32 in the same address space and the program's
+/// imports bound to it. It too starts holding no capabilities.
+pub fn spawn_windows(name: &'static str, file: &[u8], kernel32: &[u8]) -> Result<usize, user::LoadError> {
+    let image = user::load_windows(file, kernel32)?;
+    spawn_inner(name, image.entry, Some(image), next_cpu()).ok_or(user::LoadError::OutOfMemory)
+}
+
 fn spawn_inner(
     name: &'static str,
     entry_rip: u64,

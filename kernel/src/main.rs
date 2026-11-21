@@ -2902,6 +2902,102 @@ fn verdigris_checks() {
         "it runs and exits",
         task::state_of(hello) == Some(task::State::Finished),
     );
+
+    console_checks();
+}
+
+/// Verdigris, phase 2: `console.exe` (written by `scripts/console-exe.sh`)
+/// makes no system call of its own. It imports GetStdHandle, WriteFile and
+/// ExitProcess from KERNEL32.dll, and the kernel binds them to Verdigris's
+/// kernel32, mapped into the same task, before a page of it is mapped.
+fn console_checks() {
+    use mm::paging::{NO_EXECUTE, USER, WRITABLE};
+
+    let (Some(program), Some(kernel32)) = (modules::find("console.exe"), modules::find("kernel32"))
+    else {
+        println!("verdigris  : no console.exe or kernel32 module was loaded");
+        return;
+    };
+
+    // The same program asking for a function kernel32 does not have:
+    // "GetStdHandle" as "GetStdHandlX". Refused whole.
+    let mut damaged = alloc::vec::Vec::from(program.bytes);
+    if let Some(byte) = damaged.get_mut(0x400 + 0x92 + 11) {
+        *byte = b'X';
+    }
+    verdigris_check(
+        "an import kernel32 does not have is refused",
+        matches!(
+            task::user::load_windows(&damaged, kernel32.bytes),
+            Err(task::user::LoadError::Pe(corrode_pe::Error::Unresolved))
+        ),
+    );
+
+    let console = match task::spawn_windows("console.exe", program.bytes, kernel32.bytes) {
+        Ok(id) => id,
+        Err(error) => {
+            println!("verdigris  : console.exe was not loaded: {error:?}");
+            verdigris_check("load a Windows program with kernel32", false);
+            return;
+        }
+    };
+    let base = corrode_abi::verdigris::KERNEL32_BASE;
+    let (Ok(pe), Ok(runtime)) = (
+        corrode_pe::Pe::parse(program.bytes, corrode_abi::layout::IMAGE_BASE..base),
+        corrode_elf::Elf::parse(kernel32.bytes, base..corrode_abi::layout::IMAGE_END),
+    ) else {
+        return;
+    };
+    let Some(space) = task::space_of(console) else {
+        return;
+    };
+
+    // Every import's slot, read back through the task's own page tables,
+    // holds the address kernel32's table gives for it.
+    let exports = runtime
+        .segments()
+        .find(|segment| segment.address == base)
+        .and_then(|segment| corrode_pe::exports::Exports::parse(segment.data));
+    let hhdm = limine::HHDM.response.get().map(|response| response.offset);
+    let bound = exports.zip(hhdm).is_some_and(|(exports, hhdm)| {
+        pe.imports().count() == 3
+            && pe.imports().all(|import| {
+                let expected = exports.find(import.dll, import.name);
+                let held = space.translate(import.slot).map(|physical| {
+                    // SAFETY: the frame is the task's, mapped by the direct
+                    // map; the slot is 8-aligned, so inside one page.
+                    unsafe { ((physical + hhdm) as *const u64).read_volatile() }
+                });
+                expected.is_some() && held == expected
+            })
+    });
+    verdigris_check("its imports are bound into kernel32's code", bound);
+
+    let honoured = pe.segments().chain(runtime.segments()).all(|segment| {
+        segment.pages().step_by(4096).all(|page| {
+            space.leaf_flags(page).is_some_and(|flags| {
+                flags & USER != 0
+                    && (flags & WRITABLE != 0) == segment.writable
+                    && (flags & NO_EXECUTE == 0) == segment.executable
+            })
+        })
+    });
+    verdigris_check("it and kernel32 map as their files ask", honoured);
+
+    let granted = cap::grant(console, LOG_ENDPOINT, corrode_abi::verdigris::LOG, cap::Rights::WRITE).is_ok();
+    verdigris_check(
+        "it too holds the log, and nothing else",
+        granted && cap::slots_used(console) == Some(1),
+    );
+    start_all(&[Some(console)]);
+    let deadline = time::now_ns() + 2_000_000_000;
+    while task::state_of(console) != Some(task::State::Finished) && time::now_ns() < deadline {
+        task::yield_now();
+    }
+    verdigris_check(
+        "it writes through kernel32 and exits",
+        task::state_of(console) == Some(task::State::Finished),
+    );
 }
 
 /// Bootstrap's capability to the test blob, and the endpoint its reader

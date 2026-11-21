@@ -76,7 +76,7 @@ VNC_DISPLAY ?= 0
 
 
 .PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test fade-test usb-test pe-test grow-test zoom-test
-.PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
+.PHONY: all kernel user kernel32 iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
 
@@ -176,12 +176,31 @@ $(HELLO_EXE): scripts/hello-exe.sh
 	@mkdir -p build
 	bash scripts/hello-exe.sh $@
 
-iso: $(KERNEL) user $(TEST_BLOB) $(ROOT_TAR) $(HELLO_EXE)
+# Phase 2: a console program that calls kernel32, and Verdigris's kernel32,
+# linked at its own address by its own script -- so built apart from the
+# user programs, which share user/user.ld.
+CONSOLE_EXE := build/console.exe
+$(CONSOLE_EXE): scripts/console-exe.sh
+	@mkdir -p build
+	bash scripts/console-exe.sh $@
+
+KERNEL32_TARGET := target/verdigris
+KERNEL32 := $(KERNEL32_TARGET)/x86_64-unknown-none/release/kernel32
+KERNEL32_RUSTFLAGS := -C relocation-model=static -C strip=debuginfo \
+                      -C link-arg=-T$(CURDIR)/verdigris/kernel32/kernel32.ld
+
+kernel32:
+	RUSTFLAGS="$(KERNEL32_RUSTFLAGS)" cargo build --release --target-dir $(KERNEL32_TARGET) \
+	    -p corrode-kernel32
+
+iso: $(KERNEL) user kernel32 $(TEST_BLOB) $(ROOT_TAR) $(HELLO_EXE) $(CONSOLE_EXE)
 	@rm -rf $(ISO_ROOT)/boot/programs $(ISO_ROOT)/boot/firmware $(ISO_ROOT)/boot/files
 	@mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/boot/programs $(ISO_ROOT)/boot/firmware $(ISO_ROOT)/boot/files $(ISO_ROOT)/EFI/BOOT
 	cp $(KERNEL) $(ISO_ROOT)/boot/corrode
 	cp $(foreach program,$(USER_PROGRAMS),$(USER_BIN)/$(program)) $(ISO_ROOT)/boot/programs/
 	cp $(HELLO_EXE) $(ISO_ROOT)/boot/programs/hello.exe
+	cp $(CONSOLE_EXE) $(ISO_ROOT)/boot/programs/console.exe
+	cp $(KERNEL32) $(ISO_ROOT)/boot/programs/kernel32
 	cp $(TEST_BLOB) $(ISO_ROOT)/boot/firmware/test.blob
 	cp $(ROOT_TAR) $(ISO_ROOT)/boot/files/root.tar
 	@for file in $(FIRMWARE); do \
@@ -194,6 +213,8 @@ iso: $(KERNEL) user $(TEST_BLOB) $(ROOT_TAR) $(HELLO_EXE)
 	       echo "    module_path: boot():/boot/programs/$$program"; \
 	   done; \
 	   echo "    module_path: boot():/boot/programs/hello.exe"; \
+	   echo "    module_path: boot():/boot/programs/console.exe"; \
+	   echo "    module_path: boot():/boot/programs/kernel32"; \
 	   echo "    module_path: boot():/boot/firmware/test.blob"; \
 	   echo "    module_path: boot():/boot/files/root.tar"; \
 	   for file in $(FIRMWARE); do \
@@ -242,20 +263,24 @@ boot-test: iso
 	  if [ $$status -ne 0 ] && [ $$status -ne 124 ]; then exit $$status; fi
 	@echo "--- serial log captured ---"
 
-# Verdigris, phase 1: boot and check hello.exe loaded, mapped as its
-# sections ask, said its line through the log, and exited -- and that a
-# damaged copy was refused.
+# Verdigris, phases 1 and 2: boot and check hello.exe loaded, mapped as
+# its sections ask, said its line through the log, and exited, and that a
+# damaged copy was refused; then that console.exe's imports were bound to
+# kernel32 and its WriteFile reached the log.
 pe-test: iso
 	@timeout --foreground $(BOOT_TIMEOUT) \
 	    qemu-system-x86_64 $(QEMU_FLAGS) < /dev/null > build/serial.log 2>&1 || true
-	@grep -a "^verdigris \|^hello.exe " build/serial.log || echo "pe-test: nothing from Verdigris"
+	@grep -a "^verdigris \|^hello.exe \|^console.exe" build/serial.log || echo "pe-test: nothing from Verdigris"
 	@grep -aq "^hello.exe  : hello from a PE, over int 0x80" build/serial.log \
 	    && echo "pe-test: a Windows program said its line             PASS" \
 	    || echo "pe-test: a Windows program said its line             FAIL"
-	@test $$(grep -a "^verdigris " build/serial.log | grep -ac "PASS") -eq 5 \
+	@grep -aq "^console.exe: hello from kernel32, via WriteFile" build/serial.log \
+	    && echo "pe-test: ...and one through kernel32's WriteFile     PASS" \
+	    || echo "pe-test: ...and one through kernel32's WriteFile     FAIL"
+	@test $$(grep -a "^verdigris " build/serial.log | grep -ac "PASS") -eq 10 \
 	    && ! grep -a "^verdigris " build/serial.log | grep -aq "FAIL" \
-	    && echo "pe-test: the kernel's five Verdigris checks pass     PASS" \
-	    || echo "pe-test: the kernel's five Verdigris checks pass     FAIL"
+	    && echo "pe-test: the kernel's ten Verdigris checks pass      PASS" \
+	    || echo "pe-test: the kernel's ten Verdigris checks pass      FAIL"
 
 # Boot, let the kernel settle, then dump the framebuffer through the QEMU
 # monitor. This is how we verify the renderer actually put pixels where it

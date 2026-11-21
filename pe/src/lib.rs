@@ -10,10 +10,12 @@
 //! executable, not a DLL, with page-sized section alignment, that fits at
 //! its preferred base inside the range the caller allows, whose sections lie
 //! inside the file and the image, in order, never both writable and
-//! executable, and whose entry point is in an executable section. It may not
-//! import anything or have thread-local storage yet: binding imports and
-//! running TLS callbacks are later phases, and a program that needs them is
-//! refused rather than started half loaded.
+//! executable, and whose entry point is in an executable section. It may
+//! import functions by name -- [`Pe::bind`] fills its import address table
+//! from a table of exports, such as Verdigris's kernel32 carries (see
+//! [`exports`]) -- but not by ordinal, and it may not have thread-local
+//! storage yet, whose callbacks would have to run: a program that needs
+//! what is not done is refused rather than started half loaded.
 //!
 //! What comes out is what `corrode-elf` gives -- segments and an entry -- so
 //! the kernel maps both kinds of program with the same code. The headers are
@@ -62,6 +64,14 @@ const MAX_DIRECTORIES: usize = 16;
 /// Windows wants an image base on a 64 KiB boundary.
 const BASE_ALIGNMENT: u64 = 0x1_0000;
 
+/// Most DLLs a program may import from, and functions in all.
+pub const MAX_DLLS: usize = 8;
+pub const MAX_IMPORTS: usize = 64;
+/// Longest DLL or function name read, without its terminating zero.
+pub const MAX_NAME: usize = 63;
+const DESCRIPTOR_LEN: usize = 20;
+const BY_ORDINAL: u64 = 1 << 63;
+
 const SCN_EXECUTE: u32 = 0x2000_0000;
 const SCN_WRITE: u32 = 0x8000_0000;
 
@@ -94,10 +104,35 @@ pub enum Error {
     WritableAndExecutable,
     /// An entry point that is not in an executable section.
     EntryNotExecutable,
-    /// It imports from DLLs; binding imports is not done yet.
-    Imports,
+    /// An import table that does not hold together: a name or a table
+    /// outside the file's sections, a name too long or never ended, an
+    /// import address slot that is unaligned, outside the image, or in code.
+    BadImports,
+    /// More than [`MAX_DLLS`] DLLs or [`MAX_IMPORTS`] functions imported.
+    TooManyImports,
+    /// A function imported by number; only names are bound.
+    ImportByOrdinal,
+    /// A function the exports given to [`Pe::bind`] do not have.
+    Unresolved,
     /// It has thread-local storage, whose callbacks would have to run.
     ThreadLocalStorage,
+}
+
+/// One function a program imports, and where its address goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Import<'a> {
+    /// The DLL's name, as the file spells it.
+    pub dll: &'a [u8],
+    pub name: &'a [u8],
+    /// The address of its 8-byte slot in the import address table.
+    pub slot: u64,
+}
+
+/// An 8-byte value to write at an address before the page is mapped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fixup {
+    pub address: u64,
+    pub value: u64,
 }
 
 /// A Windows program that has passed every check.
@@ -105,6 +140,100 @@ pub enum Error {
 pub struct Pe<'a> {
     entry: u64,
     segments: [Option<Segment<'a>>; corrode_elf::MAX_SEGMENTS],
+    imports: [Option<Import<'a>>; MAX_IMPORTS],
+}
+
+/// `len` bytes at `address`, if a section's file bytes hold them all.
+fn file_at<'a>(segments: &[Option<Segment<'a>>], address: u64, len: u64) -> Result<&'a [u8], Error> {
+    // Index 0 is the headers, never where an import table may be.
+    for segment in segments[1..].iter().flatten() {
+        let Some(offset) = address.checked_sub(segment.address) else {
+            continue;
+        };
+        let end = offset.checked_add(len).ok_or(Error::BadImports)?;
+        if end <= segment.data.len() as u64 {
+            return Ok(&segment.data[offset as usize..end as usize]);
+        }
+    }
+    Err(Error::BadImports)
+}
+
+/// The zero-terminated name at `address`, without its zero.
+fn name_at<'a>(segments: &[Option<Segment<'a>>], address: u64) -> Result<&'a [u8], Error> {
+    for segment in segments[1..].iter().flatten() {
+        let Some(offset) = address.checked_sub(segment.address) else {
+            continue;
+        };
+        let Some(rest) = segment.data.get(offset as usize..) else {
+            continue;
+        };
+        let len = rest.iter().take(MAX_NAME + 1).position(|byte| *byte == 0);
+        return match len {
+            Some(len) if len > 0 => Ok(&rest[..len]),
+            _ => Err(Error::BadImports),
+        };
+    }
+    Err(Error::BadImports)
+}
+
+/// Read the import directory at `table`: every function, by name, and the
+/// slot its address goes in.
+fn read_imports<'a>(
+    segments: &[Option<Segment<'a>>],
+    base: u64,
+    table: u64,
+) -> Result<[Option<Import<'a>>; MAX_IMPORTS], Error> {
+    let mut imports = [None; MAX_IMPORTS];
+    let mut count = 0;
+    for index in 0.. {
+        let at = base + table + (index * DESCRIPTOR_LEN) as u64;
+        let descriptor = file_at(segments, at, DESCRIPTOR_LEN as u64)?;
+        // A descriptor of zeros ends the table.
+        if descriptor.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        if index == MAX_DLLS {
+            return Err(Error::TooManyImports);
+        }
+        let lookup = u32_at(descriptor, 0)? as u64;
+        let dll = name_at(segments, base + u32_at(descriptor, 12)? as u64)?;
+        let slots = u32_at(descriptor, 16)? as u64;
+        // The names are in the lookup table, or, when a linker left it out,
+        // in the address table before it is bound.
+        let lookup = if lookup == 0 { slots } else { lookup };
+        if slots == 0 {
+            return Err(Error::BadImports);
+        }
+        for entry in 0.. {
+            let entry_at = (entry * 8) as u64;
+            let value = u64_at(file_at(segments, base + lookup + entry_at, 8)?, 0)?;
+            if value == 0 {
+                break;
+            }
+            if value & BY_ORDINAL != 0 {
+                return Err(Error::ImportByOrdinal);
+            }
+            if count == MAX_IMPORTS {
+                return Err(Error::TooManyImports);
+            }
+            // A hint (two bytes nobody needs), then the name.
+            let hint = value.checked_add(2).filter(|at| *at < 1 << 31).ok_or(Error::BadImports)?;
+            let name = name_at(segments, base + hint)?;
+            let slot = base + slots + entry_at;
+            // The slot is written before its page is mapped, so it may be
+            // in read-only data, as linkers put it; but not in code, and
+            // not straddling two pages.
+            let holder = segments[1..].iter().flatten().find(|segment| {
+                slot >= segment.address && slot + 8 <= segment.address + segment.len
+            });
+            if !slot.is_multiple_of(8) || holder.is_none_or(|segment| segment.executable) {
+                return Err(Error::BadImports);
+            }
+            imports[count] = Some(Import { dll, name, slot });
+            count += 1;
+        }
+    }
+    Ok(imports)
 }
 
 fn u16_at(bytes: &[u8], at: usize) -> Result<u16, Error> {
@@ -177,9 +306,7 @@ impl<'a> Pe<'a> {
             let at = DIRECTORIES + index * 8;
             Ok((u32_at(header, at)?, u32_at(header, at + 4)?))
         };
-        if directory(IMPORTS)?.1 != 0 {
-            return Err(Error::Imports);
-        }
+        let (import_table, import_len) = directory(IMPORTS)?;
         if directory(TLS)?.1 != 0 {
             return Err(Error::ThreadLocalStorage);
         }
@@ -269,11 +396,41 @@ impl<'a> Pe<'a> {
         if !entry_ok {
             return Err(Error::EntryNotExecutable);
         }
+        let imports = if import_len == 0 {
+            [None; MAX_IMPORTS]
+        } else {
+            read_imports(&segments, base, import_table as u64)?
+        };
 
         Ok(Pe {
             entry: base + entry_rva,
             segments,
+            imports,
         })
+    }
+
+    /// Every function the program imports.
+    pub fn imports(&self) -> impl Iterator<Item = Import<'a>> + '_ {
+        self.imports.iter().flatten().copied()
+    }
+
+    /// Fill the import address table: `resolve` gives each import's address
+    /// from the DLL's name and the function's, or `None` if it has no such
+    /// function, which refuses the program ([`Error::Unresolved`]). The
+    /// fixups are to be written before the pages are mapped.
+    pub fn bind(
+        &self,
+        mut resolve: impl FnMut(&[u8], &[u8]) -> Option<u64>,
+    ) -> Result<[Option<Fixup>; MAX_IMPORTS], Error> {
+        let mut fixups = [None; MAX_IMPORTS];
+        for (fixup, import) in fixups.iter_mut().zip(self.imports()) {
+            let value = resolve(import.dll, import.name).ok_or(Error::Unresolved)?;
+            *fixup = Some(Fixup {
+                address: import.slot,
+                value,
+            });
+        }
+        Ok(fixups)
     }
 
     /// Where execution starts.
@@ -286,6 +443,8 @@ impl<'a> Pe<'a> {
         self.segments.iter().flatten().copied()
     }
 }
+
+pub mod exports;
 
 #[cfg(test)]
 mod tests;
