@@ -20,6 +20,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod clock;
+pub mod passcode;
 pub mod wallpaper;
 
 pub use corrode_render::Color;
@@ -557,26 +558,49 @@ pub fn color(text: &str) -> Option<Color> {
     Some(Color::rgb(byte(0)?, byte(2)?, byte(4)?))
 }
 
-/// The lock screen's passcode, from a config file's `passcode = ` line: 4
-/// to 8 digits, as ASCII, NUL-padded. `None` if there is no such line, or
-/// it is not 4 to 8 digits (a passcode that cannot be typed on the lock
-/// screen's keys would lock the screen for good).
+/// The lock screen's passcode, from a config file's `passcode = ` line:
+/// either 4 to 8 digits in the clear, or the salted hash
+/// `./corrode passcode-hash` writes (see [`passcode`](mod@passcode)).
+/// `None` if there is no such line, or it is neither (a passcode that
+/// cannot be typed on the lock screen's keys would lock the screen for
+/// good).
 ///
 /// It is not part of [`Theme`]: a theme goes to every program, and to the
 /// disk, and a passcode should do neither.
-pub fn passcode(text: &str) -> Option<[u8; 8]> {
-    let value = text
-        .lines()
-        .filter_map(|line| uncommented(line).trim().split_once('='))
-        .filter(|(key, _)| key.trim() == "passcode")
-        .map(|(_, value)| value.trim())
-        .last()?;
+pub fn passcode(text: &str) -> Option<passcode::Stored> {
+    let value = passcode_line(text)?.1;
+    if let Some(hashed) = passcode::Hashed::parse(value) {
+        return Some(passcode::Stored::Hashed(hashed));
+    }
     if !(4..=8).contains(&value.len()) || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
     let mut code = [0u8; 8];
     code[..value.len()].copy_from_slice(value.as_bytes());
-    Some(code)
+    Some(passcode::Stored::Plain(code))
+}
+
+/// The last `passcode =` line: where its value starts in `text`, and the
+/// value. The last one wins, as for every other key.
+fn passcode_line(text: &str) -> Option<(usize, &str)> {
+    text.lines()
+        .filter_map(|line| uncommented(line).trim().split_once('='))
+        .filter(|(key, _)| key.trim() == "passcode")
+        .map(|(_, value)| {
+            let value = value.trim();
+            (value.as_ptr() as usize - text.as_ptr() as usize, value)
+        })
+        .next_back()
+}
+
+/// `text` with its passcode in the clear replaced by `hashed`, or `None`
+/// if its passcode is not in the clear. Everything else is kept as it was.
+pub fn with_hashed_passcode(text: &str, hashed: &passcode::Hashed, out: &mut impl core::fmt::Write) -> Option<()> {
+    let passcode::Stored::Plain(_) = passcode(text)? else {
+        return None;
+    };
+    let (at, value) = passcode_line(text)?;
+    write!(out, "{}{}{}", &text[..at], hashed, &text[at + value.len()..]).ok()
 }
 
 /// The contents of the file at `path` in a ustar archive, if it is there.
@@ -692,15 +716,57 @@ mod tests {
 
     #[test]
     fn a_passcode_is_four_to_eight_digits() {
-        assert_eq!(passcode("passcode = 1234\n"), Some(*b"1234\0\0\0\0"));
-        assert_eq!(passcode("# lock\npasscode=87654321 # mine\n"), Some(*b"87654321"));
+        use passcode::Stored::Plain;
+        assert_eq!(passcode("passcode = 1234\n"), Some(Plain(*b"1234\0\0\0\0")));
+        assert_eq!(passcode("# lock\npasscode=87654321 # mine\n"), Some(Plain(*b"87654321")));
         // The last one wins, as for every other key.
-        assert_eq!(passcode("passcode = 1111\npasscode = 2222\n"), Some(*b"2222\0\0\0\0"));
+        assert_eq!(passcode("passcode = 1111\npasscode = 2222\n"), Some(Plain(*b"2222\0\0\0\0")));
         for bad in ["", "passcode = 123", "passcode = 123456789", "passcode = 12a4", "passcode ="] {
             assert_eq!(passcode(bad), None, "{bad:?}");
         }
         // And the theme does not take it as anything.
         assert_eq!(Theme::parse("passcode = 1234\n"), Theme::default());
+    }
+
+    #[test]
+    fn a_plain_passcode_becomes_a_hash_and_nothing_else_changes() {
+        let config = "accent = #e2643a\n# passcode = 1111\npasscode = 2468 # mine\nclock = 12h\n";
+        let hashed = passcode::Hashed::new(*b"2468\0\0\0\0", *b"a salt, sixteen!", 1_000);
+        let mut out = String::new();
+        with_hashed_passcode(config, &hashed, &mut out).unwrap();
+        assert_eq!(out, format!("accent = #e2643a\n# passcode = 1111\npasscode = {hashed} # mine\nclock = 12h\n"));
+        // It reads back as that hash, which takes the old code and no other.
+        let Some(passcode::Stored::Hashed(read)) = passcode(&out) else {
+            panic!("{out}");
+        };
+        assert_eq!(read, hashed);
+        assert!(read.matches(*b"2468\0\0\0\0"));
+        assert!(!read.matches(*b"1111\0\0\0\0"));
+        assert_eq!(Theme::parse(&out), Theme::parse(config));
+        // A hash is not hashed again, and no passcode is no change.
+        assert_eq!(with_hashed_passcode(&out, &hashed, &mut String::new()), None);
+        assert_eq!(with_hashed_passcode("clock = 12h\n", &hashed, &mut String::new()), None);
+    }
+
+    /// `./corrode passcode-hash`: rewrite `PASSCODE_CONF`'s passcode in the
+    /// clear as a hash, salted from the host's /dev/urandom.
+    #[test]
+    #[ignore]
+    fn hash_the_passcode() {
+        use std::io::Read;
+        let path = std::env::var("PASSCODE_CONF").expect("PASSCODE_CONF names the file");
+        let text = std::fs::read_to_string(&path).expect("read the config");
+        let Some(passcode::Stored::Plain(code)) = passcode(&text) else {
+            println!("passcode-hash: {path} has no passcode in the clear; nothing to do");
+            return;
+        };
+        let mut salt = [0u8; 16];
+        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut salt)).expect("salt");
+        let hashed = passcode::Hashed::new(code, salt, passcode::ITERATIONS);
+        let mut out = String::new();
+        with_hashed_passcode(&text, &hashed, &mut out).expect("rewrite");
+        std::fs::write(&path, out).expect("write the config");
+        println!("passcode-hash: {path}'s passcode is now a salted hash");
     }
 
     #[test]

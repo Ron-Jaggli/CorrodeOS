@@ -39,9 +39,10 @@ The short version, for reading first. The numbered log below has the detail.
   - Settings are kept only on a virtio disk (55): `./corrode run` uses
     build/settings.img, inside the project. Real machines' disks and
     CMOS NVRAM are still never written; there is no AHCI/NVMe driver.
-  - The lock screen's passcode (57) is in desktop.conf in the clear:
-    there are no accounts and no secret storage. It keeps a passer-by
-    out, not someone holding the disk.
+  - The lock screen's passcode (57) can be a salted hash in desktop.conf
+    (65), but 4 to 8 digits can still be guessed from it offline: there
+    are no accounts and no secret storage. It keeps a passer-by out, not
+    someone holding the disk.
 - **Speed:** frame timing is in (`./corrode perf-test`). Frosted glass
   is most of a frame's cost; dragging a window now takes about 6.5 ms a
   frame, down from 33 (47, 48, 49, 60, 61), and 4.6–5.4 ms since the
@@ -1694,13 +1695,58 @@ This part, host-tested only:
   "sse : on (saved per task)". `./corrode test` passes. Clippy is clean
   on the new code; its existing complaints elsewhere are untouched.
 
+## 65. The passcode as a salted hash
+
+- desktop.conf's `passcode =` takes, besides 4 to 8 digits, the line
+  `pbkdf2-sha256$<iterations>$<salt>$<hash>`: PBKDF2-HMAC-SHA-256
+  (RFC 8018) of the digits, 16 bytes of salt, 32 of hash, in hex
+  (`theme/src/passcode.rs`). SHA-256, HMAC and PBKDF2 are written there,
+  since nothing comes from crates.io, and are checked against FIPS 180-4,
+  RFC 4231 and RFC 7914's test vectors.
+- The kernel keeps only a hash. A passcode in the clear is hashed as
+  desktop.conf is read, salted with the clock (the hash never leaves
+  memory, and a salt need not be secret), and the boot log says which it
+  was. A try is checked against the hash, every byte compared, with
+  interrupts on and no lock held; the three-tries-then-30-s rule is
+  unchanged and is checked before any hashing.
+- `./corrode passcode-hash` rewrites a passcode in the clear in
+  `root/etc/desktop.conf` (or `PASSCODE_CONF`) as a hash, with a salt from
+  the host's /dev/urandom, keeping every other byte of the file.
+- **Choice:** "rewritten once" happens at build time, by that command.
+  The running system cannot do it: desktop.conf is in the ISO's
+  root.tar, which nothing writes, and the kept-settings record on the
+  virtio disk (55) holds the theme, never the passcode.
+- **Choice:** 50 000 iterations. A try takes 129 ms in the kernel under
+  QEMU, during which the desktop's loop is busy. The count is in each
+  line (1 000 to 1 000 000 accepted), so a later one can change it.
+- Honest limit: 4 to 8 digits are at most 10^8 codes, so someone with
+  the ISO can still find one from its hash, just more slowly. What this
+  removes is the passcode sitting readable in the file (the Files app
+  shows desktop.conf). The lock screen's limit on tries is what stops a
+  person at the keyboard.
+- Tests:
+  - host: the hash vectors; the right code matches and near misses do
+    not; another salt gives another hash; a written line reads back, and
+    malformed ones (short, wrong scheme, out-of-range iterations, extra
+    fields, bad hex) are refused; a config's plain passcode is rewritten
+    with nothing else changed, reads back as that hash, takes the old code
+    and not another, and a hashed or passcode-less config is left alone.
+  - `passcode-test` now hashes its config with `passcode-hash` first and
+    checks the boot log says so; `PASSCODE_FORM=plain` runs it on the
+    old form. Both: all five checks PASS.
+- README and desktop.conf's comment say what the hash does and does not
+  do.
+- Every scored boot-test check PASSes on both GPUs (49 each, with the
+  new one); boot self-checks 172 / 0 (default) and 179 / 0 (virtio).
+  `./corrode test` passes; clippy is clean on the new code.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
 2026-11-22T06:03-06:00). One task a pass; stop rules are in the /loop prompt.
 
 1. [x] Finish SSE (branch `sse`) -- section 64
-2. [ ] Passcode as a salted hash (`passcode-hash`)
+2. [x] Passcode as a salted hash (`passcode-hash`) -- section 65
 3. [ ] Secure-core capability, groundwork only (`secure-cap`)
 4. [ ] SSE for the glass lens (`sse-glass`)
 5. [ ] SSE for the 2x2 backdrop downscale (`sse-downscale`)

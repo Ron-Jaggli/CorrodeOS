@@ -67,7 +67,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test grow-test zoom-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash grow-test zoom-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -1016,8 +1016,17 @@ store-test: iso
 	    || echo "store-test: the driver holds only its device           FAIL"
 	@test -s build/store.ppm && pnmtopng build/store.ppm > build/store.png 2>/dev/null && rm -f build/store.ppm && echo "wrote build/store.png" || true
 
+# A passcode in the clear in desktop.conf, rewritten as a salted hash, in
+# place; the rest of the file is kept as it was. PASSCODE_CONF names
+# another file.
+PASSCODE_CONF ?= $(CURDIR)/root/etc/desktop.conf
+passcode-hash:
+	@PASSCODE_CONF=$(PASSCODE_CONF) cargo test -q --release -p corrode-theme \
+	    --target $(HOST_TARGET) hash_the_passcode -- --ignored --nocapture 2>&1 | grep '^passcode-hash'
+
 # The lock screen with a passcode. A copy of the ISO whose desktop.conf
-# has `passcode = 2468` (build/passcode.iso; the real one is untouched).
+# has `passcode = 2468` (build/passcode.iso; the real one is untouched),
+# hashed by passcode-hash first unless PASSCODE_FORM=plain.
 # Lock with Alt+L; a wrong code is refused, the right one unlocks. Lock
 # again: three wrong in a row and even the right one is refused for a
 # while. build/passcode-dots.png shows two digits typed, build/passcode.png
@@ -1026,6 +1035,7 @@ PASS_ISO := build/passcode.iso
 passcode-test: iso
 	@rm -rf build/pass_root build/pass_iso_root $(PASS_ISO) build/passcode.ppm build/passcode.png build/passcode-dots.ppm build/passcode-dots.png
 	@cp -r root build/pass_root && printf '\npasscode = 2468\n' >> build/pass_root/etc/desktop.conf
+	@if [ "$(PASSCODE_FORM)" != plain ]; then $(MAKE) -s passcode-hash PASSCODE_CONF=$(CURDIR)/build/pass_root/etc/desktop.conf; fi
 	@cp -r $(ISO_ROOT) build/pass_iso_root
 	@tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
 	    --mtime=@0 --mode=u+rw,go+r,go-w -C build/pass_root -cf build/pass_iso_root/boot/files/root.tar .
@@ -1054,6 +1064,11 @@ passcode-test: iso
 	@grep -q "^theme      : read /etc/desktop.conf, with a lock screen passcode" build/serial.log \
 	    && echo "passcode-test: the passcode is read                     PASS" \
 	    || echo "passcode-test: the passcode is read                     FAIL"
+	@if [ "$(PASSCODE_FORM)" = plain ]; then want='in the clear'; else want=hashed; fi; \
+	    ! grep -q '^passcode = 2468' build/pass_root/etc/desktop.conf || [ "$(PASSCODE_FORM)" = plain ] \
+	    && grep -q "with a lock screen passcode ($$want" build/serial.log \
+	    && printf 'passcode-test: %-41sPASS\n' "read $$want, kept as a hash" \
+	    || printf 'passcode-test: %-41sFAIL\n' "read $$want, kept as a hash"
 	@test "$$(grep -c '^lock       : wrong passcode' build/serial.log)" = 4 \
 	    && echo "passcode-test: four wrong codes are refused             PASS" \
 	    || echo "passcode-test: four wrong codes are refused             FAIL"
