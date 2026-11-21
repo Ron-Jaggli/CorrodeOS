@@ -239,6 +239,7 @@ pub extern "C" fn kmain() -> ! {
     // Programs: ring 3 tasks that came from files rather than from the
     // kernel image. Then a device, driven by one.
     program_checks();
+    verdigris_checks();
     #[cfg(not(feature = "user-test"))]
     {
         device_checks();
@@ -2811,6 +2812,96 @@ fn program_checks() {
         // This line being printed at all is the other half.
         program_check("and the machine is not", true);
     }
+}
+
+fn verdigris_check(name: &str, ok: bool) {
+    check("verdigris", name, ok);
+}
+
+/// Where a Windows program finds the log, in its own capability space: the
+/// only capability `hello.exe` holds.
+const PE_LOG: cap::CapPtr = 0;
+
+/// Verdigris, phase 1 (see `verdigris/DESIGN.md`): a Windows program loads
+/// from a module and runs as an ordinary ring 3 task.
+///
+/// `hello.exe` is a PE file written byte by byte by `scripts/hello-exe.sh`.
+/// The host tests feed the PE reader files that lie; these show that the
+/// real one maps as its sections ask, that a damaged copy is refused before
+/// anything is mapped, and that it runs: it says one line, through the
+/// log endpoint it is given and nothing else, and exits.
+fn verdigris_checks() {
+    use mm::paging::{NO_EXECUTE, USER, WRITABLE};
+
+    verdigris_check(
+        "a file that is not a PE is refused",
+        matches!(
+            task::user::load_pe(b"MZ, but nothing else a PE needs"),
+            Err(task::user::LoadError::Pe(_))
+        ),
+    );
+    let Some(module) = modules::find("hello.exe") else {
+        println!("verdigris  : no hello.exe module was loaded");
+        return;
+    };
+    let allowed = corrode_abi::layout::IMAGE_BASE..corrode_abi::layout::IMAGE_END;
+    let Ok(pe) = corrode_pe::Pe::parse(module.bytes, allowed) else {
+        verdigris_check("hello.exe is a PE this kernel runs", false);
+        return;
+    };
+
+    // The same file with its code section made writable as well: refused
+    // whole, before a frame is taken.
+    let mut damaged = alloc::vec::Vec::from(module.bytes);
+    let flags = 0x58 + 240 + 36;
+    if let Some(field) = damaged.get_mut(flags..flags + 4) {
+        let value = u32::from_le_bytes([field[0], field[1], field[2], field[3]]) | 0x8000_0000;
+        field.copy_from_slice(&value.to_le_bytes());
+    }
+    verdigris_check(
+        "a writable and executable section is refused",
+        matches!(
+            task::user::load_pe(&damaged),
+            Err(task::user::LoadError::Pe(corrode_pe::Error::WritableAndExecutable))
+        ),
+    );
+
+    let hello = match task::spawn_pe("hello.exe", module.bytes) {
+        Ok(id) => id,
+        Err(error) => {
+            println!("verdigris  : hello.exe was not loaded: {error:?}");
+            verdigris_check("load a PE from a module", false);
+            return;
+        }
+    };
+    let honoured = task::space_of(hello).is_some_and(|space| {
+        pe.segments().all(|segment| {
+            segment.pages().step_by(4096).all(|page| {
+                space.leaf_flags(page).is_some_and(|flags| {
+                    flags & USER != 0
+                        && (flags & WRITABLE != 0) == segment.writable
+                        && (flags & NO_EXECUTE == 0) == segment.executable
+                })
+            })
+        })
+    });
+    verdigris_check("a PE's headers and sections map as it asks", honoured);
+
+    let granted = cap::grant(hello, LOG_ENDPOINT, PE_LOG, cap::Rights::WRITE).is_ok();
+    verdigris_check(
+        "it holds the log, and nothing else",
+        granted && cap::slots_used(hello) == Some(1),
+    );
+    start_all(&[Some(hello)]);
+    // It says its line and exits; bounded, in case it never does.
+    let deadline = time::now_ns() + 2_000_000_000;
+    while task::state_of(hello) != Some(task::State::Finished) && time::now_ns() < deadline {
+        task::yield_now();
+    }
+    verdigris_check(
+        "it runs and exits",
+        task::state_of(hello) == Some(task::State::Finished),
+    );
 }
 
 /// Bootstrap's capability to the test blob, and the endpoint its reader

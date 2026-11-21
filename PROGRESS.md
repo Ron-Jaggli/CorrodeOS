@@ -2204,6 +2204,60 @@ would hold. The document covers:
 - Verified: no code changed from `xhci` 638686c; `./corrode test` 315
   passed; plain boots on both GPUs with no FAIL and no trap.
 
+## 74. Verdigris, phase 1: a Windows program runs
+
+`corrode-pe` reads a PE file the way `corrode-elf` reads an ELF one: a
+`no_std` crate with no kernel in it, checking the whole file before
+anything is mapped, and giving back `corrode_elf::Segment`s so the kernel
+maps both kinds with the same code. It accepts a PE32+ x86-64 executable
+(not a DLL) with page section alignment, at its preferred base inside the
+image range, sections in order inside the file and the image, never
+writable and executable, entry in code. The headers are a read-only
+segment at the image base, as Windows maps them. Imports and TLS are
+refused by name (`Error::Imports`, `Error::ThreadLocalStorage`) until the
+phases that handle them.
+
+`task::user::load_pe` shares `load`'s mapping loop (now `build`); its only
+difference is the Win64 entry stack (32 bytes of shadow space, `rsp % 16
+== 8`, a null return address). `task::spawn_pe` starts it holding nothing.
+
+`hello.exe` is written by `scripts/hello-exe.sh`, a bash script of
+commented `printf` fields and hand-assembled instructions: no Windows
+toolchain, no assembler. Its `.text` loads 32 bytes from `.rdata` and sends
+them to capability slot 0 as a `log::LINE` with `int 0x80`, then exits.
+It is a boot module; at every boot the kernel checks (`verdigris`):
+
+- a file that is not a PE is refused;
+- hello.exe with its code made writable as well is refused
+  (`WritableAndExecutable`), before a frame is taken;
+- its headers and sections map with exactly the permissions they ask for;
+- it holds the log endpoint and nothing else;
+- it runs and exits; its line `hello.exe  : hello from a PE, over int
+  0x80` is in the log.
+
+Host tests (11): a good file; bss; every refusal by name (wrong magic,
+machine, PE32, DLL, object file, imports, TLS, directory counts, base
+alignment and range, the default 0x140000000 base, image size, section
+and file alignment, section count, W+X, overlap, out-of-order, past the
+image, outside the file, empty sections, short headers, entry not in
+code); every truncation; 20 000 random corruptions of the headers that
+must never panic and, when accepted, keep every promise the kernel relies
+on; and the script's own output parsed.
+
+- **Choice:** phase 1 loads only at the preferred base; an image that
+  would need its base relocations applied is refused (`OutsideRange`),
+  including the default 64-bit base. Rebasing comes with phase 2's fixups.
+- **Choice:** hello.exe runs at every boot, like the `fault` program: it
+  takes a few milliseconds and its checks are boot self-checks.
+- **Choice:** task 11 stays on branch `verdigris` with the design it
+  implements.
+- New `pe-test` (scored).
+- Verified: the whole suite on both GPUs, 62 checks PASS on each (60
+  before, plus `pe-test`'s two), none FAIL; boot self-checks 186/193
+  (five more: the Verdigris checks), none failing, no unhandled trap;
+  `./corrode test` 326 passed; clippy at 33 after replacing two `%`
+  checks with `is_multiple_of`.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -2234,7 +2288,7 @@ copied below so a later pass can read them here.
       /root/dih and /user/dih, nothing beside them). DESIGN.md must specify
       this (as a capability: a pruned view of the files) and how Windows
       paths such as C:\ map onto the view's root.
-11. [ ] Verdigris phase 1: the PE loader; a tiny hand-built PE (bytes in repo or built by a script, no Windows toolchain) that prints over a syscall; boot test on both GPUs; malformed PEs refused, not crashed on (host tests)
+11. [x] (section 74) Verdigris phase 1: the PE loader; a tiny hand-built PE (bytes in repo or built by a script, no Windows toolchain) that prints over a syscall; boot test on both GPUs; malformed PEs refused, not crashed on (host tests)
 12. [ ] Verdigris phase 2: smallest kernel32 subset for a console "hello" PE (GetStdHandle, WriteFile, ExitProcess) on whatever narrow capability it needs; boot test
 13. [ ] Write-up: surviving-reboot key options (passcode-derived, sealed key, TPM) with trade-offs; a ring -1 hypervisor option (Rust, soft-float, own crate, signed, open source, small enough to verify); a table of every task (branch, result, perf). No code. Then stop the loop.
 

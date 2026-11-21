@@ -367,6 +367,14 @@ pub fn spawn_program_on(
     spawn_inner(name, image.entry, Some(image), cpu_index).ok_or(user::LoadError::OutOfMemory)
 }
 
+/// Create a ring 3 task from a Windows program: a PE file already in memory
+/// (see `verdigris/DESIGN.md`). Like [`spawn_program`], it starts holding no
+/// capabilities at all.
+pub fn spawn_pe(name: &'static str, file: &[u8]) -> Result<usize, user::LoadError> {
+    let image = user::load_pe(file)?;
+    spawn_inner(name, image.entry, Some(image), next_cpu()).ok_or(user::LoadError::OutOfMemory)
+}
+
 fn spawn_inner(
     name: &'static str,
     entry_rip: u64,

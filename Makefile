@@ -75,7 +75,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test fade-test usb-test grow-test zoom-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test fade-test usb-test pe-test grow-test zoom-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -115,7 +115,7 @@ clippy:
 HOST_TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
 
 test:
-	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci -p corrode-elf -p corrode-virtio -p corrode-nv -p corrode-input -p corrode-heap -p corrode-line -p corrode-shell -p corrode-theme -p corrode-seal --target $(HOST_TARGET)
+	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci -p corrode-elf -p corrode-pe -p corrode-virtio -p corrode-nv -p corrode-input -p corrode-heap -p corrode-line -p corrode-shell -p corrode-theme -p corrode-seal --target $(HOST_TARGET)
 
 # What a title bar of glass costs the software renderer, built optimised.
 glass-bench:
@@ -169,11 +169,19 @@ $(ROOT_TAR): $(ROOT_FILES)
 	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
 	    --mtime=@0 --mode=u+rw,go+r,go-w -C root -cf $@ .
 
-iso: $(KERNEL) user $(TEST_BLOB) $(ROOT_TAR)
+# Verdigris's first Windows program, a PE file written byte by byte by a
+# script: no Windows toolchain. See verdigris/DESIGN.md.
+HELLO_EXE := build/hello.exe
+$(HELLO_EXE): scripts/hello-exe.sh
+	@mkdir -p build
+	bash scripts/hello-exe.sh $@
+
+iso: $(KERNEL) user $(TEST_BLOB) $(ROOT_TAR) $(HELLO_EXE)
 	@rm -rf $(ISO_ROOT)/boot/programs $(ISO_ROOT)/boot/firmware $(ISO_ROOT)/boot/files
 	@mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/boot/programs $(ISO_ROOT)/boot/firmware $(ISO_ROOT)/boot/files $(ISO_ROOT)/EFI/BOOT
 	cp $(KERNEL) $(ISO_ROOT)/boot/corrode
 	cp $(foreach program,$(USER_PROGRAMS),$(USER_BIN)/$(program)) $(ISO_ROOT)/boot/programs/
+	cp $(HELLO_EXE) $(ISO_ROOT)/boot/programs/hello.exe
 	cp $(TEST_BLOB) $(ISO_ROOT)/boot/firmware/test.blob
 	cp $(ROOT_TAR) $(ISO_ROOT)/boot/files/root.tar
 	@for file in $(FIRMWARE); do \
@@ -185,6 +193,7 @@ iso: $(KERNEL) user $(TEST_BLOB) $(ROOT_TAR)
 	   for program in $(USER_PROGRAMS); do \
 	       echo "    module_path: boot():/boot/programs/$$program"; \
 	   done; \
+	   echo "    module_path: boot():/boot/programs/hello.exe"; \
 	   echo "    module_path: boot():/boot/firmware/test.blob"; \
 	   echo "    module_path: boot():/boot/files/root.tar"; \
 	   for file in $(FIRMWARE); do \
@@ -232,6 +241,21 @@ boot-test: iso
 	  status=$$?; \
 	  if [ $$status -ne 0 ] && [ $$status -ne 124 ]; then exit $$status; fi
 	@echo "--- serial log captured ---"
+
+# Verdigris, phase 1: boot and check hello.exe loaded, mapped as its
+# sections ask, said its line through the log, and exited -- and that a
+# damaged copy was refused.
+pe-test: iso
+	@timeout --foreground $(BOOT_TIMEOUT) \
+	    qemu-system-x86_64 $(QEMU_FLAGS) < /dev/null > build/serial.log 2>&1 || true
+	@grep -a "^verdigris \|^hello.exe " build/serial.log || echo "pe-test: nothing from Verdigris"
+	@grep -aq "^hello.exe  : hello from a PE, over int 0x80" build/serial.log \
+	    && echo "pe-test: a Windows program said its line             PASS" \
+	    || echo "pe-test: a Windows program said its line             FAIL"
+	@test $$(grep -a "^verdigris " build/serial.log | grep -ac "PASS") -eq 5 \
+	    && ! grep -a "^verdigris " build/serial.log | grep -aq "FAIL" \
+	    && echo "pe-test: the kernel's five Verdigris checks pass     PASS" \
+	    || echo "pe-test: the kernel's five Verdigris checks pass     FAIL"
 
 # Boot, let the kernel settle, then dump the framebuffer through the QEMU
 # monitor. This is how we verify the renderer actually put pixels where it

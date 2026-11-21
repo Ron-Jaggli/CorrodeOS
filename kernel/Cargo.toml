@@ -19,6 +19,7 @@ corrode-text = { path = "../text" }
 corrode-pci = { path = "../pci" }
 corrode-abi = { path = "../abi" }
 corrode-elf = { path = "../elf" }
+corrode-pe = { path = "../pe" }
 
 [features]
 # Deliberately take a page fault at the end of boot to exercise the trap

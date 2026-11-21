@@ -79,6 +79,7 @@ dependencies = [
  "corrode-elf",
  "corrode-heap",
  "corrode-pci",
+ "corrode-pe",
  "corrode-render",
  "corrode-seal",
  "corrode-text",
@@ -131,6 +132,13 @@ dependencies = [
 [[package]]
 name = "corrode-pci"
 version = "0.0.1"
+
+[[package]]
+name = "corrode-pe"
+version = "0.0.1"
+dependencies = [
+ "corrode-elf",
+]
 
 [[package]]
 name = "corrode-ps2"

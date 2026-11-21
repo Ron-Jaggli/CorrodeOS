@@ -8,6 +8,7 @@ members = [
     "pci",
     "abi",
     "elf",
+    "pe",
     "virtio",
     "nv",
     "input",

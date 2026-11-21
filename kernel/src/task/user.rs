@@ -31,7 +31,8 @@
 //! naked assembly. See [`create`].
 
 use corrode_abi::layout;
-use corrode_elf::Elf;
+use corrode_elf::{Elf, Segment};
+use corrode_pe::Pe;
 
 use crate::mm::frame;
 use crate::mm::paging::{self, Mapper};
@@ -149,6 +150,8 @@ fn map_stack(space: &mut Mapper, pages: u64) -> Option<()> {
 pub enum LoadError {
     /// The file is not a program this kernel will run, and why.
     Format(corrode_elf::Error),
+    /// The file is not a Windows program this kernel will run, and why.
+    Pe(corrode_pe::Error),
     /// Not enough frames for its memory or the page tables to map it.
     OutOfMemory,
 }
@@ -170,12 +173,38 @@ pub enum LoadError {
 /// on the file, and nothing needs it yet.
 pub fn load(file: &[u8]) -> Result<Image, LoadError> {
     let elf = Elf::parse(file, layout::IMAGE_BASE..layout::IMAGE_END).map_err(LoadError::Format)?;
+    // As for an assembly program: the stack pointer a `call` would have
+    // left, over a null return address. A compiled entry point expects
+    // exactly that alignment.
+    build(elf.entry(), elf.segments(), 8)
+}
 
+/// Build a fresh address space from a Windows program: a PE file, checked
+/// whole by [`Pe::parse`] before a frame is taken, exactly as [`load`] does
+/// for ELF, and mapped by the same code.
+///
+/// The one difference is the stack. A Windows function is entered with
+/// 32 bytes of "shadow space" above its return address for it to spill its
+/// four register arguments into, and with the stack pointer 8 below a
+/// 16-byte boundary. The return address is null: a program that returns
+/// from its entry point instead of exiting faults, and is stopped.
+pub fn load_pe(file: &[u8]) -> Result<Image, LoadError> {
+    let pe = Pe::parse(file, layout::IMAGE_BASE..layout::IMAGE_END).map_err(LoadError::Pe)?;
+    build(pe.entry(), pe.segments(), 8 + 32)
+}
+
+/// Map checked segments into a fresh address space with a stack, the
+/// stack pointer `below` bytes under the stack's top.
+fn build<'a>(
+    entry: u64,
+    segments: impl Iterator<Item = Segment<'a>>,
+    below: u64,
+) -> Result<Image, LoadError> {
     let mut space = paging::with_kernel_mapper(|kernel| kernel.fork_kernel_half())
         .flatten()
         .ok_or(LoadError::OutOfMemory)?;
 
-    for segment in elf.segments() {
+    for segment in segments {
         let mut flags = paging::USER;
         if segment.writable {
             flags |= paging::WRITABLE;
@@ -218,11 +247,8 @@ pub fn load(file: &[u8]) -> Result<Image, LoadError> {
     map_stack(&mut space, PROGRAM_STACK_PAGES).ok_or(LoadError::OutOfMemory)?;
 
     Ok(Image {
-        entry: elf.entry(),
-        // As for an assembly program: the stack pointer a `call` would have
-        // left, over a null return address. A compiled entry point expects
-        // exactly that alignment.
-        stack_top: STACK_BOTTOM + PROGRAM_STACK_PAGES * PAGE - 8,
+        entry,
+        stack_top: STACK_BOTTOM + PROGRAM_STACK_PAGES * PAGE - below,
         stack_guard: STACK_GUARD,
         space,
     })
