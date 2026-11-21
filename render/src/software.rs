@@ -752,27 +752,7 @@ impl SoftwareRenderer {
             // its sixteen) and a quarter taken by shifting: what the general
             // loop below gives them, without dividing.
             let (whole_w, whole_h) = (bw / 2, bh / 2);
-            for sy in 0..whole_h {
-                // SAFETY: `clip` kept the backdrop on the surface, and
-                // `2 * sy + 1 < bh`.
-                let (top, bottom) = unsafe {
-                    (self.target_row(bx0, by0 + 2 * sy as u32), self.target_row(bx0, by0 + 2 * sy as u32 + 1))
-                };
-                let out = &mut backdrop[sy * sw..sy * sw + whole_w];
-                for (sx, small) in out.iter_mut().enumerate() {
-                    let mut red_blue = 0;
-                    let mut green = 0;
-                    for row in [top, bottom] {
-                        for x in [2 * sx, 2 * sx + 1] {
-                            // SAFETY: `x < 2 * whole_w <= bw` keeps it on the row.
-                            let pixel = unpack(&format, unsafe { row.add(x).read_unaligned() });
-                            red_blue += pixel & 0x00ff_00ff;
-                            green += pixel & 0x0000_ff00;
-                        }
-                    }
-                    *small = (red_blue >> 2) & 0x00ff_00ff | (green >> 2) & 0x0000_ff00;
-                }
-            }
+            self.halve((bx0, by0), (whole_w, whole_h), sw, backdrop);
             for sy in 0..sh {
                 for sx in 0..sw {
                     if sx < whole_w && sy < whole_h {
@@ -994,6 +974,50 @@ impl SoftwareRenderer {
             }
         }
         self.scratch = scratch;
+    }
+
+    /// The whole two-by-two blocks of the backdrop from `(bx0, by0)`, into
+    /// the first `whole_w` pixels of each of `whole_h` rows `sw` apart in
+    /// `backdrop`. Its own function, kept out of [`Self::glass`], so the
+    /// lens loop there is compiled as it was without it: inlined, it made
+    /// Clear glass, which never comes here, measurably slower.
+    #[inline(never)]
+    fn halve(&self, (bx0, by0): (u32, u32), (whole_w, whole_h): (usize, usize), sw: usize, backdrop: &mut [u32]) {
+        let format = self.info.format;
+        for sy in 0..whole_h {
+            // SAFETY: `clip` kept the backdrop on the surface, and
+            // `2 * sy + 1 < bh`.
+            let (top, bottom) = unsafe {
+                (self.target_row(bx0, by0 + 2 * sy as u32), self.target_row(bx0, by0 + 2 * sy as u32 + 1))
+            };
+            let out = &mut backdrop[sy * sw..sy * sw + whole_w];
+            // Two small pixels at a time where SSE2 can, the rest below.
+            #[cfg(target_arch = "x86_64")]
+            let paired = if format == PixelFormat::XRGB8888 && !scalar_only() {
+                let pairs = whole_w / 2;
+                // SAFETY: both rows have `2 * whole_w <= bw` pixels from
+                // `bx0`, and `out` has `whole_w`.
+                unsafe { crate::sse::downscale_rows(top, bottom, out.as_mut_ptr(), pairs) };
+                2 * pairs
+            } else {
+                0
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let paired = 0;
+            for (sx, small) in out.iter_mut().enumerate().skip(paired) {
+                let mut red_blue = 0;
+                let mut green = 0;
+                for row in [top, bottom] {
+                    for x in [2 * sx, 2 * sx + 1] {
+                        // SAFETY: `x < 2 * whole_w <= bw` keeps it on the row.
+                        let pixel = unpack(&format, unsafe { row.add(x).read_unaligned() });
+                        red_blue += pixel & 0x00ff_00ff;
+                        green += pixel & 0x0000_ff00;
+                    }
+                }
+                *small = (red_blue >> 2) & 0x00ff_00ff | (green >> 2) & 0x0000_ff00;
+            }
+        }
     }
 
     /// Glass with nowhere to work: the material's colour, laid over the
@@ -2003,6 +2027,34 @@ mod tests {
                     assert_eq!(got, expected, "{corners:08x?} at {fx}, {fy}");
                 }
             }
+        }
+    }
+
+    /// Two rows to one of half the width, by SSE2, against the mean of
+    /// each block, the byte above blue anything at all.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn downscale_rows_matches_the_mean() {
+        use crate::glass;
+        let mut state = 0x0bad_5eed_cafe_f00du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u32
+        };
+        for _ in 0..200 {
+            let top: std::vec::Vec<u32> = (0..64).map(|_| next()).collect();
+            let bottom: std::vec::Vec<u32> = (0..64).map(|_| next()).collect();
+            let mut out = std::vec![0xdead_beefu32; 33];
+            // SAFETY: 64 pixels a row, 32 out and one to spare.
+            unsafe { crate::sse::downscale_rows(top.as_ptr(), bottom.as_ptr(), out.as_mut_ptr(), 16) };
+            for (sx, &got) in out[..32].iter().enumerate() {
+                let block = [top[2 * sx], top[2 * sx + 1], bottom[2 * sx], bottom[2 * sx + 1]];
+                let sum = block.map(glass::channels).iter().fold([0; 3], |acc, c| [0, 1, 2].map(|i| acc[i] + c[i]));
+                assert_eq!(got, glass::pack(sum.map(|total| total / 4)), "{block:08x?}");
+            }
+            assert_eq!(out[32], 0xdead_beef, "wrote past the end");
         }
     }
 

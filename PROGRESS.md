@@ -1870,6 +1870,47 @@ This part, host-tested only:
   self-checks 181 / 0 (default) and 188 / 0 (virtio). `./corrode test`
   passes, the 5 new tests among them; clippy has nothing new.
 
+## 68. SSE for the backdrop's 2x2 downscale
+
+- `sse::downscale_rows`: two rows of the screen to one of half the
+  width, four source pixels to two small ones a step: unpacked to 16-bit
+  lanes, added down and across, shifted by two, packed, the byte above
+  blue cleared. The same sums and shift as the scalar loop, which still
+  does the odd small pixel at the end of a row, the edge blocks, and any
+  layout but XRGB8888.
+- Pixel-exact: the whole-pane SSE-on/off test from 67 now covers it
+  (odd widths, the top byte set), and a new test checks it against each
+  block's mean on random rows, and that it writes nothing past its end.
+  Halving the shift on purpose fails both.
+- In the kernel (temporary bench, removed): a Regular 600x40 pane 1077
+  -> 776 us; the downscale went from about 340 us to about 40. Clear
+  does not downscale (315 us, as before). Checksum unchanged.
+- **Choice:** the whole-block downscale is its own `#[inline(never)]`
+  function, `halve`. Inlined into `glass`, an A/B in one session (the
+  SSE downscale switched off and on, alternately, two runs each) showed
+  Clear glass, which never downscales, 1.4% slower dragging (2.539 ->
+  2.575 ms): the larger function compiled its lens loop differently.
+  Out of line, the same A/B against the committed `sse-glass` code gave
+  2.540 -> 2.544 ms, noise.
+- perf-test, draw ms a frame, A/B in one session, old code (`sse-glass`)
+  against new, two runs each:
+
+  | Scene                         | 67 (A/B)    | 68 (A/B)    |
+  |-------------------------------|-------------|-------------|
+  | Dragging, Regular glass       | 4.08–4.74   | 3.63–4.15   |
+  | Control Center open, Regular  | 9.94–9.97   | 8.66–8.74   |
+  | Dragging, Clear               | 2.50–2.57   | 2.49–2.58   |
+  | Control Center open, Clear    | 6.06–6.22   | 6.21–6.24   |
+
+  Control Center with Clear glass is one number a run and moved 2.7%
+  between two runs of the same old code; the new runs sit at the top of
+  that spread, 0.3% past it at most. Taken as noise, not a slowdown,
+  since Clear runs none of the new code (see the Choice above), but
+  written down here so a later run can say otherwise.
+- Every scored boot-test check PASSes on both GPUs (51 each); boot
+  self-checks 181 / 0 (default) and 188 / 0 (virtio). `./corrode test`
+  passes; clippy has nothing new.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -1881,7 +1922,7 @@ copied below so a later pass can read them here.
 2. [x] Passcode as a salted hash (`passcode-hash`) -- section 65
 3. [x] Secure-core sealing (`secure-cap`) -- section 66
 4. [x] (section 67) SSE for the glass lens loops in render/src/software.rs; pixel-exact host tests vs scalar; perf-test before/after (`sse-glass` off `secure-cap`)
-5. [ ] SSE in the 2x2 backdrop downscale (frosted path); pixel-exact; perf-test (`sse-downscale`)
+5. [x] (section 68) SSE in the 2x2 backdrop downscale (frosted path); pixel-exact; perf-test (`sse-downscale`)
 6. [ ] Raise the 16-surface cap (SURFACES) and what in the kernel and virtio driver assumes it; boot test opening >15 windows and closing them, both GPUs (`more-surfaces`)
 7. [ ] Fix section 63's gap: fading windows show the frame's lower rim through their body; screenshot-based boot check (`fade-rim`)
 8. [ ] SSE for image / alpha-blend compositing (render/src/blend.rs, Image/ScaledImage); pixel-exact; perf-test (`sse-blend`)

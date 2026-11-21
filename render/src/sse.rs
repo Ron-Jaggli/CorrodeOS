@@ -615,3 +615,66 @@ pub fn quarter_bilinear([a, b, c, d]: [u32; 4], wx: usize, wy: usize) -> u32 {
     }
     out
 }
+
+/// Two rows of `0x??RRGGBB` pixels to one of half the width: each output
+/// pixel `0x00RRGGBB` the mean of a two-by-two block, every channel's sum
+/// of four shifted down by two. `top` and `bottom` have `4 * pairs` pixels,
+/// and `out` gets `2 * pairs`.
+///
+/// # Safety
+/// As those lengths say.
+pub unsafe fn downscale_rows(top: *const u32, bottom: *const u32, out: *mut u32, pairs: usize) {
+    if pairs == 0 {
+        return;
+    }
+    // SAFETY: the caller's bounds; every access is unaligned-safe.
+    unsafe {
+        asm!(
+            "pxor xmm7, xmm7",
+            "mov {t:e}, 0x00ffffff",
+            "movd xmm6, {t:e}",
+            "pshufd xmm6, xmm6, 0",
+            "2:",
+            "movdqu xmm0, [{top}]",
+            "movdqu xmm2, [{bottom}]",
+            "movdqa xmm1, xmm0",
+            "punpcklbw xmm0, xmm7",
+            "punpckhbw xmm1, xmm7",
+            "movdqa xmm3, xmm2",
+            "punpcklbw xmm2, xmm7",
+            "punpckhbw xmm3, xmm7",
+            // Down each column: pixels 0 and 1 in xmm0, 2 and 3 in xmm1.
+            "paddw xmm0, xmm2",
+            "paddw xmm1, xmm3",
+            // Then across: 0 + 1 into the low half, 2 + 3 beside it.
+            "movdqa xmm2, xmm0",
+            "psrldq xmm2, 8",
+            "paddw xmm0, xmm2",
+            "movdqa xmm3, xmm1",
+            "psrldq xmm3, 8",
+            "paddw xmm1, xmm3",
+            "punpcklqdq xmm0, xmm1",
+            "psrlw xmm0, 2",
+            "packuswb xmm0, xmm0",
+            "pand xmm0, xmm6",
+            "movq qword ptr [{out}], xmm0",
+            "add {top}, 16",
+            "add {bottom}, 16",
+            "add {out}, 8",
+            "dec {n}",
+            "jnz 2b",
+            top = inout(reg) top => _,
+            bottom = inout(reg) bottom => _,
+            out = inout(reg) out => _,
+            n = inout(reg) pairs => _,
+            t = out(reg) _,
+            #[cfg(target_feature = "sse2")] out("xmm0") _,
+            #[cfg(target_feature = "sse2")] out("xmm1") _,
+            #[cfg(target_feature = "sse2")] out("xmm2") _,
+            #[cfg(target_feature = "sse2")] out("xmm3") _,
+            #[cfg(target_feature = "sse2")] out("xmm6") _,
+            #[cfg(target_feature = "sse2")] out("xmm7") _,
+            options(nostack),
+        );
+    }
+}
