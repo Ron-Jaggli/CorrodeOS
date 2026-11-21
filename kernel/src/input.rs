@@ -49,6 +49,14 @@ pub enum Event {
         buttons: u8,
         wheel: i32,
     },
+    /// A tablet says where it is: across and down, each from 0 to
+    /// [`ps2::POINTER_AT_MAX`] for the far edge.
+    PointerAt {
+        x: u32,
+        y: u32,
+        buttons: u8,
+        wheel: i32,
+    },
 }
 
 /// Events waiting for the painter.
@@ -87,6 +95,33 @@ impl Queue {
                     *last = Some(Event::Pointer {
                         dx: last_x.saturating_add(dx),
                         dy: last_y.saturating_add(dy),
+                        buttons,
+                        wheel: last_wheel.saturating_add(wheel),
+                    });
+                }
+                return;
+            }
+        }
+        // And so do positions: only the last one matters.
+        if let (
+            Event::PointerAt {
+                x,
+                y,
+                buttons,
+                wheel,
+            },
+            Some(Some(Event::PointerAt {
+                buttons: last_buttons,
+                wheel: last_wheel,
+                ..
+            })),
+        ) = (event, self.last_mut().map(|last| *last))
+        {
+            if buttons == last_buttons {
+                if let Some(last) = self.last_mut() {
+                    *last = Some(Event::PointerAt {
+                        x,
+                        y,
                         buttons,
                         wheel: last_wheel.saturating_add(wheel),
                     });
@@ -157,6 +192,12 @@ fn decode(message: &ipc::Message) -> Option<Event> {
         ps2::LABEL_POINTER => Some(Event::Pointer {
             dx: (words[0] as i64).clamp(-256, 255) as i32,
             dy: (words[1] as i64).clamp(-256, 255) as i32,
+            buttons: (words[2] & 0x07) as u8,
+            wheel: (words[3] as i64).clamp(-8, 7) as i32,
+        }),
+        ps2::LABEL_POINTER_AT => Some(Event::PointerAt {
+            x: words[0].min(ps2::POINTER_AT_MAX) as u32,
+            y: words[1].min(ps2::POINTER_AT_MAX) as u32,
             buttons: (words[2] & 0x07) as u8,
             wheel: (words[3] as i64).clamp(-8, 7) as i32,
         }),
@@ -1096,6 +1137,26 @@ impl Desk {
                     buttons,
                     wheel,
                 } => {
+                    self.pointer(scene, now, dx, dy, buttons);
+                    if wheel != 0 {
+                        self.scroll(scene, wheel);
+                    }
+                    self.restack(scene);
+                }
+                // A position is the movement from where the pointer is now,
+                // so dragging and sizing work the same for both.
+                Event::PointerAt {
+                    x,
+                    y,
+                    buttons,
+                    wheel,
+                } => {
+                    let screen = scene.screen();
+                    let across = |at: u32, pixels: u32| {
+                        (at as u64 * pixels.saturating_sub(1) as u64 / ps2::POINTER_AT_MAX) as i32
+                    };
+                    let dx = across(x, screen.width) - self.at.0;
+                    let dy = across(y, screen.height) - self.at.1;
                     self.pointer(scene, now, dx, dy, buttons);
                     if wheel != 0 {
                         self.scroll(scene, wheel);

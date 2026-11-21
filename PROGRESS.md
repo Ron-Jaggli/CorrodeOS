@@ -2125,6 +2125,26 @@ desktop cannot tell the buses apart. `usb-test` types `Hi there` over QMP
 and checks the kernel's `line "Hi there"` along with the driver's first
 8-byte report (QEMU gives keys to the USB keyboard once it exists).
 
+**Step 4: the pointer.** A boot mouse uses the boot layout; anything
+else has its report descriptor read (GET_DESCRIPTOR 0x22 from the
+interface) and `Layout::parse` finds its buttons, X, Y and wheel. QEMU's
+tablet comes out absolute, 16-bit X and Y up to 0x7fff. A relative
+pointer's reports go out as `LABEL_POINTER`; an absolute one's as the new
+`LABEL_POINTER_AT` (x and y from 0 to `POINTER_AT_MAX`, buttons, wheel),
+which the kernel clamps, decodes as `Event::PointerAt`, merges with the
+last queued position as it merges movements, and turns into a movement
+from where the pointer is, so dragging, edge sizing and clicks need
+nothing new. `usb-test` puts the tablet at (180, 20), clicks the panel's
+Terminal button and types `echo usb` into the terminal that opens; the
+kernel logs the click at exactly (180, 20) and the terminal runs the
+command (build/usb.png).
+
+- **Choice:** absolute positions are a new IPC label on the existing input
+  endpoint (53), not a new system call: nothing ring 3 can do widens. The
+  kernel bounds every word as it bounds `LABEL_POINTER`'s, and only a
+  driver holding the endpoint's send half can use it, as before.
+- **Choice:** the tablet test is driven over QMP; the human monitor's
+  `mouse_move` cannot reach an absolute device.
 - **Choice:** devices are found once, at start; a device plugged in later
   is not (no hot-plug), and at most four are looked after (the pages).
 - **Choice:** the steps of this task are committed after `usb-test` and

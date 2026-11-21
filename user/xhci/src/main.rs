@@ -21,10 +21,10 @@
 #![no_std]
 #![no_main]
 
-use corrode_rt::abi::ps2::LABEL_KEY;
+use corrode_rt::abi::ps2::{LABEL_KEY, LABEL_POINTER, LABEL_POINTER_AT};
 use corrode_rt::abi::xhci::{BAR, DEVICE, EVENTS, IRQ, LOG, MEMORY, MEMORY_PAGES};
 use corrode_rt::device::{Config, Interrupt, Mmio};
-use corrode_input::usb::{find_hid, BootKeyboard, HidInterface, BOOT, KEYBOARD, MOUSE};
+use corrode_input::usb::{find_hid, BootKeyboard, HidInterface, Layout, BOOT, KEYBOARD, MOUSE};
 use corrode_input::Keyboard;
 use corrode_rt::{println, send, Error, Message};
 
@@ -146,6 +146,9 @@ const GET_DESCRIPTOR: u8 = 6;
 const SET_CONFIGURATION: u8 = 9;
 const DEVICE_DESCRIPTOR: u16 = 0x0100;
 const CONFIGURATION_DESCRIPTOR: u16 = 0x0200;
+/// A HID report descriptor, asked of the interface (HID 1.11 7.1.1).
+const REPORT_DESCRIPTOR: u16 = 0x2200;
+const FROM_INTERFACE: u8 = 0x81;
 /// HID class requests (HID 1.11 7.2): which protocol, boot or report.
 const SET_PROTOCOL: u8 = 0x0b;
 const BOOT_PROTOCOL: u16 = 0;
@@ -337,6 +340,8 @@ enum Reader {
     /// Boot reports, said as set-1 scancodes to the same decoder the PS/2
     /// driver uses.
     Keyboard(BootKeyboard, Keyboard),
+    /// A mouse or a tablet, its reports laid out as this says.
+    Pointer(Layout),
 }
 
 /// Port speeds, as PORTSC and the slot context give them.
@@ -666,6 +671,15 @@ impl Controller {
         Some((device, hid))
     }
 
+    /// How a report-protocol device's reports are laid out, from its
+    /// report descriptor: `None` if it has no X and Y, or makes no sense.
+    fn layout(&mut self, device: &mut Device, hid: &HidInterface) -> Option<Layout> {
+        let len = (hid.report_length as usize).clamp(1, MOST_CONFIG);
+        self.control(device, FROM_INTERFACE, GET_DESCRIPTOR, REPORT_DESCRIPTOR, hid.interface as u16, len as u16)?;
+        let (descriptor, len) = self.read::<MOST_CONFIG>(device, len);
+        Layout::parse(&descriptor[..len])
+    }
+
     /// Set up the device's interrupt IN endpoint (Configure Endpoint,
     /// 4.6.6) and queue reads on it.
     fn start(&mut self, mut device: Device, hid: &HidInterface, reader: Reader) -> Option<Input> {
@@ -801,6 +815,23 @@ impl Controller {
                     );
                 }
             }),
+            Reader::Pointer(layout) => {
+                if let Some(pointer) = layout.decode(&report[..len]) {
+                    let label = if pointer.absolute { LABEL_POINTER_AT } else { LABEL_POINTER };
+                    let _ = send(
+                        EVENTS,
+                        Message::new(
+                            label,
+                            [
+                                pointer.x as i64 as u64,
+                                pointer.y as i64 as u64,
+                                pointer.buttons as u64,
+                                pointer.wheel as i64 as u64,
+                            ],
+                        ),
+                    );
+                }
+            }
         }
         self.read_report(input, read.parameter, asked);
         self.ring(input.device.slot, input.target as u32);
@@ -950,15 +981,23 @@ fn main() {
         };
         let page = page::DEVICES + used * page::PER_DEVICE;
         used += 1;
-        let Some((device, hid)) = controller.enumerate(port, speed, page) else {
+        let Some((mut device, hid)) = controller.enumerate(port, speed, page) else {
             continue;
         };
-        let reader = match (hid.subclass, hid.protocol) {
-            (BOOT, KEYBOARD) => Reader::Keyboard(BootKeyboard::new(), Keyboard::new()),
-            _ => continue,
+        let (reader, what) = match (hid.subclass, hid.protocol) {
+            (BOOT, KEYBOARD) => (Reader::Keyboard(BootKeyboard::new(), Keyboard::new()), "a keyboard's"),
+            (BOOT, MOUSE) => (Reader::Pointer(Layout::BOOT_MOUSE), "a mouse's"),
+            _ => match controller.layout(&mut device, &hid) {
+                Some(layout) if layout.absolute => (Reader::Pointer(layout), "a tablet's"),
+                Some(layout) => (Reader::Pointer(layout), "a mouse's"),
+                None => {
+                    println!("slot {}: neither a keyboard nor a pointer; left alone", device.slot);
+                    continue;
+                }
+            },
         };
         if let Some(input) = controller.start(device, &hid, reader) {
-            println!("slot {}: reading reports", input.device.slot);
+            println!("slot {}: reading {what} reports", input.device.slot);
             inputs[found] = Some(input);
             found += 1;
         }
