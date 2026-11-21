@@ -46,8 +46,9 @@ pub enum Error {
     BadSurface,
 }
 
-/// How many surfaces can be attached at once.
-pub const SURFACES: usize = 16;
+/// How many surfaces can be attached at once. The kernel keeps the last
+/// for the wallpaper, so programs' windows have one fewer.
+pub const SURFACES: usize = 32;
 
 /// A client's pixels for [`Command::Image`] to draw from: rows of `width`
 /// pixels, each `0x00RRGGBB`.

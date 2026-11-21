@@ -557,7 +557,8 @@ pub mod gpu {
     /// [`SCRATCH_PAGES`] pages. Optional: without it, glass is a plain veil
     /// and there is no wallpaper.
     pub const SCRATCH: usize = 15;
-    /// Where the `n`th surface the kernel hands over lands.
+    /// Where the `n`th surface the kernel hands over lands: one slot for
+    /// each of the renderer's surfaces, 16 up to 47.
     pub const SURFACES: usize = 16;
 
     pub const QUEUE_PAGES: usize = 16;
@@ -565,8 +566,9 @@ pub mod gpu {
     /// Enough for 1920 by 1080.
     pub const SCREEN_PAGES: usize = 2048;
     pub const ATLAS_WIDTH: u32 = 1024;
-    /// The bottom third is the dock's icons drawn at their magnified size.
-    pub const ATLAS_HEIGHT: u32 = 768;
+    /// Rows 512 to 767 are the dock's icons drawn at their magnified size,
+    /// and the 256 below them more windows' titles.
+    pub const ATLAS_HEIGHT: u32 = 1024;
     /// Three screens for the glass, a little for its line buffer, and one
     /// for the wallpaper.
     pub const SCRATCH_PAGES: usize = 4 * SCREEN_PAGES + 4;

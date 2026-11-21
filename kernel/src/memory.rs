@@ -47,7 +47,7 @@ pub const USER_BASE: u64 = 0x0000_0200_0000_0000;
 /// Where the kernel keeps its own view of memory it shares with a task:
 /// four gigabytes above the heap, past the back buffer and the surfaces, in
 /// the same PML4 slot so every address space has it.
-const KERNEL_BASE: u64 = heap::HEAP_START as u64 + (4 << 30);
+pub(crate) const KERNEL_BASE: u64 = heap::HEAP_START as u64 + (4 << 30);
 
 /// Objects there can be. Each takes a gigabyte of address space here and in
 /// every task that maps it, and a PML4 slot has 512 of those.

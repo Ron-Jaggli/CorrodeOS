@@ -82,6 +82,11 @@ struct Surface {
 /// draws itself; programs' windows get the others.
 pub const WALLPAPER: u32 = SURFACES as u32 - 1;
 
+// Every window surface's span fits below what comes next: memory objects
+// in the kernel half, devices' memory in a task.
+const _: () = assert!(KERNEL_BASE + (SURFACES as u64 - 1) * SPAN <= crate::memory::KERNEL_BASE);
+const _: () = assert!(USER_BASE + (SURFACES as u64 - 1) * SPAN <= crate::device::USER_BASE);
+
 static TABLE: SpinLock<[Option<Surface>; SURFACES - 1]> =
     SpinLock::new([const { None }; SURFACES - 1]);
 

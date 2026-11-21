@@ -4346,7 +4346,10 @@ fn label_layer(screen: Rect, src: Rect, y: i32, color: Color, at: u64) -> Layer 
 /// Nothing here advances per frame. Every moving quantity is a formula held by
 /// a layer in the scene, and the scene works out what went stale.
 struct Stage {
-    scene: alloc::boxed::Box<Scene<160>>,
+    /// Room for a full house: seven layers a window (shadow, frame, three
+    /// buttons, title, body) for each of the renderer's 31 window surfaces,
+    /// and the dock, the bar and the rest around them.
+    scene: alloc::boxed::Box<Scene<320>>,
     block: LayerId,
     veil: LayerId,
     /// Where the veil rests when it is showing.

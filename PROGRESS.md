@@ -1911,6 +1911,58 @@ This part, host-tested only:
   self-checks 181 / 0 (default) and 188 / 0 (virtio). `./corrode test`
   passes; clippy has nothing new.
 
+## 69. 32 surfaces, so more than 15 windows
+
+The renderer had 16 surfaces, the last the wallpaper's, so the 16th
+window a program asked for was refused (`no window: NoSpace`). Now 32,
+and everything sized by the old number was checked:
+
+- `render::software::SURFACES` 16 -> 32. The kernel's surface table is
+  `SURFACES - 1` long, as before.
+- Address space: each surface has 64 MiB in the kernel half (from heap +
+  2 GiB) and in a task (from 1 GiB). 31 of them end at exactly heap +
+  4 GiB, where the kernel's view of memory objects begins, and at 3 GiB
+  in a task, far under devices (1 TiB). Both are now `const` asserts in
+  `surface.rs`, so a later raise past them fails the build.
+- Capability slots: bootstrap holds window `n`'s surface at 96 + n, so 96
+  to 126 of its 128; the wallpaper (31) is never handed out. The virtio
+  driver keeps one slot a surface from `gpu::SURFACES` (16), so 16 to 47
+  of its 128, and sizes that table from `SURFACES` already.
+- The wire format gives a surface number two bytes: unchanged.
+- Window titles: they are stencils in 16 slots of the mask atlas, so a
+  17th window would have opened with an empty title bar. The atlas is
+  now 1024 rows, not 768 (1 MiB; the virtio driver's atlas memory is
+  sized from the same constant), and 22 more title slots sit in the 256
+  new rows, under the dock's magnified icons: 38, and a `const` assert
+  that there are at least `SURFACES` and no more than the 64 the bitmap
+  holds.
+- The desktop's scene: 160 layers -> 320. A window takes seven (shadow,
+  frame, three buttons, title, body), so 31 windows are 217 before the
+  dock, the bar and the rest.
+- **Choice:** 32, not more. It is what fits the kernel's address-space
+  gap and bootstrap's 128 slots without moving either, and doubles what
+  there was. Going further means moving the memory objects' kernel base
+  and growing `CSPACE_SLOTS`, which touches every task.
+
+The desktop now logs `window N opened, K open` as each window joins it.
+
+**surfaces-test** (new, both GPUs): twenty terminals, each from the
+desktop's right-click menu (Down to New Terminal, Return) on a corner
+the staggered windows never reach; `build/surfaces.png` with all of them
+up (the front one, the 20th, titled from a new slot); then Quit from the
+Terminal icon's menu (Up wraps round to it). Checks: nothing refused a
+window or a surface, "quit asked 20 window(s)", and twenty windows
+closed after it. With `SURFACES` put back to 16 and nothing else
+changed, it fails: 12 terminals opened, 8 got `no window: NoSpace`.
+
+perf-test, one run against 68's: draw times a scene within 0.2% on
+average (Clear 2.548 against 2.543 ms dragging; Off 1.938 against
+1.939), single rows either way by up to 3%: noise.
+
+Every scored boot-test check PASSes on both GPUs (53 each, with
+surfaces-test's two); boot self-checks 181 / 0 (default) and 188 / 0
+(virtio). `./corrode test` passes; clippy has nothing new.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -1923,7 +1975,7 @@ copied below so a later pass can read them here.
 3. [x] Secure-core sealing (`secure-cap`) -- section 66
 4. [x] (section 67) SSE for the glass lens loops in render/src/software.rs; pixel-exact host tests vs scalar; perf-test before/after (`sse-glass` off `secure-cap`)
 5. [x] (section 68) SSE in the 2x2 backdrop downscale (frosted path); pixel-exact; perf-test (`sse-downscale`)
-6. [ ] Raise the 16-surface cap (SURFACES) and what in the kernel and virtio driver assumes it; boot test opening >15 windows and closing them, both GPUs (`more-surfaces`)
+6. [x] (section 69) Raise the 16-surface cap (SURFACES) and what in the kernel and virtio driver assumes it; boot test opening >15 windows and closing them, both GPUs (`more-surfaces`)
 7. [ ] Fix section 63's gap: fading windows show the frame's lower rim through their body; screenshot-based boot check (`fade-rim`)
 8. [ ] SSE for image / alpha-blend compositing (render/src/blend.rs, Image/ScaledImage); pixel-exact; perf-test (`sse-blend`)
 9. [ ] xHCI driver in ring 3, USB HID boot keyboard + mouse into the input path; QEMU only (qemu-xhci, usb-kbd, usb-tablet), never real host USB; boot tests typing and clicking via USB on both GPUs; commit in sub-steps (reset+rings, enumeration, keyboard, mouse) (`xhci`)

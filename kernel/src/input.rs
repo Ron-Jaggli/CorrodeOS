@@ -438,7 +438,14 @@ const TITLE_SLOT: (u32, u32) = (256, 22);
 
 /// How soon a second click must follow the first to count as a double one.
 const DOUBLE_CLICK_NS: u64 = 400_000_000;
-const TITLE_SLOTS: usize = 2 * ((512 - TITLE_ROW) / TITLE_SLOT.1) as usize;
+/// Slots between the typed line and the dock's magnified icons, and then
+/// more under those, at the foot of the atlas: enough for a title on every
+/// window the renderer has surfaces for, with some to spare for menus.
+const TITLE_SLOTS_ABOVE: usize = 2 * ((512 - TITLE_ROW) / TITLE_SLOT.1) as usize;
+const TITLE_ROW_BELOW: u32 = 768;
+const TITLE_SLOTS: usize =
+    TITLE_SLOTS_ABOVE + 2 * ((crate::ATLAS_HEIGHT - TITLE_ROW_BELOW) / TITLE_SLOT.1) as usize;
+const _: () = assert!(TITLE_SLOTS >= corrode_render::software::SURFACES && TITLE_SLOTS <= 64);
 const TITLE_STYLE: Style = Style::px(14).weight(corrode_text::Weight::Bold);
 
 /// How far a window's shadow spreads, and how far down it falls. The
@@ -1253,9 +1260,14 @@ impl Desk {
 
     fn title_src(slot: usize, width: u32) -> Rect {
         let (slot_width, slot_height) = TITLE_SLOT;
+        let (row, slot) = if slot < TITLE_SLOTS_ABOVE {
+            (TITLE_ROW, slot)
+        } else {
+            (TITLE_ROW_BELOW, slot - TITLE_SLOTS_ABOVE)
+        };
         Rect::new(
             (slot % 2) as i32 * slot_width as i32,
-            TITLE_ROW as i32 + (slot / 2) as i32 * slot_height as i32,
+            row as i32 + (slot / 2) as i32 * slot_height as i32,
             width.min(slot_width),
             slot_height,
         )
@@ -1467,6 +1479,7 @@ impl Desk {
         }
         let is_files = !docked && managed.name == "Files";
         self.windows.push(managed);
+        println!("desktop    : window {} opened, {} open", window, self.windows.len());
         if let (true, Some(words)) = (is_files, self.reveal) {
             self.reveal = None;
             crate::windows::push(window, window::REVEAL, words);

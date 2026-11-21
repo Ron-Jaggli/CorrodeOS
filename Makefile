@@ -67,7 +67,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test grow-test zoom-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test grow-test zoom-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -892,6 +892,36 @@ churn-test: iso
 	    && echo "churn-test: twenty windows opened and closed           PASS" \
 	    || echo "churn-test: twenty windows opened and closed           FAIL"
 	@test -s build/churn.ppm && pnmtopng build/churn.ppm > build/churn.png 2>/dev/null && rm -f build/churn.ppm && echo "wrote build/churn.png" || true
+
+# More windows at once than the renderer once had surfaces for (16, one
+# the wallpaper's): twenty terminals, each opened from the desktop's menu
+# (right-click a corner no window reaches, Down to New Terminal, Return),
+# build/surfaces.png with all of them up, then Quit from the Terminal
+# icon's menu (Up wraps round to Quit) closes every one.
+surfaces-test: iso
+	@rm -f build/surfaces.ppm build/surfaces.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move 250 -125"; sleep 0.2; echo "mouse_move 250 -125"; sleep 0.5; \
+	   for window in $$(seq 20); do \
+	       echo "mouse_button 2"; sleep 0.2; echo "mouse_button 0"; sleep 1.2; \
+	       echo "sendkey down"; sleep 0.2; echo "sendkey ret"; sleep 1.6; \
+	   done; \
+	   echo "screendump build/surfaces.ppm"; sleep 2; \
+	   echo "mouse_move -250 125"; sleep 0.2; echo "mouse_move -250 125"; sleep 0.2; \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 2"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   echo "sendkey up"; sleep 0.2; echo "sendkey ret"; sleep 4; echo quit ) \
+	  | timeout --foreground 180 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@echo "surfaces-test: at most $$(grep -ao 'opened, [0-9]* open' build/serial.log | awk '{print $$2}' | sort -n | tail -1) windows open; $$(grep -ao 'quit asked [0-9]* window' build/serial.log)"
+	@! grep -aq "would not take the surface\|no window" build/serial.log \
+	    && grep -aq "quit asked 20 window" build/serial.log \
+	    && echo "surfaces-test: twenty terminals open at once             PASS" \
+	    || echo "surfaces-test: twenty terminals open at once             FAIL"
+	@test "$$(sed -n '/quit asked 20 window/,$$p' build/serial.log | grep -ac 'desktop    : window .* closed')" -ge 20 \
+	    && echo "surfaces-test: Quit closed all twenty                    PASS" \
+	    || echo "surfaces-test: Quit closed all twenty                    FAIL"
+	@test -s build/surfaces.ppm && pnmtopng build/surfaces.ppm > build/surfaces.png 2>/dev/null && rm -f build/surfaces.ppm && echo "wrote build/surfaces.png" || true
 
 # Open Settings from the dock and change the look three times while it runs:
 # Light, the Dunes wallpaper, a blue accent. build/settings.png shows the
