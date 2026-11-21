@@ -2012,6 +2012,72 @@ Every scored boot-test check PASSes on both GPUs (54 each, with
 fade-test's); boot self-checks 181 / 0 (default) and 188 / 0 (virtio).
 `./corrode test` passes; clippy has nothing new.
 
+## 71. SSE for blending and images
+
+Three new SSE2 loops in `sse.rs`, each the scalar arithmetic in 16-bit
+lanes, on XRGB8888; any other layout, and the rows a rounded corner cuts,
+keep the scalar code, which also does what is left of a row.
+
+- `blend_span`: `Command::BlendRect`, four pixels a step. As
+  `Blend::over`: `(t + (t >> 8)) >> 8`, `t = d·(255 − a) + s·a + 128`,
+  every byte, the top one too. `t` is at most `255·255 + 128`.
+- `image_span`: `Command::Image` wherever it is not the plain row copy
+  (faded, or a translucent surface), four pixels a step. A translucent
+  pixel's opacity, `alpha · (255 − top byte) / 255` rounded, is worked
+  out in its lanes. The scalar loop skips opacity 0 and copies at 255;
+  the one formula gives both exactly (`(d·255 + 128)` comes back `d`),
+  so the SSE2 loop does not branch.
+- `scaled_span`: `Command::ScaledImage`, two pixels a step. The corners
+  each pixel reads, and how far across them it falls, are gathered by
+  the scalar code a chunk of 64 at a time onto the stack; the bilinear
+  mix and the blend are SSE2. The vertical mix `(top·(256 − fy) +
+  bottom·fy) >> 16` does not fit 16 bits, top and bottom being up to
+  65280, so each is split into high and low bytes and mixed apart:
+  `(256·H + L) >> 16 = (H + (L >> 8)) >> 8`, exact, and no step passes
+  65535.
+- Pixel-exact: `blending_with_sse_matches_blending_without` draws each
+  command both ways over a screen with detail and the top byte set,
+  from a surface of random pixels (every top byte), at opacities 0, 1,
+  77, 128, 254, 255, translucent and not, rounded and not, clipped at
+  every edge, stretched up past twice and down past half: every pixel
+  the same. Breaking one instruction in any of the three loops fails it.
+- In the kernel (temporary bench, removed; a 600x340 window body on a
+  1280x800 screen, checksum the same both ways), µs:
+
+  | Command                           | before | after |
+  |-----------------------------------|--------|-------|
+  | BlendRect, alpha 140              | 483    | 82    |
+  | Image, translucent                | 1415   | 289   |
+  | Image, faded to 128               | 1319   | 208   |
+  | ScaledImage to 95%                | 2379   | 879   |
+  | ScaledImage to 95%, translucent   | 2794   | 906   |
+
+  What is left of the stretched image is mostly the scalar part: the
+  division per pixel that finds where it reads.
+- perf-test, draw ms a frame, A/B in one session, old (`fade-rim`)
+  against new, three runs each, ranges:
+
+  | Scene                              | old         | new         |
+  |------------------------------------|-------------|-------------|
+  | First scene (a window opening)     | 2.17–2.61   | 0.97–1.07   |
+  | Dragging, Regular glass            | 3.62–4.19   | 3.61–4.10   |
+  | Control Center open, Regular       | 8.73–8.87   | 7.94–8.28   |
+  | Dragging, Clear                    | 2.49–2.58   | 2.49–2.58   |
+  | Control Center open, Clear         | 6.25–6.57   | 5.71–5.78   |
+  | Dragging, Off                      | 1.89–2.00   | 1.89–1.98   |
+  | First scene after turning Off      | 2.13–2.20   | 1.25–1.29   |
+  | Regular again, Control Center      | 7.95–8.18   | 7.47–7.74   |
+
+  Two rows were higher on average after the first two pairs (dragging
+  with Clear glass, +0.3% and +1.1%); a third pair settled them at
+  3.640 against 3.641 ms and 2.517 against 2.506, with every old run
+  inside the new range. Those scenes draw opaque window bodies, which
+  are the row copy this does not touch: noise, written down here so a
+  later run can say otherwise.
+- Every scored boot-test check PASSes on both GPUs (54 each); boot
+  self-checks 181 / 0 (default) and 188 / 0 (virtio). `./corrode test`
+  passes; clippy has nothing new.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -2026,7 +2092,7 @@ copied below so a later pass can read them here.
 5. [x] (section 68) SSE in the 2x2 backdrop downscale (frosted path); pixel-exact; perf-test (`sse-downscale`)
 6. [x] (section 69) Raise the 16-surface cap (SURFACES) and what in the kernel and virtio driver assumes it; boot test opening >15 windows and closing them, both GPUs (`more-surfaces`)
 7. [x] (section 70) Fix section 63's gap: fading windows show the frame's lower rim through their body; screenshot-based boot check (`fade-rim`)
-8. [ ] SSE for image / alpha-blend compositing (render/src/blend.rs, Image/ScaledImage); pixel-exact; perf-test (`sse-blend`)
+8. [x] (section 71) SSE for image / alpha-blend compositing (render/src/blend.rs, Image/ScaledImage); pixel-exact; perf-test (`sse-blend`)
 9. [ ] xHCI driver in ring 3, USB HID boot keyboard + mouse into the input path; QEMU only (qemu-xhci, usb-kbd, usb-tablet), never real host USB; boot tests typing and clicking via USB on both GPUs; commit in sub-steps (reset+rings, enumeration, keyboard, mouse) (`xhci`)
 10. [ ] Verdigris design: verdigris/DESIGN.md -- a Windows compatibility layer native to CorrodeOS, not a Proton fork (no Linux syscalls, no POSIX, no Vulkan): PE/COFF loader on the spawn_program model; minimal ntdll/kernel32 (memory, threads, files through a capability, time); user32/gdi32 onto the window server and corrode-render command lists; reusing Wine's Windows-side DLLs behind a Corrode backend, incl. LGPL vs MPL-2.0; what Direct3D needs from a future GPU backend (out of scope). No code. (`verdigris` off `xhci`)
     - **User's requirement for Verdigris files (2026-11-21, ~10:00):** no

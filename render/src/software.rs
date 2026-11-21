@@ -305,11 +305,21 @@ impl SoftwareRenderer {
         };
         let blend = Blend::new(&self.info.format, color, alpha);
         let width = (x1 - x0) as usize;
+        // Four pixels at a time by SSE2 where the layout is the usual one.
+        let groups = match self.info.format == PixelFormat::XRGB8888 && !scalar_only() {
+            true => width / 4,
+            false => 0,
+        };
         for y in y0..y1 {
             // SAFETY: `clip` returned bounds already intersected with the
             // surface.
             let row = unsafe { self.target_row(x0, y) };
-            for x in 0..width {
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: `4 * groups <= width` pixels of this row.
+            unsafe {
+                crate::sse::blend_span(row, groups, self.info.format.pack(color), alpha)
+            };
+            for x in 4 * groups..width {
                 // SAFETY: `x < width` keeps the pixel on this row and inside
                 // the surface. Unaligned access so that alignment of a
                 // firmware-chosen pitch is not load-bearing.
@@ -510,7 +520,17 @@ impl SoftwareRenderer {
                 }
                 continue;
             }
-            for offset in 0..width {
+            // Four pixels at a time by SSE2, the same arithmetic, where the
+            // screen's layout is the surface's and no corner cuts the row.
+            let mut done = 0;
+            #[cfg(target_arch = "x86_64")]
+            if same_layout && !corner_row && !scalar_only() {
+                let groups = width / 4;
+                // SAFETY: `4 * groups <= width` pixels of both spans.
+                unsafe { crate::sse::image_span(source, row, groups, alpha, translucent) };
+                done = 4 * groups;
+            }
+            for offset in done..width {
                 // SAFETY: `offset < width` keeps both pixels inside the spans
                 // described above. Read by value: the client may be writing.
                 unsafe {
@@ -592,7 +612,40 @@ impl SoftwareRenderer {
             // SAFETY: `clip` returned bounds already intersected with the
             // target.
             let row = unsafe { self.target_row(x0, row_y) };
-            for x in x0..x1 {
+            // Two pixels at a time by SSE2, a chunk at a time: the corners
+            // each reads gathered first, then mixed and put down together.
+            let mut done = x0;
+            #[cfg(target_arch = "x86_64")]
+            if format == PixelFormat::XRGB8888 && !corner_row && !scalar_only() {
+                const CHUNK: usize = 64;
+                let (mut a, mut b, mut c, mut d) = ([0u32; CHUNK], [0u32; CHUNK], [0u32; CHUNK], [0u32; CHUNK]);
+                let mut fxs = [0u16; CHUNK];
+                let even = x0 + ((x1 - x0) & !1);
+                while done < even {
+                    let count = ((even - done) as usize).min(CHUNK);
+                    for i in 0..count {
+                        let (sx0, sx1, fx) = axis(done as i64 + i as i64, rect.x, pixels.width, rect.width);
+                        [a[i], b[i], c[i], d[i]] = [read(sx0, sy0), read(sx1, sy0), read(sx0, sy1), read(sx1, sy1)];
+                        fxs[i] = fx as u16;
+                    }
+                    let corners = crate::sse::Corners {
+                        a: a.as_ptr(),
+                        b: b.as_ptr(),
+                        c: c.as_ptr(),
+                        d: d.as_ptr(),
+                        fx: fxs.as_ptr(),
+                    };
+                    // SAFETY: `count` (even) entries of each array, and as
+                    // many pixels of the row from `done`, inside the clip;
+                    // `fy < 256`.
+                    unsafe {
+                        let dst = row.add((done - x0) as usize);
+                        crate::sse::scaled_span(&corners, fy, dst, count / 2, alpha, translucent);
+                    }
+                    done += count as u32;
+                }
+            }
+            for x in done..x1 {
                 let (sx0, sx1, fx) = axis(x as i64, rect.x, pixels.width, rect.width);
                 let [a, b, c, d] = [read(sx0, sy0), read(sx1, sy0), read(sx0, sy1), read(sx1, sy1)];
                 // All four bytes, the top one being how transparent a
@@ -1839,6 +1892,93 @@ mod tests {
                         assert_eq!(part[at], whole[at], "{piece:?} at ({x}, {y})");
                     }
                 }
+            }
+        }
+    }
+
+    /// Blends, images and stretched images, by SSE2 and one pixel at a
+    /// time, over a screen with detail and the byte above blue set here and
+    /// there: the same, every pixel, at the opacities where the arithmetic
+    /// turns (0, 1, 254, 255), with translucent surfaces whose top bytes run
+    /// through every value, odd widths, clipped edges and rounded corners.
+    #[test]
+    fn blending_with_sse_matches_blending_without() {
+        let (width, height) = (203u32, 141u32);
+        let backdrop: std::vec::Vec<u32> = (0..width * height)
+            .map(|index| {
+                let (x, y) = (index % width, index / width);
+                let top = if (x * 3 + y) % 5 == 0 { 0x5c00_0000 } else { 0 };
+                top | (x * 255 / width) << 16 | (y * 255 / height) << 8 | ((x ^ y) & 0x3f) * 4
+            })
+            .collect();
+        // A surface: colours everywhere, every top byte somewhere.
+        let (sw, sh) = (61u32, 47u32);
+        let mut state = 0x5eed_1234_abcd_ef01u64;
+        let surface: &'static [u32] = Box::leak(
+            (0..sw * sh)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u32
+                })
+                .collect::<std::vec::Vec<u32>>()
+                .into_boxed_slice(),
+        );
+        let info = SurfaceInfo {
+            width,
+            height,
+            pitch: width * 4,
+            format: PixelFormat::XRGB8888,
+        };
+        let draw = |scalar: bool, command: Command| {
+            SCALAR_ONLY.with(|only| only.set(scalar));
+            let mut pixels = backdrop.clone();
+            // SAFETY: `pixels` outlives the renderer and is `width * height`;
+            // the surface is leaked, so it lives as long as anything.
+            let mut renderer = unsafe { SoftwareRenderer::new(pixels.as_mut_ptr().cast(), info) }.unwrap();
+            unsafe { renderer.attach_surface(3, surface.as_ptr(), sw, sh) }.unwrap();
+            submit(&mut renderer, &[command]);
+            SCALAR_ONLY.with(|only| only.set(false));
+            pixels
+        };
+        let mut commands = std::vec::Vec::new();
+        for alpha in [0, 1, 77, 128, 254, 255] {
+            for rect in [Rect::new(5, 7, 97, 33), Rect::new(-3, 120, 41, 30), Rect::new(160, -2, 43, 9)] {
+                commands.push(Command::BlendRect { rect, color: Color::rgb(0xe2, 0x64, 0x3a), alpha });
+                for translucent in [false, true] {
+                    for radius in [0, 9] {
+                        commands.push(Command::ScaledImage { rect, surface: 3, alpha, translucent, radius });
+                    }
+                }
+            }
+            for (x, y, src) in [
+                (10, 20, Rect::new(0, 0, sw, sh)),
+                (-5, 100, Rect::new(3, 2, 55, 44)),
+                (170, 3, Rect::new(1, 0, 37, 21)),
+            ] {
+                for translucent in [false, true] {
+                    for radius in [0, 9] {
+                        commands.push(Command::Image { x, y, src, surface: 3, alpha, translucent, radius });
+                    }
+                }
+            }
+        }
+        // Stretched to more than twice its size and to less than half.
+        for rect in [Rect::new(4, 4, 150, 130), Rect::new(30, 30, 23, 17)] {
+            commands.push(Command::ScaledImage { rect, surface: 3, alpha: 200, translucent: true, radius: 0 });
+        }
+        for command in commands {
+            let sse = draw(false, command);
+            let one = draw(true, command);
+            if let Some(at) = (0..sse.len()).find(|&at| sse[at] != one[at]) {
+                panic!(
+                    "{command:?}: ({}, {}) is {:08x}, not {:08x}",
+                    at as u32 % width,
+                    at as u32 / width,
+                    sse[at],
+                    one[at]
+                );
             }
         }
     }

@@ -678,3 +678,347 @@ pub unsafe fn downscale_rows(top: *const u32, bottom: *const u32, out: *mut u32,
         );
     }
 }
+
+/// `color` (`0x00RRGGBB`) over `4 * groups` pixels at `alpha`, as
+/// [`crate::blend::Blend::over`] puts it on an XRGB8888 pixel: every byte,
+/// the top one too, `(t + (t >> 8)) >> 8` with `t = d·(255 − a) + s·a + 128`.
+/// That sum is at most `255·255 + 128`, so a 16-bit lane holds it.
+///
+/// # Safety
+/// `dst` has `4 * groups` pixels.
+pub unsafe fn blend_span(dst: *mut u32, groups: usize, color: u32, alpha: u8) {
+    if groups == 0 {
+        return;
+    }
+    // SAFETY: the caller's bounds; every access is unaligned-safe.
+    unsafe {
+        asm!(
+            "pxor xmm7, xmm7",
+            // The alpha and 255 - alpha in every lane, and 128.
+            "movd xmm9, {alpha:e}",
+            "pshuflw xmm9, xmm9, 0",
+            "punpcklqdq xmm9, xmm9",
+            "mov {t:e}, 0x00ff00ff",
+            "movd xmm10, {t:e}",
+            "pshufd xmm10, xmm10, 0",
+            "psubw xmm10, xmm9",
+            "mov {t:e}, 0x00800080",
+            "movd xmm11, {t:e}",
+            "pshufd xmm11, xmm11, 0",
+            // s·a + 128, for two pixels.
+            "movd xmm8, {color:e}",
+            "pshufd xmm8, xmm8, 0",
+            "punpcklbw xmm8, xmm7",
+            "pmullw xmm8, xmm9",
+            "paddw xmm8, xmm11",
+            "2:",
+            "movdqu xmm0, [{dst}]",
+            "movdqa xmm1, xmm0",
+            "punpcklbw xmm0, xmm7",
+            "punpckhbw xmm1, xmm7",
+            "pmullw xmm0, xmm10",
+            "pmullw xmm1, xmm10",
+            "paddw xmm0, xmm8",
+            "paddw xmm1, xmm8",
+            "movdqa xmm2, xmm0",
+            "psrlw xmm2, 8",
+            "paddw xmm0, xmm2",
+            "psrlw xmm0, 8",
+            "movdqa xmm3, xmm1",
+            "psrlw xmm3, 8",
+            "paddw xmm1, xmm3",
+            "psrlw xmm1, 8",
+            "packuswb xmm0, xmm1",
+            "movdqu [{dst}], xmm0",
+            "add {dst}, 16",
+            "dec {n}",
+            "jnz 2b",
+            dst = inout(reg) dst => _,
+            n = inout(reg) groups => _,
+            color = in(reg) color,
+            alpha = in(reg) alpha as u32,
+            t = out(reg) _,
+            #[cfg(target_feature = "sse2")] out("xmm0") _,
+            #[cfg(target_feature = "sse2")] out("xmm1") _,
+            #[cfg(target_feature = "sse2")] out("xmm2") _,
+            #[cfg(target_feature = "sse2")] out("xmm3") _,
+            #[cfg(target_feature = "sse2")] out("xmm7") _,
+            #[cfg(target_feature = "sse2")] out("xmm8") _,
+            #[cfg(target_feature = "sse2")] out("xmm9") _,
+            #[cfg(target_feature = "sse2")] out("xmm10") _,
+            #[cfg(target_feature = "sse2")] out("xmm11") _,
+            options(nostack),
+        );
+    }
+}
+
+/// `4 * groups` pixels of a surface over as many on the screen, as
+/// `SoftwareRenderer`'s image loop draws them on XRGB8888: each source
+/// pixel's colour at `alpha`, or, for a `translucent` surface, at
+/// `alpha · (255 − its top byte) / 255` rounded. One formula does it all,
+/// the opacities 0 and 255 included, since `(d·255 + 128)` and
+/// `(s·255 + 128)` come back as `d` and `s` exactly: the top byte of the
+/// result is the screen's at `255 − a`, as [`crate::blend::Blend`] leaves it.
+///
+/// # Safety
+/// `src` and `dst` have `4 * groups` pixels each.
+pub unsafe fn image_span(src: *const u32, dst: *mut u32, groups: usize, alpha: u8, translucent: bool) {
+    if groups == 0 {
+        return;
+    }
+    // SAFETY: the caller's bounds; every access is unaligned-safe.
+    unsafe {
+        asm!(
+            "pxor xmm7, xmm7",
+            "movd xmm8, {alpha:e}",
+            "pshuflw xmm8, xmm8, 0",
+            "punpcklqdq xmm8, xmm8",
+            "mov {t:e}, 0x00ff00ff",
+            "movd xmm9, {t:e}",
+            "pshufd xmm9, xmm9, 0",
+            "mov {t:e}, 0x00800080",
+            "movd xmm10, {t:e}",
+            "pshufd xmm10, xmm10, 0",
+            // Every lane but each pixel's top one.
+            "pcmpeqd xmm11, xmm11",
+            "psrlq xmm11, 16",
+            "2:",
+            "movdqu xmm0, [{src}]",
+            "movdqa xmm1, xmm0",
+            "punpcklbw xmm0, xmm7",
+            "punpckhbw xmm1, xmm7",
+            "movdqa xmm2, xmm8",
+            "movdqa xmm3, xmm8",
+            "test {translucent:e}, {translucent:e}",
+            "jz 3f",
+            // Each pixel's top byte in all its lanes, 255 minus it, times
+            // alpha, over 255 rounded.
+            "pshuflw xmm2, xmm0, 0xff",
+            "pshufhw xmm2, xmm2, 0xff",
+            "pshuflw xmm3, xmm1, 0xff",
+            "pshufhw xmm3, xmm3, 0xff",
+            "pxor xmm2, xmm9",
+            "pxor xmm3, xmm9",
+            "pmullw xmm2, xmm8",
+            "pmullw xmm3, xmm8",
+            "paddw xmm2, xmm10",
+            "paddw xmm3, xmm10",
+            "movdqa xmm4, xmm2",
+            "psrlw xmm4, 8",
+            "paddw xmm2, xmm4",
+            "psrlw xmm2, 8",
+            "movdqa xmm5, xmm3",
+            "psrlw xmm5, 8",
+            "paddw xmm3, xmm5",
+            "psrlw xmm3, 8",
+            "3:",
+            "pand xmm0, xmm11",
+            "pand xmm1, xmm11",
+            "pmullw xmm0, xmm2",
+            "pmullw xmm1, xmm3",
+            // 255 - a, times the screen.
+            "movdqa xmm4, xmm9",
+            "psubw xmm4, xmm2",
+            "movdqa xmm5, xmm9",
+            "psubw xmm5, xmm3",
+            "movdqu xmm2, [{dst}]",
+            "movdqa xmm3, xmm2",
+            "punpcklbw xmm2, xmm7",
+            "punpckhbw xmm3, xmm7",
+            "pmullw xmm2, xmm4",
+            "pmullw xmm3, xmm5",
+            "paddw xmm0, xmm2",
+            "paddw xmm1, xmm3",
+            "paddw xmm0, xmm10",
+            "paddw xmm1, xmm10",
+            "movdqa xmm2, xmm0",
+            "psrlw xmm2, 8",
+            "paddw xmm0, xmm2",
+            "psrlw xmm0, 8",
+            "movdqa xmm3, xmm1",
+            "psrlw xmm3, 8",
+            "paddw xmm1, xmm3",
+            "psrlw xmm1, 8",
+            "packuswb xmm0, xmm1",
+            "movdqu [{dst}], xmm0",
+            "add {src}, 16",
+            "add {dst}, 16",
+            "dec {n}",
+            "jnz 2b",
+            src = inout(reg) src => _,
+            dst = inout(reg) dst => _,
+            n = inout(reg) groups => _,
+            alpha = in(reg) alpha as u32,
+            translucent = in(reg) translucent as u32,
+            t = out(reg) _,
+            #[cfg(target_feature = "sse2")] out("xmm0") _,
+            #[cfg(target_feature = "sse2")] out("xmm1") _,
+            #[cfg(target_feature = "sse2")] out("xmm2") _,
+            #[cfg(target_feature = "sse2")] out("xmm3") _,
+            #[cfg(target_feature = "sse2")] out("xmm4") _,
+            #[cfg(target_feature = "sse2")] out("xmm5") _,
+            #[cfg(target_feature = "sse2")] out("xmm7") _,
+            #[cfg(target_feature = "sse2")] out("xmm8") _,
+            #[cfg(target_feature = "sse2")] out("xmm9") _,
+            #[cfg(target_feature = "sse2")] out("xmm10") _,
+            #[cfg(target_feature = "sse2")] out("xmm11") _,
+            options(nostack),
+        );
+    }
+}
+
+/// Where a stretched surface's pixels are read from, for [`scaled_span`]:
+/// for each screen pixel the four surface pixels around it (`a b` above,
+/// `c d` below) and how far across them it falls, in 256ths.
+pub struct Corners {
+    pub a: *const u32,
+    pub b: *const u32,
+    pub c: *const u32,
+    pub d: *const u32,
+    pub fx: *const u16,
+}
+
+/// `2 * pairs` pixels of a stretched surface over the screen, as
+/// `SoftwareRenderer::scaled_image` draws them on XRGB8888: every byte read
+/// bilinearly, `(top·(256 − fy) + bottom·fy) >> 16` with each of top and
+/// bottom `p·(256 − fx) + q·fx`, then put over the screen as
+/// [`image_span`] does. Top and bottom reach 65280 and their mix does not
+/// fit sixteen bits, so each is split into its high and low bytes, `H` and
+/// `L` mixed apart: `(256·H + L) >> 16` is `(H + (L >> 8)) >> 8`, and every
+/// step stays under 65536.
+///
+/// # Safety
+/// Each of `corners`' arrays has `2 * pairs` entries, and `dst` as many
+/// pixels; `fy <= 256`.
+pub unsafe fn scaled_span(corners: &Corners, fy: u32, dst: *mut u32, pairs: usize, alpha: u8, translucent: bool) {
+    if pairs == 0 {
+        return;
+    }
+    // SAFETY: the caller's bounds; every access is unaligned-safe.
+    unsafe {
+        asm!(
+            "pxor xmm7, xmm7",
+            "movd xmm8, {alpha:e}",
+            "pshuflw xmm8, xmm8, 0",
+            "punpcklqdq xmm8, xmm8",
+            "mov {t:e}, 0x00ff00ff",
+            "movd xmm9, {t:e}",
+            "pshufd xmm9, xmm9, 0",
+            "mov {t:e}, 0x00800080",
+            "movd xmm10, {t:e}",
+            "pshufd xmm10, xmm10, 0",
+            "pcmpeqd xmm11, xmm11",
+            "psrlq xmm11, 16",
+            // fy and 256 - fy in every lane; 256 in every lane.
+            "movd xmm12, {fy:e}",
+            "pshuflw xmm12, xmm12, 0",
+            "punpcklqdq xmm12, xmm12",
+            "mov {t:e}, 0x01000100",
+            "movd xmm14, {t:e}",
+            "pshufd xmm14, xmm14, 0",
+            "movdqa xmm13, xmm14",
+            "psubw xmm13, xmm12",
+            "2:",
+            // fx for the two pixels, each in its four lanes, and 256 - fx.
+            "movd xmm4, [{fx}]",
+            "punpcklwd xmm4, xmm4",
+            "punpckldq xmm4, xmm4",
+            "movdqa xmm5, xmm14",
+            "psubw xmm5, xmm4",
+            "movq xmm0, [{a}]",
+            "movq xmm1, [{b}]",
+            "movq xmm2, [{c}]",
+            "movq xmm3, [{d}]",
+            "punpcklbw xmm0, xmm7",
+            "punpcklbw xmm1, xmm7",
+            "punpcklbw xmm2, xmm7",
+            "punpcklbw xmm3, xmm7",
+            "pmullw xmm0, xmm5",
+            "pmullw xmm1, xmm4",
+            "pmullw xmm2, xmm5",
+            "pmullw xmm3, xmm4",
+            // Top in xmm0, bottom in xmm2.
+            "paddw xmm0, xmm1",
+            "paddw xmm2, xmm3",
+            // High bytes in xmm1 and xmm3, low in xmm0 and xmm2.
+            "movdqa xmm1, xmm0",
+            "psrlw xmm1, 8",
+            "pand xmm0, xmm9",
+            "movdqa xmm3, xmm2",
+            "psrlw xmm3, 8",
+            "pand xmm2, xmm9",
+            "pmullw xmm1, xmm13",
+            "pmullw xmm3, xmm12",
+            "paddw xmm1, xmm3",
+            "pmullw xmm0, xmm13",
+            "pmullw xmm2, xmm12",
+            "paddw xmm0, xmm2",
+            "psrlw xmm0, 8",
+            "paddw xmm0, xmm1",
+            "psrlw xmm0, 8",
+            // The two pixels, every byte, in xmm0. Their opacity in xmm2.
+            "movdqa xmm2, xmm8",
+            "test {translucent:e}, {translucent:e}",
+            "jz 3f",
+            "pshuflw xmm2, xmm0, 0xff",
+            "pshufhw xmm2, xmm2, 0xff",
+            "pxor xmm2, xmm9",
+            "pmullw xmm2, xmm8",
+            "paddw xmm2, xmm10",
+            "movdqa xmm4, xmm2",
+            "psrlw xmm4, 8",
+            "paddw xmm2, xmm4",
+            "psrlw xmm2, 8",
+            "3:",
+            "pand xmm0, xmm11",
+            "pmullw xmm0, xmm2",
+            "movdqa xmm4, xmm9",
+            "psubw xmm4, xmm2",
+            "movq xmm3, [{dst}]",
+            "punpcklbw xmm3, xmm7",
+            "pmullw xmm3, xmm4",
+            "paddw xmm0, xmm3",
+            "paddw xmm0, xmm10",
+            "movdqa xmm3, xmm0",
+            "psrlw xmm3, 8",
+            "paddw xmm0, xmm3",
+            "psrlw xmm0, 8",
+            "packuswb xmm0, xmm0",
+            "movq [{dst}], xmm0",
+            "add {a}, 8",
+            "add {b}, 8",
+            "add {c}, 8",
+            "add {d}, 8",
+            "add {fx}, 4",
+            "add {dst}, 8",
+            "dec {n}",
+            "jnz 2b",
+            a = inout(reg) corners.a => _,
+            b = inout(reg) corners.b => _,
+            c = inout(reg) corners.c => _,
+            d = inout(reg) corners.d => _,
+            fx = inout(reg) corners.fx => _,
+            dst = inout(reg) dst => _,
+            n = inout(reg) pairs => _,
+            fy = in(reg) fy,
+            alpha = in(reg) alpha as u32,
+            translucent = in(reg) translucent as u32,
+            t = out(reg) _,
+            #[cfg(target_feature = "sse2")] out("xmm0") _,
+            #[cfg(target_feature = "sse2")] out("xmm1") _,
+            #[cfg(target_feature = "sse2")] out("xmm2") _,
+            #[cfg(target_feature = "sse2")] out("xmm3") _,
+            #[cfg(target_feature = "sse2")] out("xmm4") _,
+            #[cfg(target_feature = "sse2")] out("xmm5") _,
+            #[cfg(target_feature = "sse2")] out("xmm7") _,
+            #[cfg(target_feature = "sse2")] out("xmm8") _,
+            #[cfg(target_feature = "sse2")] out("xmm9") _,
+            #[cfg(target_feature = "sse2")] out("xmm10") _,
+            #[cfg(target_feature = "sse2")] out("xmm11") _,
+            #[cfg(target_feature = "sse2")] out("xmm12") _,
+            #[cfg(target_feature = "sse2")] out("xmm13") _,
+            #[cfg(target_feature = "sse2")] out("xmm14") _,
+            options(nostack),
+        );
+    }
+}
