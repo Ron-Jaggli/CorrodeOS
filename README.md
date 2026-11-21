@@ -219,6 +219,7 @@ kernel/          the privileged kernel
   src/task/user.rs user address space — aliased code pages, user stacks
   src/smp.rs       starting the other CPUs, and setting one core aside
   src/secure_core.rs  that core: a key in a register, reached through a mailbox
+  src/seal.rs      sealing for Settings and the lock screen, by that core
   src/screen_log.rs   under hw-log, the boot log on the firmware's framebuffer
   src/efi_log.rs      under efi-log, the boot log kept in UEFI variables
   src/surface.rs   pixels a task draws and the compositor shows
@@ -254,6 +255,7 @@ render/          the rendering interface
   src/wire.rs      commands as bytes, for a renderer in another process
 gfx/             the 3D engine: integer-only, software, not yet on screen
 theme/           the desktop's look: Theme, presets, desktop.conf, wallpapers, the clock's format
+seal/            AES-CCM over any block cipher, for the secure core's sealing; host-tested
 text/            the text engine
   src/lib.rs       strings to coverage: measuring, placing, inking
   src/font.rs      the typeface, as pen strokes you can read and edit

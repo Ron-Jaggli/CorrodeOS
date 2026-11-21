@@ -103,6 +103,18 @@ pub const SYS_ALLOC: u64 = 18;
 /// `r9`. A label of zero means the deadline came first. A deadline of zero
 /// looks and returns at once; `u64::MAX` waits for ever.
 pub const SYS_WAIT: u64 = 19;
+/// Seal a message with the sealer in `rdi`, in the first page of the memory
+/// in `rsi`, which must be held READ and WRITE. Needs WRITE on the sealer.
+/// `rdx` is the message's length; it is read from byte [`seal::OVERHEAD`]
+/// of the page on. The sealed message, [`seal::OVERHEAD`] bytes longer,
+/// replaces it from byte 0, and its length comes back in `rdx`.
+pub const SYS_SEAL: u64 = 20;
+/// Undo `SYS_SEAL`: the sealed message is from byte 0, `rdx` long, and what
+/// was sealed comes back from byte [`seal::OVERHEAD`], its length in `rdx`.
+/// Needs READ on the sealer. Fails with [`error::FORGED`], and the page's
+/// first `rdx` bytes zeroed, if the message was changed or another sealer
+/// sealed it.
+pub const SYS_UNSEAL: u64 = 21;
 
 /// Slot argument meaning "nowhere".
 ///
@@ -148,6 +160,11 @@ pub mod error {
     pub const NO_SPACE: u64 = 9;
     /// The capability is good and the request is not.
     pub const INVALID: u64 = 10;
+    /// A sealed message that does not check out: changed, cut short, or
+    /// sealed by someone else.
+    pub const FORGED: u64 = 11;
+    /// The secure core is not there to ask.
+    pub const UNAVAILABLE: u64 = 12;
 }
 
 /// What a capability points at, as `SYS_IDENTIFY` reports it in bits 8 and
@@ -167,6 +184,17 @@ pub mod kind {
     pub const IO_PORTS: u8 = 12;
     pub const POOL: u8 = 13;
     pub const WINDOW: u8 = 14;
+    pub const SEALER: u8 = 15;
+}
+
+/// Sealed messages, as `SYS_SEAL` writes them: the nonce, the tag, then the
+/// ciphertext.
+pub mod seal {
+    /// Bytes before the message: a 12-byte nonce and a 16-byte tag.
+    pub const OVERHEAD: usize = 28;
+    /// The longest message one call seals: what the secure core's mailbox
+    /// carries.
+    pub const MOST: usize = 4032;
 }
 
 /// What every desktop program is handed, in the same slots, and what it may
@@ -191,6 +219,9 @@ pub mod app {
     /// to the desktop shell, which takes the calls that reach past the
     /// caller's own windows -- the look, other apps' windows, notifications.
     pub const SHELL: usize = 7;
+    /// For Settings and the lock screen only: a sealer, with a key of the
+    /// program's own that never leaves the secure core.
+    pub const SEAL: usize = 8;
 
     /// Pages in each program's pool.
     pub const POOL_PAGES: u64 = 256;

@@ -38,6 +38,7 @@ mod ports;
 mod remote;
 #[cfg(feature = "hw-log")]
 mod screen_log;
+mod seal;
 mod secure_core;
 mod serial;
 mod smp;
@@ -2053,6 +2054,11 @@ const LAUNCHER_ENDPOINT: cap::CapPtr = 65;
 /// caller's own windows, for the few programs that are the desktop.
 /// Clear of the pool slots just below it (66-69).
 const SHELL_ENDPOINT: cap::CapPtr = 80;
+/// The sealers: Settings' and the lock screen's, each with a key of its own
+/// in the secure core. 70 and up, clear of the pool's (66-69) and of the
+/// disk's (82-91, in `store`).
+const SETTINGS_SEALER: cap::CapPtr = 70;
+const LOCK_SEALER: cap::CapPtr = 71;
 /// Where bootstrap is given each window's surface -- at this slot plus the
 /// surface's number -- so the renderer can be shown it.
 const WINDOW_SURFACES: cap::CapPtr = 96;
@@ -2071,6 +2077,9 @@ const LAUNCHER_FILES_SLOT: cap::CapPtr = 5;
 const LAUNCHER_SELF_SLOT: cap::CapPtr = 6;
 /// The shell's endpoint, to hand Settings, Control Center and the menu.
 const LAUNCHER_SHELL_SLOT: cap::CapPtr = 7;
+/// The sealers, to hand Settings and the lock screen, one each.
+const LAUNCHER_SETTINGS_SEALER: cap::CapPtr = 8;
+const LAUNCHER_LOCK_SEALER: cap::CapPtr = 9;
 
 fn desktop_check(name: &str, ok: bool) {
     check("desktop", name, ok);
@@ -2376,7 +2385,13 @@ extern "C" fn launcher() {
                 let files = (matches!(program, launcher::TERMINAL | launcher::FILES)
                     && cap::identify(LAUNCHER_FILES_SLOT).is_ok())
                 .then_some(LAUNCHER_FILES_SLOT);
-                match start_app(name, LAUNCHER_WINDOWS_SLOT, LAUNCHER_LOG_SLOT, launcher, files, shell) {
+                // Sealing: Settings and the lock screen, each its own.
+                let sealer = match program {
+                    launcher::SETTINGS => Some(LAUNCHER_SETTINGS_SEALER),
+                    launcher::LOCK => Some(LAUNCHER_LOCK_SEALER),
+                    _ => None,
+                };
+                match start_app(name, LAUNCHER_WINDOWS_SLOT, LAUNCHER_LOG_SLOT, launcher, files, shell, sealer) {
                     Ok(_) => 0,
                     Err(error) => error.code(),
                 }
@@ -2405,6 +2420,7 @@ fn start_app(
     launcher_slot: Option<cap::CapPtr>,
     files_slot: Option<cap::CapPtr>,
     shell_slot: Option<cap::CapPtr>,
+    sealer_slot: Option<cap::CapPtr>,
 ) -> Result<usize, cap::CapError> {
     use cap::{CapError, Object, Rights};
     use corrode_abi::app;
@@ -2420,6 +2436,10 @@ fn start_app(
     }
     if let Some(slot) = shell_slot {
         cap::grant(id, slot, app::SHELL, Rights::WRITE)?;
+    }
+    // To seal and open, not to pass on.
+    if let Some(slot) = sealer_slot {
+        cap::grant(id, slot, app::SEAL, Rights::READ_WRITE)?;
     }
     cap::issue_to(
         id,
@@ -2457,6 +2477,10 @@ fn start_desktop() {
         )
         .is_ok();
     desktop_check("mint the window server's and launcher's endpoints", minted);
+    let sealers = cap::mint(0, SETTINGS_SEALER, Object::Sealer(seal::SETTINGS), Rights::ALL).is_ok()
+        && cap::mint(0, LOCK_SEALER, Object::Sealer(seal::LOCK), Rights::ALL).is_ok();
+    desktop_check("mint a sealer for Settings and one for the lock screen", sealers);
+    seal_checks();
 
     // The pool's rules, from this side, on a pool of four pages.
     let pool_rules = cap::issue(
@@ -2504,6 +2528,8 @@ fn start_desktop() {
             && cap::grant(id, LOG_ENDPOINT, LAUNCHER_LOG_SLOT, Rights::ALL).is_ok()
             && cap::grant(id, LAUNCHER_ENDPOINT, LAUNCHER_SELF_SLOT, Rights::ALL).is_ok()
             && cap::grant(id, SHELL_ENDPOINT, LAUNCHER_SHELL_SLOT, Rights::ALL).is_ok()
+            && cap::grant(id, SETTINGS_SEALER, LAUNCHER_SETTINGS_SEALER, Rights::ALL).is_ok()
+            && cap::grant(id, LOCK_SEALER, LAUNCHER_LOCK_SEALER, Rights::ALL).is_ok()
     });
     desktop_check("start the window server and the launcher", granted);
 
@@ -2537,6 +2563,7 @@ fn start_panel() {
         Some(LAUNCHER_ENDPOINT),
         None,
         None,
+        None,
     );
     // Four, and not the shell: the panel shows the desktop, it does not
     // run it.
@@ -2545,6 +2572,112 @@ fn start_panel() {
         panel.is_ok_and(|id| cap::slots_used(id) == Some(4)),
     );
 }
+
+/// Bootstrap's slots for the sealing checks: a pool of one page, the page,
+/// a read-only copy of Settings' sealer, and one left empty: 72 to 75.
+const SEAL_POOL: cap::CapPtr = 72;
+const SEAL_PAGE: cap::CapPtr = 73;
+const SEAL_READ_ONLY: cap::CapPtr = 74;
+const SEAL_NONE: cap::CapPtr = 75;
+
+fn seal_check(name: &str, ok: bool) {
+    check("seal", name, ok);
+}
+
+/// What a sealer lets its holder do and nothing more, by the same calls
+/// `SYS_SEAL` and `SYS_UNSEAL` make, from bootstrap's side.
+fn seal_checks() {
+    use cap::{CapError, Object, Rights};
+    use corrode_abi::seal::{MOST, OVERHEAD};
+
+    if secure_core::status().secure.is_none() {
+        println!("seal       : no secure core; sealing checks skipped");
+        return;
+    }
+    let made = cap::issue(
+        SEAL_POOL,
+        Object::Pool(core::sync::atomic::AtomicU64::new(1)),
+        Rights::ALL,
+    )
+    .is_ok()
+        && memory::allocate(SEAL_POOL, 1, SEAL_PAGE).is_ok()
+        && cap::copy(SETTINGS_SEALER, SEAL_READ_ONLY, Rights::READ).is_ok();
+    seal_check("make a page to seal in", made);
+    if !made {
+        return;
+    }
+    let Ok(page) = seal::page(SEAL_PAGE) else {
+        seal_check("find the page", false);
+        return;
+    };
+    // SAFETY: the page is a whole frame of memory bootstrap just made, mapped
+    // by the HHDM, and nothing else holds it.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(page, 4096) };
+    const PLAIN: &[u8] = b"a message for this boot only";
+    let len = PLAIN.len();
+    let write = |bytes: &mut [u8]| {
+        bytes.fill(0);
+        bytes[OVERHEAD..OVERHEAD + len].copy_from_slice(PLAIN);
+    };
+
+    // Without a sealer -- nothing there, or something else there -- nothing
+    // is sealed and the page is untouched.
+    write(bytes);
+    let refused = seal::seal(SEAL_NONE, SEAL_PAGE, len as u64) == Err(CapError::Empty)
+        && seal::seal(WINDOWS_ENDPOINT, SEAL_PAGE, len as u64) == Err(CapError::WrongType)
+        && seal::unseal(SEAL_NONE, SEAL_PAGE, (OVERHEAD + len) as u64) == Err(CapError::Empty)
+        && bytes[OVERHEAD..OVERHEAD + len] == *PLAIN
+        && bytes[..OVERHEAD] == [0; OVERHEAD];
+    seal_check("a program without a sealer is refused", refused);
+    let read_only = seal::seal(SEAL_READ_ONLY, SEAL_PAGE, len as u64)
+        == Err(CapError::InsufficientRights);
+    seal_check("and one that may only open cannot seal", read_only);
+
+    let sealed = seal::seal(SETTINGS_SEALER, SEAL_PAGE, len as u64);
+    let first: alloc::vec::Vec<u8> = bytes[..OVERHEAD + len].to_vec();
+    let hidden = sealed == Ok((OVERHEAD + len) as u64)
+        && !first.windows(8).any(|w| w == &PLAIN[..8]);
+    let opened = seal::unseal(SEAL_READ_ONLY, SEAL_PAGE, (OVERHEAD + len) as u64)
+        == Ok(len as u64)
+        && bytes[OVERHEAD..OVERHEAD + len] == *PLAIN;
+    seal_check("sealed, it is hidden; opened, it is back", hidden && opened);
+
+    write(bytes);
+    let again = seal::seal(SETTINGS_SEALER, SEAL_PAGE, len as u64).is_ok()
+        && bytes[..OVERHEAD + len] != first[..];
+    seal_check("the same message sealed twice looks different", again);
+
+    let tampered = |bytes: &mut [u8], at: usize| {
+        bytes[..OVERHEAD + len].copy_from_slice(&first);
+        bytes[at] ^= 1;
+        seal::unseal(SETTINGS_SEALER, SEAL_PAGE, (OVERHEAD + len) as u64) == Err(CapError::Forged)
+            && bytes[..OVERHEAD + len].iter().all(|&b| b == 0)
+    };
+    let forged = tampered(bytes, 0) && tampered(bytes, NONCE_AT_TAG) && tampered(bytes, OVERHEAD + 3);
+    bytes[..OVERHEAD + len].copy_from_slice(&first);
+    let short = seal::unseal(SETTINGS_SEALER, SEAL_PAGE, (OVERHEAD + len - 1) as u64)
+        == Err(CapError::Forged);
+    seal_check("a changed or cut message is refused, and nothing comes out", forged && short);
+
+    bytes[..OVERHEAD + len].copy_from_slice(&first);
+    let apart = seal::unseal(LOCK_SEALER, SEAL_PAGE, (OVERHEAD + len) as u64)
+        == Err(CapError::Forged);
+    seal_check("the lock screen cannot open what Settings sealed", apart);
+
+    let sizes = seal::seal(SETTINGS_SEALER, SEAL_PAGE, MOST as u64 + 1) == Err(CapError::Invalid)
+        && seal::unseal(SETTINGS_SEALER, SEAL_PAGE, OVERHEAD as u64 - 1) == Err(CapError::Invalid)
+        && seal::seal(SETTINGS_SEALER, SEAL_PAGE, MOST as u64) == Ok((OVERHEAD + MOST) as u64)
+        && seal::unseal(SETTINGS_SEALER, SEAL_PAGE, (OVERHEAD + MOST) as u64) == Ok(MOST as u64);
+    seal_check("the most the mailbox carries, and not a byte more", sizes);
+
+    bytes.fill(0);
+    let _ = cap::delete(SEAL_PAGE);
+    let _ = cap::delete(SEAL_POOL);
+    let _ = cap::delete(SEAL_READ_ONLY);
+}
+
+/// Where the tag starts in a sealed message.
+const NONCE_AT_TAG: usize = corrode_seal::NONCE;
 
 /// Bootstrap's pool, for the checks, and where its memory goes.
 const BOOT_POOL: cap::CapPtr = 66;

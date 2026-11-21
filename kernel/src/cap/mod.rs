@@ -195,6 +195,10 @@ pub enum Object {
     /// in it -- map its pixels writable and commit them -- and READ means may
     /// wait for what happens to it: keys while it has focus, clicks on it.
     Window(usize),
+    /// Sealing with the secure core, under the key of holder `.0`: one key
+    /// per holder, made and kept in the secure core. WRITE means may seal,
+    /// READ may open what this holder sealed. See [`crate::seal`].
+    Sealer(u32),
 }
 
 impl core::fmt::Debug for Object {
@@ -213,6 +217,7 @@ impl core::fmt::Debug for Object {
             Object::Blob(index) => write!(f, "Blob({index})"),
             Object::IoPorts { base, count } => write!(f, "IoPorts({base:#x}, {count})"),
             Object::Window(index) => write!(f, "Window({index})"),
+            Object::Sealer(holder) => write!(f, "Sealer({holder})"),
             Object::Pool(left) => write!(
                 f,
                 "Pool({} pages)",
@@ -242,6 +247,7 @@ pub enum ObjectKind {
     IoPorts = kind::IO_PORTS,
     Pool = kind::POOL,
     Window = kind::WINDOW,
+    Sealer = kind::SEALER,
 }
 
 impl Object {
@@ -261,6 +267,7 @@ impl Object {
             Object::IoPorts { .. } => ObjectKind::IoPorts,
             Object::Pool(_) => ObjectKind::Pool,
             Object::Window(_) => ObjectKind::Window,
+            Object::Sealer(_) => ObjectKind::Sealer,
         }
     }
 }
@@ -323,6 +330,10 @@ pub enum CapError {
     /// keeps to itself. Distinct from `InsufficientRights` because no right
     /// would have made it legal.
     Invalid,
+    /// A sealed message that does not check out.
+    Forged,
+    /// The secure core is not there to ask.
+    Unavailable,
 }
 
 impl CapError {
@@ -346,6 +357,8 @@ impl CapError {
             CapError::Refused => error::REFUSED,
             CapError::NoSpace => error::NO_SPACE,
             CapError::Invalid => error::INVALID,
+            CapError::Forged => error::FORGED,
+            CapError::Unavailable => error::UNAVAILABLE,
         }
     }
 }
@@ -596,6 +609,22 @@ pub fn memory_of(slot: CapPtr, required: Rights) -> Result<(usize, Rights), CapE
         }
         match *cap.object {
             Object::Memory(index) => Ok((index, cap.rights)),
+            _ => Err(CapError::WrongType),
+        }
+    })
+    .ok_or(CapError::NoSuchTask)?
+}
+
+/// The holder a Sealer capability seals for. Requires `required`.
+pub fn sealer_of(slot: CapPtr, required: Rights) -> Result<u32, CapError> {
+    let current = task::current_id().ok_or(CapError::NoSuchTask)?;
+    task::with_cspace(current, |cspace| {
+        let cap = cspace.get(slot)?;
+        if !cap.rights.contains(required) {
+            return Err(CapError::InsufficientRights);
+        }
+        match *cap.object {
+            Object::Sealer(holder) => Ok(holder),
             _ => Err(CapError::WrongType),
         }
     })

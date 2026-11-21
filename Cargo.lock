@@ -80,6 +80,7 @@ dependencies = [
  "corrode-heap",
  "corrode-pci",
  "corrode-render",
+ "corrode-seal",
  "corrode-text",
  "corrode-theme",
 ]
@@ -151,6 +152,10 @@ dependencies = [
  "corrode-heap",
  "corrode-pci",
 ]
+
+[[package]]
+name = "corrode-seal"
+version = "0.0.1"
 
 [[package]]
 name = "corrode-settings"

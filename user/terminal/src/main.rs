@@ -60,7 +60,7 @@ const SLOTS: usize = 16;
 
 /// The terminal's own commands, how to call them, and what they do. The
 /// shell lists them in `help` after its own.
-const COMMANDS: [About; 11] = [
+const COMMANDS: [About; 12] = [
     ("clear", "", "start with an empty window (or Ctrl+L)"),
     ("history", "", "the lines typed so far"),
     ("uptime", "", "time since the machine started"),
@@ -70,6 +70,7 @@ const COMMANDS: [About; 11] = [
     ("caps", "", "the capabilities this terminal holds"),
     ("notify", "TEXT", "show TEXT as a notification"),
     ("quit", "APP", "try to close APP's windows (the terminal may not)"),
+    ("seal", "", "try to seal with the secure core (the terminal may not)"),
     ("about", "", "what this is"),
     ("exit", "", "close this terminal"),
 ];
@@ -377,6 +378,19 @@ impl Host for System<'_> {
                 }
                 1
             }
+            // Sealing is Settings' and the lock screen's: the terminal holds
+            // no sealer, and the kernel says so before it looks at anything
+            // else.
+            "seal" => {
+                match corrode_rt::seal(app::SEAL, app::HEAP, 0) {
+                    Ok(_) => out.line("seal: the secure core took it"),
+                    Err(error) => {
+                        println!("seal: refused ({error:?})");
+                        out.error(&format!("seal: no sealer ({error:?})"));
+                    }
+                }
+                1
+            }
             "about" => {
                 out.line("CorrodeOS terminal: a ring 3 program holding a window,");
                 out.line("a pool of memory, the log and the boot medium's files,");
@@ -429,6 +443,7 @@ fn caps(out: &mut Output) {
             kind::IO_PORTS => "i/o ports",
             kind::POOL => "pool",
             kind::WINDOW => "window",
+            kind::SEALER => "sealer",
             _ => "unknown",
         };
         let mut letters = String::new();
@@ -447,6 +462,7 @@ fn caps(out: &mut Output) {
             app::HEAP => "the heap",
             app::FILES => "the files",
             app::SHELL => "the desktop shell",
+            app::SEAL => "sealing, by the secure core",
             _ => "",
         };
         out.line(format!("{slot:>3}  {letters}  {name}  {what}").trim_end());

@@ -13,6 +13,7 @@ bench = false
 [dependencies]
 corrode-render = { path = "../render", features = ["alloc"] }
 corrode-theme = { path = "../theme" }
+corrode-seal = { path = "../seal" }
 corrode-heap = { path = "../heap" }
 corrode-text = { path = "../text" }
 corrode-pci = { path = "../pci" }

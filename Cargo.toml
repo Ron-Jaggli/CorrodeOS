@@ -15,6 +15,7 @@ members = [
     "line",
     "shell",
     "theme",
+    "seal",
     "user/rt",
     "user/edu",
     "user/fault",

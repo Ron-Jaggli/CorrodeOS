@@ -16,8 +16,9 @@
 //! The key goes from RDRAND into `xmm15` inside one `asm!` block, through
 //! `rax`, which is cleared before the block ends. Encryption uses AES-NI and
 //! expands the key schedule round by round in `xmm1`-`xmm3` instead of storing
-//! it, so no round key is ever written to memory. The scratch registers are
-//! zeroed before each block returns.
+//! it, so no round key is ever written to memory. A key derived from it, for
+//! sealing on one holder's behalf, is made the same way, in `xmm4`, for each
+//! block. The scratch registers are zeroed before each block returns.
 //!
 //! What this does not cover: anything with ring 0 on this core could read the
 //! register, so the kernel and the code here are still trusted; and SMM, below
@@ -69,6 +70,36 @@ macro_rules! expand {
     };
 }
 
+/// The ten AES-128 rounds on the block in `xmm0`, whose first round key is
+/// already in `xmm1` and already XORed in. Leaves the ciphertext in `xmm0` and
+/// the last round key in `xmm1`; uses `xmm2` and `xmm3` as scratch.
+macro_rules! rounds {
+    () => {
+        concat!(
+            expand!("0x01"),
+            "aesenc xmm0, xmm1\n",
+            expand!("0x02"),
+            "aesenc xmm0, xmm1\n",
+            expand!("0x04"),
+            "aesenc xmm0, xmm1\n",
+            expand!("0x08"),
+            "aesenc xmm0, xmm1\n",
+            expand!("0x10"),
+            "aesenc xmm0, xmm1\n",
+            expand!("0x20"),
+            "aesenc xmm0, xmm1\n",
+            expand!("0x40"),
+            "aesenc xmm0, xmm1\n",
+            expand!("0x80"),
+            "aesenc xmm0, xmm1\n",
+            expand!("0x1b"),
+            "aesenc xmm0, xmm1\n",
+            expand!("0x36"),
+            "aesenclast xmm0, xmm1\n",
+        )
+    };
+}
+
 /// Encrypt one block in place with the key in `xmm15`.
 ///
 /// # Safety
@@ -84,31 +115,49 @@ pub unsafe fn encrypt_block(block: &mut [u8; 16]) {
             "movdqu xmm0, xmmword ptr [{block}]",
             "movdqa xmm1, xmm15",
             "pxor xmm0, xmm1",
-            expand!("0x01"),
-            "aesenc xmm0, xmm1",
-            expand!("0x02"),
-            "aesenc xmm0, xmm1",
-            expand!("0x04"),
-            "aesenc xmm0, xmm1",
-            expand!("0x08"),
-            "aesenc xmm0, xmm1",
-            expand!("0x10"),
-            "aesenc xmm0, xmm1",
-            expand!("0x20"),
-            "aesenc xmm0, xmm1",
-            expand!("0x40"),
-            "aesenc xmm0, xmm1",
-            expand!("0x80"),
-            "aesenc xmm0, xmm1",
-            expand!("0x1b"),
-            "aesenc xmm0, xmm1",
-            expand!("0x36"),
-            "aesenclast xmm0, xmm1",
+            rounds!(),
             "movdqu xmmword ptr [{block}], xmm0",
             "pxor xmm0, xmm0",
             "pxor xmm1, xmm1",
             "pxor xmm2, xmm2",
             "pxor xmm3, xmm3",
+            block = in(reg) block.as_mut_ptr(),
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Encrypt one block in place with a key derived from the one in `xmm15`:
+/// the encryption of `label` under it.
+///
+/// The derived key is made afresh for every block, in `xmm4`, and zeroed
+/// with the rest before the block ends. Like the key it comes from, it is
+/// never written to memory -- which is why it is made here, every time, and
+/// not once and kept.
+///
+/// # Safety
+/// As [`encrypt_block`].
+pub unsafe fn encrypt_block_as(label: &[u8; 16], block: &mut [u8; 16]) {
+    // SAFETY: forwarded from the caller; both are 16 bytes, read unaligned.
+    // The XMM registers are not named, as in `encrypt_block`.
+    unsafe {
+        core::arch::asm!(
+            "movdqu xmm0, xmmword ptr [{label}]",
+            "movdqa xmm1, xmm15",
+            "pxor xmm0, xmm1",
+            rounds!(),
+            "movdqa xmm4, xmm0",
+            "movdqu xmm0, xmmword ptr [{block}]",
+            "movdqa xmm1, xmm4",
+            "pxor xmm0, xmm1",
+            rounds!(),
+            "movdqu xmmword ptr [{block}], xmm0",
+            "pxor xmm0, xmm0",
+            "pxor xmm1, xmm1",
+            "pxor xmm2, xmm2",
+            "pxor xmm3, xmm3",
+            "pxor xmm4, xmm4",
+            label = in(reg) label.as_ptr(),
             block = in(reg) block.as_mut_ptr(),
             options(nostack, preserves_flags),
         );

@@ -67,7 +67,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash grow-test zoom-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test grow-test zoom-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -107,7 +107,7 @@ clippy:
 HOST_TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
 
 test:
-	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci -p corrode-elf -p corrode-virtio -p corrode-nv -p corrode-input -p corrode-heap -p corrode-line -p corrode-shell -p corrode-theme --target $(HOST_TARGET)
+	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci -p corrode-elf -p corrode-virtio -p corrode-nv -p corrode-input -p corrode-heap -p corrode-line -p corrode-shell -p corrode-theme -p corrode-seal --target $(HOST_TARGET)
 
 # What a title bar of glass costs the software renderer, built optimised.
 glass-bench:
@@ -674,6 +674,27 @@ shell-test: iso
 	    && echo "shell-test: the terminal could not quit Settings  PASS" \
 	    || echo "shell-test: the terminal could not quit Settings  FAIL"
 	@test -s build/shell.ppm && pnmtopng build/shell.ppm > build/shell.png 2>/dev/null && rm -f build/shell.ppm && echo "wrote build/shell.png" || true
+
+# Sealing from ring 3: a terminal types `seal` and is refused, holding no
+# sealer; then Alt+L, and the lock screen seals and opens a message with
+# its own, through the secure core. Return unlocks.
+seal-test: iso
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 1.5; \
+	   for key in s e a l ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 1; \
+	   echo "sendkey alt-l"; sleep 1.5; \
+	   echo "sendkey ret"; sleep 1.2; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -E "seal|^lock " build/serial.log | grep -v "^seal  *:" || echo "seal-test: nothing"
+	@grep -q "^terminal   : seal: refused (Empty)" build/serial.log \
+	    && echo "seal-test: the terminal holds no sealer and is refused PASS" \
+	    || echo "seal-test: the terminal holds no sealer and is refused FAIL"
+	@grep -q "^lock       : sealed and opened 23 bytes (51 sealed)" build/serial.log \
+	    && ! grep -q "^lock       : sealing:" build/serial.log \
+	    && echo "seal-test: the lock screen sealed and opened its own  PASS" \
+	    || echo "seal-test: the lock screen sealed and opened its own  FAIL"
 
 # A terminal and Files from the dock, then Alt+D: both go
 # (build/show-desktop.png); Alt+D again brings both back.

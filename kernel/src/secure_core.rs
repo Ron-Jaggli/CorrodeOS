@@ -31,6 +31,17 @@
 //! at a time; callers queue on a lock. The data that crosses is the caller's
 //! anyway -- plaintext in, ciphertext out -- and the key never crosses at all.
 //!
+//! # Sealing
+//!
+//! What ring 3 may ask for, through a [`crate::seal`] capability, is sealing:
+//! AES-CCM ([`corrode_seal`]) under a key of the holder's own. Each holder is
+//! a number, and its key is the encryption of a label naming it under the key
+//! in `xmm15`, made afresh in a register for every block
+//! ([`aes::encrypt_block_as`]). So one holder cannot open what another sealed,
+//! and still no key is ever in memory. The secure core picks every nonce, from
+//! a counter, so no caller can make it use one twice. Raw counter mode
+//! ([`crypt`]) stays the kernel's, for its boot checks.
+//!
 //! # What it does not mean yet
 //!
 //! The kernel can still read this core's memory: its stack and the mailbox
@@ -43,7 +54,7 @@
 mod aes;
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::arch::x86_64::{self, cpu, lapic, vectors};
 use crate::sync::SpinLock;
@@ -117,18 +128,27 @@ const DONE: u32 = 2;
 
 const OP_PING: u32 = 1;
 const OP_CRYPT: u32 = 2;
+const OP_SEAL: u32 = 3;
+const OP_UNSEAL: u32 = 4;
 
 const STATUS_OK: u32 = 0;
 const STATUS_UNKNOWN_OP: u32 = 1;
 const STATUS_TOO_LONG: u32 = 2;
 const STATUS_NO_KEY: u32 = 3;
+/// Holder 0 is no one's: refused rather than given a key.
+const STATUS_NO_HOLDER: u32 = 4;
+/// The tag did not match: changed, cut short, or sealed by someone else.
+pub const STATUS_FORGED: u32 = 5;
 
 #[repr(C)]
 struct Message {
     op: u32,
     status: u32,
     len: u32,
+    /// Whose key, for sealing.
+    holder: u32,
     nonce: [u8; 12],
+    tag: [u8; corrode_seal::TAG],
     payload: [u8; PAYLOAD],
 }
 
@@ -149,7 +169,9 @@ static MAILBOX: Mailbox = Mailbox {
         op: 0,
         status: 0,
         len: 0,
+        holder: 0,
         nonce: [0; 12],
+        tag: [0; corrode_seal::TAG],
         payload: [0; PAYLOAD],
     }),
 };
@@ -169,10 +191,29 @@ pub enum CallError {
     Refused(u32),
 }
 
+/// Everything in a request but its payload, and in the answer.
+struct Exchange {
+    op: u32,
+    holder: u32,
+    nonce: [u8; 12],
+    tag: [u8; corrode_seal::TAG],
+}
+
+impl Exchange {
+    fn new(op: u32) -> Self {
+        Self {
+            op,
+            holder: 0,
+            nonce: [0; 12],
+            tag: [0; corrode_seal::TAG],
+        }
+    }
+}
+
 /// Ask the secure core whether it is there.
 pub fn ping() -> Result<(), CallError> {
     let mut reply = [0u8; 4];
-    let len = call(OP_PING, &[0; 12], &mut reply, 0)?;
+    let len = call(&mut Exchange::new(OP_PING), &mut reply, 0)?;
     if len == 4 && &reply == b"pong" {
         Ok(())
     } else {
@@ -189,13 +230,47 @@ pub fn ping() -> Result<(), CallError> {
 /// with different data.
 pub fn crypt(nonce: &[u8; 12], data: &mut [u8]) -> Result<(), CallError> {
     let len = data.len();
-    call(OP_CRYPT, nonce, data, len).map(|_| ())
+    let mut exchange = Exchange::new(OP_CRYPT);
+    exchange.nonce = *nonce;
+    call(&mut exchange, data, len).map(|_| ())
+}
+
+/// Seal `data` in place under `holder`'s key. Returns the nonce the secure
+/// core chose and the tag; [`unseal`] needs both.
+pub fn seal(holder: u32, data: &mut [u8]) -> Result<([u8; 12], [u8; corrode_seal::TAG]), CallError> {
+    let len = data.len();
+    let mut exchange = Exchange::new(OP_SEAL);
+    exchange.holder = holder;
+    call(&mut exchange, data, len)?;
+    Ok((exchange.nonce, exchange.tag))
+}
+
+/// Open what [`seal`] made for the same `holder`, in place. Refused with
+/// [`STATUS_FORGED`], and `data` zeroed, if anything about it has changed or
+/// another holder sealed it.
+pub fn unseal(
+    holder: u32,
+    nonce: &[u8; 12],
+    tag: &[u8; corrode_seal::TAG],
+    data: &mut [u8],
+) -> Result<(), CallError> {
+    let len = data.len();
+    let mut exchange = Exchange::new(OP_UNSEAL);
+    exchange.holder = holder;
+    exchange.nonce = *nonce;
+    exchange.tag = *tag;
+    let result = call(&mut exchange, data, len).map(|_| ());
+    if result.is_err() {
+        data.fill(0);
+    }
+    result
 }
 
 /// Send one request and wait for the answer. `data` goes in as the payload
-/// (its first `send` bytes) and comes back out, up to its length. Returns the
-/// payload length the secure core answered with.
-fn call(op: u32, nonce: &[u8; 12], data: &mut [u8], send: usize) -> Result<usize, CallError> {
+/// (its first `send` bytes) and comes back out, up to its length, and the
+/// answer's nonce and tag come back in `exchange`. Returns the payload length
+/// the secure core answered with.
+fn call(exchange: &mut Exchange, data: &mut [u8], send: usize) -> Result<usize, CallError> {
     if data.len() > PAYLOAD {
         return Err(CallError::TooLong);
     }
@@ -220,10 +295,12 @@ fn call(op: u32, nonce: &[u8; 12], data: &mut [u8], send: usize) -> Result<usize
         // this caller's alone until the release store below.
         unsafe {
             let message = &mut *MAILBOX.message.get();
-            message.op = op;
+            message.op = exchange.op;
             message.status = 0;
             message.len = send as u32;
-            message.nonce = *nonce;
+            message.holder = exchange.holder;
+            message.nonce = exchange.nonce;
+            message.tag = exchange.tag;
             message.payload[..send].copy_from_slice(&data[..send]);
         }
         MAILBOX.state.store(REQUEST, Ordering::Release);
@@ -253,6 +330,8 @@ fn call(op: u32, nonce: &[u8; 12], data: &mut [u8], send: usize) -> Result<usize
             } else {
                 let len = answered.min(data.len());
                 data[..len].copy_from_slice(&message.payload[..len]);
+                exchange.nonce = message.nonce;
+                exchange.tag = message.tag;
                 Ok(answered)
             };
             // The mailbox is shared kernel memory, and what crossed it was one
@@ -260,6 +339,8 @@ fn call(op: u32, nonce: &[u8; 12], data: &mut [u8], send: usize) -> Result<usize
             let used = send.max(answered).min(PAYLOAD);
             message.payload[..used].fill(0);
             message.nonce = [0; 12];
+            message.tag = [0; corrode_seal::TAG];
+            message.holder = 0;
             message.len = 0;
             result
         };
@@ -295,7 +376,7 @@ pub fn run(cpu: usize) -> ! {
         // test key in xmm15; only a passing one is followed by a real key,
         // and only a real key lets a request through.
         unsafe {
-            if aes::self_test() {
+            if aes::self_test() && seal_self_test() {
                 health |= HEALTH_SELF_TEST;
                 if aes::generate_key() {
                     health |= HEALTH_KEY;
@@ -326,7 +407,9 @@ fn serve(health: u32) {
     // check that a stray write from any other CPU could step between.
     let op = message.op;
     let len = message.len as usize;
+    let holder = message.holder;
     let nonce = message.nonce;
+    let tag = message.tag;
     message.status = match op {
         OP_PING => {
             message.payload[..4].copy_from_slice(b"pong");
@@ -339,6 +422,24 @@ fn serve(health: u32) {
             counter_mode(&nonce, &mut message.payload[..len]);
             message.len = len as u32;
             STATUS_OK
+        }
+        OP_SEAL | OP_UNSEAL if health & HEALTH_KEY == 0 => STATUS_NO_KEY,
+        OP_SEAL | OP_UNSEAL if len > PAYLOAD => STATUS_TOO_LONG,
+        OP_SEAL | OP_UNSEAL if holder == 0 => STATUS_NO_HOLDER,
+        OP_SEAL => {
+            let nonce = next_nonce();
+            message.tag = seal_as(holder, &nonce, &mut message.payload[..len]);
+            message.nonce = nonce;
+            message.len = len as u32;
+            STATUS_OK
+        }
+        OP_UNSEAL => {
+            message.len = len as u32;
+            if unseal_as(holder, &nonce, &tag, &mut message.payload[..len]) {
+                STATUS_OK
+            } else {
+                STATUS_FORGED
+            }
         }
         _ => STATUS_UNKNOWN_OP,
     };
@@ -358,6 +459,73 @@ fn counter_mode(nonce: &[u8; 12], data: &mut [u8]) {
             *byte ^= key;
         }
     }
+}
+
+/// Seals made since boot; the next nonce. Touched only by the secure CPU.
+static SEALS: AtomicU64 = AtomicU64::new(0);
+
+/// A nonce no seal has used under this boot's key: four zero bytes and a
+/// count. The key is new every boot, so the count may start again.
+fn next_nonce() -> [u8; 12] {
+    let count = SEALS.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(&count.to_be_bytes());
+    nonce
+}
+
+/// What `holder`'s key is the encryption of.
+fn label(holder: u32) -> [u8; 16] {
+    let mut label = [0u8; 16];
+    label[..12].copy_from_slice(b"corrode-seal");
+    label[12..].copy_from_slice(&holder.to_be_bytes());
+    label
+}
+
+/// Seal under `holder`'s key; see [`corrode_seal::seal`].
+fn seal_as(holder: u32, nonce: &[u8; 12], data: &mut [u8]) -> [u8; corrode_seal::TAG] {
+    let label = label(holder);
+    // SAFETY: only reached with SSE on and AES-NI present, on this CPU: from
+    // `serve` with HEALTH_KEY set, or from the start-up self-test.
+    corrode_seal::seal(&mut |block| unsafe { aes::encrypt_block_as(&label, block) }, nonce, data)
+}
+
+/// Open under `holder`'s key; see [`corrode_seal::open`].
+fn unseal_as(holder: u32, nonce: &[u8; 12], tag: &[u8; corrode_seal::TAG], data: &mut [u8]) -> bool {
+    let label = label(holder);
+    // SAFETY: as in `seal_as`.
+    corrode_seal::open(&mut |block| unsafe { aes::encrypt_block_as(&label, block) }, nonce, data, tag)
+}
+
+/// Sealing on a known key, run while `xmm15` still holds FIPS-197's test key.
+/// The answers came from a separate implementation (Python's `cryptography`,
+/// AES-CCM under the derived key); they check the derivation and CCM together,
+/// as the secure core runs them.
+fn seal_self_test() -> bool {
+    const PLAIN: &[u8; 25] = b"sealed by the secure core";
+    const NONCE: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7];
+    const SETTINGS: ([u8; 25], [u8; 16]) = (
+        [
+            0x99, 0xa5, 0x94, 0x38, 0xda, 0xa8, 0x28, 0xc1, 0x32, 0x32, 0xeb, 0xb2, 0x71, 0x03,
+            0x5e, 0x04, 0x28, 0x91, 0x81, 0x0b, 0x39, 0x58, 0xc5, 0x50, 0x7d,
+        ],
+        [
+            0x59, 0xff, 0x80, 0x5d, 0xb7, 0x9a, 0xd8, 0xfe, 0x28, 0x68, 0x9f, 0x54, 0xed, 0xee,
+            0x62, 0xaa,
+        ],
+    );
+    const LOCK_TAG: [u8; 16] = [
+        0xbc, 0x70, 0x56, 0xbf, 0xdb, 0x53, 0x4b, 0xe6, 0x89, 0xb3, 0x6c, 0xd4, 0x01, 0xfc, 0x7c,
+        0x05,
+    ];
+    let mut data = *PLAIN;
+    let tag = seal_as(1, &NONCE, &mut data);
+    let sealed = data == SETTINGS.0 && tag == SETTINGS.1;
+    let mut other = *PLAIN;
+    let other_tag = seal_as(2, &NONCE, &mut other);
+    let opened = unseal_as(1, &NONCE, &tag, &mut data) && data == *PLAIN;
+    let mut crossed = SETTINGS.0;
+    let refused = !unseal_as(2, &NONCE, &tag, &mut crossed) && crossed == [0; 25];
+    sealed && other_tag == LOCK_TAG && opened && refused
 }
 
 /// Sleep until the mailbox IPI. `sti` holds off interrupts for one more

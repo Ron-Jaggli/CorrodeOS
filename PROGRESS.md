@@ -1740,21 +1740,132 @@ This part, host-tested only:
   new one); boot self-checks 172 / 0 (default) and 179 / 0 (virtio).
   `./corrode test` passes; clippy is clean on the new code.
 
+## 66. Sealing, through the secure core, for Settings and the lock screen
+
+- A new capability kind, the **sealer** (`kind::SEALER` = 15,
+  `cap::Object::Sealer(holder)`). Bootstrap mints two, Settings' (holder
+  1) and the lock screen's (holder 2), and gives both to the launcher,
+  which hands one each, READ and WRITE but not GRANT, at `app::SEAL` (8).
+  Nothing else holds one; the terminal's `caps` would list it.
+- Two system calls and no others: `SYS_SEAL` (20) needs WRITE on the
+  sealer, `SYS_UNSEAL` (21) READ. There is no raw counter mode in ring 3;
+  `secure_core::crypt` stays the kernel's, for its boot checks.
+- **Choice:** the message does not travel in the IPC message, as the
+  stop note proposed: that is 4 words, 32 bytes. It travels in the first
+  page of a memory capability the caller holds (READ and WRITE), the
+  message at byte 28, the sealed form (12-byte nonce, 16-byte tag,
+  ciphertext) from byte 0. The kernel finds the page through the
+  capability and copies it in once and out once, so the "no pointer from
+  ring 3 is followed" rule in `syscall.rs` still holds, and a caller
+  scribbling on the page meanwhile changes nothing that was checked.
+  Up to 4032 bytes a call, what the mailbox carries.
+- In the secure core (`kernel/src/secure_core.rs`, `secure_core/aes.rs`):
+  - Each holder's key is AES(`"corrode-seal"` + holder, under the key in
+    `xmm15`), made in `xmm4` afresh for every block by one asm block
+    (`aes::encrypt_block_as`) and zeroed before it ends. The key is still
+    made and kept as before; no key, base or derived, is ever in memory.
+  - The secure core picks every nonce: a per-boot count, so a caller
+    cannot make it reuse one. Holder 0 is refused.
+  - **Choice:** AES-CCM (SP 800-38C; 12-byte nonce, 16-byte tag), not
+    counter mode plus CMAC as proposed. CCM is a standard authenticated
+    mode under one key, so there is one derived key per holder, not two;
+    and CMAC's own subkeys would be key material in memory, where nothing
+    here is. UNSEAL checks the tag before handing anything back, in
+    constant time, and zeroes the payload when it does not match.
+  - The mailbox message gained a holder and a tag; both are cleared after
+    each call with the rest.
+- CCM is a new crate, `seal/` (`corrode-seal`), generic over the block
+  cipher so it runs on the build host. Its tests use AES-NI there and
+  compare with Python's `cryptography` (`AESCCM`), a separate
+  implementation: 0 to 4004 bytes, and every flipped bit in the tag or
+  ciphertext, another nonce, another key and a cut message are refused
+  with nothing coming out.
+- The secure core's start-up self-test now also seals a known message
+  for holders 1 and 2 under FIPS-197's test key and compares with the
+  same tool's answers (derivation and CCM together, as they run there),
+  opens it, and checks holder 2 cannot. The key is made only if it passes.
+- Boot self-checks (`seal`, 8 new): without a sealer (an empty slot, or
+  an endpoint) nothing is sealed and the page is untouched; a read-only
+  sealer cannot seal; sealed, the text is gone, opened, it is back; the
+  same message sealed twice differs; a changed nonce, tag or ciphertext
+  byte, or a message cut by one byte, is refused and zeroed; the lock
+  screen's sealer cannot open what Settings' sealed; 4032 bytes seal and
+  4033 are refused. Plus one in `desktop` for minting the two.
+- Ring 3: the terminal has `seal`, which is refused ("no sealer
+  (Empty)"); the lock screen, as it starts, seals and opens a 23-byte
+  message through its own sealer and logs it. New `./corrode seal-test`
+  checks both (2 checks). Settings holds its sealer and does not use it
+  yet.
+- Nothing is sealed to disk: the key is per boot (RDRAND into `xmm15`),
+  so anything sealed is unreadable after a restart. A key that survives
+  one is task 10's write-up.
+- Bug found by the full suite and fixed, the same kind as in 46: the
+  sealers first went in bootstrap slots 81-86, which overlap the disk's
+  (82-91, `store.rs`). Every seal check passed, but the disk driver's
+  "holds its device, its memory, and nothing else" failed and with it all
+  four store-test checks on both GPUs. Moved to 70-75, between the pool's
+  (66-69) and the shell's (80).
+- The kernel's own copies of a message (its heap buffers) are wiped with
+  volatile writes before they are freed, so plaintext is not left there.
+- Holder separation rests on the kernel: it writes the holder into the
+  mailbox from the capability. The kernel is trusted here, as it already
+  is with the secure core (see "What it does not mean yet").
+- Every scored boot-test check PASSes on both GPUs (51 each: 49, plus
+  seal-test's 2); boot self-checks 181 / 0 (default) and 188 / 0
+  (virtio), one more each with a disk attached (store-test). `./corrode
+  test` passes, the seal crate's 4 tests among them; clippy is clean on
+  the new code (run with lints capped at warn, since render and theme
+  already stop `make clippy` before it reaches the kernel).
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
-2026-11-22T06:03-06:00). One task a pass; stop rules are in the /loop prompt.
+2026-11-22T06:03-06:00). One task a pass. The checklist was replaced by the
+user's second loop prompt (2026-11-21 ~09:20), 13 tasks; its rules are
+copied below so a later pass can read them here.
 
-1. [x] Finish SSE (branch `sse`) -- section 64
+1. [x] SSE (branch `sse`) -- section 64
 2. [x] Passcode as a salted hash (`passcode-hash`) -- section 65
-3. [ ] Secure-core capability, groundwork only (`secure-cap`) -- STOPPED, needs your decision (below)
-4. [ ] SSE for the glass lens (`sse-glass`)
-5. [ ] SSE for the 2x2 backdrop downscale (`sse-downscale`)
-6. [ ] Raise the 16-surface cap (`more-surfaces`)
-7. [ ] Fix the fading-window rim from section 63 (`fade-rim`)
-8. [ ] SSE for image / alpha-blend compositing (`sse-blend`)
-9. [ ] xHCI + USB HID keyboard and mouse, QEMU only (`xhci`)
-10. [ ] Write-up: surviving-reboot key options, results table
+3. [x] Secure-core sealing (`secure-cap`) -- section 66
+4. [ ] SSE for the glass lens loops in render/src/software.rs; pixel-exact host tests vs scalar; perf-test before/after (`sse-glass` off `secure-cap`)
+5. [ ] SSE in the 2x2 backdrop downscale (frosted path); pixel-exact; perf-test (`sse-downscale`)
+6. [ ] Raise the 16-surface cap (SURFACES) and what in the kernel and virtio driver assumes it; boot test opening >15 windows and closing them, both GPUs (`more-surfaces`)
+7. [ ] Fix section 63's gap: fading windows show the frame's lower rim through their body; screenshot-based boot check (`fade-rim`)
+8. [ ] SSE for image / alpha-blend compositing (render/src/blend.rs, Image/ScaledImage); pixel-exact; perf-test (`sse-blend`)
+9. [ ] xHCI driver in ring 3, USB HID boot keyboard + mouse into the input path; QEMU only (qemu-xhci, usb-kbd, usb-tablet), never real host USB; boot tests typing and clicking via USB on both GPUs; commit in sub-steps (reset+rings, enumeration, keyboard, mouse) (`xhci`)
+10. [ ] Verdigris design: verdigris/DESIGN.md -- a Windows compatibility layer native to CorrodeOS, not a Proton fork (no Linux syscalls, no POSIX, no Vulkan): PE/COFF loader on the spawn_program model; minimal ntdll/kernel32 (memory, threads, files through a capability, time); user32/gdi32 onto the window server and corrode-render command lists; reusing Wine's Windows-side DLLs behind a Corrode backend, incl. LGPL vs MPL-2.0; what Direct3D needs from a future GPU backend (out of scope). No code. (`verdigris` off `xhci`)
+    - **User's requirement for Verdigris files (2026-11-21, ~10:00):** no
+      Proton/Wine-style prefix and no hidden filesystem of its own. A
+      Windows program sees the real Corrode files, but only an allowlist:
+      its own folder plus the directories and files it was allowed.
+      Anything else is not refused, it is simply not there (an empty
+      directory, or absent): never "permission denied". The view's root
+      "zooms out" only as far as needed: one allowed file roots the view at
+      that file's directory; allowed items in different places, e.g.
+      /root/dih/robot.txt and /user/dih/robo.font, root it at their highest
+      common directory, where only the paths down to them show (it sees
+      /root/dih and /user/dih, nothing beside them). DESIGN.md must specify
+      this (as a capability: a pruned view of the files) and how Windows
+      paths such as C:\ map onto the view's root.
+11. [ ] Verdigris phase 1: the PE loader; a tiny hand-built PE (bytes in repo or built by a script, no Windows toolchain) that prints over a syscall; boot test on both GPUs; malformed PEs refused, not crashed on (host tests)
+12. [ ] Verdigris phase 2: smallest kernel32 subset for a console "hello" PE (GetStdHandle, WriteFile, ExitProcess) on whatever narrow capability it needs; boot test
+13. [ ] Write-up: surviving-reboot key options (passcode-derived, sealed key, TPM) with trade-offs; a ring -1 hypervisor option (Rust, soft-float, own crate, signed, open source, small enough to verify); a table of every task (branch, result, perf). No code. Then stop the loop.
+
+Rules (from the prompt): every task builds, passes `./corrode test` and the
+boot tests on both GPUs before committing, and logs any **Choice:** here.
+Never commit to main or desktop-glass; never touch the uncommitted change
+in kernel/src/input.rs; nothing outside the project. The secure core's
+xmm15 is never saved to memory; no task, timer or XMM-using compiled code
+on the secure core. SSE only in whole asm blocks with no call and nothing
+kept in XMM after; never in an interrupt handler. Nothing written to disk
+is encrypted with the per-boot key; the key's making and keeping do not
+change. QEMU boot tests one at a time. No anticheat work in Verdigris.
+Time cap: 30 h from the start; a task over 4 h of passes without passing
+(6 h for 9 and 11) is marked blocked. Stop and wait for the user when all
+are done, the cap is reached, a check fails twice in a row on one task, a
+task needs a design decision not covered (key persistence, an unsure
+syscall ABI, anything with security weight, a Verdigris syscall that widens
+what ring 3 can do), or a perf-test shows something slower.
 
 ### Stopped at task 3, 2026-11-21T00:55-06:00
 
@@ -1798,3 +1909,8 @@ Questions:
 - (d) Should the remaining tasks (4-10) go on without task 3? None of them
   needs it; only the branch order does (`sse-glass` would branch off
   `passcode-hash` instead).
+
+**Answered 2026-11-21T09:07-06:00:** yes to all four. Per-holder subkeys
+derived inside the secure core; only SEAL/UNSEAL with tags and nonces the
+secure core picks; Settings and Lock kept apart; and tasks 4-10 go on
+regardless. The loop restarted on task 3 with the proposal above.

@@ -152,6 +152,36 @@ fn unlock() -> ! {
     corrode_rt::exit();
 }
 
+/// Where the page for [`probe_sealing`] goes.
+const SEAL_PAGE: usize = 9;
+
+/// Seal a short message with this program's sealer and open it again, to
+/// show the path from ring 3 to the secure core works. Nothing is kept: the
+/// key is new every boot, so a sealed message is good for this boot only.
+fn probe_sealing() {
+    const PROBE: &[u8] = b"held by the lock screen";
+    const AT: usize = corrode_rt::abi::seal::OVERHEAD;
+    let result = (|| -> corrode_rt::Result<(usize, bool)> {
+        corrode_rt::alloc(app::POOL, 1, SEAL_PAGE)?;
+        let page = corrode_rt::map(SEAL_PAGE)?;
+        // SAFETY: the kernel mapped this page writable for this task alone.
+        let bytes = unsafe { core::slice::from_raw_parts_mut(page.address, page.len) };
+        bytes[AT..AT + PROBE.len()].copy_from_slice(PROBE);
+        let sealed = corrode_rt::seal(app::SEAL, SEAL_PAGE, PROBE.len())?;
+        let hidden = !bytes[..sealed].windows(PROBE.len()).any(|w| w == PROBE);
+        let opened = corrode_rt::unseal(app::SEAL, SEAL_PAGE, sealed)?;
+        let back = opened == PROBE.len() && &bytes[AT..AT + opened] == PROBE;
+        bytes.fill(0);
+        Ok((sealed, hidden && back))
+    })();
+    let _ = corrode_rt::delete(SEAL_PAGE);
+    match result {
+        Ok((sealed, true)) => println!("sealed and opened {} bytes ({} sealed)", PROBE.len(), sealed),
+        Ok((_, false)) => println!("sealing: the message did not come back as it went in"),
+        Err(error) => println!("sealing: {:?}", error),
+    }
+}
+
 fn main() {
     corrode_rt::log::set(app::LOG);
     if corrode_rt::heap::init(app::POOL, app::HEAP, 16).is_err() {
@@ -174,6 +204,7 @@ fn main() {
     };
     let mut next = draw(&mut window, &clock);
     println!("locked, {}x{}", window.width, window.height);
+    probe_sealing();
 
     loop {
         match window.wait(next) {
