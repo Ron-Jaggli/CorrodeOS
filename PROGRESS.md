@@ -2318,6 +2318,133 @@ bytes of shadow space, the fifth argument on the stack.
   passed; clippy at 33 after two fixes in corrode-pe (`is_multiple_of`,
   `as_chunks`), with pe-test rerun on both GPUs after them.
 
+## 76. Write-up: a key that survives a restart, a layer under the kernel, and every task
+
+No code. Two proposals for decisions only the owner can make, and the
+table of what this loop did.
+
+### A key that survives a restart
+
+Today the secure core's key is made by RDRAND into `xmm15` each boot and
+never leaves it (64, 66), so whatever is sealed is unreadable after a
+restart, and nothing written to disk is sealed. That stays as it is: any
+key that survives a restart is a *second* key with its own making and
+keeping, not a change to the per-boot one. The three ways to root one:
+
+| | Passcode-derived | Sealed (wrapped) data key | TPM 2.0 |
+|---|---|---|---|
+| Root of the secret | what the person types | whatever wraps it | the chip, bound to this machine |
+| Needs new hardware or drivers | no | no | a TPM driver (CRB/TIS, MMIO) and measured boot |
+| Offline guessing | the weak point: a 4-8 digit passcode is 10^4-10^8 tries; at 50 000 PBKDF2 rounds a GPU gets through 10^8 in hours | as strong as its root | the chip counts failures and locks out, so a short PIN is enough |
+| Bound to this machine | no: disk alone is enough for an attacker | no | yes (and to the boot chain, through PCRs) |
+| Survives a kernel update | yes | yes | only with a signed PCR policy (PolicyAuthorize); otherwise re-seal each update |
+| Forgotten passcode | data gone | data gone unless a recovery wrap exists | data gone unless a recovery wrap exists |
+| Where the key is in the clear | derived in memory unless derived in the secure core | wherever it is unwrapped | the response arrives in the TPM's MMIO buffer, which the secure core could read straight into a register, never into RAM |
+| Testable here | yes | yes | in QEMU only with swtpm, a host package this loop did not install |
+
+- **Passcode-derived** alone is the weakest: the passcode exists to stop
+  someone at the keyboard, and 50 000 rounds was chosen for a lock screen,
+  not for a disk an attacker can carry away. It would need a long
+  passphrase or a memory-hard function (Argon2id) to be worth much.
+- **A wrapped data key** is not a root on its own; it is how the other two
+  should be used: one random data key encrypts the data, and only the
+  data key is wrapped (by the TPM, by the passcode, by a recovery code).
+  Changing the passcode re-wraps 32 bytes instead of re-encrypting
+  everything, and several wraps can exist side by side.
+- **TPM + PIN with a wrapped data key** is the recommendation, with a
+  passcode-only wrap allowed on machines without a TPM and shown as weaker.
+  It needs: a TPM driver in ring 3 holding only its MMIO page, as the
+  other drivers do; Limine's measurement of the kernel (or the layer
+  below, next part) into PCRs; and a decision on where the unwrapped key
+  lives: a second register on the secure core (`xmm14`, under the same
+  rules as `xmm15`), or derived per request from a wrapped blob like the
+  holders' keys are.
+
+Decisions needed: (a) which root(s); (b) where the persistent key lives on
+the secure core; (c) whether a recovery code is offered; (d) what gets
+encrypted at rest first (the disk store of 55, or only Settings' and
+Lock's sealed data).
+
+### A layer under the kernel (ring -1)
+
+`kernel/src/secure_core.rs` says what the secure core does not protect
+against yet: ring 0 can read its stack and mailbox, can run code on it to
+read `xmm15`, and a device can DMA anywhere (README: no IOMMU support).
+Closing that needs something beneath the kernel:
+
+- **What:** a small hypervisor, its own crate (`hypervisor/`,
+  `corrode-hv`), `x86_64-unknown-none`, soft-float, `no_std`, no
+  allocator: every table it needs is static. MPL-2.0 like the rest.
+- **Shape:** Limine boots it first; it builds nested page tables mapping
+  all memory 1:1 *except* its own frames and the secure core's, then
+  enters the kernel as a guest on every general CPU. The secure core
+  never enters the guest: it runs in host mode as part of the hypervisor,
+  and the kernel reaches it only by a `VMMCALL` that carries the mailbox
+  request. Its frames, `xmm15` and its interrupt table are then out of
+  the kernel's reach, not just out of its habits.
+- **Soft-float matters here:** on SVM, `#VMEXIT` does not save XMM, so
+  every exit handler must leave XMM untouched or a guest's registers (and,
+  on the secure core, the key) could be spilled. Soft-float and no SSE
+  anywhere in the crate makes that a property of the build, not of care.
+- **What it handles, and nothing more:** CPUID; a few MSRs (EFER, the
+  ones that would turn off NPT or SVM); nested-page faults on its own and
+  the secure core's frames (the guest faults); AP start-up (INIT/SIPI,
+  the hardest part); and the IOMMU (AMD-Vi: device table and page tables,
+  every device identity-mapped except onto protected frames). No device
+  emulation, no scheduling, one virtual CPU per real one, everything else
+  passed through. The aim is 3 000-5 000 lines, small enough to read whole.
+- **AMD first:** this machine has SVM (and the host's `kvm_amd nested=1`,
+  so QEMU with `-cpu host` can test it nested; QEMU's TCG emulates SVM
+  too). Intel VMX later would roughly double the exit-handling code.
+- **Verifying it:** no `unsafe` outside a listed set of modules; the
+  page-table and IOMMU-table builders as pure functions with host tests and
+  model checking (Kani) for "no protected frame is ever mapped"; a
+  reproducible build, so its measurement can be checked by anyone.
+- **Signed:** Limine checks the hashes of what it loads (`#` BLAKE2B in
+  its config), and Limine itself is signed with the owner's Secure Boot
+  key (MOK or db). With a TPM (above) the hypervisor's measurement goes
+  into a PCR and the persistent key unseals only under it: the two
+  proposals fit together, and the hypervisor is what makes a TPM-bound
+  key worth binding.
+- **Costs and risks:** nested paging makes TLB misses dearer (a 2-D walk),
+  so it needs a perf-test on the drawing paths, and large pages wherever
+  possible; a bug in AP start-up or the IOMMU sits underneath everything;
+  nested QEMU is not bare metal, so it needs a real-machine boot before it
+  can be trusted.
+
+Decisions needed: (a) the secure core in host mode (proposed) or as its own
+guest; (b) AMD only at first; (c) who holds the signing key; (d) whether
+the IOMMU comes in the same step (proposed: yes, since DMA otherwise
+undoes the rest).
+
+### Every task in this loop
+
+Each branch is stacked on the one before (`sse` on `desktop-glass`), so
+merging `verdigris` brings in all of them. "Checks" are scored boot-test
+checks passing on each GPU; perf is draw ms a frame unless stated.
+
+| # | Task | Branch (tip) | Result | Perf |
+|---|---|---|---|---|
+| 1 | SSE in the kernel, SSE2 blur (64) | `sse` e6cb886 | 48 checks each GPU | blur 102 -> 36 µs; dragging Regular 5.8-7.1 -> 4.6-5.4; Control Center Regular 14.4 -> 10.1-11.2 |
+| 2 | Passcode as a salted hash (65) | `passcode-hash` 271228a (code af76226) | passcode-test plain and hashed | PBKDF2 50 000 rounds, 129 ms a try in QEMU |
+| 3 | Sealing through the secure core (66) | `secure-cap` 3da6461 | 51 checks; 8 seal self-checks. Stopped once for the owner's decision, answered | not on a drawing path |
+| 4 | SSE for the glass lens (67) | `sse-glass` 04b6ade | 51 checks | kernel bench 1343 -> 1077 µs; dragging Regular 4.6-5.4 -> 4.1-4.7; Control Center 10.1-11.2 -> 8.9-10.0 |
+| 5 | SSE for the 2x2 downscale (68) | `sse-downscale` 3b9397a | 51 checks | downscale ~340 -> ~40 µs; A/B dragging Regular 4.08-4.74 -> 3.63-4.15; Control Center 9.94-9.97 -> 8.66-8.74 (Clear within noise, noted) |
+| 6 | 32 surfaces (69) | `more-surfaces` d976aa2 | 53 checks; >15 windows open and close | within 0.2% |
+| 7 | No rim through a fading window (70) | `fade-rim` 0be8bee | 54 checks; rim 11.2 -> 0.6 levels | none recorded (not a per-frame cost when settled) |
+| 8 | SSE for blending and images (71) | `sse-blend` 20f5607 | 54 checks | BlendRect 483 -> 82 µs; translucent Image 1415 -> 289 µs; ScaledImage 2379 -> 879 µs; first scene 2.17-2.61 -> 0.97-1.07; Control Center Regular 8.73-8.87 -> 7.94-8.28 (Clear dragging within noise, noted) |
+| 9 | xHCI driver in ring 3 (72) | `xhci` 638686c | 60 checks; typing and a tablet click over USB | none: no drawing path |
+| 10 | Verdigris design (73) | `verdigris` cdc9732 | DESIGN.md; host tests 315 | - |
+| 11 | Verdigris phase 1, PE loader (74) | `verdigris` 0610583 | 62 checks; 5 Verdigris self-checks; host tests 326 | - |
+| 12 | Verdigris phase 2, kernel32 (75) | `verdigris` bf91864 | 63 checks; 10 Verdigris self-checks; host tests 333 | - |
+| 13 | This write-up (76) | `verdigris` | no code | - |
+
+No task was blocked, no check failed twice, and no perf-test showed a
+slowdown; two rows within noise are written down in 68 and 71. Clippy is
+at the same 33 warnings, all older than this loop, as before it started.
+The user's uncommitted change in `kernel/src/input.rs` is still
+uncommitted and in no commit.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -2350,7 +2477,7 @@ copied below so a later pass can read them here.
       paths such as C:\ map onto the view's root.
 11. [x] (section 74) Verdigris phase 1: the PE loader; a tiny hand-built PE (bytes in repo or built by a script, no Windows toolchain) that prints over a syscall; boot test on both GPUs; malformed PEs refused, not crashed on (host tests)
 12. [x] (section 75) Verdigris phase 2: smallest kernel32 subset for a console "hello" PE (GetStdHandle, WriteFile, ExitProcess) on whatever narrow capability it needs; boot test
-13. [ ] Write-up: surviving-reboot key options (passcode-derived, sealed key, TPM) with trade-offs; a ring -1 hypervisor option (Rust, soft-float, own crate, signed, open source, small enough to verify); a table of every task (branch, result, perf). No code. Then stop the loop.
+13. [x] (section 76) Write-up: surviving-reboot key options (passcode-derived, sealed key, TPM) with trade-offs; a ring -1 hypervisor option (Rust, soft-float, own crate, signed, open source, small enough to verify); a table of every task (branch, result, perf). No code. Then stop the loop.
 
 Rules (from the prompt): every task builds, passes `./corrode test` and the
 boot tests on both GPUs before committing, and logs any **Choice:** here.
@@ -2415,3 +2542,17 @@ Questions:
 derived inside the secure core; only SEAL/UNSEAL with tags and nonces the
 secure core picks; Settings and Lock kept apart; and tasks 4-10 go on
 regardless. The loop restarted on task 3 with the proposal above.
+
+### Stopped: every task done, 2026-11-21T16:10-06:00
+
+All 13 tasks are done, about 16 hours into the 30-hour cap. The loop
+stopped by its own rule. What is needed from you:
+
+- Review and merge: the branches are one stack, `sse` ... `verdigris`;
+  nothing was committed to main or desktop-glass.
+- Decide on a key that survives a restart (76, four questions) and on the
+  layer under the kernel (76, four questions); neither has code yet.
+- Verdigris's six open decisions in `verdigris/DESIGN.md` (where PE
+  parsing lives for your files, threads, GS base, fault delivery, JIT,
+  run-time LoadLibrary) before phase 3.
+
