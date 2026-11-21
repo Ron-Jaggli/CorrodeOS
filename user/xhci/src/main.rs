@@ -23,6 +23,7 @@
 
 use corrode_rt::abi::xhci::{BAR, DEVICE, EVENTS, IRQ, LOG, MEMORY, MEMORY_PAGES};
 use corrode_rt::device::{Config, Interrupt, Mmio};
+use corrode_input::usb::{find_hid, HidInterface, BOOT, KEYBOARD, MOUSE};
 use corrode_rt::{println, Error};
 
 corrode_rt::entry!(main);
@@ -39,11 +40,16 @@ mod page {
     pub const SEGMENTS: usize = 3;
     /// The scratchpad buffer array, if the controller wants scratchpads.
     pub const SCRATCHPAD_ARRAY: usize = 4;
-    /// Then five pages for each device: its input context, its output
-    /// context, its control endpoint's ring, its interrupt endpoint's ring,
-    /// and a page of buffers.
+    /// Then five pages for each device, in this order.
     pub const DEVICES: usize = 5;
     pub const PER_DEVICE: usize = 5;
+    pub const INPUT: usize = 0;
+    pub const OUTPUT: usize = 1;
+    pub const CONTROL: usize = 2;
+    pub const INTERRUPT: usize = 3;
+    /// Control transfers' data from byte 0, reports from [`REPORTS`].
+    pub const BUFFERS: usize = 4;
+    pub const REPORTS: usize = 2048;
 }
 
 /// Devices this driver will look after.
@@ -66,11 +72,26 @@ const CRCR: usize = 0x18;
 const DCBAAP: usize = 0x30;
 const CONFIG: usize = 0x38;
 
+/// A port's status and control (5.4.8), one a port, every 16 bytes.
+const PORTSC: usize = 0x400;
+
 const CMD_RUN: u32 = 1 << 0;
 const CMD_RESET: u32 = 1 << 1;
 const CMD_INTERRUPTS: u32 = 1 << 2;
 const STS_HALTED: u32 = 1 << 0;
 const STS_NOT_READY: u32 = 1 << 11;
+
+const PORT_CONNECTED: u32 = 1 << 0;
+const PORT_ENABLED: u32 = 1 << 1;
+const PORT_RESET: u32 = 1 << 4;
+const PORT_RESET_CHANGED: u32 = 1 << 21;
+/// The change bits, each cleared by writing 1 to it.
+const PORT_CHANGES: u32 = 0x00fe_0000;
+/// The bits that keep their value when written back as read: power, link
+/// state (ignored without its strobe), indicators, wake enables. The rest
+/// are written as 0, which leaves them alone -- writing PED as 1 would
+/// disable the port.
+const PORT_KEEP: u32 = 0x0e00_c3e0;
 
 /// Interrupter 0's registers (5.5.2), from the runtime base.
 const IMAN: usize = 0x20;
@@ -90,7 +111,13 @@ const TRBS: usize = PAGE / 16;
 
 /// TRB types.
 mod trb {
+    pub const SETUP: u32 = 2;
+    pub const DATA: u32 = 3;
+    pub const STATUS: u32 = 4;
     pub const LINK: u32 = 6;
+    pub const ENABLE_SLOT: u32 = 9;
+    pub const ADDRESS_DEVICE: u32 = 11;
+    pub const EVALUATE_CONTEXT: u32 = 13;
     pub const NO_OP_COMMAND: u32 = 23;
     pub const TRANSFER_EVENT: u32 = 32;
     pub const COMMAND_COMPLETION: u32 = 33;
@@ -99,8 +126,23 @@ mod trb {
 const CYCLE: u32 = 1 << 0;
 /// In a link TRB: flip the cycle bit when following it.
 const TOGGLE_CYCLE: u32 = 1 << 1;
+const INTERRUPT_ON_COMPLETION: u32 = 1 << 5;
+/// In a setup TRB: the eight bytes of the request are the parameter itself.
+const IMMEDIATE: u32 = 1 << 6;
 /// Completion codes (6.4.5).
 const SUCCESS: u32 = 1;
+const SHORT_PACKET: u32 = 13;
+
+/// Standard requests (USB 2.0 9.4).
+const GET_DESCRIPTOR: u8 = 6;
+const SET_CONFIGURATION: u8 = 9;
+const DEVICE_DESCRIPTOR: u16 = 0x0100;
+const CONFIGURATION_DESCRIPTOR: u16 = 0x0200;
+/// Requests' first byte: which way, whose, to what.
+const TO_DEVICE: u8 = 0x00;
+const FROM_DEVICE: u8 = 0x80;
+/// The most of a configuration descriptor read.
+const MOST_CONFIG: usize = 1024;
 
 /// A TRB as four words: a 64-bit parameter, a status word, a control word
 /// holding the type in bits 10 to 15 and the cycle bit in bit 0.
@@ -168,6 +210,11 @@ impl Pages {
     fn write32(&self, page: usize, offset: usize, value: u32) {
         // SAFETY: as for `read32`.
         unsafe { self.at(page, offset).cast::<u32>().write_volatile(value) }
+    }
+
+    fn read8(&self, page: usize, offset: usize) -> u8 {
+        // SAFETY: as for `read32`.
+        unsafe { self.at(page, offset).read_volatile() }
     }
 
     fn write64(&self, page: usize, offset: usize, value: u64) {
@@ -246,10 +293,29 @@ impl Ring {
     }
 }
 
+/// A device with an address: its slot, the first of its pages, and its
+/// control endpoint.
+struct Device {
+    slot: usize,
+    page: usize,
+    port: usize,
+    speed: u32,
+    control: Ring,
+    max_packet: u16,
+}
+
+/// Port speeds, as PORTSC and the slot context give them.
+const LOW_SPEED: u32 = 2;
+const HIGH_SPEED: u32 = 3;
+const SUPER_SPEED: u32 = 4;
+
 /// The controller, running.
 struct Controller {
     registers: Mmio,
     operational: usize,
+    ports: usize,
+    /// Bytes in each context of a device context: 32 or 64.
+    context: usize,
     runtime: usize,
     doorbells: usize,
     pages: Pages,
@@ -322,6 +388,243 @@ impl Controller {
         self.ring(0, 0);
         self.wait_for(500, |event| event.kind() == trb::COMMAND_COMPLETION && event.parameter == at)
     }
+
+    /// Run a command that must succeed, saying which did not.
+    fn must(&mut self, what: &str, trb: Trb) -> Option<Trb> {
+        match self.command(trb) {
+            Some(event) if event.code() == SUCCESS => Some(event),
+            Some(event) => {
+                println!("{what} failed: code {}", event.code());
+                None
+            }
+            None => {
+                println!("{what} was never answered");
+                None
+            }
+        }
+    }
+
+    fn portsc(&self, port: usize) -> u32 {
+        self.op32(PORTSC + 16 * port)
+    }
+
+    fn set_portsc(&self, port: usize, value: u32) {
+        self.set_op32(PORTSC + 16 * port, value)
+    }
+
+    /// Bring up port `port` (from 0) if something is plugged into it, and
+    /// say how fast it is. A USB 2 port is enabled by resetting it; a USB 3
+    /// port enables itself.
+    fn reset_port(&self, port: usize) -> Option<u32> {
+        let status = self.portsc(port);
+        if status & PORT_CONNECTED == 0 {
+            return None;
+        }
+        if status & PORT_ENABLED == 0 {
+            self.set_portsc(port, status & PORT_KEEP | PORT_RESET);
+            if !until(200, || self.portsc(port) & PORT_RESET_CHANGED != 0) {
+                println!("port {}: the reset never finished", port + 1);
+                return None;
+            }
+        }
+        let status = self.portsc(port);
+        self.set_portsc(port, status & PORT_KEEP | status & PORT_CHANGES);
+        (status & PORT_ENABLED != 0).then_some((status >> 10) & 0xf)
+    }
+
+    /// Write a device's control endpoint into its input context (6.2.3).
+    fn control_endpoint(&self, device: &Device) {
+        let at = 2 * self.context;
+        let input = device.page + page::INPUT;
+        // Three errors before giving up; a control endpoint (type 4).
+        self.pages.write32(input, at + 4, 3 << 1 | 4 << 3 | (device.max_packet as u32) << 16);
+        self.pages.write64(input, at + 8, device.control.start(&self.pages));
+        // Average TRB length: a setup packet's.
+        self.pages.write32(input, at + 16, 8);
+    }
+
+    /// Give the device on `port` a slot and an address (4.3), its pages
+    /// starting at `page`.
+    fn address(&mut self, port: usize, speed: u32, page: usize) -> Option<Device> {
+        let enabled = self.must("Enable Slot", Trb { control: trb::ENABLE_SLOT << 10, ..Trb::default() })?;
+        let slot = enabled.slot();
+        for offset in [page::INPUT, page::OUTPUT, page::BUFFERS] {
+            self.pages.zero(page + offset);
+        }
+        let device = Device {
+            slot,
+            page,
+            port,
+            speed,
+            control: Ring::new(&self.pages, page + page::CONTROL),
+            // Until the device says otherwise: the most a control endpoint
+            // may have at this speed, or the only size at low.
+            max_packet: match speed {
+                LOW_SPEED => 8,
+                HIGH_SPEED => 64,
+                SUPER_SPEED.. => 512,
+                _ => 64,
+            },
+        };
+        // The input context: add the slot context and endpoint 0's (6.2.5).
+        let input = page + page::INPUT;
+        self.pages.write32(input, 4, 0b11);
+        // One context entry; the speed; the root hub port, from 1.
+        self.pages.write32(input, self.context, speed << 20 | 1 << 27);
+        self.pages.write32(input, self.context + 4, ((port + 1) as u32) << 16);
+        self.control_endpoint(&device);
+        self.pages.write64(page::CONTEXTS, slot * 8, self.pages.physical(page + page::OUTPUT, 0));
+        self.must(
+            "Address Device",
+            Trb {
+                parameter: self.pages.physical(input, 0),
+                status: 0,
+                control: trb::ADDRESS_DEVICE << 10 | (slot as u32) << 24,
+            },
+        )?;
+        Some(device)
+    }
+
+    /// Make a control request (USB 2.0 9.3). What a device sends back is in
+    /// its buffer page from byte 0.
+    fn control(
+        &mut self,
+        device: &mut Device,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        length: u16,
+    ) -> Option<()> {
+        let setup = request_type as u64
+            | (request as u64) << 8
+            | (value as u64) << 16
+            | (index as u64) << 32
+            | (length as u64) << 48;
+        let reading = request_type & FROM_DEVICE != 0;
+        // The transfer type: no data stage, data out, data in.
+        let stages = match (length, reading) {
+            (0, _) => 0,
+            (_, false) => 2,
+            (_, true) => 3,
+        };
+        device.control.push(
+            &self.pages,
+            Trb { parameter: setup, status: 8, control: trb::SETUP << 10 | IMMEDIATE | stages << 16 },
+        );
+        if length > 0 {
+            device.control.push(
+                &self.pages,
+                Trb {
+                    parameter: self.pages.physical(device.page + page::BUFFERS, 0),
+                    status: length as u32,
+                    control: trb::DATA << 10 | (reading as u32) << 16,
+                },
+            );
+        }
+        // The status stage goes the other way from the data; in if none.
+        let status_in = length == 0 || !reading;
+        let at = device.control.push(
+            &self.pages,
+            Trb {
+                parameter: 0,
+                status: 0,
+                control: trb::STATUS << 10 | INTERRUPT_ON_COMPLETION | (status_in as u32) << 16,
+            },
+        );
+        self.ring(device.slot, 1);
+        let slot = device.slot;
+        let done = |code: u32| matches!(code, SUCCESS | SHORT_PACKET);
+        // The status stage's event, or the event of a stage that failed.
+        let event = self.wait_for(500, |event| {
+            event.kind() == trb::TRANSFER_EVENT && event.slot() == slot && (event.parameter == at || !done(event.code()))
+        });
+        match event {
+            Some(event) if event.parameter == at && done(event.code()) => Some(()),
+            Some(event) => {
+                println!("slot {slot}: request {request} failed: code {}", event.code());
+                None
+            }
+            None => {
+                println!("slot {slot}: request {request} was never answered");
+                None
+            }
+        }
+    }
+
+    /// The first `len` bytes of a device's buffer page.
+    fn read<const N: usize>(&self, device: &Device, len: usize) -> ([u8; N], usize) {
+        let mut bytes = [0; N];
+        let len = len.min(N);
+        for (offset, byte) in bytes[..len].iter_mut().enumerate() {
+            *byte = self.pages.read8(device.page + page::BUFFERS, offset);
+        }
+        (bytes, len)
+    }
+
+    /// Address the device on `port`, read its descriptors, and configure
+    /// it if it has a HID interface: what is needed to start reading its
+    /// reports.
+    fn enumerate(&mut self, port: usize, speed: u32, page: usize) -> Option<(Device, HidInterface)> {
+        let mut device = self.address(port, speed, page)?;
+        // The first eight bytes of the device descriptor say how large the
+        // control endpoint's packets really are (at super speed, as a power
+        // of two, and always 512).
+        self.control(&mut device, FROM_DEVICE, GET_DESCRIPTOR, DEVICE_DESCRIPTOR, 0, 8)?;
+        let (first, _) = self.read::<8>(&device, 8);
+        let max_packet = first[7] as u16;
+        if speed < SUPER_SPEED && max_packet >= 8 && max_packet != device.max_packet {
+            device.max_packet = max_packet;
+            let input = device.page + page::INPUT;
+            self.pages.write32(input, 0, 0);
+            self.pages.write32(input, 4, 0b10);
+            self.control_endpoint(&device);
+            self.must(
+                "Evaluate Context",
+                Trb {
+                    parameter: self.pages.physical(input, 0),
+                    status: 0,
+                    control: trb::EVALUATE_CONTEXT << 10 | (device.slot as u32) << 24,
+                },
+            )?;
+        }
+        self.control(&mut device, FROM_DEVICE, GET_DESCRIPTOR, DEVICE_DESCRIPTOR, 0, 18)?;
+        let (descriptor, _) = self.read::<18>(&device, 18);
+        let vendor = u16::from_le_bytes([descriptor[8], descriptor[9]]);
+        let product = u16::from_le_bytes([descriptor[10], descriptor[11]]);
+
+        // The configuration's first nine bytes say how long all of it is.
+        self.control(&mut device, FROM_DEVICE, GET_DESCRIPTOR, CONFIGURATION_DESCRIPTOR, 0, 9)?;
+        let (head, _) = self.read::<9>(&device, 9);
+        let total = (u16::from_le_bytes([head[2], head[3]]) as usize).clamp(9, MOST_CONFIG);
+        self.control(&mut device, FROM_DEVICE, GET_DESCRIPTOR, CONFIGURATION_DESCRIPTOR, 0, total as u16)?;
+        let (config, len) = self.read::<MOST_CONFIG>(&device, total);
+        let Some(hid) = find_hid(&config[..len]) else {
+            println!("port {}: {vendor:04x}:{product:04x}, not a keyboard or a pointer; left alone", port + 1);
+            return None;
+        };
+        self.control(&mut device, TO_DEVICE, SET_CONFIGURATION, hid.configuration as u16, 0, 0)?;
+        let what = match (hid.subclass, hid.protocol) {
+            (BOOT, KEYBOARD) => "a keyboard",
+            (BOOT, MOUSE) => "a mouse",
+            // What it is, its report descriptor says.
+            _ => "a HID device",
+        };
+        println!(
+            "port {}: {vendor:04x}:{product:04x} at {}, {what}: interface {}, endpoint {} in, {}-byte packets",
+            port + 1,
+            match speed {
+                LOW_SPEED => "low speed",
+                HIGH_SPEED => "high speed",
+                SUPER_SPEED.. => "super speed",
+                _ => "full speed",
+            },
+            hid.interface,
+            hid.endpoint,
+            hid.max_packet,
+        );
+        Some((device, hid))
+    }
 }
 
 /// Wait up to `ms` for `done` to say so.
@@ -387,6 +690,8 @@ fn bring_up(registers: Mmio) -> Result<Controller, &'static str> {
     let controller = Controller {
         registers,
         operational,
+        ports,
+        context: if wide_contexts { 64 } else { 32 },
         runtime,
         doorbells,
         pages,
@@ -450,7 +755,23 @@ fn main() {
         None => println!("a no-op command was never answered"),
     }
 
-    let _ = (EVENTS, trb::TRANSFER_EVENT, Trb::slot);
+    // Every port with something on it, until there are no more pages.
+    let mut found = 0;
+    for port in 0..controller.ports {
+        if found == MOST_DEVICES {
+            break;
+        }
+        let Some(speed) = controller.reset_port(port) else {
+            continue;
+        };
+        let page = page::DEVICES + found * page::PER_DEVICE;
+        if controller.enumerate(port, speed, page).is_some() {
+            found += 1;
+        }
+    }
+    println!("{found} USB input devices");
+
+    let _ = EVENTS;
     let irq = Interrupt(IRQ);
     loop {
         if irq.wait().is_err() {

@@ -2099,6 +2099,22 @@ context table, a command ring and a one-segment event ring, a page each
 Success. QEMU's controller: 64 slots, 8 ports, no scratchpads, 32-byte
 contexts.
 
+**Step 2: enumeration.** Every port with something on it is brought up
+(a USB 2 port by a reset, preserving the change bits; a USB 3 port enables
+itself), given a slot (Enable Slot) and an address (Address Device, with
+an input context of the slot and endpoint 0), and read: the first eight
+bytes of the device descriptor for endpoint 0's packet size (Evaluate
+Context if it differs from the speed's default), the whole device
+descriptor, then the configuration descriptor's head and all of it.
+`corrode_input::usb::find_hid` (host-tested, including broken and fuzzed
+descriptors) picks the first HID interface with an interrupt IN endpoint;
+SET_CONFIGURATION selects it. Each device gets five pages: input and
+output contexts, control and interrupt rings, buffers. On QEMU the
+keyboard (boot, protocol 1) and the tablet (report protocol) both come up
+at high speed on ports 5 and 6; `usb-test` checks both.
+
+- **Choice:** devices are found once, at start; a device plugged in later
+  is not (no hot-plug), and at most four are looked after (the pages).
 - **Choice:** the steps of this task are committed after `usb-test` and
   `input-test` on both GPUs and `./corrode test`; the whole suite runs
   before the last. Without `USB=1` the kernel says "no xHCI controller"

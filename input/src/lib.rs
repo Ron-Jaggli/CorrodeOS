@@ -17,6 +17,8 @@
 #[cfg(test)]
 mod tests;
 
+pub mod usb;
+
 /// A key, by where it is rather than what it says.
 ///
 /// The number is the key's scancode in set 1, which is what a controller

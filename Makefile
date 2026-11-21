@@ -997,6 +997,12 @@ usb-test: iso
 	@grep -aq "^xhci       : controller up: reset, rings set, a no-op command answered" build/serial.log \
 	    && echo "usb-test: the controller is up and takes commands     PASS" \
 	    || echo "usb-test: the controller is up and takes commands     FAIL"
+	@grep -aqE "^xhci       : port [0-9]+: .*, a keyboard: " build/serial.log \
+	    && echo "usb-test: the keyboard is addressed and configured    PASS" \
+	    || echo "usb-test: the keyboard is addressed and configured    FAIL"
+	@grep -aqE "^xhci       : port [0-9]+: .*, a HID device: " build/serial.log \
+	    && echo "usb-test: the tablet is addressed and configured      PASS" \
+	    || echo "usb-test: the tablet is addressed and configured      FAIL"
 	@test -s build/usb.ppm && pnmtopng build/usb.ppm > build/usb.png 2>/dev/null && rm -f build/usb.ppm && echo "wrote build/usb.png" || true
 
 # Open Settings from the dock and change the look three times while it runs:
