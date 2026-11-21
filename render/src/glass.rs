@@ -389,38 +389,15 @@ pub fn tint(rgb: [u32; 3], glass: &Glass) -> [u32; 3] {
     [0, 1, 2].map(|i| (colour[i] * amount + rgb[i] * (255 - amount)) / 255)
 }
 
-/// The widest box [`box_blur`] takes: red and blue are summed together in
-/// one word, sixteen bits each, which holds `255 * (2 * radius + 1)`.
+/// The widest box [`box_blur`] takes: a sum of `2 * radius + 1` bytes has
+/// to fit in sixteen bits, and `255 * 257` is the most that does.
 pub const MAX_BLUR_RADIUS: usize = 128;
 
 /// How much `line` [`box_blur`] needs, for an image `width` by `height`
 /// blurred at up to `radius`.
-pub fn blur_scratch(width: usize, height: usize, radius: usize) -> usize {
+pub fn blur_scratch(width: usize, _height: usize, radius: usize) -> usize {
     let radius = radius.min(MAX_BLUR_RADIUS);
-    width.max(height) + (radius + 1) * width + 2 * width
-}
-
-/// `n / d` for the sums a box makes, by multiplying: `reciprocal(d)` once,
-/// then `divide(n, that)`. Exact for every `n` up to `255 * d`, as
-/// `n * (m * d - 2^32) < 2^32` there, with `m * d - 2^32 < d`.
-fn reciprocal(d: u32) -> u64 {
-    (1u64 << 32).div_ceil(d as u64)
-}
-
-fn divide(n: u32, reciprocal: u64) -> u32 {
-    ((n as u64 * reciprocal) >> 32) as u32
-}
-
-/// Red and blue of a pixel, apart enough to add up in one word; green.
-fn split(pixel: u32) -> (u32, u32) {
-    (pixel & 0x00ff_00ff, (pixel >> 8) & 0xff)
-}
-
-/// A pixel from the sums of `span` of them.
-fn mean((red_blue, green): (u32, u32), reciprocal: u64) -> u32 {
-    divide(red_blue >> 16, reciprocal) << 16
-        | divide(green, reciprocal) << 8
-        | divide(red_blue & 0xffff, reciprocal)
+    2 * (width + 2 * radius + 1) + (radius + 1) * width + 2 * width
 }
 
 /// Box-blur `pixels`, `width` by `height` of `0x00RRGGBB`, in place:
@@ -429,25 +406,169 @@ fn mean((red_blue, green): (u32, u32), reciprocal: u64) -> u32 {
 /// least [`blur_scratch`] long. A radius over [`MAX_BLUR_RADIUS`] is taken
 /// as that.
 ///
+/// Rows are done two at a time, from copies with their edges repeated, so
+/// the running sum never has to look past either end.
+///
 /// Down the columns is done a row at a time, with a running sum for every
 /// column, so memory is read in order rather than a pixel a row apart. A
 /// row is written before the rows above it are done with, so the last
 /// `radius + 1` rows are kept as they were, in a ring.
+///
+/// On x86_64 both are SSE2 (see [`crate::sse`]), four channels to a sum;
+/// elsewhere, [`box_blur_scalar`].
+#[cfg(target_arch = "x86_64")]
 pub fn box_blur(pixels: &mut [u32], width: usize, height: usize, radius: usize, line: &mut [u32]) {
+    use crate::sse;
+
+    let radius = radius.min(MAX_BLUR_RADIUS);
+    if radius == 0 || width == 0 || height == 0 {
+        return;
+    }
+    let span = 2 * radius + 1;
+    let divisor = sse::Divisor::new(span as u32);
+    let (padded, rest) = line.split_at_mut(2 * (width + span));
+    let (ring, rest) = rest.split_at_mut((radius + 1) * width);
+    let sums = &mut rest[..2 * width];
+    assert!(pixels.len() >= width * height);
+
+    let (first, second) = padded.split_at_mut(width + span);
+    for y in (0..height).step_by(2) {
+        let pair = (y + 1).min(height - 1);
+        repeat_edges(&pixels[y * width..(y + 1) * width], radius, first);
+        repeat_edges(&pixels[pair * width..(pair + 1) * width], radius, second);
+        // SAFETY: both copies are `width + span` long, and rows `y` and
+        // `pair` are inside `pixels`.
+        unsafe {
+            let out = pixels.as_mut_ptr();
+            sse::rows(
+                first.as_ptr(),
+                second.as_ptr(),
+                out.add(y * width),
+                out.add(pair * width),
+                width,
+                span,
+                divisor,
+            );
+        }
+    }
+
+    // Four lanes a pixel: blue, green, red and the unused top byte. The
+    // last `width % 4` pixels are done here, the rest in groups of four.
+    // SAFETY: `sums` is `2 * width` words, which is `4 * width` lanes, and
+    // a u32's alignment is enough for a u16.
+    let lanes = unsafe { core::slice::from_raw_parts_mut(sums.as_mut_ptr().cast::<u16>(), 4 * width) };
+    let groups = width / 4;
+    let tail = 4 * groups;
+    let add = |lanes: &mut [u16], pixel: u32, sign: u16| {
+        for (c, lane) in lanes.iter_mut().enumerate() {
+            *lane = lane.wrapping_add(((pixel >> (8 * c)) as u16 & 0xff).wrapping_mul(sign));
+        }
+    };
+
+    let row_at = |y: isize| y.clamp(0, height as isize - 1) as usize * width;
+    lanes.fill(0);
+    for y in -(radius as isize)..=radius as isize {
+        let from = row_at(y);
+        // SAFETY: a row of `width` pixels, and `4 * width` lanes.
+        unsafe { sse::add_row(lanes.as_mut_ptr(), pixels[from..].as_ptr(), groups) };
+        for x in tail..width {
+            add(&mut lanes[4 * x..4 * x + 4], pixels[from + x], 1);
+        }
+    }
+    for y in 0..height {
+        let slot = (y % (radius + 1)) * width;
+        let at = y * width;
+        ring[slot..slot + width].copy_from_slice(&pixels[at..at + width]);
+        // SAFETY: as above.
+        unsafe { sse::mean_row(lanes.as_ptr(), pixels[at..].as_mut_ptr(), groups, divisor) };
+        for x in tail..width {
+            let lane = |c: usize| (lanes[4 * x + c] as u32 / span as u32) << (8 * c);
+            pixels[at + x] = lane(2) | lane(1) | lane(0);
+        }
+        if y + 1 == height {
+            break;
+        }
+        // In: the row `radius + 1` below, not yet written. Out: the row
+        // `radius` above, as it was, from the ring.
+        let incoming = row_at(y as isize + radius as isize + 1);
+        let leaving = (y.saturating_sub(radius) % (radius + 1)) * width;
+        // SAFETY: as above, and the ring's slots are `width` long.
+        unsafe {
+            sse::step_row(
+                lanes.as_mut_ptr(),
+                pixels[incoming..].as_ptr(),
+                ring[leaving..].as_ptr(),
+                groups,
+            )
+        };
+        for x in tail..width {
+            add(&mut lanes[4 * x..4 * x + 4], pixels[incoming + x], 1);
+            add(&mut lanes[4 * x..4 * x + 4], ring[leaving + x], u16::MAX);
+        }
+    }
+}
+
+/// `row` into `out` with `radius` copies of its first pixel before it and
+/// `radius + 1` of its last after.
+#[cfg(target_arch = "x86_64")]
+fn repeat_edges(row: &[u32], radius: usize, out: &mut [u32]) {
+    let (before, rest) = out.split_at_mut(radius);
+    let (middle, after) = rest.split_at_mut(row.len());
+    before.fill(row[0]);
+    middle.copy_from_slice(row);
+    after[..radius + 1].fill(row[row.len() - 1]);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn box_blur(pixels: &mut [u32], width: usize, height: usize, radius: usize, line: &mut [u32]) {
+    box_blur_scalar(pixels, width, height, radius, line)
+}
+
+/// `n / d` for the sums a box makes, by multiplying: `reciprocal(d)` once,
+/// then `divide(n, that)`. Exact for every `n` up to `255 * d`, as
+/// `n * (m * d - 2^32) < 2^32` there, with `m * d - 2^32 < d`.
+#[cfg(any(test, not(target_arch = "x86_64")))]
+fn reciprocal(d: u32) -> u64 {
+    (1u64 << 32).div_ceil(d as u64)
+}
+
+#[cfg(any(test, not(target_arch = "x86_64")))]
+fn divide(n: u32, reciprocal: u64) -> u32 {
+    ((n as u64 * reciprocal) >> 32) as u32
+}
+
+/// Red and blue of a pixel, apart enough to add up in one word; green.
+#[cfg(any(test, not(target_arch = "x86_64")))]
+fn split(pixel: u32) -> (u32, u32) {
+    (pixel & 0x00ff_00ff, (pixel >> 8) & 0xff)
+}
+
+/// A pixel from the sums of `span` of them.
+#[cfg(any(test, not(target_arch = "x86_64")))]
+fn mean((red_blue, green): (u32, u32), reciprocal: u64) -> u32 {
+    divide(red_blue >> 16, reciprocal) << 16
+        | divide(green, reciprocal) << 8
+        | divide(red_blue & 0xffff, reciprocal)
+}
+
+/// [`box_blur`] without SSE: red and blue summed together in one word,
+/// green in another, a pixel at a time.
+#[cfg(any(test, not(target_arch = "x86_64")))]
+pub fn box_blur_scalar(pixels: &mut [u32], width: usize, height: usize, radius: usize, line: &mut [u32]) {
     let radius = radius.min(MAX_BLUR_RADIUS);
     if radius == 0 || width == 0 || height == 0 {
         return;
     }
     let inverse = reciprocal(2 * radius as u32 + 1);
-    let (row_copy, rest) = line.split_at_mut(width.max(height));
+    let (row_copy, rest) = line.split_at_mut(width);
     let (ring, rest) = rest.split_at_mut((radius + 1) * width);
     let (red_blue, rest) = rest.split_at_mut(width);
     let green = &mut rest[..width];
 
     for y in 0..height {
         let row = &mut pixels[y * width..(y + 1) * width];
-        row_copy[..width].copy_from_slice(row);
-        blur_line(&row_copy[..width], radius, inverse, row);
+        row_copy.copy_from_slice(row);
+        blur_line(row_copy, radius, inverse, row);
     }
 
     let row_at = |y: isize| y.clamp(0, height as isize - 1) as usize * width;
@@ -471,8 +592,6 @@ pub fn box_blur(pixels: &mut [u32], width: usize, height: usize, radius: usize, 
         if y + 1 == height {
             break;
         }
-        // In: the row `radius + 1` below, not yet written. Out: the row
-        // `radius` above, as it was, from the ring.
         let incoming = row_at(y as isize + radius as isize + 1);
         let leaving = (y.saturating_sub(radius) % (radius + 1)) * width;
         for x in 0..width {
@@ -484,6 +603,7 @@ pub fn box_blur(pixels: &mut [u32], width: usize, height: usize, radius: usize, 
     }
 }
 
+#[cfg(any(test, not(target_arch = "x86_64")))]
 fn blur_line(line: &[u32], radius: usize, inverse: u64, out: &mut [u32]) {
     let last = line.len() as isize - 1;
     let at = |i: isize| line[i.clamp(0, last) as usize];
@@ -568,15 +688,22 @@ mod tests {
             seed ^= seed << 5;
             seed & 0x00ff_ffff
         };
-        for (width, height) in [(1, 1), (1, 9), (9, 1), (37, 23), (23, 37), (64, 3)] {
-            let image: Vec<u32> = (0..width * height).map(|_| noise()).collect();
+        for (width, height) in [(1, 1), (1, 9), (9, 1), (4, 4), (37, 23), (23, 37), (64, 3), (66, 5)] {
+            // Every third pixel has its unused top byte set, which neither
+            // blur may let into its sums' output.
+            let image: Vec<u32> = (0..width * height)
+                .map(|i| noise() | if i % 3 == 0 { 0xff00_0000 } else { 0 })
+                .collect();
             for radius in [1, 2, 3, 7, 10, 40, MAX_BLUR_RADIUS] {
                 let mut fast = image.clone();
                 let mut line = vec![0u32; blur_scratch(width, height, radius)];
                 box_blur(&mut fast, width, height, radius, &mut line);
+                let mut scalar = image.clone();
+                box_blur_scalar(&mut scalar, width, height, radius, &mut line);
                 let mut plain = image.clone();
                 box_blur_reference(&mut plain, width, height, radius);
                 assert_eq!(fast, plain, "{width}x{height}, radius {radius}");
+                assert_eq!(scalar, plain, "scalar, {width}x{height}, radius {radius}");
             }
         }
         // Every divisor a box makes, at every sum it can reach.
@@ -584,6 +711,15 @@ mod tests {
             let inverse = reciprocal(span);
             for n in 0..=255 * span {
                 assert_eq!(divide(n, inverse), n / span, "{n} / {span}");
+            }
+        }
+        // And the SSE lanes' way, for every span a box makes, at every
+        // sixteen-bit sum.
+        #[cfg(target_arch = "x86_64")]
+        for span in (3..=2 * MAX_BLUR_RADIUS as u32 + 1).step_by(2) {
+            let divisor = crate::sse::Divisor::new(span);
+            for n in 0..=u16::MAX {
+                assert_eq!(divisor.divide(n) as u32, n as u32 / span, "{n} / {span}");
             }
         }
     }

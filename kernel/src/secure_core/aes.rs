@@ -5,7 +5,9 @@
 //!
 //! * The kernel is built soft-float. The compiler never allocates an XMM
 //!   register, and the trap stubs save general-purpose registers only, so no
-//!   context switch or interrupt frame ever writes `xmm15` to memory.
+//!   interrupt frame ever writes `xmm15` to memory. Task switches do save
+//!   XMM registers (`arch::x86_64::fpu`), but only on general CPUs: the
+//!   secure core is never given a task, so it never switches.
 //! * Nothing else runs on the secure core, so nothing else executes an SSE
 //!   instruction there either. (The firmware calls in `efi_log` do, on the
 //!   CPU that makes them. The one way that could be this CPU is its own panic

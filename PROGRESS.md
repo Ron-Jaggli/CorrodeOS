@@ -44,8 +44,8 @@ The short version, for reading first. The numbered log below has the detail.
     out, not someone holding the disk.
 - **Speed:** frame timing is in (`./corrode perf-test`). Frosted glass
   is most of a frame's cost; dragging a window now takes about 6.5 ms a
-  frame, down from 33 (47, 48, 49, 60, 61). The likely next big lever, the
-  kernel's disabled SSE, is yours to decide (49).
+  frame, down from 33 (47, 48, 49, 60, 61), and 4.6–5.4 ms since the
+  blur went SSE2 (64).
 - **Security:** calls that act on other apps need the shell capability,
   held only by Settings, Control Center and the menu (46). The desktop's
   own window titles belong to its own programs, so no app can post a
@@ -1640,3 +1640,72 @@ This part, host-tested only:
   moment. The old fade-and-rise had it too.
 - Full suite PASSes on both GPUs (96 lines); input-test 172 / 0 and
   179 / 0; `./corrode test` passes.
+
+## 64. SSE in the kernel, and an SSE2 blur
+
+- The question left open in section 49, done the way that keeps the
+  secure core's promise. Corrode's target is soft-float, and this rustc
+  will not change that: `#[target_feature(enable = "sse2")]` and
+  `-C target-feature=+sse2` both produce no XMM instructions at all, and
+  `-soft-float` is deprecated and breaks the ABI against the shipped
+  `core`. A hard-float custom target would need nightly `build-std` and
+  would let compiled code use XMM anywhere, including on the secure core,
+  where `xmm15` holds the key.
+- **Choice:** so SSE is used only inside whole `asm!` blocks, the way the
+  secure core already uses AES-NI. Each block makes no call and keeps
+  nothing in XMM past its end, and none runs in an interrupt handler.
+  The one place a task's XMM state can be disturbed is then a task
+  switch, so:
+  - every general CPU turns SSE on before its first task (`kmain`, and
+    `ap_main` after the secure core and parked CPUs have left);
+  - each task has a 512-byte `fxsave` image (`arch/x86_64/fpu.rs`),
+    saved and loaded by `task::on_tick` on every switch. Eagerly, not
+    lazily, so no task's registers are ever live while another runs
+    (CVE-2018-3665);
+  - the secure core never switches tasks, so its `xmm15` is still never
+    written to memory. `secure_core/aes.rs` says why.
+- `render/src/sse.rs`: the box blur in SSE2. A pixel's four bytes are
+  four 16-bit lanes; the widest box sums 257 bytes, and `255 * 257`
+  fills a lane exactly. Rows go two at a time from copies with their
+  edges repeated; columns four at a time. Division is Granlund and
+  Montgomery's multiply-and-shift, exact for every 16-bit sum. On a host
+  build the blocks name the XMM registers they use (`#[cfg]` on asm
+  operands); a soft-float build has none to name. Other architectures
+  keep the scalar blur.
+- Tests: the SSE blur, the scalar one and the original reference agree
+  on every shape and radius, with the unused top byte set on every third
+  pixel; the lanes' division is checked against `n / span` for every
+  span and every 16-bit `n`.
+- Results:
+  - In the kernel, one 320x60 radius-12 blur: 102 us scalar, 36 us SSE,
+    the same pixels (a temporary boot benchmark, not kept).
+  - perf-test, draw ms a frame, two runs, against section 62's numbers
+    (a same-session run of the old build was too noisy to use):
+
+    | Scene                         | 62        | 64          |
+    |-------------------------------|-----------|-------------|
+    | Dragging, Regular glass       | 5.8–7.1   | 4.6–5.4     |
+    | Control Center open, Regular  | 14.4      | 10.1–11.2   |
+    | Dragging, Clear (no blur)     | 2.6       | 2.5         |
+    | Dragging, glass Off           | 2.2       | 2.0         |
+
+- All 48 scored boot-test checks PASS on both GPUs; boot self-checks
+  172 / 0 (default) and 179 / 0 (virtio), each logging
+  "sse : on (saved per task)". `./corrode test` passes. Clippy is clean
+  on the new code; its existing complaints elsewhere are untouched.
+
+## Loop state
+
+Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
+2026-11-22T06:03-06:00). One task a pass; stop rules are in the /loop prompt.
+
+1. [x] Finish SSE (branch `sse`) -- section 64
+2. [ ] Passcode as a salted hash (`passcode-hash`)
+3. [ ] Secure-core capability, groundwork only (`secure-cap`)
+4. [ ] SSE for the glass lens (`sse-glass`)
+5. [ ] SSE for the 2x2 backdrop downscale (`sse-downscale`)
+6. [ ] Raise the 16-surface cap (`more-surfaces`)
+7. [ ] Fix the fading-window rim from section 63 (`fade-rim`)
+8. [ ] SSE for image / alpha-blend compositing (`sse-blend`)
+9. [ ] xHCI + USB HID keyboard and mouse, QEMU only (`xhci`)
+10. [ ] Write-up: surviving-reboot key options, results table

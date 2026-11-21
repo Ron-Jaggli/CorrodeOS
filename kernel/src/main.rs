@@ -118,6 +118,11 @@ pub extern "C" fn kmain() -> ! {
     // Prove the trap path round-trips before trusting it with a real fault.
     x86_64::breakpoint();
 
+    // Before the first task: every switch saves and loads SSE state.
+    // SAFETY: ring 0; nothing on this CPU relies on SSE being off.
+    unsafe { x86_64::enable_sse() };
+    println!("sse        : on (saved per task)");
+
     report_memory();
     init_frames();
     init_paging();

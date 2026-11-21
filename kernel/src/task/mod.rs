@@ -18,10 +18,11 @@
 pub mod stack;
 pub mod user;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
-use crate::arch::x86_64::{self, cpu, cpu::MAX_CPUS, gdt, idt::TrapFrame, vectors};
+use crate::arch::x86_64::{self, cpu, cpu::MAX_CPUS, fpu::FpuState, gdt, idt::TrapFrame, vectors};
 use crate::cap::CSpace;
 use crate::sync::SpinLock;
 
@@ -51,6 +52,9 @@ pub struct Task {
     pub state: State,
     /// Stack pointer at which this task's `TrapFrame` sits while suspended.
     saved_rsp: u64,
+    /// Its x87 and SSE registers while suspended. Boxed so the image stays
+    /// put, and aligned, as the task list grows.
+    fpu: Box<FpuState>,
     /// How many times this task has been scheduled in.
     pub switches: u64,
     /// Everything this task is allowed to touch. A task with an empty cspace
@@ -182,6 +186,7 @@ pub fn init() {
             cpu: 0,
             is_idle: false,
             saved_rsp: 0,
+            fpu: Box::new(FpuState::INITIAL),
             switches: 1,
             cspace: CSpace::new(CSPACE_SLOTS),
             pending_in: None,
@@ -248,6 +253,7 @@ pub fn adopt_as_idle(cpu_index: usize, stack_top: u64) {
             is_idle: true,
             // Filled in by this CPU's first tick, exactly like task 0's.
             saved_rsp: 0,
+            fpu: Box::new(FpuState::INITIAL),
             switches: 1,
             cspace: CSpace::new(CSPACE_SLOTS),
             pending_in: None,
@@ -446,6 +452,7 @@ fn spawn_inner(
             cpu: cpu_index.min(MAX_CPUS - 1),
             is_idle: false,
             saved_rsp: frame_addr,
+            fpu: Box::new(FpuState::INITIAL),
             switches: 0,
             // Deliberately empty. A new task starts with no authority at all;
             // whatever it can do, its parent had to hand it explicitly.
@@ -650,6 +657,12 @@ pub fn on_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
     scheduler.current[this_cpu] = next;
     if next != current {
         scheduler.tasks[next].switches += 1;
+        // Nothing since the trap has touched an XMM register, so the CPU
+        // still holds the outgoing task's.
+        let (from, to) = pair_mut(&mut scheduler.tasks, current, next);
+        // SAFETY: every general CPU enables SSE before its first task, and
+        // each image is INITIAL or one `fxsave` wrote.
+        unsafe { x86_64::fpu::switch(&mut from.fpu, &to.fpu) };
     }
     scheduler.tasks[next].state = State::Running;
 
@@ -684,6 +697,17 @@ pub fn on_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
     }
 
     scheduler.tasks[next].saved_rsp as *mut TrapFrame
+}
+
+/// Two different tasks, one to change and one to read.
+fn pair_mut(tasks: &mut [Task], a: usize, b: usize) -> (&mut Task, &Task) {
+    if a < b {
+        let (low, high) = tasks.split_at_mut(b);
+        (&mut low[a], &high[0])
+    } else {
+        let (low, high) = tasks.split_at_mut(a);
+        (&mut high[0], &low[b])
+    }
 }
 
 /// Copy out task status without allocating or holding the lock afterwards.

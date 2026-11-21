@@ -322,7 +322,8 @@ unsafe fn save() -> Result<usize, Failure> {
     unsafe {
         let previous = read_cr3();
         // UEFI promises the firmware SSE. Nothing of the kernel's lives in
-        // those registers on this CPU for it to clobber.
+        // those registers on this CPU for it to clobber: the renderer's SSE
+        // stays inside asm blocks, and none of them calls in here.
         x86_64::enable_sse();
         paging::activate_root(space.root);
         call_on_stack(space.stack_top, session_main, &mut session);

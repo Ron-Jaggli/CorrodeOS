@@ -30,6 +30,8 @@ pub mod damage;
 pub mod glass;
 pub mod scene;
 pub mod software;
+#[cfg(target_arch = "x86_64")]
+pub mod sse;
 pub mod wire;
 
 /// How pixels are packed in a surface's memory.
