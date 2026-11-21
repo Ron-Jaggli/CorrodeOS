@@ -2145,6 +2145,15 @@ command (build/usb.png).
   driver holding the endpoint's send half can use it, as before.
 - **Choice:** the tablet test is driven over QMP; the human monitor's
   `mouse_move` cannot reach an absolute device.
+
+**Result.** Four commits on `xhci` (92b3642 reset and rings, 99b1b9f
+enumeration, 293d99d keyboard, 5f2de54 pointer). The whole suite on both
+GPUs: 60 checks PASS on each (54 before, plus `usb-test`'s six), none
+FAIL, boot self-checks 181/188 with none failing and no unhandled trap;
+`./corrode test` 315 passed; clippy unchanged at 33. The committed tree
+(without the uncommitted kernel/src/input.rs change) builds on its own.
+No perf-test: nothing on a drawing path changed, and without `USB=1` the
+kernel only logs "no xHCI controller".
 - **Choice:** devices are found once, at start; a device plugged in later
   is not (no hot-plug), and at most four are looked after (the pages).
 - **Choice:** the steps of this task are committed after `usb-test` and
@@ -2171,7 +2180,7 @@ copied below so a later pass can read them here.
 6. [x] (section 69) Raise the 16-surface cap (SURFACES) and what in the kernel and virtio driver assumes it; boot test opening >15 windows and closing them, both GPUs (`more-surfaces`)
 7. [x] (section 70) Fix section 63's gap: fading windows show the frame's lower rim through their body; screenshot-based boot check (`fade-rim`)
 8. [x] (section 71) SSE for image / alpha-blend compositing (render/src/blend.rs, Image/ScaledImage); pixel-exact; perf-test (`sse-blend`)
-9. [ ] xHCI driver in ring 3, USB HID boot keyboard + mouse into the input path; QEMU only (qemu-xhci, usb-kbd, usb-tablet), never real host USB; boot tests typing and clicking via USB on both GPUs; commit in sub-steps (reset+rings, enumeration, keyboard, mouse) (`xhci`)
+9. [x] (section 72) xHCI driver in ring 3, USB HID boot keyboard + mouse into the input path; QEMU only (qemu-xhci, usb-kbd, usb-tablet), never real host USB; boot tests typing and clicking via USB on both GPUs; commit in sub-steps (reset+rings, enumeration, keyboard, mouse) (`xhci`)
 10. [ ] Verdigris design: verdigris/DESIGN.md -- a Windows compatibility layer native to CorrodeOS, not a Proton fork (no Linux syscalls, no POSIX, no Vulkan): PE/COFF loader on the spawn_program model; minimal ntdll/kernel32 (memory, threads, files through a capability, time); user32/gdi32 onto the window server and corrode-render command lists; reusing Wine's Windows-side DLLs behind a Corrode backend, incl. LGPL vs MPL-2.0; what Direct3D needs from a future GPU backend (out of scope). No code. (`verdigris` off `xhci`)
     - **User's requirement for Verdigris files (2026-11-21, ~10:00):** no
       Proton/Wine-style prefix and no hidden filesystem of its own. A
