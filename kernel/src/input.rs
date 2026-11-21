@@ -554,7 +554,8 @@ impl Shortcut {
 /// frame is only the title bar and one corner's radius more: enough to
 /// reach under the body's square top edge, whose own rounding is only at
 /// the bottom. A translucent body, or a window without a bar, shows the
-/// glass through, so has all of it.
+/// glass through, so has all of it; and so does any window while it fades
+/// (see [`Managed::fade_frame`]).
 fn frame_height(body: u32, bar: u32, translucent: bool, radius: u32) -> u32 {
     if translucent || bar == 0 {
         body + bar
@@ -602,6 +603,9 @@ struct Managed {
     /// back to.
     unzoomed: Option<((i32, i32), (u32, u32))>,
     body: LayerId,
+    /// When the fade it is in ends, if it is in one: until then its frame
+    /// is the whole window's height.
+    fade_until: Option<u64>,
 }
 
 /// What part of a window a layer is.
@@ -615,6 +619,27 @@ enum Part {
 }
 
 impl Managed {
+    /// How tall its frame is now: see [`frame_height`].
+    fn frame_rows(&self, radius: u32) -> u32 {
+        let whole = self.fade_until.is_some() || crate::windows::translucent(self.window);
+        frame_height(self.height, self.bar(), whole, radius)
+    }
+
+    /// Its frame the whole window's height until `until`, for a fade. A
+    /// frame only a radius deeper than the bar ends under the body, and a
+    /// body less than opaque shows that edge through it: a line under the
+    /// title bar. The desk trims the frame back once the fade is over.
+    fn fade_frame<const N: usize>(&mut self, scene: &mut Scene<N>, until: u64) {
+        self.fade_until = Some(until);
+        let whole = frame_height(self.height, self.bar(), true, 0) as i32;
+        if let Some(layer) = self.frame.and_then(|id| scene.layer_mut(id)) {
+            // Already growing to it, as it does while it zooms in: left be.
+            if layer.height.target().round() != whole {
+                layer.height = Animation::rest(Fx::from_int(whole));
+            }
+        }
+    }
+
     fn bar(&self) -> u32 {
         if self.docked || self.popover || self.cover {
             0
@@ -1349,7 +1374,9 @@ impl Desk {
                 scene.add(Layer::shadow(0, 0, width, height + bar, radius, SHADOW_BLUR))
             })
             .flatten();
-        let frame_height = frame_height(height, if chrome { BAR } else { 0 }, translucent, radius as u32);
+        // A window fades in as it opens, all of its frame there meanwhile.
+        let fades_in = chrome && theme.ms(250) > 0;
+        let frame_height = frame_height(height, if chrome { BAR } else { 0 }, translucent || fades_in, radius as u32);
         let frame = scene.add(pane(Rect::new(0, 0, width, frame_height), radius, &theme));
         let mut lights = [None; 3];
         if chrome && self.stencils {
@@ -1412,6 +1439,7 @@ impl Desk {
             minimized: false,
             unzoomed: None,
             body,
+            fade_until: fades_in.then(|| now + theme.ms(250) as u64 * 1_000_000),
         };
         let rise = theme.ms(250);
         // A window zooms in from a little smaller, about its own middle, as
@@ -1921,6 +1949,18 @@ impl Desk {
             self.closed.push(fading.surface);
         }
         self.fading = kept;
+        // Frames given all of a window for a fade, back to the bar and a
+        // radius once it is over.
+        let radius = self.theme.radius as u32;
+        for managed in &mut self.windows {
+            if managed.fade_until.is_some_and(|until| now >= until) {
+                managed.fade_until = None;
+                let rows = managed.frame_rows(if managed.docked { 0 } else { radius });
+                if let Some(layer) = managed.frame.and_then(|id| scene.layer_mut(id)) {
+                    layer.height = Animation::rest(Fx::from_int(rows as i32));
+                }
+            }
+        }
 
         let mut index = 0;
         while index < self.windows.len() {
@@ -1928,11 +1968,12 @@ impl Desk {
                 index += 1;
                 continue;
             }
-            let managed = self.windows.remove(index);
+            let mut managed = self.windows.remove(index);
             // A window fades out where it was; a docked one just goes.
             let ms = if managed.docked { 0 } else { self.theme.ms(CLOSING_MS) };
             let layers: Vec<LayerId> = managed.layers().collect();
             if ms > 0 {
+                managed.fade_frame(scene, now + ms as u64 * 1_000_000);
                 for id in &layers {
                     if let Some(layer) = scene.layer_mut(*id) {
                         let from = layer.opacity.sample(now).value;
@@ -2329,6 +2370,9 @@ impl Desk {
         println!("desktop    : window {} minimized", managed.window);
         let drop = scene.screen().height as i32;
         let ms = self.theme.ms(280);
+        if ms > 0 {
+            managed.fade_frame(scene, now + ms as u64 * 1_000_000);
+        }
         let ids: Vec<(LayerId, (i32, i32))> = managed.places(managed.at, self.theme.buttons);
         for (id, (_, y)) in ids {
             if let Some(layer) = scene.layer_mut(id) {
@@ -2363,6 +2407,9 @@ impl Desk {
             managed.minimized = false;
             println!("desktop    : window {} restored", managed.window);
             let ms = self.theme.ms(250);
+            if ms > 0 {
+                managed.fade_frame(scene, now + ms as u64 * 1_000_000);
+            }
             for (id, (_, y)) in managed.places(managed.at, self.theme.buttons) {
                 if let Some(layer) = scene.layer_mut(id) {
                     if ms == 0 {
@@ -2590,12 +2637,7 @@ impl Desk {
             (
                 managed.frame,
                 width,
-                frame_height(
-                    height,
-                    managed.bar(),
-                    crate::windows::translucent(managed.window),
-                    self.theme.radius as u32,
-                ),
+                managed.frame_rows(self.theme.radius as u32),
             ),
             (Some(managed.body), width, height),
         ];
@@ -2648,12 +2690,7 @@ impl Desk {
             crate::windows::push(managed.window, window::THEME, theme.to_words());
             let radius = if managed.docked { 0 } else { theme.radius as u16 };
             let width = managed.width;
-            let height = frame_height(
-                managed.height,
-                managed.bar(),
-                crate::windows::translucent(managed.window),
-                radius as u32,
-            );
+            let height = managed.frame_rows(radius as u32);
             if let Some(id) = managed.frame {
                 let fresh = pane(Rect::new(0, 0, width, height), radius, &theme);
                 if let Some(layer) = scene.layer_mut(id) {

@@ -67,7 +67,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test grow-test zoom-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test fade-test grow-test zoom-test
 .PHONY: all kernel user iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -551,6 +551,49 @@ zoom-test: iso
 	    || echo "zoom-test: the terminal zoomed in as it opened        FAIL"
 	@test -s build/zoom-in.ppm && pnmtopng build/zoom-in.ppm > build/zoom-in.png 2>/dev/null && rm -f build/zoom-in.ppm || true
 	@test -s build/zoom.ppm && pnmtopng build/zoom.ppm > build/zoom.png 2>/dev/null && rm -f build/zoom.ppm && echo "wrote build/zoom.png" || true
+
+# A window fading shows no line under its title bar. The frame behind a
+# titled window is the bar and one corner's radius more, reaching under
+# the top of the body; a body half faded would show that edge through it.
+# A copy of the ISO with animations at a twentieth of their speed
+# (build/fade.iso), so the fades are seconds long: a terminal from the
+# dock, a screenshot as it zooms in (build/fade-open.png, by eye), and
+# once it has settled one as Alt+Q fades it out (build/fade.png), where
+# it is still: the first window is at (120, 90). scripts/rim.sh measures
+# the steepest step down the body's margin under the bar; an edge there
+# is tens of levels, smooth is a few.
+FADE_ISO := build/fade.iso
+RIM_MOST ?= 6
+fade-test: iso
+	@rm -rf build/fade_root build/fade_iso_root $(FADE_ISO) build/fade*.ppm build/fade*.png
+	@cp -r root build/fade_root && printf '\nanimation_speed = 5\n' >> build/fade_root/etc/desktop.conf
+	@cp -r $(ISO_ROOT) build/fade_iso_root
+	@tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
+	    --mtime=@0 --mode=u+rw,go+r,go-w -C build/fade_root -cf build/fade_iso_root/boot/files/root.tar .
+	@xorriso -as mkisofs -quiet -R -r -J \
+	    -b boot/limine/limine-bios-cd.bin \
+	    -no-emul-boot -boot-load-size 4 -boot-info-table \
+	    --efi-boot boot/limine/limine-uefi-cd.bin \
+	    -efi-boot-part --efi-boot-image \
+	    --protective-msdos-label \
+	    build/fade_iso_root -o $(FADE_ISO) && $(LIMINE_DIR)/limine bios-install $(FADE_ISO) > /dev/null
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 0.35; \
+	   echo "screendump build/fade-open.ppm"; sleep 8; \
+	   echo "screendump build/fade-settled.ppm"; sleep 1; \
+	   echo "sendkey alt-q"; sleep 0.8; \
+	   echo "screendump build/fade.ppm"; sleep 5; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(subst $(ISO),$(FADE_ISO),$(QEMU_COMMON)) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -q "^theme      : read /etc/desktop.conf" build/serial.log || echo "fade-test: the slowed desktop.conf was not read"
+	@echo "fade-test: steepest step settled $$(scripts/rim.sh build/fade-settled.ppm 120 90), fading $$(scripts/rim.sh build/fade.ppm 120 90) (most $(RIM_MOST))"
+	@grep -aq "desktop    : window .* closed" build/serial.log \
+	    && [ "$$(scripts/rim.sh build/fade.ppm 120 90 | cut -d' ' -f1 | cut -d. -f1)" -le $(RIM_MOST) ] \
+	    && [ "$$(scripts/rim.sh build/fade-settled.ppm 120 90 | cut -d' ' -f1 | cut -d. -f1)" -le $(RIM_MOST) ] \
+	    && echo "fade-test: no rim under the bar of a fading window    PASS" \
+	    || echo "fade-test: no rim under the bar of a fading window    FAIL"
+	@for shot in fade-open fade-settled fade; do test -s build/$$shot.ppm && pnmtopng build/$$shot.ppm > build/$$shot.png 2>/dev/null && rm -f build/$$shot.ppm; done; echo "wrote build/fade.png"
 
 # Control Center's notifications card grows while it is open. A terminal
 # sleeps, with two notifications queued behind the sleep; Control Center

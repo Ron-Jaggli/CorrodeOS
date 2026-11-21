@@ -1963,6 +1963,55 @@ Every scored boot-test check PASSes on both GPUs (53 each, with
 surfaces-test's two); boot self-checks 181 / 0 (default) and 188 / 0
 (virtio). `./corrode test` passes; clippy has nothing new.
 
+## 70. No rim through a fading window
+
+The gap from 63: a titled window's frame is only its title bar and one
+corner's radius more (`frame_height`), reaching under the opaque body so
+its own lower corners are hidden, and frosting no more than it must.
+While the body is less than opaque -- as the window zooms in, closes,
+minimizes or comes back -- that hidden edge showed through it as a line
+under the title bar. Caught on screen before the fix (a step of 11 of
+255 levels exactly bar + radius under the window's top).
+
+- The fix, in the desk: `Managed::fade_frame` gives the frame the whole
+  window's height for as long as a fade lasts, and records when it ends
+  (`fade_until`); `forget_abandoned`, which runs every frame, trims the
+  frame back to the bar and a radius once it is over. Through a
+  half-faded body there is glass all the way down, so no edge, and a
+  settled window frosts no more than before. Opening (the frame is made
+  whole and grows with the zoom), closing, minimizing and restoring all
+  use it; resizing and a theme change mid-fade keep the frame whole
+  through `Managed::frame_rows`.
+- **Choice:** a taller frame for the fade's length, not a frame with
+  only its top corners rounded that stops at the bar. That would need a
+  new glass shape in the renderer, the wire format and the virtio
+  driver; and the overlap also hides the one-pixel seams rounding leaves
+  between frame and body as they zoom at fractional sizes.
+- The uncommitted change in `kernel/src/input.rs` (the body fading in
+  over 2/5 of the zoom) was left as it was and is not in this commit; it
+  shortens the time the line showed but did not remove it. With this
+  fix it is no longer needed.
+
+**fade-test** (new, scored, both GPUs): a copy of the ISO whose
+desktop.conf says `animation_speed = 5`, so fades take twenty times as
+long (`build/fade.iso`, as passcode-test builds its own). A terminal
+from the dock; a screenshot 0.35 s into its zoom (`build/fade-open.png`,
+by eye: body half there, no line); once settled one as Alt+Q fades it
+out where it stands (`build/fade.png`). `scripts/rim.sh` (netpbm and
+awk, which the build container has; it has no Python) cuts a strip of
+the body's left margin under the bar, where no text is, and prints the
+steepest step from one row to the next. Most allowed: 6 (`RIM_MOST`).
+Before the fix 11.2 (row 130 = 90 + 28 + 12); after, 0.6 on both GPUs,
+0.0 settled.
+
+The commit leaves the uncommitted change out, so what it holds was also
+built alone in a worktree: fade-test PASS there too (0.6), and its
+zoom-in shot, the body fading over the whole zoom, shows no line.
+
+Every scored boot-test check PASSes on both GPUs (54 each, with
+fade-test's); boot self-checks 181 / 0 (default) and 188 / 0 (virtio).
+`./corrode test` passes; clippy has nothing new.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -1976,7 +2025,7 @@ copied below so a later pass can read them here.
 4. [x] (section 67) SSE for the glass lens loops in render/src/software.rs; pixel-exact host tests vs scalar; perf-test before/after (`sse-glass` off `secure-cap`)
 5. [x] (section 68) SSE in the 2x2 backdrop downscale (frosted path); pixel-exact; perf-test (`sse-downscale`)
 6. [x] (section 69) Raise the 16-surface cap (SURFACES) and what in the kernel and virtio driver assumes it; boot test opening >15 windows and closing them, both GPUs (`more-surfaces`)
-7. [ ] Fix section 63's gap: fading windows show the frame's lower rim through their body; screenshot-based boot check (`fade-rim`)
+7. [x] (section 70) Fix section 63's gap: fading windows show the frame's lower rim through their body; screenshot-based boot check (`fade-rim`)
 8. [ ] SSE for image / alpha-blend compositing (render/src/blend.rs, Image/ScaledImage); pixel-exact; perf-test (`sse-blend`)
 9. [ ] xHCI driver in ring 3, USB HID boot keyboard + mouse into the input path; QEMU only (qemu-xhci, usb-kbd, usb-tablet), never real host USB; boot tests typing and clicking via USB on both GPUs; commit in sub-steps (reset+rings, enumeration, keyboard, mouse) (`xhci`)
 10. [ ] Verdigris design: verdigris/DESIGN.md -- a Windows compatibility layer native to CorrodeOS, not a Proton fork (no Linux syscalls, no POSIX, no Vulkan): PE/COFF loader on the spawn_program model; minimal ntdll/kernel32 (memory, threads, files through a capability, time); user32/gdi32 onto the window server and corrode-render command lists; reusing Wine's Windows-side DLLs behind a Corrode backend, incl. LGPL vs MPL-2.0; what Direct3D needs from a future GPU backend (out of scope). No code. (`verdigris` off `xhci`)
