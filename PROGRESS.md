@@ -2165,6 +2165,45 @@ kernel only logs "no xHCI controller".
   tablet takes positions; the Makefile's `qmp` turns `key`, `at X Y`,
   `click`, `shot` and `wait` lines into QMP commands.
 
+## 73. Verdigris: the design
+
+`verdigris/DESIGN.md` designs a Windows compatibility layer native to
+CorrodeOS; no code. The shape: Wine's DLLs split into a PE half and a
+Linux "Unix half"; Verdigris keeps that cut and puts CorrodeOS under it.
+Wine's PE DLLs above the Nt*/NtUser*/NtGdi* layer are reused unmodified;
+ntdll, kernel32/kernelbase and win32u are Verdigris's own, in Rust, in the
+program's task, using only the capabilities a native program in its seat
+would hold. The document covers:
+
+- PE loading on the `spawn_program` model (`corrode-pe`, checked whole
+  before a frame is taken, W^X, fixups written before mapping, Win64
+  entry);
+- the kernel32 subset by phase (phase 2: GetStdHandle, WriteFile to the
+  log endpoint, ExitProcess, no new capability) and memory, time, files,
+  threads, TEB/PEB, exceptions after it;
+- user32/gdi32 as win32u on the window server (one surface per top-level
+  window, events to messages) and `corrode-render` command lists;
+- the user's file requirement: a pruned view of the real files as an
+  endpoint capability, rooted at the deepest common directory, `C:\` at
+  the root, everything not allowed absent (not found), never denied;
+- Wine's DLLs under the LGPL beside MPL-2.0 code (separate files, no Wine
+  code in MPL files, Microsoft's DLLs never shipped; to be checked by
+  someone who answers for the project before distribution);
+- what Direct3D needs from a future GPU backend (out of scope).
+
+- **Choice:** the five recorded in DESIGN.md's "Decisions taken here":
+  the cut at the Nt* layer; one process one task, no added authority;
+  PEs mapped like ELF with no ring 3 code creation (so `PAGE_EXECUTE*`
+  and run-time `LoadLibrary` of new DLLs are refused for now); the pruned
+  view with write-protected pass-through directories; `AppData`, `Temp`
+  and registry changes as visible files in the program's own folder.
+- Six decisions are left for the owner, each with security weight and
+  none needed for phases 1-2: kernel vs ring 3 PE parsing for the
+  person's files, ring 3 threads, a per-task GS base, fault delivery to
+  ring 3, JIT, run-time DLL mapping.
+- Verified: no code changed from `xhci` 638686c; `./corrode test` 315
+  passed; plain boots on both GPUs with no FAIL and no trap.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -2181,7 +2220,7 @@ copied below so a later pass can read them here.
 7. [x] (section 70) Fix section 63's gap: fading windows show the frame's lower rim through their body; screenshot-based boot check (`fade-rim`)
 8. [x] (section 71) SSE for image / alpha-blend compositing (render/src/blend.rs, Image/ScaledImage); pixel-exact; perf-test (`sse-blend`)
 9. [x] (section 72) xHCI driver in ring 3, USB HID boot keyboard + mouse into the input path; QEMU only (qemu-xhci, usb-kbd, usb-tablet), never real host USB; boot tests typing and clicking via USB on both GPUs; commit in sub-steps (reset+rings, enumeration, keyboard, mouse) (`xhci`)
-10. [ ] Verdigris design: verdigris/DESIGN.md -- a Windows compatibility layer native to CorrodeOS, not a Proton fork (no Linux syscalls, no POSIX, no Vulkan): PE/COFF loader on the spawn_program model; minimal ntdll/kernel32 (memory, threads, files through a capability, time); user32/gdi32 onto the window server and corrode-render command lists; reusing Wine's Windows-side DLLs behind a Corrode backend, incl. LGPL vs MPL-2.0; what Direct3D needs from a future GPU backend (out of scope). No code. (`verdigris` off `xhci`)
+10. [x] (section 73) Verdigris design: verdigris/DESIGN.md -- a Windows compatibility layer native to CorrodeOS, not a Proton fork (no Linux syscalls, no POSIX, no Vulkan): PE/COFF loader on the spawn_program model; minimal ntdll/kernel32 (memory, threads, files through a capability, time); user32/gdi32 onto the window server and corrode-render command lists; reusing Wine's Windows-side DLLs behind a Corrode backend, incl. LGPL vs MPL-2.0; what Direct3D needs from a future GPU backend (out of scope). No code. (`verdigris` off `xhci`)
     - **User's requirement for Verdigris files (2026-11-21, ~10:00):** no
       Proton/Wine-style prefix and no hidden filesystem of its own. A
       Windows program sees the real Corrode files, but only an allowlist:
