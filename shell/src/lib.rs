@@ -22,6 +22,7 @@ mod commands;
 pub mod fs;
 pub mod parse;
 pub mod pattern;
+pub mod windows;
 
 #[cfg(test)]
 mod tests;

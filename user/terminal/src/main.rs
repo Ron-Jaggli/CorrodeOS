@@ -638,15 +638,9 @@ fn main() {
 fn win(path: &str, args: &[String], out: &mut Output) -> i32 {
     use corrode_rt::win::{self, Ended, NotStarted};
 
-    // The path, a line feed, and the arguments as Windows would have them
-    // quoted.
-    let mut text = format!("{path}\n");
-    for (index, arg) in args.iter().enumerate() {
-        if index > 0 {
-            text.push(' ');
-        }
-        text.push_str(&windows_quoted(arg));
-    }
+    // The path, a line feed, and the arguments quoted as Windows' rule
+    // needs, so the program's C runtime splits them back exactly.
+    let text = format!("{path}\n{}", corrode_shell::windows::joined(args));
     let name = corrode_shell::fs::name_of(path);
     let mut line = String::new();
     let mut lines = 0;
@@ -708,22 +702,5 @@ fn win(path: &str, args: &[String], out: &mut Output) -> i32 {
             1
         }
     }
-}
-
-/// One argument as a Windows command line carries it: in quotes if it is
-/// empty or holds a space or tab, with a quote inside it after a `\`.
-fn windows_quoted(arg: &str) -> String {
-    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
-        return String::from(arg);
-    }
-    let mut quoted = String::from("\"");
-    for character in arg.chars() {
-        if character == '"' {
-            quoted.push('\\');
-        }
-        quoted.push(character);
-    }
-    quoted.push('"');
-    quoted
 }
 
