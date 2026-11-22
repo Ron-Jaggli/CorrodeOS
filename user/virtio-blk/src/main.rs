@@ -276,6 +276,10 @@ fn serve(disk: &mut Disk, message: Message) -> Result<[u64; 4], Error> {
             disk.transfer(blk::T_OUT, THEME_SECTOR)?;
             Ok([0; 4])
         }
+        store::READ => {
+            disk.transfer(blk::T_IN, message.words[0])?;
+            Ok([0; 4])
+        }
         _ => Err(Error::Invalid),
     }
 }

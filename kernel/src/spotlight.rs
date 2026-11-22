@@ -267,7 +267,7 @@ impl Spotlight {
         self.matches = starts.into_iter().map(Hit::App).collect();
         // Files, by name, once something is typed.
         if !query.is_empty() {
-            let archive = crate::modules::find("root.tar").map_or(&[][..], |module| module.bytes);
+            let archive = crate::vault::root().map_or(&[][..], |(_, module)| module.bytes);
             let mut starts = Vec::new();
             let mut contains = Vec::new();
             for (path, _) in corrode_theme::tar_files(archive) {

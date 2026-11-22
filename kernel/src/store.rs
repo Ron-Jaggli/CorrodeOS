@@ -5,7 +5,7 @@
 //! No disk is the usual case, and fine: the theme is then whatever
 //! /etc/desktop.conf says, every boot.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use corrode_abi::store;
 use corrode_theme::Theme;
@@ -21,6 +21,10 @@ const STORE_QUEUE: cap::CapPtr = 84;
 const STORE_BARS: cap::CapPtr = 86;
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
+/// The queue memory's object, for `read_sector`.
+static QUEUE: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// Its page the driver reads a sector into.
+const SECTOR_PAGE: usize = 2;
 
 /// Find a virtio disk and start its driver. Says whether there is one.
 pub fn start() -> bool {
@@ -40,7 +44,8 @@ pub fn start() -> bool {
         println!("store      : a disk at {}, but no driver for it", found.address);
         return false;
     };
-    let Some(queue) = memory::create(store::QUEUE_PAGES, false) else {
+    // Kernel-visible, so `read_sector` can take what the driver read.
+    let Some(queue) = memory::create(store::QUEUE_PAGES, true) else {
         println!("store      : no memory for the disk's queue");
         return false;
     };
@@ -75,6 +80,7 @@ pub fn start() -> bool {
     if !given {
         return false;
     }
+    QUEUE.store(queue, Ordering::Release);
     crate::start_all(&[Some(driver)]);
     println!("store      : a disk at {}, driven in ring 3", found.address);
     RUNNING.store(true, Ordering::Release);
@@ -105,6 +111,23 @@ pub fn load() -> Option<Theme> {
         }
         None => None,
     }
+}
+
+/// One sector of the disk, if there is a disk and it gives it.
+pub fn read_sector(sector: u64) -> Option<[u8; 512]> {
+    call(store::READ, [sector, 0, 0, 0])?;
+    let (address, len) = memory::in_kernel(QUEUE.load(Ordering::Acquire))?;
+    if len < (SECTOR_PAGE + 1) * 4096 {
+        return None;
+    }
+    let mut bytes = [0u8; 512];
+    // SAFETY: inside the object, which the kernel can see. The driver
+    // wrote the sector there before answering and waits for the next call
+    // now, so nothing writes it while it is copied.
+    unsafe {
+        core::ptr::copy_nonoverlapping(address.add(SECTOR_PAGE * 4096), bytes.as_mut_ptr(), bytes.len())
+    };
+    Some(bytes)
 }
 
 /// Keep `theme` on the disk, if there is one.

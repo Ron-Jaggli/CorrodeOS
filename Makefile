@@ -75,8 +75,8 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test fade-test usb-test pe-test verify-test grow-test zoom-test
-.PHONY: all kernel user kernel32 iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test fade-test usb-test pe-test verify-test vault-test grow-test zoom-test
+.PHONY: all kernel user kernel32 iso vault-iso vault-disk run-vault run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
 
@@ -115,7 +115,7 @@ clippy:
 HOST_TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
 
 test:
-	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci -p corrode-elf -p corrode-pe -p corrode-virtio -p corrode-nv -p corrode-input -p corrode-heap -p corrode-line -p corrode-shell -p corrode-theme -p corrode-seal --target $(HOST_TARGET)
+	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci -p corrode-elf -p corrode-pe -p corrode-virtio -p corrode-nv -p corrode-input -p corrode-heap -p corrode-line -p corrode-shell -p corrode-theme -p corrode-seal -p corrode-vault --target $(HOST_TARGET)
 
 # What a title bar of glass costs the software renderer, built optimised.
 glass-bench:
@@ -1237,6 +1237,88 @@ store-test: iso
 	    && echo "store-test: the driver holds only its device           PASS" \
 	    || echo "store-test: the driver holds only its device           FAIL"
 	@test -s build/store.ppm && pnmtopng build/store.ppm > build/store.png 2>/dev/null && rm -f build/store.ppm && echo "wrote build/store.png" || true
+
+# The vault (corrode_vault, kernel/src/vault.rs): the root directory
+# sealed on the disk under the passcode, and a boot medium without it.
+#
+#   ./corrode vault-disk VAULT_PASSCODE=2468   seal root/ into build/vault.img
+#   ./corrode run-vault                        boot it: the lock screen first
+#
+# vault-iso is the ISO's tree less boot/files/root.tar, sealed again by
+# scripts/seal-iso.sh, so Limine still checks every file it loads.
+VAULT_ISO := build/vault.iso
+VAULT_IMG ?= build/vault.img
+VAULT_PASSCODE ?=
+vault-iso: iso
+	@rm -rf build/vault_iso_root $(VAULT_ISO) && cp -r $(ISO_ROOT) build/vault_iso_root
+	@rm -f build/vault_iso_root/boot/files/root.tar
+	@sed -i '/boot():\/boot\/files\/root.tar/d' build/vault_iso_root/boot/limine/limine.conf
+	@LIMINE_DIR=$(LIMINE_DIR) bash scripts/seal-iso.sh build/vault_iso_root $(VAULT_ISO)
+	@rm -rf build/vault_iso_root
+	@echo "built $(VAULT_ISO): the kernel and programs, no files"
+
+vault-disk: $(ROOT_TAR)
+	@test -n "$(VAULT_PASSCODE)" || { echo "vault-disk: give VAULT_PASSCODE=<4 to 8 digits>"; exit 1; }
+	@VAULT_TAR=$(CURDIR)/$(ROOT_TAR) VAULT_DISK=$(abspath $(VAULT_IMG)) VAULT_PASSCODE=$(VAULT_PASSCODE) \
+	    cargo test -q --release -p corrode-vault --target $(HOST_TARGET) seal_the_root \
+	    -- --ignored --nocapture 2>&1 | grep '^vault-disk' \
+	    || { echo "vault-disk: could not seal $(ROOT_TAR)"; exit 1; }
+
+run-vault: vault-iso
+	@test -f $(VAULT_IMG) || { echo "run-vault: no $(VAULT_IMG); make one with vault-disk"; exit 1; }
+	qemu-system-x86_64 $(subst $(ISO),$(VAULT_ISO),$(QEMU_FLAGS)) $(call store_flags,$(VAULT_IMG))
+
+# A fresh vault sealed with 2468 and booted from the vault ISO. The lock
+# screen must be up at boot with no files given to anyone; 1111 is
+# refused; 2468 opens it, and a terminal from the dock then has files
+# (build/vault-locked.png at boot, build/vault.png after). A second boot
+# of a copy with one sealed byte changed: 2468 opens nothing.
+VAULT_TEST_IMG := build/vault-test.img
+vault-test: vault-iso
+	@rm -f $(VAULT_TEST_IMG) build/vault-bad.img build/vault*.ppm build/vault*.png build/vault-*.log
+	@$(MAKE) -s vault-disk VAULT_IMG=$(VAULT_TEST_IMG) VAULT_PASSCODE=2468
+	@cp $(VAULT_TEST_IMG) build/vault-bad.img && printf '\x5a' \
+	    | dd of=build/vault-bad.img bs=1 seek=$$((4096 + 512 + 700)) conv=notrunc status=none
+	@( sleep $(SHOT_DELAY); sleep 1; echo "screendump build/vault-locked.ppm"; sleep 0.5; \
+	   for key in 1 1 1 1 ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 2; \
+	   for key in 2 4 6 8 ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 3; \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 3; \
+	   echo "screendump build/vault.ppm"; sleep 1; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(subst $(ISO),$(VAULT_ISO),$(QEMU_COMMON)) \
+	      $(call store_flags,$(VAULT_TEST_IMG)) -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@( sleep $(SHOT_DELAY); sleep 1; \
+	   for key in 2 4 6 8 ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 3; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(subst $(ISO),$(VAULT_ISO),$(QEMU_COMMON)) \
+	      $(call store_flags,build/vault-bad.img) -serial file:build/vault-bad.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -ahE "^(vault|files|lock) " build/serial.log | grep -v PASS || echo "vault-test: nothing from the vault"
+	@! grep -aq "Loading module .boot():/boot/files/root.tar" build/serial.log \
+	    && echo "vault-test: the boot medium carries no files          PASS" \
+	    || echo "vault-test: the boot medium carries no files          FAIL"
+	@grep -aq "^vault      : the root directory is sealed on the disk" build/serial.log \
+	    && grep -aq "^files      : sealed on the disk until the passcode is given" build/serial.log \
+	    && grep -aq "^lock " build/serial.log \
+	    && echo "vault-test: sealed at boot, lock screen up, no files  PASS" \
+	    || echo "vault-test: sealed at boot, lock screen up, no files  FAIL"
+	@awk '/^desktop    : a wrong passcode/ {wrong = 1} /^vault      : opened/ {exit !wrong} END {if (!wrong) exit 1}' build/serial.log \
+	    && echo "vault-test: a wrong passcode is refused first         PASS" \
+	    || echo "vault-test: a wrong passcode is refused first         FAIL"
+	@grep -aq "^vault      : opened" build/serial.log \
+	    && grep -aq "give the launcher the terminal's files[[:space:]]*PASS" build/serial.log \
+	    && grep -aq "^terminal   : [0-9]* files and directories" build/serial.log \
+	    && echo "vault-test: the right one opens it; files reach apps  PASS" \
+	    || echo "vault-test: the right one opens it; files reach apps  FAIL"
+	@grep -aq "^desktop    : a wrong passcode" build/vault-bad.log \
+	    && ! grep -aq "^vault      : opened" build/vault-bad.log \
+	    && echo "vault-test: one byte changed on disk: nothing opens   PASS" \
+	    || echo "vault-test: one byte changed on disk: nothing opens   FAIL"
+	@test $$(grep -a "^vault " build/serial.log | grep -ac "PASS") -eq 3 \
+	    && ! grep -a "^vault " build/serial.log | grep -aq "FAIL" \
+	    && echo "vault-test: the kernel's three vault checks pass      PASS" \
+	    || echo "vault-test: the kernel's three vault checks pass      FAIL"
+	@for shot in vault-locked vault; do \
+	    test -s build/$$shot.ppm && pnmtopng build/$$shot.ppm > build/$$shot.png 2>/dev/null && rm -f build/$$shot.ppm; \
+	done; true
 
 # A passcode in the clear in desktop.conf, rewritten as a salted hash, in
 # place; the rest of the file is kept as it was. PASSCODE_CONF names

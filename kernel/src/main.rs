@@ -48,9 +48,10 @@ mod syscall;
 mod task;
 mod time;
 mod usb;
+mod vault;
 mod windows;
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use arch::x86_64::{self, cpu, halt_forever, ioapic, lapic, pic, pit, vectors};
 use corrode_render::{
@@ -2159,10 +2160,13 @@ fn serve(shell: bool) {
             } else if words[1] == 1 {
                 [!look::has_passcode() as u64, 0, 0, 0]
             } else {
+                let was_sealed = vault::locked();
                 match look::try_passcode(words[0].to_le_bytes(), time::now_ns()) {
                     Ok(right) => {
                         if !right {
                             println!("desktop    : a wrong passcode from task {}", received.from);
+                        } else if was_sealed {
+                            give_files();
                         }
                         [right as u64, 0, 0, 0]
                     }
@@ -2538,20 +2542,41 @@ fn start_desktop() {
     });
     desktop_check("start the window server and the launcher", granted);
 
-    // The terminal's files. A boot medium without them still gets a
-    // terminal, with nothing to read.
-    if let (Some(id), Some((index, module))) = (launcher_task, modules::position("root.tar")) {
+    // The terminal's files come later, from `give_files`: whether they are
+    // the boot medium's or a vault's is known once the disk has been read.
+    if let Some(id) = launcher_task {
+        LAUNCHER_TASK.store(id, Ordering::Release);
+    }
+    start_all(&[server, shell, launcher_task]);
+}
+
+/// The launcher, once started, for `give_files`.
+static LAUNCHER_TASK: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Give the launcher the root directory, which it hands the terminal and
+/// Files: the boot medium's, or the vault's once it is open. A boot medium
+/// without them still gets a terminal, with nothing to read. Called by the
+/// painter after reading the disk, and again when the vault opens.
+fn give_files() {
+    let id = LAUNCHER_TASK.load(Ordering::Acquire);
+    if id == usize::MAX {
+        return;
+    }
+    if vault::locked() {
+        println!("files      : sealed on the disk until the passcode is given");
+        return;
+    }
+    if let Some((index, module)) = vault::root() {
         let given = cap::issue_to(
             id,
             LAUNCHER_FILES_SLOT,
-            Object::Blob(index),
-            Rights::READ_GRANT,
+            cap::Object::Blob(index),
+            cap::Rights::READ_GRANT,
         )
         .is_ok();
         desktop_check("give the launcher the terminal's files", given);
         println!("files      : root.tar, {} KiB", module.bytes.len() / 1024);
     }
-    start_all(&[server, shell, launcher_task]);
 }
 
 /// Start the panel. Done by the painter once it knows the screen's size --
@@ -5004,14 +5029,22 @@ const DESKTOP_DELAY_MS: u64 = 1200;
 /// things are at the current nanosecond, and writes only the pixels that
 /// answer changed.
 fn render_loop(renderer: &mut Screen) -> ! {
+    // The disk first: if it keeps the root directory sealed, the boot
+    // medium's files are not read at all.
+    let disk = store::start();
+    if disk && vault::probe() {
+        vault::self_check();
+    }
     look::load();
     // A theme kept from an earlier boot wins over the file: it is what was
     // last picked.
-    if store::start() {
+    if disk {
         if let Some(theme) = store::load() {
             look::set(theme);
+            look::set_kept();
         }
     }
+    give_files();
     rtc::init();
     let Some(mut stage) = Stage::new(renderer, time::now_ns()) else {
         println!("scene      : no room for the boot screen's layers");
@@ -5057,6 +5090,21 @@ fn render_loop(renderer: &mut Screen) -> ! {
         windows::set_screen(screen.width, screen.height);
     }
     start_panel();
+    // A sealed root directory: the lock screen is the first thing shown.
+    if vault::locked() {
+        let asked = ipc::call(
+            LAUNCHER_ENDPOINT,
+            ipc::Message {
+                label: corrode_abi::launcher::LAUNCH,
+                words: [corrode_abi::launcher::LOCK, 0, 0, 0],
+            },
+            None,
+            None,
+        );
+        if asked.is_err() {
+            println!("vault      : no launcher to put the lock screen up");
+        }
+    }
     let screen = stage.scene.screen().area();
 
     // A renderer that fails paints nothing, which is what the counters below

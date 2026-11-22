@@ -84,6 +84,7 @@ dependencies = [
  "corrode-seal",
  "corrode-text",
  "corrode-theme",
+ "corrode-vault",
 ]
 
 [[package]]
@@ -213,6 +214,14 @@ version = "0.0.1"
 dependencies = [
  "corrode-rt",
  "corrode-text",
+ "corrode-theme",
+]
+
+[[package]]
+name = "corrode-vault"
+version = "0.0.1"
+dependencies = [
+ "corrode-seal",
  "corrode-theme",
 ]
 

@@ -5,7 +5,7 @@
 //! here is the one current theme, and a count of how many times it has
 //! changed, so the painter can notice a change with one load and no lock.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use corrode_theme::Theme;
 use corrode_theme::passcode::{self, Hashed, Stored};
@@ -27,10 +27,18 @@ static TRIES: SpinLock<(u32, u64)> = SpinLock::new((0, 0));
 const FREE_TRIES: u32 = 3;
 const WAIT_NS: u64 = 30_000_000_000;
 
-/// Read the theme from the boot medium's files, if they have one.
+/// Whether the disk kept a theme, which then wins over desktop.conf.
+static KEPT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_kept() {
+    KEPT.store(true, Ordering::Release);
+}
+
+/// Read the theme from the root directory's files, if they have one: the
+/// boot medium's, or the vault's (nothing while it is sealed).
 pub fn load() {
-    let text = crate::modules::find("root.tar")
-        .and_then(|module| corrode_theme::find_in_tar(module.bytes, "etc/desktop.conf"))
+    let text = crate::vault::root()
+        .and_then(|(_, module)| corrode_theme::find_in_tar(module.bytes, "etc/desktop.conf"))
         .and_then(|bytes| core::str::from_utf8(bytes).ok());
     match text {
         Some(text) => {
@@ -75,18 +83,21 @@ pub fn set(theme: Theme) {
     CHANGES.fetch_add(1, Ordering::Release);
 }
 
-/// Whether the lock screen needs a passcode.
+/// Whether the lock screen needs a passcode: one is set, or the vault is
+/// still sealed.
 pub fn has_passcode() -> bool {
-    without_interrupts(|| PASSCODE.lock().is_some())
+    crate::vault::locked() || without_interrupts(|| PASSCODE.lock().is_some())
 }
 
 /// Is `code` the passcode? `Some(true)` or `Some(false)`, or `None` with
 /// the seconds to wait if too many wrong tries came just before. With no
 /// passcode set, anything is right.
 pub fn try_passcode(code: [u8; 8], now: u64) -> Result<bool, u64> {
-    let Some(passcode) = without_interrupts(|| *PASSCODE.lock()) else {
+    let sealed = crate::vault::locked();
+    let passcode = without_interrupts(|| *PASSCODE.lock());
+    if passcode.is_none() && !sealed {
         return Ok(true);
-    };
+    }
     let wait = without_interrupts(|| {
         let (_, next) = *TRIES.lock();
         (now < next).then(|| (next - now).div_ceil(1_000_000_000))
@@ -97,7 +108,19 @@ pub fn try_passcode(code: [u8; 8], now: u64) -> Result<bool, u64> {
     // Slow on purpose, so with interrupts on and no lock held. Only the
     // lock screen may try, through the desktop's one loop, so no second
     // try can start in between.
-    let right = passcode.matches(code);
+    let right = match passcode {
+        // The vault's passcode is the one that opens it, whatever
+        // desktop.conf says.
+        _ if sealed => {
+            let opened = crate::vault::unlock(passcode::digits(&code));
+            if opened {
+                opened_vault(code);
+            }
+            opened
+        }
+        Some(passcode) => passcode.matches(code),
+        None => true,
+    };
     without_interrupts(|| {
         let mut tries = TRIES.lock();
         let (wrong, _) = *tries;
@@ -110,4 +133,22 @@ pub fn try_passcode(code: [u8; 8], now: u64) -> Result<bool, u64> {
         };
     });
     Ok(right)
+}
+
+/// The vault opened with `code`. Its files' desktop.conf gives the look
+/// (unless the disk kept one), and `code`, hashed, is the lock screen's
+/// passcode from now on: what opened the files locks the screen.
+fn opened_vault(code: [u8; 8]) {
+    let kept = KEPT.load(Ordering::Acquire);
+    let theme = crate::vault::root()
+        .and_then(|(_, module)| corrode_theme::find_in_tar(module.bytes, "etc/desktop.conf"))
+        .and_then(|bytes| core::str::from_utf8(bytes).ok())
+        .map(Theme::parse);
+    if let (Some(theme), false) = (theme, kept) {
+        set(theme);
+    }
+    let mut salt = [0u8; 16];
+    salt[..8].copy_from_slice(&crate::time::now_ns().to_le_bytes());
+    let hashed = Hashed::new(code, salt, passcode::ITERATIONS);
+    without_interrupts(|| *PASSCODE.lock() = Some(hashed));
 }

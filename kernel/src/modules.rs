@@ -19,6 +19,10 @@ pub struct Module {
     pub bytes: &'static [u8],
     /// Where its first byte is in physical memory. Page aligned.
     pub physical: u64,
+    /// For a file the kernel made rather than the bootloader loaded (the
+    /// opened vault, `crate::vault`): the memory object holding it, whose
+    /// frames are not contiguous. `physical` is then unused.
+    pub memory: Option<usize>,
 }
 
 impl Module {
@@ -29,7 +33,7 @@ impl Module {
 }
 
 /// Every module the bootloader loaded, in the order the configuration
-/// listed them.
+/// listed them, and last the opened vault's root directory if there is one.
 pub fn all() -> impl Iterator<Item = Module> {
     let hhdm = limine::HHDM.response.get().map_or(0, |hhdm| hhdm.offset);
     limine::MODULES
@@ -57,8 +61,10 @@ pub fn all() -> impl Iterator<Item = Module> {
                 path: file.path(),
                 bytes,
                 physical,
+                memory: None,
             })
         })
+        .chain(crate::vault::module())
 }
 
 /// The module called `name`, whatever directory it was in.

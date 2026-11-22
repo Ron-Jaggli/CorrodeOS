@@ -572,6 +572,10 @@ pub mod store {
     pub const LOAD: u64 = 90;
     /// Keep the theme in words 0..4. The answer's label is the status.
     pub const SAVE: u64 = 91;
+    /// Read the sector numbered in word 0 into the queue memory's sector
+    /// page, where the kernel, which made that memory, reads it. The
+    /// answer's label is the status. For the vault (`corrode_vault`).
+    pub const READ: u64 = 92;
 }
 
 pub mod gpu {

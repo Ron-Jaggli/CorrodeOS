@@ -2473,6 +2473,77 @@ secret -- but nothing changed may boot.
   before, plus verify-test's four), none FAIL; boot self-checks 191/198,
   no unhandled trap; `./corrode test` 333 passed.
 
+## 78. The vault: the root directory sealed on the disk
+
+The root directory (`root/`, a tar) can now live on the disk, encrypted
+under the passcode, instead of on the boot medium.
+
+- **Format** (`vault/`, `corrode-vault`, no_std): at byte 4096 of the
+  disk, after the theme's sector, a 64-byte header (magic `CRDVAULT`,
+  version, PBKDF2 iterations, salt, nonce, length, tag) and from byte 4608
+  the tar sealed with AES-128-CCM (`corrode_seal`) under the first 16
+  bytes of PBKDF2-HMAC-SHA-256(passcode, salt). Every header field goes
+  into the key or the tag, so changing one only makes the right passcode
+  fail. A header asking for fewer than 50 000 or more than 2 000 000
+  iterations, or more than 4 MiB, is not a vault. Like corrode-seal it
+  runs no AES itself: the caller passes the block cipher.
+- **`./corrode vault-disk VAULT_PASSCODE=2468`** seals `build/root.tar`
+  into `build/vault.img` (`VAULT_IMG=` for another), salt and nonce from
+  /dev/urandom, 200 000 iterations; the theme's sector is left alone.
+  **`./corrode vault-iso`** is the ISO's tree less `root.tar`, sealed again
+  by seal-iso.sh; **`./corrode run-vault`** boots the two together.
+- **The disk driver** answers `store::READ` (92): one sector into its
+  queue memory's sector page, which the kernel now also maps
+  (`memory::create(.., true)`) and copies from (`store::read_sector`). No
+  new capability: the driver holds what it held, and its check passes.
+- **The kernel** (`kernel/src/vault.rs`): after the disk comes up, the
+  painter reads the header and the sealed bytes (`vault::probe`). If there
+  is a vault, it -- and never a `root.tar` on the boot medium -- is the
+  root directory (`vault::root`, used by the theme, Spotlight and the
+  launcher). The launcher's files are no longer given in `start_desktop`
+  but by `give_files`, after the disk is read, and not at all while the
+  vault is shut ("files : sealed on the disk until the passcode is
+  given"). The lock screen is launched before anything else is shown.
+  `look::try_passcode` sends the lock screen's digits to `vault::unlock`
+  while it is shut, under the same three-tries-then-30-s limit: the key is
+  made, the tar opened into a kernel-visible memory object, the key and
+  every copy of the plaintext wiped (`corrode_vault::wipe`, volatile). The
+  opened tar becomes a module (`Module::memory`, which `blob::map` maps
+  frame by frame), and the launcher gets it as a blob, as before.
+  desktop.conf from the vault then sets the look (unless the disk kept
+  one), and the passcode that opened it, hashed, is the lock screen's.
+- **AES** runs in `vault::aes_block`: one `asm!` block a block, the round
+  keys expanded in xmm1-xmm3 and never stored, xmm0-xmm3 zeroed before it
+  ends, no call inside, on a general CPU in the desktop's loop -- never in
+  an interrupt handler, never on the secure core, whose key is untouched.
+- **Checks:** three boot self-checks when a vault is found (AES-NI gives
+  FIPS-197's answer; a wrong passcode opens nothing and leaves zeros; the
+  right one opens it). Five host tests (round trip; four wrong passcodes;
+  each header field and a body byte changed; header parsing; key wiping).
+  New scored `vault-test`, both GPUs: a fresh vault sealed with 2468 and
+  the vault ISO -- no `root.tar` loaded; at boot the vault is found, the
+  lock screen is up and no files are given; 1111 is refused before
+  anything opens; 2468 opens it and a terminal from the dock has files;
+  a copy with one sealed byte changed opens for nothing; the three
+  self-checks pass. build/vault-locked.png is the lock screen at boot,
+  build/vault.png the terminal after.
+
+- **Choice:** the root directory is read-only, as it was: the vault is
+  sealed once, by `vault-disk`, and opened each boot. Writing files back
+  needs a filesystem CorrodeOS does not have.
+- **Choice:** the passcode alone makes the key (no TPM yet). 4 to 8 digits
+  is the weak point against someone who has the disk; task 3 of this run
+  lengthens it.
+- **Choice:** the opened files stay in memory until shutdown; locking the
+  screen again does not shut the vault. The lock screen keeps people at
+  the keyboard out; the vault keeps out whoever takes the disk.
+- **Choice:** with no vault on the disk, nothing changes: the boot medium's
+  `root.tar` is the root directory, and every other test boots as before.
+- Verified: the whole suite on both GPUs, 73 checks PASS on each (67
+  before, plus vault-test's six), none FAIL; boot self-checks 191/198 as
+  before, 195/202 with a vault; no unhandled trap; `./corrode test` 338
+  passed; clippy at 33.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -2597,7 +2668,7 @@ one task.
 
 1. [x] (section 77) Limine checks a hash of every file it loads, and its
    config's hash is enrolled; `verify-test`.
-2. [ ] The vault: the root directory sealed on the disk under the
+2. [x] (section 78) The vault: the root directory sealed on the disk under the
    passcode, a boot medium without it, the lock screen at boot; files only
    after the right passcode; `vault-test`.
 3. [ ] Longer passcodes: up to 32 characters, letters and digits, on the

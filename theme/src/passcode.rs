@@ -77,8 +77,8 @@ impl fmt::Display for Hashed {
     }
 }
 
-/// The digits of a NUL-padded code.
-fn digits(code: &[u8; 8]) -> &[u8] {
+/// The digits of a NUL-padded code, as the lock screen sends it.
+pub fn digits(code: &[u8; 8]) -> &[u8] {
     let len = code.iter().position(|&byte| byte == 0).unwrap_or(code.len());
     &code[..len]
 }

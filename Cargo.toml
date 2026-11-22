@@ -17,6 +17,7 @@ members = [
     "shell",
     "theme",
     "seal",
+    "vault",
     "user/rt",
     "user/edu",
     "user/fault",
