@@ -1903,8 +1903,8 @@ extern "C" fn log_server() {
     use alloc::vec::Vec;
     use corrode_abi::log;
 
-    // One unfinished line per sender.
-    let mut partial: Vec<(usize, String)> = Vec::new();
+    // One unfinished line per sender, and whether it has filled up.
+    let mut partial: Vec<(usize, String, bool)> = Vec::new();
 
     loop {
         let Ok(received) = ipc::recv(LOG_TASK_ENDPOINT, None, None) else {
@@ -1914,10 +1914,10 @@ extern "C" fn log_server() {
         let length = received.message.text_bytes(&mut buffer);
         let text = core::str::from_utf8(&buffer[..length]).unwrap_or("?");
 
-        let index = match partial.iter().position(|(from, _)| *from == received.from) {
+        let index = match partial.iter().position(|(from, _, _)| *from == received.from) {
             Some(index) => index,
             None => {
-                partial.push((received.from, String::new()));
+                partial.push((received.from, String::new(), false));
                 partial.len() - 1
             }
         };
@@ -1925,9 +1925,17 @@ extern "C" fn log_server() {
         if !matches!(received.message.label, log::TEXT | log::LINE) {
             continue;
         }
-        let line = &mut partial[index].1;
-        if line.len() + text.len() <= LOG_LINE_MAX {
-            line.push_str(text);
+        let (_, line, full) = &mut partial[index];
+        // A line too long keeps its beginning: the piece that overflows is
+        // cut to the room left, and nothing after it is added, so the end
+        // is never pieces glued on past a gap.
+        if !*full {
+            let mut room = (LOG_LINE_MAX - line.len()).min(text.len());
+            while !text.is_char_boundary(room) {
+                room -= 1;
+            }
+            line.push_str(&text[..room]);
+            *full = room < text.len();
         }
 
         if received.message.label == log::LINE {
