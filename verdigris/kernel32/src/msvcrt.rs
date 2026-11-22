@@ -386,6 +386,10 @@ pub unsafe extern "win64" fn fwrite(data: *const u8, size: usize, count: usize, 
         set_errno(EBADF);
         return 0;
     };
+    // Nothing asked for is nothing written: 0, whichever of the two is 0.
+    if size == 0 || count == 0 {
+        return 0;
+    }
     let Some(len) = size.checked_mul(count) else {
         set_errno(EINVAL);
         return 0;
