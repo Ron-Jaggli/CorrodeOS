@@ -71,7 +71,7 @@ const COMMANDS: [About; 13] = [
     ("notify", "TEXT", "show TEXT as a notification"),
     ("quit", "APP", "try to close APP's windows (the terminal may not)"),
     ("seal", "", "try to seal with the secure core (the terminal may not)"),
-    ("win", "PATH", "run a Windows program; it sees its own folder alone"),
+    ("win", "PATH [ARGS]", "run a Windows program; it sees its own folder alone"),
     ("about", "", "what this is"),
     ("exit", "", "close this terminal"),
 ];
@@ -400,7 +400,7 @@ impl Host for System<'_> {
                     out.error("win: which program");
                     1
                 }
-                Some(path) => win(&corrode_shell::fs::resolve(self.cwd, path), out),
+                Some(path) => win(&corrode_shell::fs::resolve(self.cwd, path), &rest[1..], out),
             },
             "about" => {
                 out.line("CorrodeOS terminal: a ring 3 program holding a window,");
@@ -629,26 +629,43 @@ fn main() {
     }
 }
 
-/// `win PATH`: run the Windows program at `PATH` in the files, and show
-/// what it writes, line by line, until it ends. The desktop starts it
-/// (`window::RUN`) seeing its own folder alone, and hands this terminal
-/// the endpoint its output goes to; the kernel says when it has ended,
-/// however it ended, or after ten seconds that it is still running.
-fn win(path: &str, out: &mut Output) -> i32 {
+/// `win PATH ARGS`: run the Windows program at `PATH` in the files, with
+/// `ARGS` as its command line, and show what it writes, line by line,
+/// until it ends. The desktop starts it (`window::RUN`) seeing its own
+/// folder alone, and hands this terminal the endpoint its output goes to;
+/// the kernel says when it has ended, however it ended, or after ten
+/// seconds that it is still running.
+fn win(path: &str, args: &[String], out: &mut Output) -> i32 {
     use corrode_rt::abi::log;
 
-    let mut bytes = [0u8; 32];
-    if path.len() > bytes.len() {
-        out.error("win: the path is longer than 32 bytes, all the call carries");
+    // The path, a line feed, and the arguments as Windows would have them
+    // quoted, sent ahead of `RUN` 32 bytes at a time.
+    let mut text = format!("{path}\n");
+    for (index, arg) in args.iter().enumerate() {
+        if index > 0 {
+            text.push(' ');
+        }
+        text.push_str(&windows_quoted(arg));
+    }
+    if text.len() > window::RUN_TEXT_MOST {
+        out.error("win: the command line is too long");
         return 1;
     }
-    bytes[..path.len()].copy_from_slice(path.as_bytes());
-    let mut words = [0u64; 4];
-    for (word, chunk) in words.iter_mut().zip(bytes.as_chunks::<8>().0) {
-        *word = u64::from_le_bytes(*chunk);
+    for chunk in text.as_bytes().chunks(32) {
+        let mut bytes = [0u8; 32];
+        bytes[..chunk.len()].copy_from_slice(chunk);
+        let mut words = [0u64; 4];
+        for (word, part) in words.iter_mut().zip(bytes.as_chunks::<8>().0) {
+            *word = u64::from_le_bytes(*part);
+        }
+        let taken = corrode_rt::call(app::WINDOWS, corrode_rt::Message::new(window::RUN_TEXT, words), None);
+        if !taken.is_ok_and(|answer| answer.message.words[0] == 1) {
+            out.error("win: the desktop would not take the command line");
+            return 1;
+        }
     }
     let _ = corrode_rt::delete(app::PROGRAM);
-    let message = corrode_rt::Message::new(window::RUN, words);
+    let message = corrode_rt::Message::new(window::RUN, [0; 4]);
     let answer = match corrode_rt::call(app::WINDOWS, message, Some(app::PROGRAM)) {
         Ok(answer) => answer.message.words,
         Err(error) => {
@@ -707,5 +724,22 @@ fn win(path: &str, out: &mut Output) -> i32 {
     };
     let _ = corrode_rt::delete(app::PROGRAM);
     status
+}
+
+/// One argument as a Windows command line carries it: in quotes if it is
+/// empty or holds a space or tab, with a quote inside it after a `\`.
+fn windows_quoted(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return String::from(arg);
+    }
+    let mut quoted = String::from("\"");
+    for character in arg.chars() {
+        if character == '"' {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
 }
 

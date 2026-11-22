@@ -16,6 +16,10 @@
 //! may see, and this file never does. Failures set `GetLastError`'s
 //! number, as on Windows. Nothing here holds or asks for more.
 //!
+//! `GetCommandLineW`: the kernel leaves the command line at the start of
+//! the shared page before the program starts, and the first use of the
+//! page takes it from there.
+//!
 //! This is not a PE DLL yet (see `verdigris/DESIGN.md`, section 2): it is a
 //! CorrodeOS program linked at `KERNEL32_BASE` by `kernel32.ld`, carrying
 //! its export table at that address, which the kernel reads to bind a
@@ -80,13 +84,28 @@ extern "win64" fn set_last_error(code: u32) {
 /// Where the shared page is mapped, once it is: 0 until then.
 static PAGE_AT: AtomicUsize = AtomicUsize::new(0);
 
-/// The page shared with the view, mapped the first time it is needed.
+/// The command line: UTF-16, ending in a zero.
+struct CommandLine(UnsafeCell<[u16; 2048]>);
+
+// SAFETY: one thread (see `Pending`).
+unsafe impl Sync for CommandLine {}
+
+static COMMAND_LINE: CommandLine = CommandLine(UnsafeCell::new([0; 2048]));
+
+/// The page shared with the view, mapped the first time it is needed. Its
+/// first use takes the command line out of it, before anything is written.
 fn page() -> Option<&'static mut [u8; 4096]> {
     let mut at = PAGE_AT.load(Ordering::Relaxed);
     if at == 0 {
         let mapping = map(PAGE).ok().filter(|mapping| mapping.len >= 4096)?;
         at = mapping.address as usize;
         PAGE_AT.store(at, Ordering::Relaxed);
+        // SAFETY: as below, and nothing else holds the command line now.
+        let (shared, line) = unsafe { (&*(at as *const [u8; 4096]), &mut *COMMAND_LINE.0.get()) };
+        // The last unit stays zero, whatever the page holds.
+        for (unit, bytes) in line[..2047].iter_mut().zip(shared.as_chunks::<2>().0) {
+            *unit = u16::from_le_bytes(*bytes);
+        }
     }
     // SAFETY: the kernel mapped at least a page here, writable, for the life
     // of this task; one thread, and no reference to it outlives a call.
@@ -458,6 +477,13 @@ const STD_INPUT_HANDLE: u32 = -10i32 as u32;
 const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
 const STD_ERROR_HANDLE: u32 = -12i32 as u32;
 
+/// The command line, as the program was started with it. Empty for a
+/// program given no view.
+extern "win64" fn get_command_line_w() -> *const u16 {
+    let _ = page();
+    COMMAND_LINE.0.get().cast::<u16>()
+}
+
 /// The handle for standard input, output or error.
 extern "win64" fn get_std_handle(which: u32) -> isize {
     match which {
@@ -616,9 +642,9 @@ const fn export(name: &[u8], function: *const ()) -> Export {
 /// What this kernel32 offers, at `KERNEL32_BASE` (see `kernel32.ld`).
 #[used]
 #[link_section = ".verdigris.exports"]
-static EXPORTS: Table<15> = Table {
+static EXPORTS: Table<16> = Table {
     magic: MAGIC,
-    count: 15,
+    count: 16,
     size: ENTRY as u32,
     entries: [
         export(b"GetStdHandle", get_std_handle as *const ()),
@@ -636,5 +662,6 @@ static EXPORTS: Table<15> = Table {
         export(b"GetCurrentDirectoryW", get_current_directory_w as *const ()),
         export(b"SetCurrentDirectoryW", set_current_directory_w as *const ()),
         export(b"GetFullPathNameW", get_full_path_name_w as *const ()),
+        export(b"GetCommandLineW", get_command_line_w as *const ()),
     ],
 };

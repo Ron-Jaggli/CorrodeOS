@@ -14,8 +14,9 @@ The system:
     uname uptime free caps whoami about sleep exit
 
 Windows programs (Verdigris):
-    win PATH  run one; it sees its own folder as C:\ and nothing else
-              win /programs/reader/reader.exe
+    win PATH [ARGS]  run one; it sees its own folder as C:\ and nothing
+                     else, and ARGS on its command line
+                     win /programs/reader/reader.exe one "two three"
 
 Things that need permission first (see capabilities.txt):
     ps       the running tasks             grant ps

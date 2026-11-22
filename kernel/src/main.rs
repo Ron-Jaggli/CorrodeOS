@@ -2124,6 +2124,8 @@ extern "C" fn shell_server() {
 fn serve(shell: bool) {
     use corrode_abi::window;
 
+    // `window::RUN_TEXT` so far: whose, and what.
+    let mut run_text: Option<(usize, alloc::string::String)> = None;
     loop {
         let Ok(received) = ipc::recv(SERVICE_ENDPOINT_SLOT, None, Some(SERVICE_REPLY_SLOT)) else {
             return;
@@ -2199,8 +2201,28 @@ fn serve(shell: bool) {
             let _ = ipc::reply(SERVICE_REPLY_SLOT, ipc::Message { label, words: answer }, None);
             continue;
         }
+        if received.message.label == window::RUN_TEXT {
+            // Collected for the `RUN` after it, from the terminal alone.
+            let terminal = task::name_of(received.from) == Some("terminal");
+            if run_text.as_ref().is_none_or(|(from, _)| *from != received.from) {
+                run_text = Some((received.from, alloc::string::String::new()));
+            }
+            let raw = passcode_of(words);
+            let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
+            let taken = match (&mut run_text, core::str::from_utf8(&raw[..end])) {
+                (Some((_, text)), Ok(part)) if terminal && text.len() + part.len() <= window::RUN_TEXT_MOST => {
+                    text.push_str(part);
+                    1
+                }
+                _ => 0,
+            };
+            let answer = ipc::Message { label: window::RUN_TEXT, words: [taken, 0, 0, 0] };
+            let _ = ipc::reply(SERVICE_REPLY_SLOT, answer, None);
+            continue;
+        }
         if received.message.label == window::RUN {
-            let (answer, transfer) = run_windows(received.from, words);
+            let text = run_text.take().filter(|(from, _)| *from == received.from).map(|(_, text)| text);
+            let (answer, transfer) = run_windows(received.from, text.as_deref().unwrap_or(""));
             let _ = ipc::reply(SERVICE_REPLY_SLOT, ipc::Message { label: window::RUN, words: answer }, transfer);
             for slot in [SERVICE_SPARE_SLOT, SERVICE_VIEW_SLOT, SERVICE_PAGE_SLOT] {
                 let _ = cap::delete(slot);
@@ -2592,7 +2614,7 @@ fn passcode_of(words: [u64; 4]) -> corrode_theme::passcode::Code {
 /// view is its own folder alone; its output goes to an endpoint the
 /// terminal is handed, to receive on; a watcher ends that output when the
 /// program ends, however it ends.
-fn run_windows(from: usize, words: [u64; 4]) -> ([u64; 4], Option<(cap::CapPtr, cap::Rights)>) {
+fn run_windows(from: usize, text: &str) -> ([u64; 4], Option<(cap::CapPtr, cap::Rights)>) {
     const ACCESS_DENIED: u64 = 5;
     const FILE_NOT_FOUND: u64 = 2;
     const BAD_EXE_FORMAT: u64 = 193;
@@ -2608,11 +2630,7 @@ fn run_windows(from: usize, words: [u64; 4]) -> ([u64; 4], Option<(cap::CapPtr, 
     let Some((tree, module)) = vault::root() else {
         return refuse(FILE_NOT_FOUND);
     };
-    let raw = passcode_of(words);
-    let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
-    let Ok(path) = core::str::from_utf8(&raw[..end]) else {
-        return refuse(FILE_NOT_FOUND);
-    };
+    let (path, arguments) = text.split_once('\n').unwrap_or((text, ""));
     let Ok(fs) = corrode_shell::fs::Fs::from_tar(module.bytes) else {
         return refuse(FILE_NOT_FOUND);
     };
@@ -2623,6 +2641,14 @@ fn run_windows(from: usize, words: [u64; 4]) -> ([u64; 4], Option<(cap::CapPtr, 
     // A task's name lives as long as the task: the file's name, cut short.
     let name: alloc::string::String = corrode_shell::fs::name_of(path).chars().take(15).collect();
     let name: &'static str = alloc::boxed::Box::leak(name.into_boxed_str());
+    // As Windows would show it: the program where its view puts it, then
+    // the arguments as the terminal quoted them.
+    let file = corrode_shell::fs::name_of(path);
+    let mut command_line = if file.contains(' ') { alloc::format!("\"C:\\{file}\"") } else { alloc::format!("C:\\{file}") };
+    if !arguments.is_empty() {
+        command_line.push(' ');
+        command_line.push_str(arguments);
+    }
 
     // Spawning reaps too; done here first to say what came back.
     let reaped = task::reap();
@@ -2636,7 +2662,7 @@ fn run_windows(from: usize, words: [u64; 4]) -> ([u64; 4], Option<(cap::CapPtr, 
     };
     let started = output
         .map_err(|_| "no endpoint for its output")
-        .and_then(|_| start_windows(name, exe.data, folder, &[], tree, &slots));
+        .and_then(|_| start_windows(name, exe.data, &command_line, folder, &[], tree, &slots));
     let (program, server) = match started {
         Ok(started) => started,
         Err(why) => {
@@ -3265,7 +3291,7 @@ fn view_checks() {
         return;
     };
     let slots = Slots { view: VIEW_ENDPOINT, page: VIEW_PAGE, output: LOG_ENDPOINT, log: LOG_ENDPOINT };
-    let started = start_windows("reader.exe", program.bytes, READER_FOLDER, &[READER_ALLOWED], tree, &slots);
+    let started = start_windows("reader.exe", program.bytes, "reader.exe", READER_FOLDER, &[READER_ALLOWED], tree, &slots);
     let (reader, server) = match started {
         Ok(started) => started,
         Err(why) => {
@@ -3323,6 +3349,7 @@ struct Slots {
 fn start_windows(
     name: &'static str,
     exe: &[u8],
+    command_line: &str,
     folder: &str,
     allowed: &[&str],
     tree: usize,
@@ -3343,6 +3370,16 @@ fn start_windows(
         memory::let_go(page);
         memory::let_go(list);
     });
+    // The command line, in UTF-16 at the start of the page, for kernel32 to
+    // take before the page is used for anything else. The page is zeroed,
+    // so it ends in a zero: at most 2047 units are written.
+    let Some(shared) = memory::frame_of(page, 0) else {
+        return Err("no memory for the view");
+    };
+    let units: alloc::vec::Vec<u8> = command_line.encode_utf16().take(2047).flat_map(u16::to_le_bytes).collect();
+    // SAFETY: the object's frame, which no task has been given yet; at most
+    // 4094 bytes from its start.
+    mm::paging::with_kernel_mapper(|mapper| unsafe { mapper.write_frame(shared, 0, &units) });
     // The list, written through the direct map before the view maps it,
     // read-only. One page: what does not fit is left out.
     let Some(frame) = memory::frame_of(list, 0) else {

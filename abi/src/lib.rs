@@ -354,14 +354,20 @@ pub mod window {
     /// passcode. The vault is sealed again under it on the disk. The
     /// answer's word 0 is 1 if it was.
     pub const PASSCODE_SET: u64 = 86;
-    /// The terminal only: run the Windows program at the absolute path
-    /// carried in the four words (up to 32 bytes, zero-padded), from the
-    /// files. Its view is its own folder alone. The answer's word 0 is 1 if
-    /// it started, with the program's output endpoint to receive on:
-    /// [`log`](super::log) messages, then [`log::END`](super::log::END).
-    /// Otherwise word 1 is a Windows error number (2, the file is not
-    /// there; 193, `ERROR_BAD_EXE_FORMAT`).
+    /// The terminal only: run a Windows program from the files, as the text
+    /// sent before it with [`RUN_TEXT`] says: its absolute path, a line
+    /// feed, and its arguments, quoted as on Windows. Its view is its own
+    /// folder alone, and `GetCommandLineW` gives it `C:\NAME ARGUMENTS`.
+    /// The answer's word 0 is 1 if it started, with the program's output
+    /// endpoint to receive on: [`log`](super::log) messages, then
+    /// [`log::END`](super::log::END). Otherwise word 1 is a Windows error
+    /// number (2, the file is not there; 193, `ERROR_BAD_EXE_FORMAT`).
     pub const RUN: u64 = 87;
+    /// The terminal only: up to 32 more bytes of the text for the next
+    /// [`RUN`], in the four words, zero-padded. Word 0 of the answer is 1 if
+    /// they were taken, 0 if the text would pass [`RUN_TEXT_MOST`].
+    pub const RUN_TEXT: u64 = 88;
+    pub const RUN_TEXT_MOST: usize = 2048;
     /// The calls only the shell endpoint takes.
     pub const SHELL_ONLY: [u64; 6] = [SET_THEME, QUIT, LIST, RAISE, HISTORY, CONTEXT];
 

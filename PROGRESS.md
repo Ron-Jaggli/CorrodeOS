@@ -3019,6 +3019,51 @@ allocator when nothing has a use for it, and its number is used again.
   before, plus win-test's object count), none FAIL, no unhandled trap, no
   boot self-check failing; `./corrode test` 351 passed; clippy at 33.
 
+## 88. `win PATH ARGS`: a command line for Windows programs
+
+`win /programs/reader/reader.exe one "two three"` starts reader.exe
+with the command line `C:\reader.exe one "two three"`, and
+`GetCommandLineW` gives it that. The path is no longer limited to the 32
+bytes one message carries.
+
+- **`window::RUN_TEXT` (88)**, the terminal only: 32 more bytes of the
+  text for the next `RUN`, up to `RUN_TEXT_MOST` (2048). The text is the
+  absolute path, a line feed, and the arguments. `RUN` now takes its path
+  from there; its words are unused. The window server keeps one caller's
+  text at a time and drops it at the `RUN`.
+- **The command line** is made by the kernel as Windows shows one: the
+  program where its view puts it (`C:\NAME`, quoted if the name has a
+  space), then the arguments. It is written in UTF-16 at the start of
+  the page the program shares with its view, before either starts. The
+  boot check's reader.exe gets `reader.exe`.
+- **kernel32** takes the command line out of the page the first time it
+  maps it, before anything else is written there, and
+  `GetCommandLineW` returns that copy (2047 units at most). 16 exports.
+- **reader.exe** imports `GetCommandLineW` and writes its command line
+  first.
+- **The terminal** quotes each argument as Windows would: in quotes if it
+  is empty or holds a space, tab or quote, with a `\` before each quote
+  inside. `help` and `/docs/commands.txt` show `win PATH [ARGS]`.
+- **pe's host test** of reader.exe now expects its 15 imports. The first
+  `./corrode test` of this change failed there (it still listed 14); it
+  was the test that was behind, not the program.
+- **win-test**, one scored line more: the first run's command line is
+  exactly `C:\reader.exe one "two three"`, the other seven `C:\reader.exe`.
+
+- **Choice:** the text goes in 32-byte messages, not a memory capability
+  sent with the call. The runtime's `call` cannot pass a capability
+  along yet, and a command line is short.
+- **Choice:** the command line is handed over in the shared page, not
+  asked of the view. The view decides what files a program sees; what it
+  was started with is the kernel's to say, and needs no extra call.
+- **Open:** the quoting is the simple form. Windows' full rule (runs of
+  `\` before a quote are doubled) is not followed, so an argument ending
+  in `\` before a quote would be read differently by a C runtime.
+- Verified: the whole suite on both GPUs, 90 checks PASS on each (89
+  before, plus win-test's command line), none FAIL, no unhandled trap, no
+  boot self-check failing; `./corrode test` 351 passed (after the import
+  list above); clippy at 33.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -3172,7 +3217,10 @@ one task.
 11. [x] (section 87) Memory objects are given back when nothing holds or maps them
    any more: a `win` run then costs no frames at all (win-test's bound
    goes to 0), and the object table no longer fills up after ~100 runs.
-12. [ ] Wrap-up for the owner: what the vault run did, what to review and
+12. [x] (section 88) `win PATH ARGS`: a Windows program gets its command line
+   (`GetCommandLineW`); the path is no longer held to 32 bytes; win-test
+   checks a quoted argument arrives as typed.
+13. [ ] Wrap-up for the owner: what the vault run did, what to review and
    merge, what is still open. No code. Then stop the loop.
 
 Tasks 7-9 were added at 2026-11-22T03:10-06:00, by me (and 9, running a

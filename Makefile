@@ -1524,7 +1524,8 @@ close-test: iso
 # again from its folder, by a relative one; and a file that is not a
 # program. Run from its folder it sees that folder alone, so of all it
 # looks for, only itself is there. build/win.png is the terminal after.
-WIN_KEYS := w i n spc slash p r o g r a m s slash r e a d e r slash r e a d e r dot e x e ret
+WIN_KEYS := w i n spc slash p r o g r a m s slash r e a d e r slash r e a d e r dot e x e \
+            spc o n e spc shift-apostrophe t w o spc t h r e e shift-apostrophe ret
 WIN_AGAIN_KEYS := c d spc slash p r o g r a m s slash r e a d e r ret \
                   w i n spc r e a d e r dot e x e ret
 WIN_BAD_KEYS := w i n spc slash e t c slash m o t d ret
@@ -1558,6 +1559,10 @@ win-test: iso
 	    && grep -aqxF 'terminal   : win: reader.exe: c:/Etc/MOTD: not there (3, ERROR_PATH_NOT_FOUND)' build/win-lines.log \
 	    && echo "win-test: its output came back; it saw its folder alone PASS" \
 	    || echo "win-test: its output came back; it saw its folder alone FAIL"
+	@grep -aqxF 'terminal   : win: reader.exe: command line: C:\reader.exe one "two three"' build/win-lines.log \
+	    && test $$(grep -acxF 'terminal   : win: reader.exe: command line: C:\reader.exe' build/win-lines.log) -eq 7 \
+	    && echo "win-test: it gets its command line, quoted as typed PASS" \
+	    || echo "win-test: it gets its command line, quoted as typed FAIL"
 	@grep -aqxF 'terminal   : win: /etc/motd: not a program Verdigris runs' build/win-lines.log \
 	    && echo "win-test: a file that is not a program is refused   PASS" \
 	    || echo "win-test: a file that is not a program is refused   FAIL"

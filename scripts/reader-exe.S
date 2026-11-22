@@ -7,7 +7,8 @@
 #
 # It imports CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError,
 # FindFirstFileW, FindNextFileW, FindClose, GetStdHandle, WriteFile and
-# ExitProcess from KERNEL32.dll. For each path in its first table it opens
+# ExitProcess from KERNEL32.dll. First it writes the command line it was
+# started with (GetCommandLineW). For each path in its first table it opens
 # the file, reads it, and writes the file's first line to standard output;
 # for each in its second it searches, and writes each name found (a
 # directory's with a `\` after it). Last it moves its current directory
@@ -83,6 +84,15 @@ optional_end:
 code:
         # On entry rsp is 8 below a 16-byte boundary.
         sub rsp, 0x28
+        # First, what it was started with.
+        lea rcx, [rip + say_cl]
+        mov edx, say_cl_end - say_cl
+        call put
+        call [rip + GetCommandLineW]
+        mov rcx, rax
+        xor edx, edx
+        xor r8d, r8d
+        call put_name
         .irp n, 1, 2, 3, 4, 5, 6, 7, 8, 9
         lea rcx, [rip + say_\n]
         mov edx, say_\n\()_end - say_\n
@@ -373,19 +383,19 @@ imports_end:
 
         .balign 8, 0
 lookup:
-        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, FindFirstFileW, FindNextFileW, FindClose, GetCurrentDirectoryW, SetCurrentDirectoryW, GetFullPathNameW, GetStdHandle, WriteFile, ExitProcess
+        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, FindFirstFileW, FindNextFileW, FindClose, GetCurrentDirectoryW, SetCurrentDirectoryW, GetFullPathNameW, GetCommandLineW, GetStdHandle, WriteFile, ExitProcess
         .quad hint_\name - base
         .endr
         .quad 0
 iat:
-        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, FindFirstFileW, FindNextFileW, FindClose, GetCurrentDirectoryW, SetCurrentDirectoryW, GetFullPathNameW, GetStdHandle, WriteFile, ExitProcess
+        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, FindFirstFileW, FindNextFileW, FindClose, GetCurrentDirectoryW, SetCurrentDirectoryW, GetFullPathNameW, GetCommandLineW, GetStdHandle, WriteFile, ExitProcess
 \name:  .quad hint_\name - base
         .endr
         .quad 0
 iat_end:
 
 dll:    .asciz "KERNEL32.dll"
-        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, FindFirstFileW, FindNextFileW, FindClose, GetCurrentDirectoryW, SetCurrentDirectoryW, GetFullPathNameW, GetStdHandle, WriteFile, ExitProcess
+        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, FindFirstFileW, FindNextFileW, FindClose, GetCurrentDirectoryW, SetCurrentDirectoryW, GetFullPathNameW, GetCommandLineW, GetStdHandle, WriteFile, ExitProcess
         .balign 2, 0
 hint_\name:
         .short 0
@@ -442,6 +452,8 @@ path_\n:
         listing d9, "SetCurrentDirectoryW(C:/)", "C:/"
         listing d10, "current directory", ""
 
+say_cl: .ascii "command line: "
+say_cl_end:
 agrees: .ascii "GetFileSize and the next ReadFile agree\n"
 agrees_end:
 disagrees:
