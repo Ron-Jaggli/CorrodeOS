@@ -633,8 +633,8 @@ fn main() {
 /// `ARGS` as its command line, and show what it writes, line by line,
 /// until it ends. The desktop starts it (`window::RUN`) seeing its own
 /// folder alone, and hands this terminal the endpoint its output goes to;
-/// the kernel says when it has ended, however it ended, or after ten
-/// seconds that it is still running.
+/// the kernel says when it has ended, however it ended. One still
+/// running after ten seconds is stopped.
 fn win(path: &str, args: &[String], out: &mut Output) -> i32 {
     use corrode_rt::abi::log;
 
@@ -712,8 +712,13 @@ fn win(path: &str, args: &[String], out: &mut Output) -> i32 {
                 if !line.is_empty() {
                     out.line(&line);
                 }
-                if words[0] == 1 {
+                if words[0] == log::END_RUNNING {
                     out.error(&format!("win: {name} is still running; no more of it is shown"));
+                    break 1;
+                }
+                if words[0] == log::END_STOPPED {
+                    println!("win: {name} ran 10 seconds and was stopped");
+                    out.error(&format!("win: {name} ran 10 seconds and was stopped"));
                     break 1;
                 }
                 println!("win: {name} ended after {lines} lines");

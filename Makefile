@@ -164,13 +164,16 @@ FIRMWARE := $(shell find firmware -type f -name '*.bin' 2>/dev/null | sort)
 # fixed, so the same tree always makes the same bytes.
 ROOT_TAR := build/root.tar
 READER_EXE := build/reader.exe
+SPIN_EXE := build/spin.exe
 ROOT_FILES := $(shell find root 2>/dev/null)
-# With reader.exe at /programs/reader, for the terminal's `win`: after
+# With reader.exe at /programs/reader and spin.exe, which never ends, at
+# /programs/spin, for the terminal's `win`: after
 # every other top folder, so none of them moves in Files.
-$(ROOT_TAR): $(ROOT_FILES) $(READER_EXE)
+$(ROOT_TAR): $(ROOT_FILES) $(READER_EXE) $(SPIN_EXE)
 	@mkdir -p build
 	@rm -rf build/root_staged && cp -r root build/root_staged
 	@mkdir -p build/root_staged/programs/reader && cp $(READER_EXE) build/root_staged/programs/reader/reader.exe
+	@mkdir -p build/root_staged/programs/spin && cp $(SPIN_EXE) build/root_staged/programs/spin/spin.exe
 	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
 	    --mtime=@0 --mode=u+rw,go+r,go-w -C build/root_staged -cf $@ .
 
@@ -194,6 +197,10 @@ $(CONSOLE_EXE): scripts/console-exe.sh
 $(READER_EXE): scripts/reader-exe.sh scripts/reader-exe.S
 	@mkdir -p build
 	bash scripts/reader-exe.sh $@
+
+$(SPIN_EXE): scripts/reader-exe.sh scripts/spin-exe.S
+	@mkdir -p build
+	bash scripts/reader-exe.sh $@ spin-exe.S
 
 KERNEL32_TARGET := target/verdigris
 KERNEL32 := $(KERNEL32_TARGET)/x86_64-unknown-none/release/kernel32
@@ -1529,6 +1536,7 @@ WIN_KEYS := w i n spc slash p r o g r a m s slash r e a d e r slash r e a d e r 
 WIN_AGAIN_KEYS := c d spc slash p r o g r a m s slash r e a d e r ret \
                   w i n spc r e a d e r dot e x e ret
 WIN_BAD_KEYS := w i n spc slash e t c slash m o t d ret
+WIN_SPIN_KEYS := w i n spc slash p r o g r a m s slash s p i n slash s p i n dot e x e ret
 # Frames a `win` run may keep once the next one has started: none. Its
 # tasks are given back, and so is the memory it and its view shared.
 WIN_RUN_FRAMES ?= 0
@@ -1544,15 +1552,21 @@ win-test: iso
 	   for key in $(WIN_BAD_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 1.5; \
 	   for key in up up ret; do echo "sendkey $$key"; sleep 0.12; done; sleep 2.5; \
 	   for run in 1 2 3 4 5; do for key in up ret; do echo "sendkey $$key"; sleep 0.12; done; sleep 2.5; done; \
+	   for key in $(WIN_SPIN_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 13; \
+	   for key in up up ret; do echo "sendkey $$key"; sleep 0.12; done; sleep 2.5; \
 	   echo "screendump build/win.ppm"; sleep 1; echo quit ) \
-	  | timeout --foreground 150 qemu-system-x86_64 $(QEMU_COMMON) \
+	  | timeout --foreground 180 qemu-system-x86_64 $(QEMU_COMMON) \
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
 	@tr -d '\r' < build/serial.log > build/win-lines.log
 	@grep -a "^terminal   : win\|^desktop    : /programs\|^desktop    : task" build/win-lines.log || echo "win-test: nothing from win"
-	@test $$(grep -acxF 'desktop    : /programs/reader/reader.exe started for the terminal, seeing /programs/reader alone' build/win-lines.log) -eq 8 \
-	    && test $$(grep -acE '^terminal   : win: reader.exe ended after [0-9]+ lines$$' build/win-lines.log) -eq 8 \
-	    && echo "win-test: the terminal ran it 8 times, to its end    PASS" \
-	    || echo "win-test: the terminal ran it 8 times, to its end    FAIL"
+	@test $$(grep -acxF 'desktop    : /programs/reader/reader.exe started for the terminal, seeing /programs/reader alone' build/win-lines.log) -eq 9 \
+	    && test $$(grep -acE '^terminal   : win: reader.exe ended after [0-9]+ lines$$' build/win-lines.log) -eq 9 \
+	    && echo "win-test: the terminal ran it 9 times, to its end    PASS" \
+	    || echo "win-test: the terminal ran it 9 times, to its end    FAIL"
+	@grep -aqxF 'terminal   : win: spin.exe: spinning, and never ending' build/win-lines.log \
+	    && grep -aqxF 'terminal   : win: spin.exe ran 10 seconds and was stopped' build/win-lines.log \
+	    && echo "win-test: a program that never ends is stopped      PASS" \
+	    || echo "win-test: a program that never ends is stopped      FAIL"
 	@grep -aqxF 'terminal   : win: reader.exe: C:\*: reader.exe' build/win-lines.log \
 	    && grep -aqxF 'terminal   : win: reader.exe: current directory: C:\' build/win-lines.log \
 	    && grep -aqxF 'terminal   : win: reader.exe: keys.txt: not there (2, ERROR_FILE_NOT_FOUND)' build/win-lines.log \
@@ -1560,7 +1574,7 @@ win-test: iso
 	    && echo "win-test: its output came back; it saw its folder alone PASS" \
 	    || echo "win-test: its output came back; it saw its folder alone FAIL"
 	@grep -aqxF 'terminal   : win: reader.exe: command line: C:\reader.exe one "two three"' build/win-lines.log \
-	    && test $$(grep -acxF 'terminal   : win: reader.exe: command line: C:\reader.exe' build/win-lines.log) -eq 7 \
+	    && test $$(grep -acxF 'terminal   : win: reader.exe: command line: C:\reader.exe' build/win-lines.log) -eq 8 \
 	    && echo "win-test: it gets its command line, quoted as typed PASS" \
 	    || echo "win-test: it gets its command line, quoted as typed FAIL"
 	@grep -aqxF 'terminal   : win: /etc/motd: not a program Verdigris runs' build/win-lines.log \
@@ -1571,8 +1585,10 @@ win-test: iso
 	    | awk '{ back += $$1 } END { exit back < 7 * 100 }' \
 	    && echo "win-test: each run gets back the last one's tasks   PASS" \
 	    || echo "win-test: each run gets back the last one's tasks   FAIL"
-	@grep -aoE '^desktop    : [0-9]+ frames free' build/win-lines.log | grep -oE '[0-9]+' | tail -n +2 \
-	    | awk 'NR > 1 && last - $$1 > $(WIN_RUN_FRAMES) { bad = 1 } { last = $$1 } END { exit bad || NR != 7 }' \
+	@# reader.exe's runs, the last after spin.exe was stopped and reaped.
+	@grep -aA1 -xF 'desktop    : /programs/reader/reader.exe started for the terminal, seeing /programs/reader alone' build/win-lines.log \
+	    | grep -aoE '^desktop    : [0-9]+ frames free' | grep -oE '[0-9]+' | tail -n +2 \
+	    | awk 'NR > 1 && last - $$1 > $(WIN_RUN_FRAMES) { bad = 1 } { last = $$1 } END { exit bad || NR != 8 }' \
 	    && echo "win-test: a run keeps no memory once it is over     PASS" \
 	    || echo "win-test: a run keeps no memory once it is over     FAIL"
 	@test $$(grep -aoE ', [0-9]+ memory objects$$' build/win-lines.log | sort -u | wc -l) -eq 1 \

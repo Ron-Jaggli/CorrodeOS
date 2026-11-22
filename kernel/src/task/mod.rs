@@ -123,6 +123,9 @@ pub struct Task {
     /// is on its kernel stack or in its address space any more. Set by
     /// [`on_tick`], which is where a CPU leaves a stack.
     pub left: bool,
+    /// Asked to stop ([`stop`]): finished by its CPU at a tick that finds
+    /// it in ring 3.
+    pub stopping: bool,
 }
 
 /// Slots per capability space.
@@ -210,6 +213,7 @@ pub fn init() {
             space: None,
             stack: None,
             left: false,
+            stopping: false,
         }];
         let root = crate::mm::paging::kernel_root().unwrap_or(0);
         *guard = Some(Scheduler {
@@ -277,6 +281,7 @@ pub fn adopt_as_idle(cpu_index: usize, stack_top: u64) {
             space: None,
             stack: None,
             left: false,
+            stopping: false,
         });
 
         scheduler.current[cpu_index] = id;
@@ -497,6 +502,7 @@ fn spawn_inner(
             space: image.map(|image| image.space),
             stack: Some(stack),
             left: false,
+            stopping: false,
         });
         Some(id)
     })?;
@@ -609,6 +615,24 @@ pub fn reap() -> usize {
     freed
 }
 
+/// Ask task `id` to stop: its CPU finishes it at the first tick that
+/// finds it running its own code, in ring 3. A task waiting in the kernel
+/// (on an endpoint, asleep) is not stopped until it is back in ring 3.
+/// Kernel tasks never are. False if there is no such user task.
+pub fn stop(id: usize) -> bool {
+    x86_64::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let Some(task) = guard.as_mut().and_then(|scheduler| scheduler.tasks.get_mut(id)) else {
+            return false;
+        };
+        if !task.user {
+            return false;
+        }
+        task.stopping = true;
+        true
+    })
+}
+
 /// Mark the task on this CPU finished, and say which it was.
 ///
 /// For a task that has asked to stop, or has faulted in ring 3 and is being
@@ -683,6 +707,24 @@ pub fn on_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
     // Wake this CPU's sleepers whose time has come. Checked on every pass
     // through here, which is at least every tick, so a sleep ends within one
     // tick of its deadline.
+    // A task asked to stop is finished here, by its own CPU, and only if it
+    // was in ring 3: then it is in no kernel path, holds no lock, and waits
+    // on no endpoint, so nothing can wake it again. One in the kernel is
+    // left until a tick finds it out. The frame of one not running is the
+    // frame it was last stopped at, on its own stack.
+    for task in scheduler.tasks.iter_mut() {
+        if !task.stopping || task.cpu != this_cpu || task.state == State::Finished {
+            continue;
+        }
+        // SAFETY: `saved_rsp` is the trap frame on the task's own kernel
+        // stack: the one this tick took (`frame`, for `current`), or the one
+        // its last switch left.
+        let cs = unsafe { (*(task.saved_rsp as *const TrapFrame)).cs };
+        if cs & 3 == 3 && matches!(task.state, State::Ready | State::Running) {
+            task.state = State::Finished;
+        }
+    }
+
     let now = crate::time::now_ns();
     for task in scheduler.tasks.iter_mut() {
         // A finished task of this CPU's that is not the one whose stack this

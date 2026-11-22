@@ -3064,6 +3064,46 @@ bytes one message carries.
   boot self-check failing; `./corrode test` 351 passed (after the import
   list above); clippy at 33.
 
+## 89. A program that never ends is stopped
+
+Until now nothing could stop a task (`kill` in /docs/commands.txt was
+never built). A Windows program that looped for ever under `win` was told
+to the terminal as "still running" after 10 s, and then ran on for good,
+holding its tasks and memory.
+
+- **`task::stop(id)`** asks a user task to stop. Its own CPU finishes it
+  at the first tick whose frame for it is a ring-3 one: then it is in no
+  kernel path, holds no lock and waits on no endpoint, so nothing can
+  wake it again, and section 86's reap gives everything back. A task
+  waiting in the kernel stays until it is back in ring 3; kernel tasks
+  are never stopped.
+- **The watcher** (section 85) stops a program still running at the 10 s
+  deadline, waits up to a second for it, then ends its view as for a
+  program that faulted.
+- **`log::END`** now says how a program ended: `END_ENDED` (0),
+  `END_RUNNING` (1, could not be stopped) or `END_STOPPED` (2). The
+  terminal says "win: spin.exe ran 10 seconds and was stopped".
+- **spin.exe** (scripts/spin-exe.S, built by reader-exe.sh, which now
+  takes the source as a second argument) writes one line and loops in
+  ring 3. It is packed into the files at /programs/spin.
+- **win-test**: spin.exe is run after the eight reader.exe runs, then
+  reader.exe once more. Scored: spin.exe said its line and was stopped;
+  reader.exe ran 9 times; its frames free are the same on each of its
+  runs, the last one after spin.exe's tasks were reaped (114 frames back).
+
+- **Choice:** stop only in ring 3, at a tick, by the task's own CPU. A
+  task stopped in the kernel could be in an endpoint's queue or hold a
+  lock, and taking it out safely means undoing each of those; a program
+  that spins, the case `win` meets, is always found in ring 3.
+- **Choice:** no `kill` command yet. Who may stop which task is a
+  capability question (a task capability with WRITE, say); the watcher
+  stops only what the terminal's own `win` started.
+- **Open:** a program blocked for good in the kernel (its view gone, say)
+  is still not stopped; the terminal is told it is still running.
+- Verified: the whole suite on both GPUs, 91 checks PASS on each (90
+  before, plus win-test's stopped program), none FAIL, no unhandled trap,
+  no boot self-check failing; `./corrode test` 351 passed; clippy at 33.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -3220,7 +3260,10 @@ one task.
 12. [x] (section 88) `win PATH ARGS`: a Windows program gets its command line
    (`GetCommandLineW`); the path is no longer held to 32 bytes; win-test
    checks a quoted argument arrives as typed.
-13. [ ] Wrap-up for the owner: what the vault run did, what to review and
+13. [x] (section 89) A Windows program still running at `win`'s deadline is stopped
+   (it was left running for good, holding its memory); spin.exe, which
+   never ends, packed at /programs/spin; win-test stops it.
+14. [ ] Wrap-up for the owner: what the vault run did, what to review and
    merge, what is still open. No code. Then stop the loop.
 
 Tasks 7-9 were added at 2026-11-22T03:10-06:00, by me (and 9, running a

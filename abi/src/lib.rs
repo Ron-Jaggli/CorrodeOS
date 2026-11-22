@@ -424,9 +424,16 @@ pub mod log {
     pub const TEXT: u64 = 1;
     pub const LINE: u64 = 2;
     /// The kernel, to whoever reads a program's output: it has ended, after
-    /// its last line. Word 0 is 0 if it ended, 1 if it was still running
-    /// when the kernel stopped waiting. The log itself ignores it.
+    /// its last line. Word 0 says how: [`END_ENDED`], [`END_STOPPED`] or
+    /// [`END_RUNNING`]. The log itself ignores it.
     pub const END: u64 = 3;
+    /// It ended by itself (or faulted).
+    pub const END_ENDED: u64 = 0;
+    /// It was still running when the kernel stopped waiting, and could not
+    /// be stopped: it was waiting in the kernel.
+    pub const END_RUNNING: u64 = 1;
+    /// It was still running at the deadline, and the kernel stopped it.
+    pub const END_STOPPED: u64 = 2;
     /// Bytes in one message.
     pub const CAPACITY: usize = 32;
 }

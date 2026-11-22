@@ -2703,8 +2703,9 @@ const WATCH_VIEW: cap::CapPtr = 1;
 const RUN_WAIT_NS: u64 = 10_000_000_000;
 
 /// Wait for one program the terminal ran to end, then say so on its
-/// output, after its last line. A program that faulted never told its view
-/// to end; this does.
+/// output, after its last line. One still running at the deadline is
+/// stopped (`task::stop`). A program that faulted or was stopped never told
+/// its view to end; this does.
 extern "C" fn watch_program() {
     use corrode_abi::{log, view};
 
@@ -2722,6 +2723,15 @@ extern "C" fn watch_program() {
     while !finished(watch.program) && time::now_ns() < deadline {
         task::sleep_until(time::now_ns() + 20_000_000);
     }
+    // Still running at the deadline: stopped, if it is in its own code.
+    let mut stopped = false;
+    if !finished(watch.program) && task::stop(watch.program) {
+        let grace = time::now_ns() + 1_000_000_000;
+        while !finished(watch.program) && time::now_ns() < grace {
+            task::sleep_until(time::now_ns() + 10_000_000);
+        }
+        stopped = finished(watch.program);
+    }
     let ended = finished(watch.program);
     if ended {
         // Given a moment: a program that exited told its view itself.
@@ -2733,7 +2743,14 @@ extern "C" fn watch_program() {
             let _ = ipc::send(WATCH_VIEW, ipc::Message { label: view::DONE, words: [0; 4] }, None);
         }
     }
-    let _ = ipc::send(WATCH_OUTPUT, ipc::Message { label: log::END, words: [u64::from(!ended), 0, 0, 0] }, None);
+    let how = if stopped {
+        log::END_STOPPED
+    } else if ended {
+        log::END_ENDED
+    } else {
+        log::END_RUNNING
+    };
+    let _ = ipc::send(WATCH_OUTPUT, ipc::Message { label: log::END, words: [how, 0, 0, 0] }, None);
 }
 
 /// Which task proved the passcode for a change, and until when.
