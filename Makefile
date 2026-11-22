@@ -75,7 +75,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test fade-test usb-test pe-test grow-test zoom-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test fade-test usb-test pe-test verify-test grow-test zoom-test
 .PHONY: all kernel user kernel32 iso run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -220,19 +220,46 @@ iso: $(KERNEL) user kernel32 $(TEST_BLOB) $(ROOT_TAR) $(HELLO_EXE) $(CONSOLE_EXE
 	   for file in $(FIRMWARE); do \
 	       echo "    module_path: boot():/boot/$$file"; \
 	   done; } > $(ISO_ROOT)/boot/limine/limine.conf
-	cp $(LIMINE_DIR)/limine-bios.sys \
-	   $(LIMINE_DIR)/limine-bios-cd.bin \
-	   $(LIMINE_DIR)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
-	cp $(LIMINE_DIR)/BOOTX64.EFI $(LIMINE_DIR)/BOOTIA32.EFI $(ISO_ROOT)/EFI/BOOT/
-	xorriso -as mkisofs -quiet -R -r -J \
-	    -b boot/limine/limine-bios-cd.bin \
-	    -no-emul-boot -boot-load-size 4 -boot-info-table \
-	    --efi-boot boot/limine/limine-uefi-cd.bin \
-	    -efi-boot-part --efi-boot-image \
-	    --protective-msdos-label \
-	    $(ISO_ROOT) -o $(ISO)
-	$(LIMINE_DIR)/limine bios-install $(ISO)
+	@# Hashes on every path, the config's hash enrolled into Limine.
+	LIMINE_DIR=$(LIMINE_DIR) bash scripts/seal-iso.sh $(ISO_ROOT) $(ISO)
 	@echo "built $(ISO)"
+
+# Limine boots only what was built (scripts/seal-iso.sh). Copies of the
+# ISO's tree, each packed as it is, not sealed again: the copy untouched,
+# which must boot (so packing is not what stops the others); a byte of the
+# kernel changed, and a byte of a program, which Limine must refuse by
+# name; and the config with one hash taken off, which must stop Limine
+# before it reads a line of it -- the config's own hash, enrolled, no
+# longer matches.
+VERIFY_TIMEOUT ?= 8
+verify-test: iso
+	@rm -rf build/verify_root build/verify.iso build/verify-*.log
+	@for case in none kernel program config; do \
+	    rm -rf build/verify_root && cp -r $(ISO_ROOT) build/verify_root; \
+	    case $$case in \
+	    kernel)  printf '\x90' | dd of=build/verify_root/boot/corrode bs=1 seek=4096 conv=notrunc status=none ;; \
+	    program) printf '\x90' | dd of=build/verify_root/boot/programs/terminal bs=1 seek=4096 conv=notrunc status=none ;; \
+	    config)  sed -i '0,/#[0-9a-f]*$$/s/#[0-9a-f]*$$//' build/verify_root/boot/limine/limine.conf ;; \
+	    esac; \
+	    LIMINE_DIR=$(LIMINE_DIR) bash scripts/seal-iso.sh --pack-only build/verify_root build/verify.iso; \
+	    timeout --foreground $(VERIFY_TIMEOUT) qemu-system-x86_64 \
+	        $(subst $(ISO),build/verify.iso,$(QEMU_FLAGS)) < /dev/null > build/verify-$$case.log 2>&1 || true; \
+	done
+	@rm -rf build/verify_root build/verify.iso
+	@grep -aq "^Corrode v" build/verify-none.log \
+	    && echo "verify-test: the tree as built boots             PASS" \
+	    || echo "verify-test: the tree as built boots             FAIL"
+	@grep -aq "hash for URI .boot():/boot/corrode. does not match" build/verify-kernel.log \
+	    && ! grep -aq "^Corrode v" build/verify-kernel.log \
+	    && echo "verify-test: a changed kernel is refused         PASS" \
+	    || echo "verify-test: a changed kernel is refused         FAIL"
+	@grep -aq "hash for URI .boot():/boot/programs/terminal. does not match" build/verify-program.log \
+	    && ! grep -aq "^Corrode v" build/verify-program.log \
+	    && echo "verify-test: a changed program is refused        PASS" \
+	    || echo "verify-test: a changed program is refused        FAIL"
+	@! grep -aq "limine: Loading\|^Corrode v" build/verify-config.log \
+	    && echo "verify-test: an edited config is refused         PASS" \
+	    || echo "verify-test: an edited config is refused         FAIL"
 
 # Interactive boot. Ctrl-A X to quit QEMU.
 run: iso
@@ -627,13 +654,7 @@ fade-test: iso
 	@cp -r $(ISO_ROOT) build/fade_iso_root
 	@tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
 	    --mtime=@0 --mode=u+rw,go+r,go-w -C build/fade_root -cf build/fade_iso_root/boot/files/root.tar .
-	@xorriso -as mkisofs -quiet -R -r -J \
-	    -b boot/limine/limine-bios-cd.bin \
-	    -no-emul-boot -boot-load-size 4 -boot-info-table \
-	    --efi-boot boot/limine/limine-uefi-cd.bin \
-	    -efi-boot-part --efi-boot-image \
-	    --protective-msdos-label \
-	    build/fade_iso_root -o $(FADE_ISO) && $(LIMINE_DIR)/limine bios-install $(FADE_ISO) > /dev/null
+	@LIMINE_DIR=$(LIMINE_DIR) bash scripts/seal-iso.sh build/fade_iso_root $(FADE_ISO)
 	@( sleep $(SHOT_DELAY); \
 	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 0.35; \
@@ -1240,13 +1261,7 @@ passcode-test: iso
 	@cp -r $(ISO_ROOT) build/pass_iso_root
 	@tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
 	    --mtime=@0 --mode=u+rw,go+r,go-w -C build/pass_root -cf build/pass_iso_root/boot/files/root.tar .
-	@xorriso -as mkisofs -quiet -R -r -J \
-	    -b boot/limine/limine-bios-cd.bin \
-	    -no-emul-boot -boot-load-size 4 -boot-info-table \
-	    --efi-boot boot/limine/limine-uefi-cd.bin \
-	    -efi-boot-part --efi-boot-image \
-	    --protective-msdos-label \
-	    build/pass_iso_root -o $(PASS_ISO) && $(LIMINE_DIR)/limine bios-install $(PASS_ISO) > /dev/null
+	@LIMINE_DIR=$(LIMINE_DIR) bash scripts/seal-iso.sh build/pass_iso_root $(PASS_ISO)
 	@( sleep $(SHOT_DELAY); \
 	   echo "sendkey alt-l"; sleep 1.5; \
 	   echo "sendkey ret"; sleep 0.3; \

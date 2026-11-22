@@ -2445,6 +2445,34 @@ at the same 33 warnings, all older than this loop, as before it started.
 The user's uncommitted change in `kernel/src/input.rs` is still
 uncommitted and in no commit.
 
+## 77. Limine boots only what was built
+
+The owner's direction after 76 (2026-11-21): the kernel and the root
+directory are what matter; the root directory is encrypted on the disk,
+and the rest was left to me. The kernel itself is not encrypted -- the
+machine must read it before anything could decrypt it, and it holds no
+secret -- but nothing changed may boot.
+
+- `scripts/seal-iso.sh TREE OUT` packs every ISO (the ISO, and the copies
+  fade-test and passcode-test make). It puts each file's BLAKE2B after its
+  path in limine.conf (`kernel_path: boot():/boot/corrode#<hash>`, and
+  every `module_path`), so Limine refuses a file that does not match; then
+  enrolls the config's own hash into `limine-bios.sys`, `BOOTX64.EFI` and
+  `BOOTIA32.EFI` (and the copies inside `limine-uefi-cd.bin`, which UEFI
+  boots a CD from), so an edited config is refused too. What is left to
+  trust is Limine itself, which Secure Boot signs on real hardware.
+- New scored `verify-test`: copies of the ISO tree packed as they are
+  (`--pack-only`): unchanged, it boots (so packing is not what stops the
+  rest); a byte of the kernel changed, Limine panics naming the kernel; a
+  byte of `terminal` changed, it names `terminal`; one hash taken off the
+  config, Limine stops before reading a line of it.
+- **Choice:** hashes, not signatures: Limine checks hashes, and the
+  config holding them is what is enrolled. A signature over the whole
+  chain is Secure Boot's job, with the owner's key.
+- Verified: the whole suite on both GPUs, 67 checks PASS on each (63
+  before, plus verify-test's four), none FAIL; boot self-checks 191/198,
+  no unhandled trap; `./corrode test` 333 passed.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -2555,4 +2583,30 @@ stopped by its own rule. What is needed from you:
 - Verdigris's six open decisions in `verdigris/DESIGN.md` (where PE
   parsing lives for your files, threads, GS base, fault delivery, JIT,
   run-time LoadLibrary) before phase 3.
+
+### Loop state (vault run)
+
+Started 2026-11-21T23:40-06:00 at the owner's word ("keep running for 15
+hours"); cap 2026-11-22T14:40-06:00. Branch `vault`, off `verdigris`.
+One task a pass; decisions are mine, recorded as **Choice:**. Same rules as
+above: build, `./corrode test`, boot tests on both GPUs before each commit;
+never main or desktop-glass; never the uncommitted kernel/src/input.rs
+change; QEMU runs one at a time; nothing on disk under the per-boot key.
+Stop at the cap, when all are done, or when a test fails twice in a row on
+one task.
+
+1. [x] (section 77) Limine checks a hash of every file it loads, and its
+   config's hash is enrolled; `verify-test`.
+2. [ ] The vault: the root directory sealed on the disk under the
+   passcode, a boot medium without it, the lock screen at boot; files only
+   after the right passcode; `vault-test`.
+3. [ ] Longer passcodes: up to 32 characters, letters and digits, on the
+   lock screen, in desktop.conf and in `vault-disk`.
+4. [ ] Change the passcode from Settings: the vault re-sealed under the
+   new one, fresh salt and nonce, written to the disk.
+5. [ ] README: how to make and boot a vault, and what it does and does not
+   protect against.
+6. [ ] Verdigris phase 3: a Windows program reads files through the
+   pruned view DESIGN.md specifies (CreateFileW, ReadFile, CloseHandle,
+   GetFileSize), only what it was allowed, anything else absent.
 
