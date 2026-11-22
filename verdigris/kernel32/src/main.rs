@@ -34,6 +34,7 @@ extern crate alloc;
 mod format;
 mod msvcrt;
 mod process;
+mod stdio;
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -194,6 +195,36 @@ unsafe fn path_to_page(name: *const u16) -> Result<usize, u32> {
         len += character.encode_utf8(&mut page[len..]).len();
     }
     Ok(len)
+}
+
+/// Open a file for reading through the view, its name UTF-8 (the C
+/// runtime's code page): a file handle, or the Windows error.
+pub(crate) fn open_for_reading(name: &[u8]) -> Result<isize, u32> {
+    let page = page().ok_or(ERROR_FILE_NOT_FOUND)?;
+    if name.len() > view::MOST_PATH {
+        return Err(ERROR_FILENAME_EXCED_RANGE);
+    }
+    page[..name.len()].copy_from_slice(name);
+    // `OPEN_EXISTING`: reading never makes a file.
+    ask(view::OPEN, [name.len() as u64, 0, 3, 0]).map(|file| FILE_HANDLES + file as isize)
+}
+
+/// Read into `buffer` from a handle `open_for_reading` gave: how many
+/// bytes came, 0 at the end, or the Windows error.
+pub(crate) fn read_some(handle: isize, buffer: &mut [u8]) -> Result<usize, u32> {
+    let mut got = 0u32;
+    // SAFETY: `buffer` has room for its length, `got` is writable.
+    let ok = unsafe { read_file(handle, buffer.as_mut_ptr(), buffer.len() as u32, &mut got, core::ptr::null_mut()) };
+    if ok == 0 {
+        Err(get_last_error())
+    } else {
+        Ok(got as usize)
+    }
+}
+
+/// Close a handle `open_for_reading` gave.
+pub(crate) fn close(handle: isize) {
+    close_handle(handle);
 }
 
 /// Fail with `code`, as a Windows call does: the number for
@@ -690,7 +721,7 @@ const fn crt(name: &[u8], function: *const ()) -> Export {
     export_from(b"msvcrt.dll", name, function)
 }
 
-const EXPORT_COUNT: usize = 96;
+const EXPORT_COUNT: usize = 103;
 
 /// What Verdigris's DLLs offer, at `KERNEL32_BASE` (see `kernel32.ld`):
 /// kernel32's functions, msvcrt's functions and variables, and the start
@@ -776,6 +807,13 @@ static EXPORTS: Table<EXPORT_COUNT> = Table {
         crt(b"fwrite", msvcrt::fwrite as *const ()),
         crt(b"fputs", msvcrt::fputs as *const ()),
         crt(b"puts", msvcrt::puts as *const ()),
+        crt(b"fopen", stdio::fopen as *const ()),
+        crt(b"fclose", stdio::fclose as *const ()),
+        crt(b"fgetc", stdio::fgetc as *const ()),
+        crt(b"fgets", stdio::fgets as *const ()),
+        crt(b"fread", stdio::fread as *const ()),
+        crt(b"feof", stdio::feof as *const ()),
+        crt(b"ferror", stdio::ferror as *const ()),
         crt(b"fflush", msvcrt::fflush as *const ()),
         crt(b"printf", msvcrt::printf as *const ()),
         crt(b"fprintf", msvcrt::fprintf as *const ()),

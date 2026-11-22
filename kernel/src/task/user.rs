@@ -213,8 +213,10 @@ pub fn load_pe(file: &[u8]) -> Result<Image, LoadError> {
 pub fn load_windows(file: &[u8], kernel32: &[u8]) -> Result<Image, LoadError> {
     use corrode_abi::verdigris::{
         KERNEL32_BASE, PEB, START_ENTRY, START_TLS_CALLBACKS, TEB, TEB_PAGES, TLS_BLOCK, TLS_VECTOR,
+        WALL_AT, WALL_UNIX,
     };
     let pe = Pe::parse(file, layout::IMAGE_BASE..KERNEL32_BASE).map_err(LoadError::Pe)?;
+    let wall = crate::rtc::anchor();
     // kernel32 ends below the TEB, which is the kernel's to lay out.
     let runtime = Elf::parse(kernel32, KERNEL32_BASE..TEB).map_err(LoadError::Format)?;
     let exports = runtime
@@ -264,6 +266,9 @@ pub fn load_windows(file: &[u8], kernel32: &[u8]) -> Result<Image, LoadError> {
         (START_ENTRY, pe.entry()),
         (START_TLS_CALLBACKS, tls.map_or(0, |tls| tls.callbacks)),
         (TLS_VECTOR, TLS_BLOCK),
+        // The wall clock, as DESIGN.md says a program gets it: at its start.
+        (WALL_UNIX, wall.map_or(0, |(unix, _)| unix as u64)),
+        (WALL_AT, wall.map_or(0, |(_, at)| at)),
     ] {
         fixups.push(Some(Fixup { address, value }));
     }

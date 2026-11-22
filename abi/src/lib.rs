@@ -524,6 +524,11 @@ pub mod verdigris {
     /// callbacks (a zero-ended array of addresses; 0 for none).
     pub const START_ENTRY: u64 = PEB + 0x800;
     pub const START_TLS_CALLBACKS: u64 = PEB + 0x808;
+    /// The wall clock when the program was loaded, in the PEB page: Unix
+    /// seconds, and the monotonic clock's nanoseconds at that second. Both
+    /// 0 when the machine has no clock to read.
+    pub const WALL_UNIX: u64 = PEB + 0x810;
+    pub const WALL_AT: u64 = PEB + 0x818;
     /// The program's TLS vector (`TEB.ThreadLocalStoragePointer`): one
     /// entry, its block, for TLS index 0.
     pub const TLS_VECTOR: u64 = PEB + 0x900;

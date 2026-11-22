@@ -31,10 +31,10 @@ static ERRNO: One<i32> = One::new(0);
 static ARGV: One<(i32, *mut *mut u8)> = One::new((0, core::ptr::null_mut()));
 static AT_EXIT: One<Vec<usize>> = One::new(Vec::new());
 
-const EINVAL: i32 = 22;
+pub(crate) const EINVAL: i32 = 22;
 const ENOMEM: i32 = 12;
-const EBADF: i32 = 9;
-const EOF: i32 = -1;
+pub(crate) const EBADF: i32 = 9;
+pub(crate) const EOF: i32 = -1;
 
 /// A string kept for the life of the program, zero-ended.
 fn leak(bytes: &[u8]) -> *mut u8 {
@@ -249,7 +249,7 @@ pub extern "win64" fn errno() -> *mut i32 {
     ERRNO.as_ptr()
 }
 
-fn set_errno(value: i32) {
+pub(crate) fn set_errno(value: i32) {
     // SAFETY: one thread.
     unsafe { *ERRNO.get() = value };
 }
@@ -373,7 +373,7 @@ pub extern "win64" fn strerror(number: i32) -> *const u8 {
 // ---------------------------------------------------------------- streams
 
 /// msvcrt's `FILE` (48 bytes). Only `_file` means anything here: which
-/// standard stream it is.
+/// standard stream it is, or a file's handle (`stdio`).
 #[repr(C)]
 pub struct File {
     ptr: *mut u8,
@@ -386,7 +386,7 @@ pub struct File {
     tmpfname: *mut u8,
 }
 
-const fn stream(file: i32) -> File {
+pub(crate) const fn stream(file: i32) -> File {
     File {
         ptr: core::ptr::null_mut(),
         count: 0,
@@ -404,6 +404,13 @@ static IOB: One<[File; 3]> = One::new([stream(0), stream(1), stream(2)]);
 
 pub extern "win64" fn iob_func() -> *mut File {
     IOB.as_ptr().cast()
+}
+
+/// Whether `file` is stdin, stdout or stderr.
+pub(crate) fn is_standard(file: *const File) -> bool {
+    let first = IOB.as_ptr() as *const File;
+    // SAFETY: only compared, never read through.
+    (0..3).any(|i| core::ptr::eq(unsafe { first.add(i) }, file))
 }
 
 /// Which standard stream `file` is, if it is one that can be written.
