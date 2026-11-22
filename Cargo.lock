@@ -30,6 +30,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "corrode-crt-tests"
+version = "0.0.1"
+
+[[package]]
 name = "corrode-edu"
 version = "0.0.1"
 dependencies = [

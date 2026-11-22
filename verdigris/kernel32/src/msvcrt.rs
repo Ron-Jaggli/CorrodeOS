@@ -14,6 +14,7 @@ use core::ffi::c_void;
 
 use crate::format::{format, Args};
 use crate::process::{allocate, release, resize};
+use crate::text::split;
 use crate::{exit_process, get_command_line_w, write_out, One};
 
 // ---------------------------------------------------------------- data
@@ -75,76 +76,6 @@ pub fn before_main() {
         MSVCRT_INITENV = environment;
         MSVCRT_ACMDLN = leak(line.as_bytes());
     }
-}
-
-/// A command line split into arguments as the Microsoft C runtime splits
-/// it: white space between arguments; quotes group and are removed; `2n`
-/// backslashes before a quote are `n` backslashes and the quote counts,
-/// `2n+1` are `n` and a literal quote; `""` inside quotes is a literal
-/// quote; other backslashes are themselves. The first argument, the
-/// program's name, takes quotes but not backslash rules.
-pub fn split(line: &[u8]) -> Vec<Vec<u8>> {
-    let mut arguments = Vec::new();
-    let mut at = 0;
-    // The program's name.
-    let mut name = Vec::new();
-    let mut quoted = false;
-    while at < line.len() {
-        let byte = line[at];
-        if byte == b'"' {
-            quoted = !quoted;
-        } else if !quoted && (byte == b' ' || byte == b'\t') {
-            break;
-        } else {
-            name.push(byte);
-        }
-        at += 1;
-    }
-    arguments.push(name);
-    loop {
-        while at < line.len() && (line[at] == b' ' || line[at] == b'\t') {
-            at += 1;
-        }
-        if at == line.len() {
-            break;
-        }
-        let mut argument = Vec::new();
-        let mut quoted = false;
-        while at < line.len() {
-            let byte = line[at];
-            if !quoted && (byte == b' ' || byte == b'\t') {
-                break;
-            }
-            if byte == b'\\' {
-                let run = line[at..].iter().take_while(|byte| **byte == b'\\').count();
-                at += run;
-                if line.get(at) == Some(&b'"') {
-                    argument.extend(core::iter::repeat_n(b'\\', run / 2));
-                    if run % 2 == 1 {
-                        argument.push(b'"');
-                        at += 1;
-                    }
-                } else {
-                    argument.extend(core::iter::repeat_n(b'\\', run));
-                }
-                continue;
-            }
-            if byte == b'"' {
-                if quoted && line.get(at + 1) == Some(&b'"') {
-                    argument.push(b'"');
-                    at += 2;
-                    continue;
-                }
-                quoted = !quoted;
-                at += 1;
-                continue;
-            }
-            argument.push(byte);
-            at += 1;
-        }
-        arguments.push(argument);
-    }
-    arguments
 }
 
 /// `__getmainargs`: `argc`, `argv` and the environment for `main`. The
