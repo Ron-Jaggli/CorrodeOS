@@ -17,6 +17,8 @@ Windows programs (Verdigris):
     win PATH [ARGS]  run one; it sees its own folder as C:\ and nothing
                      else, and ARGS on its command line
                      win /programs/reader/reader.exe one "two three"
+                     win /programs/dir/dir.exe *.exe
+                     One that never ends is stopped after 10 seconds.
 
 Things that need permission first (see capabilities.txt):
     ps       the running tasks             grant ps

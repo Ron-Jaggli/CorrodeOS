@@ -165,15 +165,18 @@ FIRMWARE := $(shell find firmware -type f -name '*.bin' 2>/dev/null | sort)
 ROOT_TAR := build/root.tar
 READER_EXE := build/reader.exe
 SPIN_EXE := build/spin.exe
+DIR_EXE := build/dir.exe
 ROOT_FILES := $(shell find root 2>/dev/null)
-# With reader.exe at /programs/reader and spin.exe, which never ends, at
-# /programs/spin, for the terminal's `win`: after
+# With reader.exe at /programs/reader, spin.exe (which never ends) at
+# /programs/spin and dir.exe (compiled, not assembled) at /programs/dir,
+# for the terminal's `win`: after
 # every other top folder, so none of them moves in Files.
-$(ROOT_TAR): $(ROOT_FILES) $(READER_EXE) $(SPIN_EXE)
+$(ROOT_TAR): $(ROOT_FILES) $(READER_EXE) $(SPIN_EXE) $(DIR_EXE)
 	@mkdir -p build
 	@rm -rf build/root_staged && cp -r root build/root_staged
 	@mkdir -p build/root_staged/programs/reader && cp $(READER_EXE) build/root_staged/programs/reader/reader.exe
 	@mkdir -p build/root_staged/programs/spin && cp $(SPIN_EXE) build/root_staged/programs/spin/spin.exe
+	@mkdir -p build/root_staged/programs/dir && cp $(DIR_EXE) build/root_staged/programs/dir/dir.exe
 	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
 	    --mtime=@0 --mode=u+rw,go+r,go-w -C build/root_staged -cf $@ .
 
@@ -197,6 +200,10 @@ $(CONSOLE_EXE): scripts/console-exe.sh
 $(READER_EXE): scripts/reader-exe.sh scripts/reader-exe.S
 	@mkdir -p build
 	bash scripts/reader-exe.sh $@
+
+$(DIR_EXE): scripts/dir-exe.sh verdigris/dir/src/main.rs
+	@mkdir -p build
+	bash scripts/dir-exe.sh $@
 
 $(SPIN_EXE): scripts/reader-exe.sh scripts/spin-exe.S
 	@mkdir -p build
@@ -1537,6 +1544,10 @@ WIN_AGAIN_KEYS := c d spc slash p r o g r a m s slash r e a d e r ret \
                   w i n spc r e a d e r dot e x e ret
 WIN_BAD_KEYS := w i n spc slash e t c slash m o t d ret
 WIN_SPIN_KEYS := w i n spc slash p r o g r a m s slash s p i n slash s p i n dot e x e ret
+# dir.exe, compiled: its whole folder (C:\, a root, so no . or ..), then a
+# pattern nothing matches.
+WIN_DIR_KEYS := w i n spc slash p r o g r a m s slash d i r slash d i r dot e x e ret
+WIN_DIR_NONE_KEYS := up spc x shift-8 dot t x t ret
 # Frames a `win` run may keep once the next one has started: none. Its
 # tasks are given back, and so is the memory it and its view shared.
 WIN_RUN_FRAMES ?= 0
@@ -1554,8 +1565,10 @@ win-test: iso
 	   for run in 1 2 3 4 5; do for key in up ret; do echo "sendkey $$key"; sleep 0.12; done; sleep 2.5; done; \
 	   for key in $(WIN_SPIN_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 13; \
 	   for key in up up ret; do echo "sendkey $$key"; sleep 0.12; done; sleep 2.5; \
+	   for key in $(WIN_DIR_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 2.5; \
+	   for key in $(WIN_DIR_NONE_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 2.5; \
 	   echo "screendump build/win.ppm"; sleep 1; echo quit ) \
-	  | timeout --foreground 180 qemu-system-x86_64 $(QEMU_COMMON) \
+	  | timeout --foreground 200 qemu-system-x86_64 $(QEMU_COMMON) \
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
 	@tr -d '\r' < build/serial.log > build/win-lines.log
 	@grep -a "^terminal   : win\|^desktop    : /programs\|^desktop    : task" build/win-lines.log || echo "win-test: nothing from win"
@@ -1577,6 +1590,12 @@ win-test: iso
 	    && test $$(grep -acxF 'terminal   : win: reader.exe: command line: C:\reader.exe' build/win-lines.log) -eq 8 \
 	    && echo "win-test: it gets its command line, quoted as typed PASS" \
 	    || echo "win-test: it gets its command line, quoted as typed FAIL"
+	@size=$$(stat -c %s $(DIR_EXE)) \
+	    && grep -aqxF "terminal   : win: dir.exe: dir.exe  $$size" build/win-lines.log \
+	    && grep -aqxF "terminal   : win: dir.exe: 1 files, $$size bytes" build/win-lines.log \
+	    && grep -aqxF 'terminal   : win: dir.exe: dir: x*.txt: error 2' build/win-lines.log \
+	    && echo "win-test: a compiled program lists its folder      PASS" \
+	    || echo "win-test: a compiled program lists its folder      FAIL"
 	@grep -aqxF 'terminal   : win: /etc/motd: not a program Verdigris runs' build/win-lines.log \
 	    && echo "win-test: a file that is not a program is refused   PASS" \
 	    || echo "win-test: a file that is not a program is refused   FAIL"

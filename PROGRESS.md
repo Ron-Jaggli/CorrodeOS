@@ -3149,6 +3149,57 @@ them (endpoint, then scheduler).
   (203 on virtio, 196 on the default GPU), none failing;
   `./corrode test` 351 passed; clippy at 33.
 
+## 91. A Windows program a compiler wrote
+
+Until now every program Verdigris ran was assembled by hand
+(`scripts/reader-exe.S`, `spin-exe.S`): each byte of its PE headers and
+import tables written out by us, so they could only show that the loader
+agrees with our own idea of a PE file. `dir.exe` is the first written by
+a toolchain that has never heard of this system: Rust, compiled for
+`x86_64-pc-windows-msvc`, linked by `rust-lld` as `lld-link`, the same
+linker real Windows Rust programs are linked with.
+
+- **verdigris/dir/src/main.rs**: `dir /b` with sizes. Its first argument
+  is the pattern (`*` if none); it prints each name, `\` after folders,
+  the size after files, then a total. Eight imports from KERNEL32.dll --
+  GetStdHandle, WriteFile, ExitProcess, GetCommandLineW, FindFirstFileW,
+  FindNextFileW, FindClose, GetLastError -- all of which Verdigris
+  already had. `no_std`, no C runtime: entry `start`, `/NODEFAULTLIB`,
+  and `_fltused` defined, as MSVC's runtime would. 6.6 KB.
+- **scripts/dir-exe.sh**, the Makefile's DIR_EXE rule: the toolchain has
+  no standard library for that target and the build has no network, so
+  `core` and `compiler_builtins` are compiled from the toolchain's own
+  `rust-src` (about 8 s), then the program against them. Imports are
+  `raw-dylib`, so no Windows import library is needed. Staged at
+  `/programs/dir/dir.exe`; documented in docs/commands.txt.
+- **win-test** runs it twice: `win /programs/dir/dir.exe` must list
+  `dir.exe` with its size as built and the total; `... x*.txt` must say
+  `error 2` (ERROR_FILE_NOT_FOUND, what Windows gives).
+
+The check found a bug on its first run -- in dir.exe, not Verdigris: I
+wrote `WIN32_FIND_DATAW`'s FILETIMEs as `u64`, which Rust aligns to 8,
+moving every field after them 4 bytes (`r.exe  28587302322176`).
+FILETIME is two `u32`s; a compile-time assert now pins the name at 44
+and the size at 592. That failure is also the check failing when it
+should.
+
+- **Choice:** `RUSTC_BOOTSTRAP=1`, for this script only. `core` and
+  `compiler_builtins` use unstable features, and building them is the
+  only way to get a library for a target the toolchain image has none
+  for, offline. The kernel and every other crate stay on plain stable.
+- **Choice:** rustc called directly, not cargo `-Zbuild-std`: that wants
+  crates.io for the standard library's own dependencies (proc_macro's),
+  and the build has no network. What compiler_builtins' build.rs would
+  set for this target is set by hand (`mem`, unmangled names, `f16`).
+- **Choice:** `/FIXED` at 0x400000, no relocations, as the hand-written
+  programs are, since the loader maps at the preferred base.
+- **Open:** the loader still ignores `.pdata`, so a fault in a compiled
+  program cannot be unwound; with `panic=abort` and no SEH none is
+  needed yet.
+- Verified: the whole suite on both GPUs, 92 checks PASS on each (the
+  new one included), none FAIL, no unhandled trap; `./corrode test` 351
+  passed; clippy at 33.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -3311,7 +3362,10 @@ one task.
 14. [x] (section 90) A call to a server that has ended is refused, not waited on for
    good: a call it took and never answered, and an endpoint nobody left
    can receive on. Boot self-checks, both cases, both GPUs.
-15. [ ] Wrap-up for the owner: what the vault run did, what to review and
+15. [x] (section 91) A Windows program a compiler wrote: dir.exe, Rust built for
+   x86_64-pc-windows-msvc and linked by rust-lld, run by `win` and
+   checked in win-test on both GPUs.
+16. [ ] Wrap-up for the owner: what the vault run did, what to review and
    merge, what is still open. No code. Then stop the loop.
 
 Tasks 7-9 were added at 2026-11-22T03:10-06:00, by me (and 9, running a
