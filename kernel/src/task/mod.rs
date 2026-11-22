@@ -116,6 +116,13 @@ pub struct Task {
     /// because they *are* the kernel -- separating them would buy nothing, as
     /// they can already reach every byte of it by construction.
     pub space: Option<crate::mm::paging::Mapper>,
+    /// The kernel stack from `stack::allocate`, until [`reap`] gives it
+    /// back. `None` for the tasks that run on a stack of their own.
+    pub stack: Option<stack::Stack>,
+    /// Finished, and its CPU has run on another task's stack since: nothing
+    /// is on its kernel stack or in its address space any more. Set by
+    /// [`on_tick`], which is where a CPU leaves a stack.
+    pub left: bool,
 }
 
 /// Slots per capability space.
@@ -201,6 +208,8 @@ pub fn init() {
             kernel_stack_top: 0,
             user: false,
             space: None,
+            stack: None,
+            left: false,
         }];
         let root = crate::mm::paging::kernel_root().unwrap_or(0);
         *guard = Some(Scheduler {
@@ -266,6 +275,8 @@ pub fn adopt_as_idle(cpu_index: usize, stack_top: u64) {
             kernel_stack_top: stack_top,
             user: false,
             space: None,
+            stack: None,
+            left: false,
         });
 
         scheduler.current[cpu_index] = id;
@@ -389,6 +400,7 @@ fn spawn_inner(
     image: Option<user::Image>,
     cpu_index: usize,
 ) -> Option<usize> {
+    reap();
     let stack = stack::allocate()?;
     let user = image.is_some();
 
@@ -483,6 +495,8 @@ fn spawn_inner(
             kernel_stack_top: stack.top,
             user,
             space: image.map(|image| image.space),
+            stack: Some(stack),
+            left: false,
         });
         Some(id)
     })?;
@@ -551,6 +565,47 @@ pub fn hand_off(id: usize) {
             }
         }
     });
+}
+
+/// Give back what finished tasks alone held, once nothing can be using it:
+/// their kernel stacks, their address spaces (the frames marked
+/// `paging::OWNED`, and the tables), and the capabilities in their slots.
+/// Their records stay, so their ids keep meaning the same task and say it
+/// finished. Returns the frames given back.
+///
+/// Called before every spawn, from a task, never from an interrupt: dropping
+/// capabilities touches the heap.
+pub fn reap() -> usize {
+    let mut taken = Vec::new();
+    x86_64::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let Some(scheduler) = guard.as_mut() else {
+            return;
+        };
+        for task in scheduler.tasks.iter_mut().filter(|task| task.left) {
+            if task.stack.is_none() && task.space.is_none() && task.cspace.occupied() == 0 {
+                continue;
+            }
+            let cspace = core::mem::replace(&mut task.cspace, CSpace::new(0));
+            taken.push((task.stack.take(), task.space.take(), cspace));
+        }
+    });
+    let mut freed = 0;
+    // Outside the scheduler lock: a capability dropped here may reach
+    // anything an object's owner does when its last holder goes.
+    for (stack, space, cspace) in taken {
+        drop(cspace);
+        if let Some(space) = space {
+            // SAFETY: `left` says its CPU has since installed another space,
+            // no other CPU ever ran it, and taking it out of the record means
+            // nothing will install or use it again.
+            freed += unsafe { space.release_user_half() };
+        }
+        if let Some(stack) = stack {
+            stack::release(stack);
+        }
+    }
+    freed
 }
 
 /// Mark the task on this CPU finished, and say which it was.
@@ -629,6 +684,12 @@ pub fn on_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
     // tick of its deadline.
     let now = crate::time::now_ns();
     for task in scheduler.tasks.iter_mut() {
+        // A finished task of this CPU's that is not the one whose stack this
+        // is: the CPU switched off it at an earlier tick (and put another
+        // address space in), and tasks never move to another CPU.
+        if task.cpu == this_cpu && task.state == State::Finished && task.id != current {
+            task.left = true;
+        }
         if task.cpu == this_cpu && task.state == State::Blocked {
             if let Some(due) = task.wake_at {
                 if due <= now {

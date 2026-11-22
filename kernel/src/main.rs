@@ -2624,6 +2624,9 @@ fn run_windows(from: usize, words: [u64; 4]) -> ([u64; 4], Option<(cap::CapPtr, 
     let name: alloc::string::String = corrode_shell::fs::name_of(path).chars().take(15).collect();
     let name: &'static str = alloc::boxed::Box::leak(name.into_boxed_str());
 
+    // Spawning reaps too; done here first to say what came back.
+    let reaped = task::reap();
+    println!("desktop    : {reaped} frames of finished tasks given back");
     let output = cap::issue(SERVICE_SPARE_SLOT, cap::Object::Endpoint(ipc::Endpoint::new()), cap::Rights::ALL);
     let slots = Slots {
         view: SERVICE_VIEW_SLOT,
@@ -2651,6 +2654,9 @@ fn run_windows(from: usize, words: [u64; 4]) -> ([u64; 4], Option<(cap::CapPtr, 
     }
     start_all(&[Some(server), Some(program), watcher.filter(|_| watching)]);
     println!("desktop    : {path} started for the terminal, seeing {folder} alone");
+    // What the run has cost so far: with the earlier runs' tasks given back
+    // as this one was started, this stays level from run to run.
+    println!("desktop    : {} frames free", mm::frame::stats().0);
     // Received on, not sent to, and not passed on.
     ([1, 0, 0, 0], Some((SERVICE_SPARE_SLOT, cap::Rights::READ)))
 }

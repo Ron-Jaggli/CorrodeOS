@@ -34,6 +34,11 @@ pub const WRITE_THROUGH: u64 = 1 << 3;
 pub const NO_CACHE: u64 = 1 << 4;
 pub const HUGE: u64 = 1 << 7;
 pub const GLOBAL: u64 = 1 << 8;
+/// Software's bit, ignored by the CPU: the frame under this leaf belongs to
+/// the address space alone (a program's copied image, its stack), so it goes
+/// back to the allocator with the space. A leaf without it -- shared code,
+/// a memory object, a blob, a surface, device memory -- is someone else's.
+pub const OWNED: u64 = 1 << 9;
 pub const NO_EXECUTE: u64 = 1 << 63;
 
 /// Bits 12..51 of an entry: the physical address of the next table or page.
@@ -52,8 +57,8 @@ const fn index(va: u64, level: u32) -> usize {
 /// An address space: a PML4 and the offset that reaches physical memory.
 ///
 /// `Copy` because it is two numbers and owns nothing. Dropping one frees no
-/// frames -- tearing an address space down means walking it, and nothing here
-/// destroys one yet.
+/// frames: tearing an address space down is [`Mapper::release_user_half`],
+/// once nothing can be running in it.
 #[derive(Clone, Copy)]
 pub struct Mapper {
     /// Physical address of the PML4.
@@ -178,6 +183,61 @@ impl Mapper {
         }
 
         Some(forked)
+    }
+
+    /// Give back everything this space alone holds: the frames under
+    /// [`OWNED`] leaves, every table of the lower half, and the PML4. The
+    /// kernel half is shared and left alone. Returns the frames freed.
+    ///
+    /// # Safety
+    /// No CPU may have this space installed, or install it again, and
+    /// nothing may use this `Mapper` (or a copy of it) afterwards. A space
+    /// that was installed must have been replaced on that CPU since, which
+    /// flushed its entries from the TLB.
+    pub unsafe fn release_user_half(self) -> usize {
+        let mut freed = 0;
+        // SAFETY: `frame` is a frame only this space holds, per the contract.
+        let mut give_back = |frame: u64| {
+            unsafe { frame::free(frame::Frame::from_addr(frame)) };
+            freed += 1;
+        };
+        let present = |entry: u64| entry & PRESENT != 0;
+        // SAFETY: every table reached through a PRESENT, non-HUGE interior
+        // entry of a live table is itself a live table; leaves are only read.
+        unsafe {
+            for slot4 in 0..256 {
+                let p4 = self.entry(self.root, slot4).read();
+                if !present(p4) || p4 & HUGE != 0 {
+                    continue;
+                }
+                let pdpt = p4 & ADDR_MASK;
+                for slot3 in 0..512 {
+                    let p3 = self.entry(pdpt, slot3).read();
+                    if !present(p3) || p3 & HUGE != 0 {
+                        continue;
+                    }
+                    let pd = p3 & ADDR_MASK;
+                    for slot2 in 0..512 {
+                        let p2 = self.entry(pd, slot2).read();
+                        if !present(p2) || p2 & HUGE != 0 {
+                            continue;
+                        }
+                        let pt = p2 & ADDR_MASK;
+                        for slot1 in 0..512 {
+                            let leaf = self.entry(pt, slot1).read();
+                            if present(leaf) && leaf & OWNED != 0 {
+                                give_back(leaf & ADDR_MASK);
+                            }
+                        }
+                        give_back(pt);
+                    }
+                    give_back(pd);
+                }
+                give_back(pdpt);
+            }
+        }
+        give_back(self.root);
+        freed
     }
 
     /// Physical address a virtual address resolves to in *this* space.

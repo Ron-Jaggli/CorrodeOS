@@ -24,6 +24,12 @@ impl Frame {
     pub const fn addr(self) -> u64 {
         self.0
     }
+
+    /// The frame at `addr`, page-aligned; for giving back one that was
+    /// handed out and is known only by its address.
+    pub const fn from_addr(addr: u64) -> Frame {
+        Frame(addr & !(FRAME_SIZE - 1))
+    }
 }
 
 pub struct FrameAllocator {

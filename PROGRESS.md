@@ -2916,6 +2916,56 @@ comes back to the terminal, line by line, until it ends.
   before, plus win-test's three), none FAIL, no unhandled trap, no boot
   self-check failing; `./corrode test` 351 passed; clippy at 33.
 
+## 86. A finished task gives back what was its own
+
+Until now nothing a task had was ever given back: tasks were made once,
+at boot. With `win` (section 85) every run makes three, so a long session
+would have run out of memory. Now, when a task is made, every finished
+task whose CPU has left it is reaped:
+
+- **Its kernel stack** goes onto a free list and is handed out whole to a
+  later task. Still mapped, never unmapped, so no CPU's TLB can hold a
+  stale entry for memory that has become something else.
+- **Its address space**: `Mapper::release_user_half` walks the lower half
+  and frees every table, the PML4, and the frames under leaves marked
+  `paging::OWNED` (bit 9, which the CPU ignores). Only the loader sets it:
+  a program's copied segments and its stack. Shared code, memory objects,
+  blobs, surfaces and device memory are someone else's and are left.
+- **Its capabilities** are dropped, outside the scheduler lock.
+- Its record stays, so its id still names it and says it finished.
+
+**When it is safe** is the scheduler's to say. Tasks never change CPU, so
+`on_tick` marks a finished task `left` when its CPU is running on another
+task's stack. By then that CPU has also put another address space in,
+which flushed the dead one from its TLB. Reaping is done in task context,
+before a spawn, never from an interrupt (dropping capabilities touches
+the heap).
+
+- **Measured** (win-test, eight runs): each run gives back 117 frames of
+  the last one's tasks, and a run now costs 36 frames, down from 177.
+  With reaping turned off both new checks FAIL (177 a run, nothing back).
+- **win-test** runs reader.exe 8 times now (the full path, the relative
+  one, then six more from the history), and gained two scored lines:
+  - the runs together get back at least 100 frames a run;
+  - no run costs more than `WIN_RUN_FRAMES` (48): its view's memory
+    objects and the kernel's tables mapping them, which are never freed
+    yet. That is task 11.
+- The window server logs, per run, the frames given back and the frames
+  free after starting.
+
+- **Choice:** reap at spawn, not in `on_tick` or in a reaper task. The
+  tick runs in an interrupt and may not touch the heap; a reaper task
+  would be one more thing to schedule. Spawning is when memory is wanted.
+- **Choice:** stacks are reused, not freed. Freeing them means unmapping
+  kernel memory every CPU can see, which needs a TLB shootdown this
+  kernel does not have.
+- **Open:** a task blocked on a dead task's endpoint stays blocked, as
+  before; and a boot self-check that reads a finished task's tables could
+  now race a reap (it would fail, not corrupt anything).
+- Verified: the whole suite on both GPUs, 88 checks PASS on each (86
+  before, plus win-test's two), none FAIL, no unhandled trap, no boot
+  self-check failing; `./corrode test` 351 passed; clippy at 33.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -3062,10 +3112,22 @@ one task.
    terminal; reader.exe packed into the files at /apps/reader (put at
    /programs/reader instead; section 85 says why); a scored boot test,
    both GPUs.
-10. [ ] Wrap-up for the owner: what the vault run did, what to review and
+10. [x] (section 86) A finished task gives back what is its own: its kernel stack, the
+   frames only it had (its image, its stack, its page tables) and its
+   capability slots. `win` run again and again keeps the free frames
+   level; scored, both GPUs.
+11. [ ] Memory objects are given back when nothing holds or maps them
+   any more: a `win` run then costs no frames at all (win-test's bound
+   goes to 0), and the object table no longer fills up after ~100 runs.
+12. [ ] Wrap-up for the owner: what the vault run did, what to review and
    merge, what is still open. No code. Then stop the loop.
 
 Tasks 7-9 were added at 2026-11-22T03:10-06:00, by me (and 9, running a
 program from the terminal, at 04:05, the wrap-up moving to 10): 1-6 were done with
 11.5 of the 15 hours left, which the owner asked to have used. They carry
 on from 6 and need no decision from the owner.
+
+Task 10 was added at 2026-11-22T05:05-06:00, the wrap-up moving to 11:
+with 9 in, every `win` loses three tasks' memory for good (nothing a task
+had was ever given back, since tasks were only made at boot), so a long
+session would run out. 9.5 hours were left.

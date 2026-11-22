@@ -6,16 +6,20 @@
 //! the exact instruction responsible, instead of quietly scribbling over
 //! whatever the allocator happened to place underneath.
 //!
-//! Stacks are never reclaimed yet. Ranges are handed out by bumping a cursor,
-//! so a long-lived system that spawns and exits many tasks would eventually run
-//! out of address space. Fixing that needs a free list of ranges and a way to
-//! know no CPU is still running on the stack, neither of which matters while
-//! tasks are created once at boot.
+//! Ranges are handed out by bumping a cursor, and a finished task's stack
+//! comes back through [`release`] to be handed out again whole, still mapped.
+//! Never unmapped: the frames stay the stack's, so no other CPU's TLB can
+//! hold a stale entry for memory that has become something else. When a
+//! stack is out of use is the scheduler's to know (`task::reap`).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use alloc::vec::Vec;
+
+use crate::arch::x86_64::without_interrupts;
 use crate::mm::frame;
 use crate::mm::paging;
+use crate::sync::SpinLock;
 
 /// Virtual region set aside for task stacks. PML4 slot 384: clear of the direct
 /// map (256), the heap (320), MMIO (352-ish) and the kernel image (511).
@@ -34,6 +38,9 @@ const SLOT_SIZE: u64 = (STACK_PAGES + GUARD_PAGES) * PAGE;
 
 static NEXT_SLOT: AtomicU64 = AtomicU64::new(STACK_AREA_BASE);
 
+/// Stacks given back, mapped and ready.
+static FREE: SpinLock<Vec<Stack>> = SpinLock::new(Vec::new());
+
 #[derive(Debug, Clone, Copy)]
 pub struct Stack {
     /// Lowest mapped address.
@@ -45,8 +52,11 @@ pub struct Stack {
     pub guard: u64,
 }
 
-/// Carve out and map one task stack.
+/// A stack: one given back, or a fresh range carved out and mapped.
 pub fn allocate() -> Option<Stack> {
+    if let Some(stack) = without_interrupts(|| FREE.lock().pop()) {
+        return Some(stack);
+    }
     let slot = NEXT_SLOT.fetch_add(SLOT_SIZE, Ordering::Relaxed);
 
     // Guard first, then the stack above it -- stacks grow down, so the guard
@@ -71,4 +81,10 @@ pub fn allocate() -> Option<Stack> {
     }
 
     Some(Stack { bottom, top, guard })
+}
+
+/// Take back a stack from [`allocate`] that nothing runs on, or ever will
+/// again, to be handed out whole to a later task.
+pub fn release(stack: Stack) {
+    without_interrupts(|| FREE.lock().push(stack));
 }

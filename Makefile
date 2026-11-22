@@ -1528,6 +1528,10 @@ WIN_KEYS := w i n spc slash p r o g r a m s slash r e a d e r slash r e a d e r 
 WIN_AGAIN_KEYS := c d spc slash p r o g r a m s slash r e a d e r ret \
                   w i n spc r e a d e r dot e x e ret
 WIN_BAD_KEYS := w i n spc slash e t c slash m o t d ret
+# Frames a `win` run may keep after its tasks are given back: its view's
+# memory objects (the shared page, the list, the view's 32-page heap) and
+# the kernel's tables mapping them. Objects are never freed yet.
+WIN_RUN_FRAMES ?= 48
 win-test: iso
 	@rm -f build/win.ppm build/win.png
 	@( sleep $(SHOT_DELAY); \
@@ -1538,15 +1542,17 @@ win-test: iso
 	   for key in $(WIN_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 3; \
 	   for key in $(WIN_AGAIN_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 3; \
 	   for key in $(WIN_BAD_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 1.5; \
+	   for key in up up ret; do echo "sendkey $$key"; sleep 0.12; done; sleep 2.5; \
+	   for run in 1 2 3 4 5; do for key in up ret; do echo "sendkey $$key"; sleep 0.12; done; sleep 2.5; done; \
 	   echo "screendump build/win.ppm"; sleep 1; echo quit ) \
-	  | timeout --foreground 120 qemu-system-x86_64 $(QEMU_COMMON) \
+	  | timeout --foreground 150 qemu-system-x86_64 $(QEMU_COMMON) \
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
 	@tr -d '\r' < build/serial.log > build/win-lines.log
 	@grep -a "^terminal   : win\|^desktop    : /programs\|^desktop    : task" build/win-lines.log || echo "win-test: nothing from win"
-	@test $$(grep -acxF 'desktop    : /programs/reader/reader.exe started for the terminal, seeing /programs/reader alone' build/win-lines.log) -eq 2 \
-	    && test $$(grep -acE '^terminal   : win: reader.exe ended after [0-9]+ lines$$' build/win-lines.log) -eq 2 \
-	    && echo "win-test: the terminal ran it twice, to its end      PASS" \
-	    || echo "win-test: the terminal ran it twice, to its end      FAIL"
+	@test $$(grep -acxF 'desktop    : /programs/reader/reader.exe started for the terminal, seeing /programs/reader alone' build/win-lines.log) -eq 8 \
+	    && test $$(grep -acE '^terminal   : win: reader.exe ended after [0-9]+ lines$$' build/win-lines.log) -eq 8 \
+	    && echo "win-test: the terminal ran it 8 times, to its end    PASS" \
+	    || echo "win-test: the terminal ran it 8 times, to its end    FAIL"
 	@grep -aqxF 'terminal   : win: reader.exe: C:\*: reader.exe' build/win-lines.log \
 	    && grep -aqxF 'terminal   : win: reader.exe: current directory: C:\' build/win-lines.log \
 	    && grep -aqxF 'terminal   : win: reader.exe: keys.txt: not there (2, ERROR_FILE_NOT_FOUND)' build/win-lines.log \
@@ -1556,6 +1562,15 @@ win-test: iso
 	@grep -aqxF 'terminal   : win: /etc/motd: not a program Verdigris runs' build/win-lines.log \
 	    && echo "win-test: a file that is not a program is refused   PASS" \
 	    || echo "win-test: a file that is not a program is refused   FAIL"
+	@grep -aE "^desktop    : [0-9]+ frames (free|of)" build/win-lines.log | grep -oE '[0-9]+ frames( free)?' | tr '\n' ' '; echo
+	@grep -aoE '^desktop    : [0-9]+ frames of finished' build/win-lines.log | grep -oE '[0-9]+' \
+	    | awk '{ back += $$1 } END { exit back < 7 * 100 }' \
+	    && echo "win-test: each run gets back the last one's tasks   PASS" \
+	    || echo "win-test: each run gets back the last one's tasks   FAIL"
+	@grep -aoE '^desktop    : [0-9]+ frames free' build/win-lines.log | grep -oE '[0-9]+' \
+	    | awk 'NR > 1 && last - $$1 > $(WIN_RUN_FRAMES) { bad = 1 } { last = $$1 } END { exit bad || NR != 8 }' \
+	    && echo "win-test: a run costs at most its view's memory     PASS" \
+	    || echo "win-test: a run costs at most its view's memory     FAIL"
 	@test -s build/win.ppm && pnmtopng build/win.ppm > build/win.png 2>/dev/null && rm -f build/win.ppm; true
 
 TERMINAL_KEYS ?= e c tab h i ret \

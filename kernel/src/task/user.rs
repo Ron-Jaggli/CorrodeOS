@@ -137,7 +137,7 @@ fn map_stack(space: &mut Mapper, pages: u64) -> Option<()> {
         if !space.map_4k(
             STACK_BOTTOM + i * PAGE,
             frame.addr(),
-            paging::USER | paging::WRITABLE | paging::NO_EXECUTE,
+            paging::USER | paging::WRITABLE | paging::NO_EXECUTE | paging::OWNED,
         ) {
             return None;
         }
@@ -242,7 +242,8 @@ fn build<'a>(
         .ok_or(LoadError::OutOfMemory)?;
 
     for segment in segments {
-        let mut flags = paging::USER;
+        // The segment's frames are copies, this space's alone.
+        let mut flags = paging::USER | paging::OWNED;
         if segment.writable {
             flags |= paging::WRITABLE;
         }
