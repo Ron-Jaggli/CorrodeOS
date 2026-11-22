@@ -8,16 +8,25 @@
 //!
 //! It holds nothing the terminal does not: changing the look is something
 //! any program with a window may do.
+//!
+//! The last row changes the passcode: the current one, then the new one
+//! twice, each typed as dots. The desktop checks the current one under the
+//! lock screen's limit on tries, and seals the vault on the disk again
+//! under the new one (`window::PASSCODE_CHECK`, `PASSCODE_SET`); it takes
+//! those calls from Settings alone. Without a vault there is nothing kept
+//! to change, and the row says so.
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+use alloc::string::String;
+
 use corrode_rt::abi::app;
 use corrode_rt::println;
 use corrode_ui::theme::{Buttons, Color, GlassMode, Wallpaper, PRESETS};
-use corrode_ui::{line_height, rgb, width_of, Event, Rgb, Style, Theme, Weight, Window, CLEAR};
+use corrode_ui::{line_height, rgb, width_of, Change, Event, Rgb, Style, Theme, Weight, Window, CLEAR};
 
 corrode_rt::entry!(main);
 
@@ -53,6 +62,9 @@ enum Control {
         set: fn(&mut Theme, usize),
     },
     Accent,
+    /// A button that starts changing the passcode, and the place it is
+    /// typed while it is being changed.
+    Passcode,
 }
 
 struct Row {
@@ -68,7 +80,7 @@ const fn on_off(value: bool) -> Option<usize> {
 /// segments, in percent. Medium is what the presets that magnify use.
 const MAGNIFY: [u8; 4] = [100, 120, 140, 170];
 
-const ROWS: [Row; 12] = [
+const ROWS: [Row; 13] = [
     Row {
         label: "Preset",
         control: Control::Choice {
@@ -186,9 +198,81 @@ const ROWS: [Row; 12] = [
             set: |theme, index| theme.speed = [0, 60, 100, 160][index],
         },
     },
+    Row {
+        label: "Passcode",
+        control: Control::Passcode,
+    },
 ];
 
-const HEIGHT: u32 = (HEADER + ROWS.len() as i32 * ROW + 2 * MARGIN) as u32;
+/// Room under the card for what the passcode row last said.
+const SAID: i32 = 24;
+const HEIGHT: u32 = (HEADER + ROWS.len() as i32 * ROW + 2 * MARGIN + SAID) as u32;
+
+/// Return, Backspace and Escape, by scancode.
+const KEY_ENTER: u8 = 0x1c;
+const KEY_BACKSPACE: u8 = 0x0e;
+const KEY_ESCAPE: u8 = 0x01;
+const MOST: usize = 32;
+const DOT: u32 = 8;
+const MOST_DOTS: usize = 16;
+
+/// Where changing the passcode is.
+enum Step {
+    Idle,
+    Current(String),
+    New(String),
+    Again { new: String, typed: String },
+}
+
+/// The passcode row's state: the step, and what it last said.
+struct Passcode {
+    step: Step,
+    said: Option<&'static str>,
+}
+
+impl Passcode {
+    fn typed(&mut self) -> Option<&mut String> {
+        match &mut self.step {
+            Step::Idle => None,
+            Step::Current(typed) | Step::New(typed) | Step::Again { typed, .. } => Some(typed),
+        }
+    }
+
+    /// Return: the next step, asking the desktop where it must.
+    fn submit(&mut self) {
+        let step = core::mem::replace(&mut self.step, Step::Idle);
+        let (step, said) = match step {
+            Step::Idle => (Step::Idle, None),
+            Step::Current(typed) => match corrode_ui::check_passcode(&typed) {
+                Change::Done => (Step::New(String::new()), None),
+                Change::Wrong => (Step::Current(String::new()), Some("That is not the passcode")),
+                Change::Wait(_) => (Step::Idle, Some("Too many tries - wait, then try again")),
+                Change::NoVault => (Step::Idle, Some("No vault on the disk: no passcode is kept to change")),
+            },
+            Step::New(typed) if !allowed(&typed) => {
+                (Step::New(String::new()), Some("4 to 32 characters, no space and no #"))
+            }
+            Step::New(typed) => (Step::Again { new: typed, typed: String::new() }, None),
+            Step::Again { new, typed } if new != typed => {
+                (Step::New(String::new()), Some("They differ - type the new one again"))
+            }
+            Step::Again { new, .. } => match corrode_ui::set_passcode(&new) {
+                Change::Done => {
+                    println!("the passcode changed");
+                    (Step::Idle, Some("Changed. The files on the disk are sealed under it."))
+                }
+                _ => (Step::Idle, Some("Not changed: the disk did not take it")),
+            },
+        };
+        self.step = step;
+        self.said = said;
+    }
+}
+
+/// What a passcode can hold (`corrode_theme::passcode::allowed`).
+fn allowed(text: &str) -> bool {
+    (4..=MOST).contains(&text.len()) && text.bytes().all(|byte| byte.is_ascii_graphic() && byte != b'#')
+}
 
 /// The colours, from the theme.
 struct Look {
@@ -243,7 +327,7 @@ fn swatch(index: usize, which: usize) -> (i32, i32, u32) {
     (x + 12 + which as i32 * 30, y + height as i32 / 2, 9)
 }
 
-fn draw(window: &mut Window, theme: &Theme) {
+fn draw(window: &mut Window, theme: &Theme, passcode: &Passcode) {
     let look = Look::of(theme);
     window.fill(0, 0, window.width, window.height, CLEAR);
     window.fill(0, 0, window.width, window.height, look.background);
@@ -303,6 +387,33 @@ fn draw(window: &mut Window, theme: &Theme) {
                     );
                 }
             }
+            Control::Passcode => {
+                let (x, y, width, height) = control_box(index);
+                window.rounded(x, y, width, height, 7, look.track);
+                let ty = y + (height as i32 - line_height(SMALL) as i32) / 2;
+                let (prompt, count) = match &passcode.step {
+                    Step::Idle => ("Change passcode", None),
+                    Step::Current(typed) => ("Current", Some(typed.len())),
+                    Step::New(typed) => ("New", Some(typed.len())),
+                    Step::Again { typed, .. } => ("New, again", Some(typed.len())),
+                };
+                match count {
+                    None => {
+                        let ow = width_of(prompt, SMALL);
+                        window.text(x + (width as i32 - ow as i32) / 2, ty, prompt, SMALL, look.accent);
+                    }
+                    Some(count) => {
+                        window.text(x + 10, ty, prompt, SMALL, look.secondary);
+                        // A dot for each character, never the character.
+                        let mut dx = x + 110;
+                        let dy = y + (height - DOT) as i32 / 2;
+                        for _ in 0..count.min(MOST_DOTS) {
+                            window.rounded(dx, dy, DOT, DOT, DOT / 2, look.text);
+                            dx += 2 * DOT as i32;
+                        }
+                    }
+                }
+            }
             Control::Accent => {
                 for (which, color) in ACCENTS.iter().enumerate() {
                     let (cx, cy, r) = swatch(index, which);
@@ -316,6 +427,10 @@ fn draw(window: &mut Window, theme: &Theme) {
                 }
             }
         }
+    }
+    if let Some(said) = passcode.said {
+        let y = row_top(ROWS.len()) + (SAID - line_height(SMALL) as i32) / 2 + 2;
+        window.text(MARGIN + 12, y, said, SMALL, look.secondary);
     }
     window.commit_all();
 }
@@ -343,6 +458,7 @@ fn click(theme: &Theme, x: i32, y: i32) -> Option<Theme> {
             })?;
             changed.accent = ACCENTS[which];
         }
+        Control::Passcode => return None,
     }
     (changed != *theme).then_some(changed)
 }
@@ -361,21 +477,66 @@ fn main() {
         }
     };
     let mut theme = Theme::default();
-    draw(&mut window, &theme);
+    let mut passcode = Passcode { step: Step::Idle, said: None };
+    let passcode_row = ROWS.len() - 1;
+    draw(&mut window, &theme, &passcode);
     println!("open, {}x{}", window.width, window.height);
 
     loop {
         match window.wait(u64::MAX) {
             Event::Theme(now) => {
                 theme = now;
-                draw(&mut window, &theme);
+                draw(&mut window, &theme, &passcode);
             }
             Event::Button { x, y, buttons } if buttons & 1 != 0 => {
-                if let Some(changed) = click(&theme, x, y) {
+                let (bx, by, bw, bh) = control_box(passcode_row);
+                let on_passcode = x >= bx && x < bx + bw as i32 && y >= by && y < by + bh as i32;
+                if on_passcode && matches!(passcode.step, Step::Idle) {
+                    passcode.step = Step::Current(String::new());
+                    passcode.said = None;
+                    draw(&mut window, &theme, &passcode);
+                } else if let Some(changed) = click(&theme, x, y) {
                     match corrode_ui::set_theme(&changed) {
                         Ok(()) => println!("the look changed"),
                         Err(error) => println!("the look could not change: {:?}", error),
                     }
+                }
+            }
+            Event::Key {
+                key: KEY_ENTER,
+                pressed: true,
+                ..
+            } => {
+                passcode.submit();
+                draw(&mut window, &theme, &passcode);
+            }
+            Event::Key {
+                key: KEY_ESCAPE,
+                pressed: true,
+                ..
+            } => {
+                passcode.step = Step::Idle;
+                passcode.said = None;
+                draw(&mut window, &theme, &passcode);
+            }
+            Event::Key {
+                key: KEY_BACKSPACE,
+                pressed: true,
+                ..
+            } => {
+                if let Some(typed) = passcode.typed() {
+                    typed.pop();
+                    draw(&mut window, &theme, &passcode);
+                }
+            }
+            Event::Key {
+                text: Some(character),
+                pressed: true,
+                ..
+            } if character.is_ascii_graphic() && character != '#' => {
+                if let Some(typed) = passcode.typed().filter(|typed| typed.len() < MOST) {
+                    typed.push(character);
+                    draw(&mut window, &theme, &passcode);
                 }
             }
             Event::Close => {

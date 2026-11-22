@@ -340,6 +340,18 @@ pub mod window {
     /// To Control Center: a notification was just posted, so the list it
     /// shows is out of date. Nothing in the words; ask again.
     pub const NOTIFIED: u64 = 84;
+    /// A call, from Settings and only it: is this, in words 0..4 as for
+    /// [`UNLOCK`], the passcode? The first step of changing it, under the
+    /// same limit on tries. The answer's word 0 is 1 for yes; word 1 the
+    /// seconds to wait after too many wrong tries; word 2 is 1 if there is
+    /// no vault, whose passcode is the only one that can be changed (the
+    /// boot medium's desktop.conf cannot be written).
+    pub const PASSCODE_CHECK: u64 = 85;
+    /// A call, from Settings and only it, within a minute of a yes to
+    /// [`PASSCODE_CHECK`] from the same task: make words 0..4 the
+    /// passcode. The vault is sealed again under it on the disk. The
+    /// answer's word 0 is 1 if it was.
+    pub const PASSCODE_SET: u64 = 86;
     /// The calls only the shell endpoint takes.
     pub const SHELL_ONLY: [u64; 6] = [SET_THEME, QUIT, LIST, RAISE, HISTORY, CONTEXT];
 
@@ -577,6 +589,9 @@ pub mod store {
     /// page, where the kernel, which made that memory, reads it. The
     /// answer's label is the status. For the vault (`corrode_vault`).
     pub const READ: u64 = 92;
+    /// Write the queue memory's sector page, which the kernel filled, to
+    /// the sector numbered in word 0. The answer's label is the status.
+    pub const WRITE: u64 = 93;
 }
 
 pub mod gpu {

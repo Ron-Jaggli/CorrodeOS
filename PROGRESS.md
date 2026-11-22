@@ -2570,6 +2570,58 @@ under the passcode, instead of on the boot medium.
   vault-test, passcode-test and lock-test again on both GPUs; `./corrode
   test` 338 passed; clippy at 33.
 
+## 80. Changing the passcode in Settings
+
+- Settings has a last row, **Passcode**: "Change passcode", then the
+  current passcode, the new one, and the new one again, each typed as
+  dots (Return to go on, Backspace, Escape to stop). What it last said is
+  under the card: not the passcode, too many tries, the two differ, not
+  allowed (4 to 32, no space, no #), no vault, changed.
+- Two new calls, `window::PASSCODE_CHECK` (85) and `PASSCODE_SET` (86),
+  taken from the task named `settings` alone, as UNLOCK is from `lock`.
+  CHECK is a try at the passcode under the lock screen's limit (three
+  wrong, then 30 s): a yes is remembered for that task for one minute and
+  one SET. SET without it, from another task, after the minute, or twice
+  is refused. Without a vault the answer says so: desktop.conf on the boot
+  medium cannot be written, so there is nothing kept to change.
+- **Sealing again** (`vault::reseal`): the opened tar sealed under the new
+  passcode with salt and nonce from RDRAND, 200 000 iterations, into the
+  *other* slot; read back; then the header -- one sector -- written last
+  and read back. The vault header gained the slot's first sector (bytes
+  64..72; zero, as in an older header, is the first slot; anything but
+  the two slots is not a vault, so a header cannot send the reads
+  elsewhere). Until the header is written the old one, and the old
+  passcode, still open the old copy: a crash or a refused write loses
+  nothing. `vault-disk` makes the disk big enough for both slots.
+- **The disk**: `store::WRITE` (93) writes the sector page the kernel
+  filled; the driver refuses it for the theme's sector, which only SAVE,
+  with its record check, writes. Every driver call now takes the driver
+  to itself (`store::alone`, waiting by yielding), since the painter
+  saves themes and the window server now seals the vault through the one
+  sector page.
+- Found by the test, fixed: the window server -- where Settings' calls are
+  answered -- held no capability for the disk; only the painter did. It is
+  now granted a send-only copy of the disk's endpoint in the same slot.
+  The disk driver's own capabilities are unchanged and its check passes.
+- New boot check (with a vault): the painter, not being Settings, is
+  refused a passcode change. vault-test now counts four.
+- New scored `rekey-test`, both GPUs: a vault sealed with Rust4ever;
+  unlocked; Settings from the dock; its Passcode row; Rust4ever, then
+  Corrode5 twice -- the log says it was sealed again (into the second
+  slot) and Settings says it changed; the next boot refuses Rust4ever and
+  Corrode5 opens the files. build/rekey-settings.png, build/rekey.png.
+
+- **Choice:** only the vault's passcode can be changed, and only in
+  Settings; a lock-screen-only passcode in desktop.conf stays what the
+  file says, as the file cannot be written.
+- **Choice:** the old passcode is asked for even though the screen is
+  unlocked: an unlocked, unattended desktop should not let anyone take
+  the files' passcode over.
+- Verified: the whole suite on both GPUs, 76 checks PASS on each (73
+  before, plus rekey-test's three), none FAIL, no unhandled trap; boot
+  self-checks with a vault count one more; `./corrode test` 338 passed;
+  clippy at 33.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -2699,7 +2751,7 @@ one task.
    after the right passcode; `vault-test`.
 3. [x] (section 79) Longer passcodes: up to 32 characters, letters and digits, on the
    lock screen, in desktop.conf and in `vault-disk`.
-4. [ ] Change the passcode from Settings: the vault re-sealed under the
+4. [x] (section 80) Change the passcode from Settings: the vault re-sealed under the
    new one, fresh salt and nonce, written to the disk.
 5. [ ] README: how to make and boot a vault, and what it does and does not
    protect against.

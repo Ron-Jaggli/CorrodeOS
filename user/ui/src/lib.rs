@@ -495,6 +495,19 @@ pub fn passcode_needed() -> bool {
 /// Is `code` the passcode? `Ok(true)` or `Ok(false)`, or `Err(seconds)`
 /// to wait after too many wrong tries.
 pub fn try_passcode(code: &str) -> core::result::Result<bool, u64> {
+    // An empty code would only ask whether there is a passcode.
+    let Some(words) = passcode_words(code) else {
+        return Ok(false);
+    };
+    match corrode_rt::call(app::WINDOWS, Message::new(window::UNLOCK, words), None) {
+        Ok(answer) if answer.message.words[1] > 0 => Err(answer.message.words[1]),
+        Ok(answer) => Ok(answer.message.words[0] == 1),
+        Err(_) => Ok(false),
+    }
+}
+
+/// A passcode as the desktop's calls carry it, or `None` if empty.
+fn passcode_words(code: &str) -> Option<[u64; 4]> {
     let mut bytes = [0u8; 32];
     for (slot, byte) in bytes.iter_mut().zip(code.bytes()) {
         *slot = byte;
@@ -503,14 +516,42 @@ pub fn try_passcode(code: &str) -> core::result::Result<bool, u64> {
     for (word, chunk) in words.iter_mut().zip(bytes.as_chunks::<8>().0) {
         *word = u64::from_le_bytes(*chunk);
     }
-    if words == [0; 4] {
-        // That would only ask whether there is a passcode.
-        return Ok(false);
+    (words != [0; 4]).then_some(words)
+}
+
+/// What the desktop said to a passcode change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    Done,
+    Wrong,
+    Wait(u64),
+    /// No vault: nothing whose passcode can be changed.
+    NoVault,
+}
+
+/// Settings only: is `code` the passcode? The first step of changing it.
+pub fn check_passcode(code: &str) -> Change {
+    let Some(words) = passcode_words(code) else {
+        return Change::Wrong;
+    };
+    match corrode_rt::call(app::WINDOWS, Message::new(window::PASSCODE_CHECK, words), None) {
+        Ok(answer) if answer.message.words[2] == 1 => Change::NoVault,
+        Ok(answer) if answer.message.words[1] > 0 => Change::Wait(answer.message.words[1]),
+        Ok(answer) if answer.message.words[0] == 1 => Change::Done,
+        _ => Change::Wrong,
     }
-    match corrode_rt::call(app::WINDOWS, Message::new(window::UNLOCK, words), None) {
-        Ok(answer) if answer.message.words[1] > 0 => Err(answer.message.words[1]),
-        Ok(answer) => Ok(answer.message.words[0] == 1),
-        Err(_) => Ok(false),
+}
+
+/// Settings only, after a yes from [`check_passcode`]: make `code` the
+/// passcode, the vault sealed again under it.
+pub fn set_passcode(code: &str) -> Change {
+    let Some(words) = passcode_words(code) else {
+        return Change::Wrong;
+    };
+    match corrode_rt::call(app::WINDOWS, Message::new(window::PASSCODE_SET, words), None) {
+        Ok(answer) if answer.message.words[2] == 1 => Change::NoVault,
+        Ok(answer) if answer.message.words[0] == 1 => Change::Done,
+        _ => Change::Wrong,
     }
 }
 

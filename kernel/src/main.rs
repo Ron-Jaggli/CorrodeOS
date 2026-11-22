@@ -2161,11 +2161,7 @@ fn serve(shell: bool) {
                 [!look::has_passcode() as u64, 0, 0, 0]
             } else {
                 let was_sealed = vault::locked();
-                let mut code = [0u8; corrode_theme::passcode::MOST];
-                for (bytes, word) in code.as_chunks_mut::<8>().0.iter_mut().zip(words) {
-                    *bytes = word.to_le_bytes();
-                }
-                match look::try_passcode(code, time::now_ns()) {
+                match look::try_passcode(passcode_of(words), time::now_ns()) {
                     Ok(right) => {
                         if !right {
                             println!("desktop    : a wrong passcode from task {}", received.from);
@@ -2185,6 +2181,12 @@ fn serve(shell: bool) {
                 },
                 None,
             );
+            continue;
+        }
+        if matches!(received.message.label, window::PASSCODE_CHECK | window::PASSCODE_SET) {
+            let label = received.message.label;
+            let answer = change_passcode(received.from, label, words);
+            let _ = ipc::reply(SERVICE_REPLY_SLOT, ipc::Message { label, words: answer }, None);
             continue;
         }
         if received.message.label == window::NOTIFY {
@@ -2551,11 +2553,71 @@ fn start_desktop() {
     if let Some(id) = launcher_task {
         LAUNCHER_TASK.store(id, Ordering::Release);
     }
+    if let Some(id) = server {
+        WINDOW_SERVER.store(id, Ordering::Release);
+    }
     start_all(&[server, shell, launcher_task]);
+}
+
+/// A passcode as `window::UNLOCK` and the change calls carry it.
+fn passcode_of(words: [u64; 4]) -> corrode_theme::passcode::Code {
+    let mut code = [0u8; corrode_theme::passcode::MOST];
+    for (bytes, word) in code.as_chunks_mut::<8>().0.iter_mut().zip(words) {
+        *bytes = word.to_le_bytes();
+    }
+    code
+}
+
+/// Which task proved the passcode for a change, and until when.
+static PROVEN: SpinLock<Option<(usize, u64)>> = SpinLock::new(None);
+const PROOF_NS: u64 = 60_000_000_000;
+
+/// `window::PASSCODE_CHECK` and `PASSCODE_SET`: Settings changes the
+/// vault's passcode, proving the old one first. Only Settings may: anyone
+/// else could guess, or use up the lock screen's tries.
+fn change_passcode(from: usize, label: u64, words: [u64; 4]) -> [u64; 4] {
+    use corrode_abi::window;
+    if task::name_of(from) != Some("settings") {
+        println!("desktop    : task {from} is not Settings; the passcode is not its to change");
+        return [0; 4];
+    }
+    if !vault::present() {
+        return [0, 0, 1, 0];
+    }
+    let now = time::now_ns();
+    if label == window::PASSCODE_CHECK {
+        return match look::try_passcode(passcode_of(words), now) {
+            Ok(true) => {
+                arch::x86_64::without_interrupts(|| *PROVEN.lock() = Some((from, now + PROOF_NS)));
+                [1, 0, 0, 0]
+            }
+            Ok(false) => {
+                println!("desktop    : a wrong passcode from Settings");
+                [0; 4]
+            }
+            Err(wait) => [0, wait, 0, 0],
+        };
+    }
+    // Set: only for the task that just proved it, once.
+    let proven = arch::x86_64::without_interrupts(|| PROVEN.lock().take());
+    let code = passcode_of(words);
+    let chars = corrode_theme::passcode::chars(&code);
+    if !proven.is_some_and(|(task, until)| task == from && now < until) {
+        println!("desktop    : a new passcode without the old one first; not changed");
+        return [0; 4];
+    }
+    if !corrode_theme::passcode::allowed(chars) || !vault::reseal(chars) {
+        return [0; 4];
+    }
+    look::set_passcode(code);
+    [1, 0, 0, 0]
 }
 
 /// The launcher, once started, for `give_files`.
 static LAUNCHER_TASK: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// The window server, once started: `store::start` lets it call the disk,
+/// which changing the vault's passcode needs.
+pub static WINDOW_SERVER: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// Give the launcher the root directory, which it hands the terminal and
 /// Files: the boot medium's, or the vault's once it is open. A boot medium
@@ -5038,6 +5100,11 @@ fn render_loop(renderer: &mut Screen) -> ! {
     let disk = store::start();
     if disk && vault::probe() {
         vault::self_check();
+        // The painter is not Settings: it may not set a passcode, whatever
+        // it sends.
+        let painter = task::current_id().unwrap_or(0);
+        let refused = change_passcode(painter, corrode_abi::window::PASSCODE_SET, [0x3131_3131_3131_3131; 4]);
+        check("vault", "only Settings may change the passcode", refused == [0; 4]);
     }
     look::load();
     // A theme kept from an earlier boot wins over the file: it is what was

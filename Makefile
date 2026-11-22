@@ -75,7 +75,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test fade-test usb-test pe-test verify-test vault-test grow-test zoom-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test fade-test usb-test pe-test verify-test vault-test rekey-test grow-test zoom-test
 .PHONY: all kernel user kernel32 iso vault-iso vault-disk run-vault run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -1314,11 +1314,55 @@ vault-test: vault-iso
 	    && ! grep -aq "^vault      : opened" build/vault-bad.log \
 	    && echo "vault-test: one byte changed on disk: nothing opens   PASS" \
 	    || echo "vault-test: one byte changed on disk: nothing opens   FAIL"
-	@test $$(grep -a "^vault " build/serial.log | grep -ac "PASS") -eq 3 \
+	@test $$(grep -a "^vault " build/serial.log | grep -ac "PASS") -eq 4 \
 	    && ! grep -a "^vault " build/serial.log | grep -aq "FAIL" \
-	    && echo "vault-test: the kernel's three vault checks pass      PASS" \
-	    || echo "vault-test: the kernel's three vault checks pass      FAIL"
+	    && echo "vault-test: the kernel's four vault checks pass       PASS" \
+	    || echo "vault-test: the kernel's four vault checks pass       FAIL"
 	@for shot in vault-locked vault; do \
+	    test -s build/$$shot.ppm && pnmtopng build/$$shot.ppm > build/$$shot.png 2>/dev/null && rm -f build/$$shot.ppm; \
+	done; true
+
+# Changing the vault's passcode in Settings. A vault sealed with
+# Rust4ever, opened; Settings from the dock; its Passcode row clicked;
+# Rust4ever, then Corrode5 twice. build/rekey-settings.png shows the row
+# asking, build/rekey.png the answer. The next boot: Rust4ever is refused,
+# Corrode5 opens the vault and a terminal has files.
+REKEY_IMG := build/rekey-test.img
+rekey-test: vault-iso
+	@rm -f $(REKEY_IMG) build/rekey*.ppm build/rekey*.png build/rekey-*.log
+	@$(MAKE) -s vault-disk VAULT_IMG=$(REKEY_IMG) VAULT_PASSCODE=Rust4ever
+	@( sleep $(SHOT_DELAY); sleep 1; \
+	   for key in $(VAULT_TEST_KEYS); do echo "sendkey $$key"; sleep 0.15; done; sleep 3; \
+	   echo "mouse_move 28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2.5; \
+	   echo "mouse_move -184 -105"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 0.5; \
+	   for key in $(VAULT_TEST_KEYS); do echo "sendkey $$key"; sleep 0.15; done; sleep 1.5; \
+	   echo "screendump build/rekey-settings.ppm"; sleep 0.5; \
+	   for key in shift-c o r r o d e 5 ret shift-c o r r o d e 5 ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 4; \
+	   echo "screendump build/rekey.ppm"; sleep 0.5; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(subst $(ISO),$(VAULT_ISO),$(QEMU_COMMON)) \
+	      $(call store_flags,$(REKEY_IMG)) -serial file:build/rekey-first.log -monitor stdio > /dev/null 2>&1 || true
+	@( sleep $(SHOT_DELAY); sleep 1; \
+	   for key in $(VAULT_TEST_KEYS); do echo "sendkey $$key"; sleep 0.15; done; sleep 2; \
+	   for key in shift-c o r r o d e 5 ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 3; \
+	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 3; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(subst $(ISO),$(VAULT_ISO),$(QEMU_COMMON)) \
+	      $(call store_flags,$(REKEY_IMG)) -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@grep -ahE "^(vault|settings|desktop) " build/rekey-first.log build/serial.log | grep -v PASS || echo "rekey-test: nothing"
+	@grep -aq "^vault      : sealed again under the new passcode" build/rekey-first.log \
+	    && grep -aq "^settings   : the passcode changed" build/rekey-first.log \
+	    && echo "rekey-test: Settings changed it, the old one first    PASS" \
+	    || echo "rekey-test: Settings changed it, the old one first    FAIL"
+	@awk '/^desktop    : a wrong passcode/ {wrong = 1} /^vault      : opened/ {exit !wrong} END {if (!wrong) exit 1}' build/serial.log \
+	    && echo "rekey-test: next boot, the old passcode is refused    PASS" \
+	    || echo "rekey-test: next boot, the old passcode is refused    FAIL"
+	@grep -aq "^vault      : opened" build/serial.log \
+	    && grep -aq "^terminal   : [0-9]* files and directories" build/serial.log \
+	    && echo "rekey-test: and the new one opens the files           PASS" \
+	    || echo "rekey-test: and the new one opens the files           FAIL"
+	@for shot in rekey-settings rekey; do \
 	    test -s build/$$shot.ppm && pnmtopng build/$$shot.ppm > build/$$shot.png 2>/dev/null && rm -f build/$$shot.ppm; \
 	done; true
 

@@ -23,7 +23,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use corrode_vault::{Header, DATA_OFFSET, OFFSET, SECTOR};
+use corrode_vault::{Header, OFFSET, SECTOR};
 
 use crate::arch::x86_64::without_interrupts;
 use crate::modules::Module;
@@ -42,6 +42,9 @@ static SEALED: SpinLock<Option<(Header, Vec<u8>)>> = SpinLock::new(None);
 /// The opened tar: a memory object the kernel can see, and its length.
 static OPENED: SpinLock<Option<(usize, usize)>> = SpinLock::new(None);
 
+/// The header on the disk now, once open: `reseal` writes beside it.
+static CURRENT: SpinLock<Option<Header>> = SpinLock::new(None);
+
 /// Look for a vault on the disk, after `store::start`. Says whether there
 /// is one.
 pub fn probe() -> bool {
@@ -57,7 +60,7 @@ pub fn probe() -> bool {
         println!("vault      : no memory for the sealed files");
         return false;
     }
-    let first_sector = DATA_OFFSET / SECTOR as u64;
+    let first_sector = header.data_sector;
     for sector in first_sector..first_sector + header.sectors() {
         let Some(bytes) = store::read_sector(sector) else {
             println!("vault      : the disk would not give sector {sector}");
@@ -129,12 +132,111 @@ pub fn unlock(passcode: &[u8]) -> bool {
     let len = data.len();
     without_interrupts(|| {
         *OPENED.lock() = Some((object, len));
+        *CURRENT.lock() = Some(header);
         // The sealed copy is not needed again.
         *SEALED.lock() = None;
     });
     STATE.store(OPEN, Ordering::Release);
     println!("vault      : opened, {} KiB of files", len.div_ceil(1024));
     true
+}
+
+/// Seal the open vault again under `passcode`, with a fresh salt and nonce
+/// from RDRAND, into the slot it is not in; then write the header that
+/// points there, and read both back. Until that one sector is written the
+/// old header, and the old passcode, still open the old copy. True if the
+/// disk now holds the vault under `passcode`.
+pub fn reseal(passcode: &[u8]) -> bool {
+    if STATE.load(Ordering::Acquire) != OPEN || !aes_supported() {
+        return false;
+    }
+    let Some(((object, len), old)) = without_interrupts(|| (*OPENED.lock()).zip(*CURRENT.lock())) else {
+        return false;
+    };
+    let Some((address, _)) = memory::in_kernel(object) else {
+        return false;
+    };
+    let (Some(salt), Some(nonce)) = (random::<16>(), random::<12>()) else {
+        println!("vault      : RDRAND gave nothing; not sealed again");
+        return false;
+    };
+    let mut data = Vec::new();
+    if data.try_reserve_exact(old.slot_sectors() as usize * SECTOR).is_err() {
+        return false;
+    }
+    // SAFETY: the opened tar, `len` bytes written in `unlock` and never
+    // again.
+    data.extend_from_slice(unsafe { core::slice::from_raw_parts(address as *const u8, len) });
+    let mut header = corrode_vault::seal(
+        &mut aes_block,
+        passcode,
+        salt,
+        nonce,
+        corrode_vault::ITERATIONS,
+        &mut data,
+    );
+    header.data_sector = old.other();
+    data.resize(header.sectors() as usize * SECTOR, 0);
+
+    let mut written = true;
+    for (index, chunk) in data.chunks(SECTOR).enumerate() {
+        let mut sector = [0u8; SECTOR];
+        sector.copy_from_slice(chunk);
+        written &= store::write_sector(header.data_sector + index as u64, &sector);
+    }
+    let back = store::read_sector(header.data_sector).is_some_and(|sector| sector[..] == data[..SECTOR]);
+    if !written || !back {
+        println!(
+            "vault      : the new copy did not reach the disk (written {written}, read back {back}); \
+             the old passcode still opens it"
+        );
+        return false;
+    }
+    let mut first = [0u8; SECTOR];
+    first[..corrode_vault::HEADER_LEN].copy_from_slice(&header.to_bytes());
+    let switched = store::write_sector(OFFSET / SECTOR as u64, &first)
+        && store::read_sector(OFFSET / SECTOR as u64).is_some_and(|sector| Header::parse(&sector) == Some(header));
+    if !switched {
+        println!("vault      : the header did not reach the disk; the old passcode still opens it");
+        return false;
+    }
+    without_interrupts(|| *CURRENT.lock() = Some(header));
+    println!(
+        "vault      : sealed again under the new passcode, in sector {} on",
+        header.data_sector
+    );
+    true
+}
+
+/// `N` bytes from RDRAND, or `None` if it would not give them.
+fn random<const N: usize>() -> Option<[u8; N]> {
+    let mut out = [0u8; N];
+    for chunk in out.chunks_mut(8) {
+        let mut word = 0u64;
+        let mut tries = 0;
+        loop {
+            let ok: u8;
+            // SAFETY: RDRAND writes one register and the carry flag.
+            unsafe {
+                core::arch::asm!(
+                    "rdrand {word}",
+                    "setc {ok}",
+                    word = out(reg) word,
+                    ok = out(reg_byte) ok,
+                    options(nomem, nostack),
+                );
+            }
+            if ok == 1 && word != u64::MAX {
+                break;
+            }
+            tries += 1;
+            if tries == 100 {
+                return None;
+            }
+        }
+        chunk.copy_from_slice(&word.to_le_bytes()[..chunk.len()]);
+    }
+    Some(out)
 }
 
 /// The opened root directory as a module, for `modules::all`.

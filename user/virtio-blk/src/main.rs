@@ -280,6 +280,12 @@ fn serve(disk: &mut Disk, message: Message) -> Result<[u64; 4], Error> {
             disk.transfer(blk::T_IN, message.words[0])?;
             Ok([0; 4])
         }
+        // The theme's sector only through SAVE, which checks the record.
+        store::WRITE if message.words[0] == THEME_SECTOR => Err(Error::Invalid),
+        store::WRITE => {
+            disk.transfer(blk::T_OUT, message.words[0])?;
+            Ok([0; 4])
+        }
         _ => Err(Error::Invalid),
     }
 }

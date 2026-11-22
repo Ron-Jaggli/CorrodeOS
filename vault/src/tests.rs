@@ -106,15 +106,29 @@ fn headers_round_trip_and_odd_ones_are_refused() {
     let bytes = header.to_bytes();
     assert_eq!(Header::parse(&bytes), Some(header));
     assert_eq!(header.sectors(), 6);
-    let mut long = bytes.to_vec();
-    long.extend_from_slice(&[0xff; 448]);
-    assert_eq!(Header::parse(&long), Some(header), "a whole sector, junk after");
-    assert_eq!(Header::parse(&bytes[..63]), None);
     let damaged = |at: usize, value: &[u8]| {
         let mut bytes = bytes;
         bytes[at..at + value.len()].copy_from_slice(value);
         Header::parse(&bytes)
     };
+    let mut long = bytes.to_vec();
+    long.extend_from_slice(&[0xff; 440]);
+    assert_eq!(Header::parse(&long), Some(header), "a whole sector, junk after");
+    assert_eq!(Header::parse(&bytes[..71]), None);
+    // The slots: the first, the other, an old header's zero for the first;
+    // nowhere else, so a header cannot point the reads at the theme or
+    // past the vault.
+    assert_eq!(header.data_sector, DATA_SECTOR);
+    assert_eq!(header.slot_sectors(), 8);
+    assert_eq!(header.other(), DATA_SECTOR + 8);
+    assert_eq!(header.disk_len(), (DATA_SECTOR + 16) * 512);
+    let moved = Header { data_sector: header.other(), ..header };
+    assert_eq!(Header::parse(&moved.to_bytes()), Some(moved));
+    assert_eq!(moved.other(), DATA_SECTOR);
+    assert_eq!(damaged(64, &0u64.to_le_bytes()).map(|h| h.data_sector), Some(DATA_SECTOR));
+    for wrong in [1u64, DATA_SECTOR + 1, DATA_SECTOR + 16, u64::MAX] {
+        assert_eq!(damaged(64, &wrong.to_le_bytes()), None, "{wrong}");
+    }
     assert_eq!(damaged(0, b"X"), None);
     assert_eq!(damaged(8, &2u32.to_le_bytes()), None);
     assert_eq!(damaged(12, &(MIN_ITERATIONS - 1).to_le_bytes()), None);
@@ -162,8 +176,8 @@ fn seal_the_root() {
         .truncate(false)
         .open(&disk)
         .expect("open the disk image");
-    let end = DATA_OFFSET + header.sectors() * SECTOR as u64;
-    let size = file.metadata().expect("its size").len().max(end).max(1 << 20);
+    // Room for both slots, so the passcode can be changed later.
+    let size = file.metadata().expect("its size").len().max(header.disk_len()).max(1 << 20);
     file.set_len(size).expect("size the disk image");
     let mut first = [0u8; SECTOR];
     first[..HEADER_LEN].copy_from_slice(&header.to_bytes());

@@ -81,18 +81,53 @@ pub fn start() -> bool {
         return false;
     }
     QUEUE.store(queue, Ordering::Release);
+    // The window server answers Settings' passcode change, which seals the
+    // vault again on the disk: it may send to the driver too, from the same
+    // slot, and do nothing else with it.
+    let server = crate::WINDOW_SERVER.load(Ordering::Acquire);
+    if server != usize::MAX && cap::grant(server, STORE_ENDPOINT, STORE_ENDPOINT, Rights::WRITE).is_err() {
+        println!("store      : the window server cannot reach the disk; the passcode cannot be changed");
+    }
     crate::start_all(&[Some(driver)]);
     println!("store      : a disk at {}, driven in ring 3", found.address);
     RUNNING.store(true, Ordering::Release);
     true
 }
 
+/// One call to the driver at a time: the painter saves the theme and the
+/// desktop's loop reads and writes the vault, and both go through the one
+/// sector page. Held across the call, so waited for by yielding, not
+/// spinning with interrupts off.
+static BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Run `work` with the driver to itself.
+fn alone<T>(work: impl FnOnce() -> T) -> T {
+    while BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        task::yield_now();
+    }
+    let result = work();
+    BUSY.store(false, Ordering::Release);
+    result
+}
+
 fn call(label: u64, words: [u64; 4]) -> Option<[u64; 4]> {
     if !RUNNING.load(Ordering::Acquire) {
         return None;
     }
+    alone(|| raw_call(label, words))
+}
+
+/// A call, for one that already holds the driver.
+fn raw_call(label: u64, words: [u64; 4]) -> Option<[u64; 4]> {
     let answer = ipc::call(STORE_ENDPOINT, ipc::Message { label, words }, None, None).ok()?;
     (answer.message.label == corrode_abi::STATUS_OK).then_some(answer.message.words)
+}
+
+/// The sector page of the queue memory, as the kernel sees it.
+fn sector_page() -> Option<*mut u8> {
+    let (address, len) = memory::in_kernel(QUEUE.load(Ordering::Acquire))?;
+    // SAFETY: the page is inside the object, checked against its length.
+    (len >= (SECTOR_PAGE + 1) * 4096).then(|| unsafe { address.add(SECTOR_PAGE * 4096) })
 }
 
 /// The theme kept on the disk, if there is a disk and it keeps one.
@@ -115,19 +150,46 @@ pub fn load() -> Option<Theme> {
 
 /// One sector of the disk, if there is a disk and it gives it.
 pub fn read_sector(sector: u64) -> Option<[u8; 512]> {
-    call(store::READ, [sector, 0, 0, 0])?;
-    let (address, len) = memory::in_kernel(QUEUE.load(Ordering::Acquire))?;
-    if len < (SECTOR_PAGE + 1) * 4096 {
+    if !RUNNING.load(Ordering::Acquire) {
         return None;
     }
-    let mut bytes = [0u8; 512];
-    // SAFETY: inside the object, which the kernel can see. The driver
-    // wrote the sector there before answering and waits for the next call
-    // now, so nothing writes it while it is copied.
-    unsafe {
-        core::ptr::copy_nonoverlapping(address.add(SECTOR_PAGE * 4096), bytes.as_mut_ptr(), bytes.len())
-    };
-    Some(bytes)
+    alone(|| {
+        let page = sector_page()?;
+        raw_call(store::READ, [sector, 0, 0, 0])?;
+        let mut bytes = [0u8; 512];
+        // SAFETY: the sector page, which the kernel can see. The driver
+        // wrote the sector there before answering and touches it only
+        // during a call, and this one holds the driver.
+        unsafe { core::ptr::copy_nonoverlapping(page, bytes.as_mut_ptr(), bytes.len()) };
+        Some(bytes)
+    })
+}
+
+/// Write one sector of the disk. Not the theme's: that is `save`'s.
+pub fn write_sector(sector: u64, bytes: &[u8; 512]) -> bool {
+    if !RUNNING.load(Ordering::Acquire) {
+        return false;
+    }
+    alone(|| {
+        let Some(page) = sector_page() else {
+            return false;
+        };
+        // SAFETY: as in `read_sector`; the driver reads the page only
+        // during the call below.
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), page, bytes.len()) };
+        let answer = ipc::call(STORE_ENDPOINT, ipc::Message { label: store::WRITE, words: [sector, 0, 0, 0] }, None, None);
+        match answer {
+            Ok(answer) if answer.message.label == corrode_abi::STATUS_OK => true,
+            Ok(answer) => {
+                println!("store      : the disk would not write sector {sector} (status {})", answer.message.label);
+                false
+            }
+            Err(error) => {
+                println!("store      : no answer writing sector {sector}: {error:?}");
+                false
+            }
+        }
+    })
 }
 
 /// Keep `theme` on the disk, if there is one.

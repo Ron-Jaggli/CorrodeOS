@@ -18,8 +18,14 @@
 //! | 32..44 | CCM nonce                     |
 //! | 44..48 | bytes of the tar              |
 //! | 48..64 | CCM tag                       |
+//! | 64..72 | the sector the tar starts at  |
 //!
-//! and the tar, encrypted, from byte [`DATA_OFFSET`].
+//! and the tar, encrypted, from that sector: [`DATA_OFFSET`]'s, or one
+//! slot past it. Two slots, so a vault sealed again (a new passcode) is
+//! written beside the old copy, and only the header -- one sector, written
+//! last -- says which is current: a crash between leaves the old passcode
+//! opening the old copy. A header from before the field has zeros there,
+//! read as the first slot.
 //!
 //! The key is the first 16 bytes of PBKDF2-HMAC-SHA-256 of the passcode
 //! (`corrode_theme::passcode::pbkdf2`), an AES-128 key, and the tar is
@@ -40,10 +46,13 @@ use corrode_theme::passcode::pbkdf2;
 
 /// Where the header is on the disk, in bytes: the theme has sector 0.
 pub const OFFSET: u64 = 4096;
-/// Where the sealed tar starts, in bytes: the sector after the header's.
+/// Where the first slot of the sealed tar starts, in bytes: the sector
+/// after the header's.
 pub const DATA_OFFSET: u64 = OFFSET + SECTOR as u64;
 pub const SECTOR: usize = 512;
-pub const HEADER_LEN: usize = 64;
+pub const HEADER_LEN: usize = 72;
+/// The first slot's first sector.
+pub const DATA_SECTOR: u64 = DATA_OFFSET / SECTOR as u64;
 
 pub const MAGIC: [u8; 8] = *b"CRDVAULT";
 pub const VERSION: u32 = 1;
@@ -71,6 +80,8 @@ pub struct Header {
     /// Bytes of the tar, and of what is sealed.
     pub len: u32,
     pub tag: [u8; TAG],
+    /// Where the sealed tar starts: [`DATA_SECTOR`], or [`Header::other`].
+    pub data_sector: u64,
 }
 
 impl Header {
@@ -78,17 +89,25 @@ impl Header {
     pub fn parse(bytes: &[u8]) -> Option<Header> {
         let bytes: &[u8; HEADER_LEN] = bytes.get(..HEADER_LEN)?.try_into().ok()?;
         let word = |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
-        let header = Header {
+        let data_sector = match u64::from_le_bytes(bytes[64..72].try_into().ok()?) {
+            0 => DATA_SECTOR,
+            sector => sector,
+        };
+        let mut header = Header {
             iterations: word(12),
             salt: bytes[16..32].try_into().ok()?,
             nonce: bytes[32..44].try_into().ok()?,
             len: word(44),
             tag: bytes[48..64].try_into().ok()?,
+            data_sector: DATA_SECTOR,
         };
         let sound = bytes[..8] == MAGIC
             && word(8) == VERSION
             && (MIN_ITERATIONS..=MAX_ITERATIONS).contains(&header.iterations)
             && (1..=MAX_LEN).contains(&(header.len as usize));
+        // Only the two slots: the header cannot send the reads elsewhere.
+        let slot = (data_sector == DATA_SECTOR || data_sector == header.other()).then_some(data_sector);
+        header.data_sector = slot?;
         sound.then_some(header)
     }
 
@@ -101,7 +120,27 @@ impl Header {
         bytes[32..44].copy_from_slice(&self.nonce);
         bytes[44..48].copy_from_slice(&self.len.to_le_bytes());
         bytes[48..64].copy_from_slice(&self.tag);
+        bytes[64..72].copy_from_slice(&self.data_sector.to_le_bytes());
         bytes
+    }
+
+    /// Sectors one slot takes: the tar's, rounded up to a page.
+    pub fn slot_sectors(&self) -> u64 {
+        (self.len as u64).div_ceil(4096) * (4096 / SECTOR as u64)
+    }
+
+    /// The slot this vault is not in: where sealing it again goes.
+    pub fn other(&self) -> u64 {
+        if self.data_sector == DATA_SECTOR {
+            DATA_SECTOR + self.slot_sectors()
+        } else {
+            DATA_SECTOR
+        }
+    }
+
+    /// Bytes of disk the vault needs, both slots.
+    pub fn disk_len(&self) -> u64 {
+        (DATA_SECTOR + 2 * self.slot_sectors()) * SECTOR as u64
     }
 
     /// Sectors the sealed tar takes, from [`DATA_OFFSET`].
@@ -159,7 +198,7 @@ pub fn seal(
     assert!((MIN_ITERATIONS..=MAX_ITERATIONS).contains(&iterations));
     let key = Key::new(passcode, &salt, iterations);
     let tag = corrode_seal::seal(&mut |block: &mut [u8; 16]| cipher(key.bytes(), block), &nonce, data);
-    Header { iterations, salt, nonce, len: data.len() as u32, tag }
+    Header { iterations, salt, nonce, len: data.len() as u32, tag, data_sector: DATA_SECTOR }
 }
 
 /// Open what `header` describes, `data` being its `len` sealed bytes,

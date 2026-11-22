@@ -135,6 +135,14 @@ pub fn try_passcode(code: passcode::Code, now: u64) -> Result<bool, u64> {
     Ok(right)
 }
 
+/// Make `code` the lock screen's passcode, hashed.
+pub fn set_passcode(code: passcode::Code) {
+    let mut salt = [0u8; 16];
+    salt[..8].copy_from_slice(&crate::time::now_ns().to_le_bytes());
+    let hashed = Hashed::new(code, salt, passcode::ITERATIONS);
+    without_interrupts(|| *PASSCODE.lock() = Some(hashed));
+}
+
 /// The vault opened with `code`. Its files' desktop.conf gives the look
 /// (unless the disk kept one), and `code`, hashed, is the lock screen's
 /// passcode from now on: what opened the files locks the screen.
@@ -147,8 +155,5 @@ fn opened_vault(code: passcode::Code) {
     if let (Some(theme), false) = (theme, kept) {
         set(theme);
     }
-    let mut salt = [0u8; 16];
-    salt[..8].copy_from_slice(&crate::time::now_ns().to_le_bytes());
-    let hashed = Hashed::new(code, salt, passcode::ITERATIONS);
-    without_interrupts(|| *PASSCODE.lock() = Some(hashed));
+    set_passcode(code);
 }
