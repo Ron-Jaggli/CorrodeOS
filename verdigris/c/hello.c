@@ -1,9 +1,9 @@
 /*
  * A test program for Verdigris, not part of CorrodeOS: an ordinary C
  * console program, compiled the normal way by mingw-w64's gcc
- * (`x86_64-w64-mingw32-gcc -O2 hello.c -o hello.exe`, no special flags),
- * so it imports msvcrt.dll and kernel32.dll as such programs do and starts
- * through mingw's own start-up code. win-test checks what it prints.
+ * (`x86_64-w64-mingw32-gcc -O2 -s hello.c -o hello.exe`: stripped, and
+ * no other flags), so it imports msvcrt.dll and kernel32.dll as such
+ * programs do and starts through mingw's own start-up code. win-test checks what it prints.
  */
 #include <stdio.h>
 #include <stdlib.h>

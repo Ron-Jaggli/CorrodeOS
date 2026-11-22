@@ -215,7 +215,7 @@ $(DIR_EXE): verdigris/scripts/dir-exe.sh verdigris/dir/src/main.rs
 # mingw's own start-up code. A test program only; Verdigris is Rust.
 $(HELLO_C_EXE): verdigris/c/hello.c
 	@mkdir -p build
-	x86_64-w64-mingw32-gcc -O2 -o $@ $<
+	x86_64-w64-mingw32-gcc -O2 -s -o $@ $<
 
 $(SPIN_EXE): verdigris/scripts/reader-exe.sh verdigris/scripts/spin-exe.S
 	@mkdir -p build
@@ -480,7 +480,7 @@ files-run-test: iso
 	@( sleep $(SHOT_DELAY); \
 	   echo "mouse_move -84 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 2; \
-	   for key in down down down down ret down ret down ret; do echo "sendkey $$key"; sleep 0.6; done; sleep 3; \
+	   for key in down down down down ret down down ret down ret; do echo "sendkey $$key"; sleep 0.6; done; sleep 3; \
 	   echo "screendump build/files-run.ppm"; sleep 2; echo quit ) \
 	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
