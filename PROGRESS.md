@@ -3104,6 +3104,51 @@ holding its tasks and memory.
   before, plus win-test's stopped program), none FAIL, no unhandled trap,
   no boot self-check failing; `./corrode test` 351 passed; clippy at 33.
 
+## 90. A call to a server that has ended is refused
+
+ipc.rs recorded it as a known gap: a caller waits for good if its server
+never answers. For a live server that is still so. For one that has
+*ended* -- faulted, stopped (section 89), or simply returned -- the
+caller now gets `Refused`, and with section 89 that matters: a Windows
+program whose view is gone was blocked in the kernel, where it cannot
+even be stopped.
+
+When `task::reap` (section 86) takes a finished task's capabilities, it
+first looks at what they leave behind (`cap::loose_ends`):
+
+- **Calls it was handed and never answered** (its reply capabilities):
+  `ipc::unanswerable` wakes each caller still waiting on that very call,
+  refused.
+- **Endpoints it could receive on**: for each that no task still running
+  can receive on (`cap::can_receive` over every task's slots),
+  `ipc::orphan` refuses everyone queued to send there and marks it
+  orphaned, so a later send that finds nobody waiting is refused at once
+  instead of waiting for good.
+
+Both run after the dead task's capabilities are dropped, outside every
+lock but the endpoint's own, taken in the same order as a send takes
+them (endpoint, then scheduler).
+
+- **Boot self-checks** (`ipc`, two more on every boot): a caller blocked
+  on a server that ended without receiving, and one whose server took
+  the call and ended without answering, are both refused once the server
+  is reaped. With `unanswerable` and `orphan` turned off, both FAIL (the
+  callers are still waiting at the 2 s deadline).
+
+- **Choice:** done at reap, not when a capability is dropped. Some
+  capabilities are dropped while the scheduler lock is held (a failed
+  `put` in `deliver`), and waking a task there would deadlock; reap is
+  in task context with nothing held.
+- **Choice:** an endpoint is orphaned for good. Rights only narrow, so
+  once no task can receive on it, none ever can again.
+- **Open:** a plain `send` refused this way returns as if taken (it was
+  never promised an answer), and a live server that never answers still
+  keeps its caller waiting.
+- Verified: the whole suite on both GPUs, 91 checks PASS on each, none
+  FAIL, no unhandled trap; every boot now runs two more self-checks
+  (203 on virtio, 196 on the default GPU), none failing;
+  `./corrode test` 351 passed; clippy at 33.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -3263,7 +3308,10 @@ one task.
 13. [x] (section 89) A Windows program still running at `win`'s deadline is stopped
    (it was left running for good, holding its memory); spin.exe, which
    never ends, packed at /programs/spin; win-test stops it.
-14. [ ] Wrap-up for the owner: what the vault run did, what to review and
+14. [x] (section 90) A call to a server that has ended is refused, not waited on for
+   good: a call it took and never answered, and an endpoint nobody left
+   can receive on. Boot self-checks, both cases, both GPUs.
+15. [ ] Wrap-up for the owner: what the vault run did, what to review and
    merge, what is still open. No code. Then stop the loop.
 
 Tasks 7-9 were added at 2026-11-22T03:10-06:00, by me (and 9, running a

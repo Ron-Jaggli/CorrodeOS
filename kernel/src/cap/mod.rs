@@ -414,6 +414,31 @@ impl CSpace {
     }
 }
 
+/// What a finished task's capabilities leave that another task may be
+/// waiting on: the calls it was handed to answer, and the endpoints it
+/// could receive on.
+pub fn loose_ends(cspace: &CSpace) -> (Vec<crate::ipc::ReplyToken>, Vec<Arc<Object>>) {
+    let mut replies = Vec::new();
+    let mut endpoints = Vec::new();
+    for cap in cspace.slots.iter().flatten() {
+        match &*cap.object {
+            Object::Reply(token) => replies.push(*token),
+            Object::Endpoint(_) if cap.rights.contains(Rights::READ) => endpoints.push(Arc::clone(&cap.object)),
+            _ => {}
+        }
+    }
+    (replies, endpoints)
+}
+
+/// Whether `cspace` can receive on `endpoint`, that very object.
+pub fn can_receive(cspace: &CSpace, endpoint: &Arc<Object>) -> bool {
+    cspace
+        .slots
+        .iter()
+        .flatten()
+        .any(|cap| Arc::ptr_eq(&cap.object, endpoint) && cap.rights.contains(Rights::READ))
+}
+
 /// Create authority from nothing and place it in `task`'s capability space.
 ///
 /// # The bootstrap hole

@@ -3276,6 +3276,65 @@ fn console_checks() {
     );
 
     view_checks();
+    orphan_checks();
+}
+
+/// Where task 0 holds each check's endpoint while handing it out, and then
+/// no longer: a reader left in task 0 would keep the endpoint alive.
+const ORPHAN_ENDPOINT: cap::CapPtr = 78;
+/// The servers' and callers' own slots.
+const ORPHAN_SLOT: cap::CapPtr = 0;
+const ORPHAN_REPLY: cap::CapPtr = 1;
+
+/// How each check's caller came back: 0 not yet, 1 refused, 2 otherwise.
+static ORPHAN_CALLS: [core::sync::atomic::AtomicU64; 2] =
+    [core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)];
+
+/// A server that ends leaves no caller waiting for good: one that ended
+/// before taking a call, and one that took it and ended without answering.
+/// Both callers are refused once the servers are reaped (`task::reap`).
+fn orphan_checks() {
+    extern "C" fn quits() {}
+    extern "C" fn takes_and_quits() {
+        let _ = ipc::recv(ORPHAN_SLOT, None, Some(ORPHAN_REPLY));
+    }
+    fn caller(which: usize) {
+        let answer = ipc::call(ORPHAN_SLOT, ipc::Message::EMPTY, None, None);
+        let how = if matches!(answer, Err(cap::CapError::Refused)) { 1 } else { 2 };
+        ORPHAN_CALLS[which].store(how, core::sync::atomic::Ordering::SeqCst);
+    }
+    extern "C" fn calls_first() {
+        caller(0);
+    }
+    extern "C" fn calls_second() {
+        caller(1);
+    }
+    let cases: [(&str, extern "C" fn(), extern "C" fn()); 2] = [
+        ("a call to a server that ended unheard is refused", quits, calls_first),
+        ("a call taken and never answered is refused", takes_and_quits, calls_second),
+    ];
+    for (which, (name, server, client)) in cases.into_iter().enumerate() {
+        let (server, client) = (task::spawn("ipc-server", server), task::spawn("ipc-caller", client));
+        let (Some(server), Some(client)) = (server, client) else {
+            check("ipc", name, false);
+            continue;
+        };
+        let handed = cap::issue(ORPHAN_ENDPOINT, cap::Object::Endpoint(ipc::Endpoint::new()), cap::Rights::ALL).is_ok()
+            && cap::grant(server, ORPHAN_ENDPOINT, ORPHAN_SLOT, cap::Rights::READ).is_ok()
+            && cap::grant(client, ORPHAN_ENDPOINT, ORPHAN_SLOT, cap::Rights::WRITE).is_ok();
+        let _ = cap::delete(ORPHAN_ENDPOINT);
+        start_all(&[Some(server), Some(client)]);
+        // The server finishes (having taken the call, in the second case),
+        // its CPU leaves it, and it is reaped; then the caller must return.
+        let deadline = time::now_ns() + 2_000_000_000;
+        while ORPHAN_CALLS[which].load(core::sync::atomic::Ordering::SeqCst) == 0 && time::now_ns() < deadline {
+            if task::state_of(server) == Some(task::State::Finished) {
+                task::reap();
+            }
+            task::sleep_until(time::now_ns() + 10_000_000);
+        }
+        check("ipc", name, handed && ORPHAN_CALLS[which].load(core::sync::atomic::Ordering::SeqCst) == 1);
+    }
 }
 
 /// Bootstrap's capabilities for reader.exe's view: its endpoint and the

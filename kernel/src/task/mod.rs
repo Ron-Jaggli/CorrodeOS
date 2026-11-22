@@ -600,7 +600,17 @@ pub fn reap() -> usize {
     // Outside the scheduler lock: a capability dropped here may reach
     // anything an object's owner does when its last holder goes.
     for (stack, space, cspace) in taken {
+        // Who was waiting on it: callers it never answered, and senders to
+        // an endpoint nobody else can receive on. Told after its
+        // capabilities are gone, outside every lock.
+        let (replies, endpoints) = crate::cap::loose_ends(&cspace);
         drop(cspace);
+        for token in replies {
+            crate::ipc::unanswerable(token);
+        }
+        for endpoint in endpoints.iter().filter(|endpoint| !anyone_can_receive(endpoint)) {
+            crate::ipc::orphan(endpoint);
+        }
         if let Some(space) = space {
             crate::memory::forget_space(&space);
             // SAFETY: `left` says its CPU has since installed another space,
@@ -613,6 +623,20 @@ pub fn reap() -> usize {
         }
     }
     freed
+}
+
+/// Whether a task that has not finished can receive on `endpoint`.
+fn anyone_can_receive(endpoint: &alloc::sync::Arc<crate::cap::Object>) -> bool {
+    x86_64::without_interrupts(|| {
+        let guard = SCHEDULER.lock();
+        guard.as_ref().is_some_and(|scheduler| {
+            scheduler
+                .tasks
+                .iter()
+                .filter(|task| task.state != State::Finished)
+                .any(|task| crate::cap::can_receive(&task.cspace, endpoint))
+        })
+    })
 }
 
 /// Ask task `id` to stop: its CPU finishes it at the first tick that
