@@ -26,6 +26,7 @@ members = [
     "user/xhci",
     "verdigris/kernel32",
     "verdigris/view",
+    "verdigris/crt-tests",
     "user/blob-reader",
     "user/nvidia",
     "user/ps2",

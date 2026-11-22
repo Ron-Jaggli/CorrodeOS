@@ -32,9 +32,12 @@
 extern crate alloc;
 
 mod format;
+mod libc;
 mod msvcrt;
 mod process;
 mod stdio;
+mod system;
+mod text;
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -721,7 +724,7 @@ const fn crt(name: &[u8], function: *const ()) -> Export {
     export_from(b"msvcrt.dll", name, function)
 }
 
-const EXPORT_COUNT: usize = 103;
+const EXPORT_COUNT: usize = 136;
 
 /// What Verdigris's DLLs offer, at `KERNEL32_BASE` (see `kernel32.ld`):
 /// kernel32's functions, msvcrt's functions and variables, and the start
@@ -836,5 +839,38 @@ static EXPORTS: Table<EXPORT_COUNT> = Table {
         crt(b"strncmp", msvcrt::strncmp as *const ()),
         crt(b"strcmp", msvcrt::strcmp as *const ()),
         crt(b"strcpy", msvcrt::strcpy as *const ()),
+        crt(b"strcat", libc::strcat as *const ()),
+        crt(b"strncpy", libc::strncpy as *const ()),
+        crt(b"strchr", libc::strchr as *const ()),
+        crt(b"strrchr", libc::strrchr as *const ()),
+        crt(b"strstr", libc::strstr as *const ()),
+        crt(b"memchr", libc::memchr as *const ()),
+        crt(b"strtol", libc::strtol as *const ()),
+        crt(b"strtoul", libc::strtoul as *const ()),
+        crt(b"atoi", libc::atoi as *const ()),
+        crt(b"qsort", libc::qsort as *const ()),
+        crt(b"bsearch", libc::bsearch as *const ()),
+        crt(b"getenv", libc::getenv as *const ()),
+        crt(b"srand", libc::srand as *const ()),
+        crt(b"rand", libc::rand as *const ()),
+        crt(b"_vscprintf", libc::vscprintf as *const ()),
+        crt(b"isalnum", libc::isalnum as *const ()),
+        crt(b"isalpha", libc::isalpha as *const ()),
+        crt(b"isdigit", libc::isdigit as *const ()),
+        crt(b"islower", libc::islower as *const ()),
+        crt(b"isupper", libc::isupper as *const ()),
+        crt(b"isxdigit", libc::isxdigit as *const ()),
+        crt(b"ispunct", libc::ispunct as *const ()),
+        crt(b"isspace", libc::isspace as *const ()),
+        crt(b"toupper", libc::toupper as *const ()),
+        crt(b"tolower", libc::tolower as *const ()),
+        crt(b"_time64", libc::time64 as *const ()),
+        crt(b"clock", libc::clock as *const ()),
+        export(b"GetModuleHandleW", system::get_module_handle as *const ()),
+        export(b"GetModuleHandleA", system::get_module_handle as *const ()),
+        export(b"GetModuleFileNameW", system::get_module_file_name_w as *const ()),
+        export(b"GetEnvironmentVariableW", system::get_environment_variable_w as *const ()),
+        export(b"GetFileType", system::get_file_type as *const ()),
+        export(b"GetSystemTimeAsFileTime", system::get_system_time_as_file_time as *const ()),
     ],
 };
