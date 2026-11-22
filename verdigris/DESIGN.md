@@ -332,14 +332,20 @@ view holds no path the program could reach around, and a symbolic link,
 when the store has them, is followed in the real tree and then checked
 against the allowed set like any other path.
 
-Two things to decide when this is built, neither needing a new system
-call:
+Decided when phase 3 built it (PROGRESS section 82):
 
-- the service needs one endpoint per view, since endpoints carry no
-  badge; it serves many either with one task per view or with a kernel
-  feature to receive on several endpoints at once;
-- where the person's allowlists are kept between boots: in the store, in
-  the clear. Nothing on disk is encrypted with the per-boot key.
+- **one task per view.** Endpoints carry no badge, so the service runs
+  once for each program it serves: `fileview`, holding that view's
+  endpoint, the tree, the list and the page, and nothing else. It ends
+  when the program does (kernel32's `ExitProcess` tells it). No kernel
+  feature was needed.
+- **the list is the service's, in a read-only page.** The program never
+  holds it, so it cannot widen it, and the service copies each path out
+  of the shared page before reading it.
+- where the person's allowlists are kept between boots is still open; it
+  comes with the launcher starting Windows programs from Files. In the
+  store, in the clear: nothing on disk is encrypted with the per-boot
+  key.
 
 ## 5. Reusing Wine's PE DLLs, and the licences
 

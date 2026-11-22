@@ -3089,6 +3089,113 @@ fn console_checks() {
         "it writes through kernel32 and exits",
         task::state_of(console) == Some(task::State::Finished),
     );
+
+    view_checks();
+}
+
+/// Bootstrap's capabilities for reader.exe's view: its endpoint and the
+/// page the program and the view share. Both are granted on, narrowed.
+const VIEW_ENDPOINT: cap::CapPtr = 76;
+const VIEW_PAGE: cap::CapPtr = 77;
+
+/// What reader.exe may see: its own folder, and one file elsewhere. Its
+/// `C:\` is then `/`, where only `docs` and `etc` show, and in `etc` only
+/// `motd`.
+const READER_FOLDER: &str = "/docs";
+const READER_ALLOWED: &str = "/etc/motd";
+
+/// Verdigris, phase 3: `reader.exe` (assembled from `scripts/reader-exe.S`)
+/// reads files with CreateFileW, ReadFile, GetFileSize and CloseHandle,
+/// through a view of them (`verdigris/DESIGN.md` section 4).
+///
+/// The view is `fileview`, a task of its own holding the files and the
+/// list of what the program may see. The program holds neither: its view
+/// endpoint, send-only, and a page shared with the view for paths and
+/// what is read. What it may read and what is not there for it is in the
+/// log; `pe-test` reads it.
+fn view_checks() {
+    use corrode_abi::{verdigris, view};
+
+    let (Some(program), Some(kernel32), Some(service)) = (
+        modules::find("reader.exe"),
+        modules::find("kernel32"),
+        modules::find("fileview"),
+    ) else {
+        println!("verdigris  : no reader.exe, kernel32 or fileview module was loaded");
+        return;
+    };
+    let Some((tree, _)) = vault::root() else {
+        println!("verdigris  : no files on the boot medium (a vault keeps them); reader.exe is not run");
+        return;
+    };
+    let (Some(page), Some(list)) = (memory::create(1, false), memory::create(1, true)) else {
+        verdigris_check("make the view's page and list", false);
+        return;
+    };
+    // The list, written where only the view will map it, read-only.
+    if let Some((at, len)) = memory::in_kernel(list) {
+        let text = [READER_FOLDER.as_bytes(), b"\n", READER_ALLOWED.as_bytes(), b"\n"];
+        let mut offset = 0;
+        for part in text {
+            let part = &part[..part.len().min(len - offset)];
+            // SAFETY: the kernel's own mapping of the object, `len` bytes,
+            // which no task has been given yet.
+            unsafe { core::ptr::copy_nonoverlapping(part.as_ptr(), at.add(offset), part.len()) };
+            offset += part.len();
+        }
+    }
+    let (reader, server) = match (
+        task::spawn_windows("reader.exe", program.bytes, kernel32.bytes),
+        task::spawn_program("fileview", service.bytes),
+    ) {
+        (Ok(reader), Ok(server)) => (reader, server),
+        (reader, server) => {
+            println!("verdigris  : reader.exe or its view was not loaded: {reader:?} {server:?}");
+            verdigris_check("load a Windows program and its view", false);
+            return;
+        }
+    };
+
+    let minted = cap::mint(0, VIEW_ENDPOINT, cap::Object::Endpoint(ipc::Endpoint::new()), cap::Rights::ALL).is_ok()
+        && cap::mint(0, VIEW_PAGE, cap::Object::Memory(page), cap::Rights::ALL).is_ok();
+    let served = minted
+        && cap::grant(server, VIEW_ENDPOINT, view::SERVE, cap::Rights::READ).is_ok()
+        && cap::grant(server, VIEW_PAGE, view::PAGE, cap::Rights::READ_WRITE).is_ok()
+        && cap::grant(server, LOG_ENDPOINT, view::LOG, cap::Rights::WRITE).is_ok()
+        && cap::issue_to(server, view::TREE, cap::Object::Blob(tree), cap::Rights::READ).is_ok()
+        && cap::issue_to(server, view::SPEC, cap::Object::Memory(list), cap::Rights::READ).is_ok()
+        && cap::issue_to(
+            server,
+            view::POOL,
+            cap::Object::Pool(core::sync::atomic::AtomicU64::new(view::HEAP_PAGES as u64)),
+            cap::Rights::READ_WRITE,
+        )
+        .is_ok();
+    verdigris_check(
+        "the view holds the files, its list, page and log",
+        served && cap::slots_used(server) == Some(6),
+    );
+    let given = minted
+        && cap::grant(reader, LOG_ENDPOINT, verdigris::LOG, cap::Rights::WRITE).is_ok()
+        && cap::grant(reader, VIEW_ENDPOINT, verdigris::VIEW, cap::Rights::WRITE).is_ok()
+        && cap::grant(reader, VIEW_PAGE, verdigris::PAGE, cap::Rights::READ_WRITE).is_ok();
+    verdigris_check(
+        "reader.exe holds its view and page, not the files",
+        given && cap::slots_used(reader) == Some(3),
+    );
+    if !served || !given {
+        return;
+    }
+    start_all(&[Some(server), Some(reader)]);
+    let finished = |id| task::state_of(id) == Some(task::State::Finished);
+    let deadline = time::now_ns() + 5_000_000_000;
+    while !(finished(reader) && finished(server)) && time::now_ns() < deadline {
+        task::yield_now();
+    }
+    verdigris_check(
+        "it reads through its view; the view ends with it",
+        finished(reader) && finished(server),
+    );
 }
 
 /// Bootstrap's capability to the test blob, and the endpoint its reader

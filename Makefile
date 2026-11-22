@@ -93,7 +93,7 @@ kernel:
 # crate built for it. RUSTFLAGS in the environment replaces the ones in
 # .cargo/config.toml outright, and a separate target directory stops the two
 # sets of flags from invalidating each other's build of the crates they share.
-USER_PROGRAMS := edu fault virtio-gpu virtio-blk blob-reader nvidia ps2 xhci terminal panel settings about files control lock menu
+USER_PROGRAMS := edu fault virtio-gpu virtio-blk blob-reader nvidia ps2 xhci terminal panel settings about files control lock menu fileview
 USER_TARGET   := target/user
 USER_BIN      := $(USER_TARGET)/x86_64-unknown-none/release
 USER_RUSTFLAGS := -C relocation-model=static -C strip=debuginfo \
@@ -115,7 +115,7 @@ clippy:
 HOST_TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
 
 test:
-	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci -p corrode-elf -p corrode-pe -p corrode-virtio -p corrode-nv -p corrode-input -p corrode-heap -p corrode-line -p corrode-shell -p corrode-theme -p corrode-seal -p corrode-vault --target $(HOST_TARGET)
+	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci -p corrode-elf -p corrode-pe -p corrode-virtio -p corrode-nv -p corrode-input -p corrode-heap -p corrode-line -p corrode-shell -p corrode-theme -p corrode-seal -p corrode-vault -p corrode-view --target $(HOST_TARGET)
 
 # What a title bar of glass costs the software renderer, built optimised.
 glass-bench:
@@ -184,6 +184,13 @@ $(CONSOLE_EXE): scripts/console-exe.sh
 	@mkdir -p build
 	bash scripts/console-exe.sh $@
 
+# Phase 3: a program that reads files through its view, assembled whole --
+# headers and all -- by GNU as.
+READER_EXE := build/reader.exe
+$(READER_EXE): scripts/reader-exe.sh scripts/reader-exe.S
+	@mkdir -p build
+	bash scripts/reader-exe.sh $@
+
 KERNEL32_TARGET := target/verdigris
 KERNEL32 := $(KERNEL32_TARGET)/x86_64-unknown-none/release/kernel32
 KERNEL32_RUSTFLAGS := -C relocation-model=static -C strip=debuginfo \
@@ -193,13 +200,14 @@ kernel32:
 	RUSTFLAGS="$(KERNEL32_RUSTFLAGS)" cargo build --release --target-dir $(KERNEL32_TARGET) \
 	    -p corrode-kernel32
 
-iso: $(KERNEL) user kernel32 $(TEST_BLOB) $(ROOT_TAR) $(HELLO_EXE) $(CONSOLE_EXE)
+iso: $(KERNEL) user kernel32 $(TEST_BLOB) $(ROOT_TAR) $(HELLO_EXE) $(CONSOLE_EXE) $(READER_EXE)
 	@rm -rf $(ISO_ROOT)/boot/programs $(ISO_ROOT)/boot/firmware $(ISO_ROOT)/boot/files
 	@mkdir -p $(ISO_ROOT)/boot/limine $(ISO_ROOT)/boot/programs $(ISO_ROOT)/boot/firmware $(ISO_ROOT)/boot/files $(ISO_ROOT)/EFI/BOOT
 	cp $(KERNEL) $(ISO_ROOT)/boot/corrode
 	cp $(foreach program,$(USER_PROGRAMS),$(USER_BIN)/$(program)) $(ISO_ROOT)/boot/programs/
 	cp $(HELLO_EXE) $(ISO_ROOT)/boot/programs/hello.exe
 	cp $(CONSOLE_EXE) $(ISO_ROOT)/boot/programs/console.exe
+	cp $(READER_EXE) $(ISO_ROOT)/boot/programs/reader.exe
 	cp $(KERNEL32) $(ISO_ROOT)/boot/programs/kernel32
 	cp $(TEST_BLOB) $(ISO_ROOT)/boot/firmware/test.blob
 	cp $(ROOT_TAR) $(ISO_ROOT)/boot/files/root.tar
@@ -214,6 +222,7 @@ iso: $(KERNEL) user kernel32 $(TEST_BLOB) $(ROOT_TAR) $(HELLO_EXE) $(CONSOLE_EXE
 	   done; \
 	   echo "    module_path: boot():/boot/programs/hello.exe"; \
 	   echo "    module_path: boot():/boot/programs/console.exe"; \
+	   echo "    module_path: boot():/boot/programs/reader.exe"; \
 	   echo "    module_path: boot():/boot/programs/kernel32"; \
 	   echo "    module_path: boot():/boot/firmware/test.blob"; \
 	   echo "    module_path: boot():/boot/files/root.tar"; \
@@ -297,17 +306,36 @@ boot-test: iso
 pe-test: iso
 	@timeout --foreground $(BOOT_TIMEOUT) \
 	    qemu-system-x86_64 $(QEMU_FLAGS) < /dev/null > build/serial.log 2>&1 || true
-	@grep -a "^verdigris \|^hello.exe \|^console.exe" build/serial.log || echo "pe-test: nothing from Verdigris"
+	@grep -a "^verdigris \|^hello.exe \|^console.exe\|^reader.exe \|^fileview " build/serial.log || echo "pe-test: nothing from Verdigris"
 	@grep -aq "^hello.exe  : hello from a PE, over int 0x80" build/serial.log \
 	    && echo "pe-test: a Windows program said its line             PASS" \
 	    || echo "pe-test: a Windows program said its line             FAIL"
 	@grep -aq "^console.exe: hello from kernel32, via WriteFile" build/serial.log \
 	    && echo "pe-test: ...and one through kernel32's WriteFile     PASS" \
 	    || echo "pe-test: ...and one through kernel32's WriteFile     FAIL"
-	@test $$(grep -a "^verdigris " build/serial.log | grep -ac "PASS") -eq 10 \
+	@test $$(grep -a "^verdigris " build/serial.log | grep -ac "PASS") -eq 13 \
 	    && ! grep -a "^verdigris " build/serial.log | grep -aq "FAIL" \
-	    && echo "pe-test: the kernel's ten Verdigris checks pass      PASS" \
-	    || echo "pe-test: the kernel's ten Verdigris checks pass      FAIL"
+	    && echo "pe-test: the kernel's 13 Verdigris checks pass       PASS" \
+	    || echo "pe-test: the kernel's 13 Verdigris checks pass       FAIL"
+	@# Phase 3: reader.exe, in /docs, allowed /etc/motd besides. Whole
+	@# lines are matched, so without the serial port's carriage returns.
+	@tr -d '\r' < build/serial.log > build/pe-lines.log
+	@motd=$$(head -1 root/etc/motd); keys=$$(head -1 root/docs/keys.txt); \
+	grep -aqxF "reader.exe : keys.txt: $$keys" build/pe-lines.log \
+	    && grep -aqxF "reader.exe : c:/Etc/MOTD: $$motd" build/pe-lines.log \
+	    && grep -aqxF "reader.exe : ..\..\etc\motd: $$motd" build/pe-lines.log \
+	    && test $$(grep -acxF "reader.exe : GetFileSize and the next ReadFile agree" build/pe-lines.log) -eq 3 \
+	    && echo "pe-test: reader.exe reads what it may, any spelling  PASS" \
+	    || echo "pe-test: reader.exe reads what it may, any spelling  FAIL"
+	@grep -aqxF 'reader.exe : C:\etc\desktop.conf: not there (2, ERROR_FILE_NOT_FOUND)' build/pe-lines.log \
+	    && grep -aqxF 'reader.exe : C:\etc\nothing.txt: not there (2, ERROR_FILE_NOT_FOUND)' build/pe-lines.log \
+	    && grep -aqxF 'reader.exe : C:\home\hello.txt: not there (3, ERROR_PATH_NOT_FOUND)' build/pe-lines.log \
+	    && grep -aqxF 'reader.exe : D:\etc\motd: not there (3, ERROR_PATH_NOT_FOUND)' build/pe-lines.log \
+	    && echo "pe-test: ...the rest is absent, as a missing name is PASS" \
+	    || echo "pe-test: ...the rest is absent, as a missing name is FAIL"
+	@grep -aqxF 'reader.exe : C:\etc\motd, to write: read-only (19, ERROR_WRITE_PROTECT)' build/pe-lines.log \
+	    && echo "pe-test: ...and nothing it sees can be written       PASS" \
+	    || echo "pe-test: ...and nothing it sees can be written       FAIL"
 
 # Boot, let the kernel settle, then dump the framebuffer through the QEMU
 # monitor. This is how we verify the renderer actually put pixels where it

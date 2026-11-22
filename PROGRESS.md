@@ -2647,6 +2647,91 @@ under the passcode, instead of on the boot medium.
   a long passcode with letters: out of reach) rather than as a table of
   rates, since the rate depends on the attacker's hardware.
 
+## 82. Verdigris, phase 3: files through a pruned view
+
+A Windows program reads files with `CreateFileW`, `ReadFile`, `GetFileSize`
+and `CloseHandle`, and sees only what it was allowed. Everything else is
+absent, exactly as a name that does not exist (DESIGN.md section 4).
+
+- **`corrode-view`** (`verdigris/view`, `no_std`, host-tested) is the rule.
+  It works out the view's root (the deepest directory holding everything
+  allowed, the program's own folder included) and resolves Windows paths:
+  `\` or `/`, `C:` or none, `\\?\`, `.` and `..` (`..` at the root
+  stays), names matched without regard to ASCII case, exact match first.
+  An allowed directory shows whole, a directory on the way shows only what
+  leads on, and anything else is `ERROR_FILE_NOT_FOUND` (2) or
+  `ERROR_PATH_NOT_FOUND` (3), never "access denied". Other drives, UNC and
+  `\\.\` paths are not files (3). Asking to write or create where the
+  view shows a directory is `ERROR_WRITE_PROTECT` (19); the tree is
+  read-only today. Opening a directory as a file is Windows' own
+  `ERROR_ACCESS_DENIED` (5): that directory is visible, so it reveals
+  nothing.
+  - 8 host tests, among them DESIGN.md's root-and-listing table entry by
+    entry; every pair of a hidden name and a missing one giving the same
+    answer, for reading, writing and all five dispositions; and names
+    differing only in case.
+- **`fileview`**, a ring 3 service, one task per view. It holds the
+  tree (the archive, a read-only blob), the list of what the program may
+  see (a page only it holds, read-only), its endpoint, the page shared
+  with the program, the log, and a pool for its heap. Calls (`abi::view`):
+  OPEN, READ, SIZE, CLOSE, and DONE when the program ends. Paths and data
+  go through the shared page; a path is copied out before it is read.
+  16 files open at once, 2048-byte paths.
+- **kernel32** gained `CreateFileW` (UTF-16 to UTF-8 into the page),
+  `ReadFile` (a page a call, looping), `GetFileSize`, `CloseHandle`,
+  `GetLastError` and `SetLastError`. File handles are 0x100 and up.
+  Writing to a file handle is refused (5); `ExitProcess` tells the view
+  to end. kernel32 never decides what is visible.
+- **`reader.exe`** is the first program written in assembly rather than
+  bytes: `scripts/reader-exe.S`, the whole PE (headers, an import table
+  for eight functions, code, a `.bss`) assembled by GNU as into one flat
+  section. File alignment 0x1000 puts each section at a file offset equal
+  to its RVA, so the assembler resolves every RVA and RIP-relative
+  address itself, with no linker and no Windows toolchain. A host test
+  parses and binds what the script writes.
+- **The boot check.** reader.exe runs in `/docs`, allowed `/etc/motd`
+  besides, so its `C:\` is `/`. It holds three capabilities: the log, its
+  view send-only, and the page. It never holds the files. The kernel's
+  three new checks: what the view holds (6 capabilities), what
+  reader.exe holds (3), and that both end. Its log:
+
+  ```
+  reader.exe : keys.txt: Keys
+  reader.exe : GetFileSize and the next ReadFile agree
+  reader.exe : c:/Etc/MOTD: Welcome to CorrodeOS. Type help for ...
+  reader.exe : ..\..\etc\motd: Welcome to CorrodeOS. ...
+  reader.exe : C:\etc\desktop.conf: not there (2, ERROR_FILE_NOT_FOUND)
+  reader.exe : C:\etc\nothing.txt: not there (2, ERROR_FILE_NOT_FOUND)
+  reader.exe : C:\home\hello.txt: not there (3, ERROR_PATH_NOT_FOUND)
+  reader.exe : C:\etc\motd, to write: read-only (19, ERROR_WRITE_PROTECT)
+  reader.exe : D:\etc\motd: not there (3, ERROR_PATH_NOT_FOUND)
+  reader.exe : C:\docs: refused (5, ERROR_ACCESS_DENIED)
+  ```
+
+  `desktop.conf` is real and `nothing.txt` is not; the program cannot
+  tell which is which.
+- `pe-test` gained three scored lines: what it may read, under any
+  spelling; the rest absent, as a missing name is; nothing writable. Its
+  check count is now 13. On a vault boot the boot medium has no files,
+  so reader.exe is not run, and it says so.
+
+- **Choice:** one task per view (DESIGN.md's first open decision). It needs
+  no new kernel feature, and a view holds nothing another program's
+  view could reach.
+- **Choice:** the list goes to the service in a read-only page that only
+  it holds, written by the kernel before the service starts. Later the
+  launcher writes it, from the person's choices.
+- **Choice:** the service keeps each handle's read position, so kernel32
+  holds no per-file state.
+- **Choice:** case is folded for ASCII only, for now. Windows folds by its
+  own Unicode table, which comes with names beyond ASCII in the tree.
+- **Choice:** listing (`FindFirstFileW`) is in `corrode-view` and tested,
+  but kernel32 does not offer it yet; the task named the four calls.
+- Verified: the whole suite on both GPUs, 79 checks PASS on each (76
+  before, plus pe-test's three), none FAIL, no unhandled trap; boot
+  self-checks 194 (three more); `./corrode test` 347 passed (8 view tests,
+  one more pe test); clippy at 33.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -2780,7 +2865,17 @@ one task.
    new one, fresh salt and nonce, written to the disk.
 5. [x] (section 81) README: how to make and boot a vault, and what it does and does not
    protect against.
-6. [ ] Verdigris phase 3: a Windows program reads files through the
+6. [x] (section 82) Verdigris phase 3: a Windows program reads files through the
    pruned view DESIGN.md specifies (CreateFileW, ReadFile, CloseHandle,
    GetFileSize), only what it was allowed, anything else absent.
+7. [ ] Verdigris: FindFirstFileW, FindNextFileW and FindClose through the
+   view -- a listing shows only what the view shows; pe-test.
+8. [ ] Verdigris: GetCurrentDirectoryW, SetCurrentDirectoryW and
+   GetFullPathNameW -- `C:\` paths only, never where the view sits in the
+   real tree; a relative open follows the current directory; pe-test.
+9. [ ] Wrap-up for the owner: what the vault run did, what to review and
+   merge, what is still open. No code. Then stop the loop.
 
+Tasks 7-9 were added at 2026-11-22T03:10-06:00, by me: 1-6 were done with
+11.5 of the 15 hours left, which the owner asked to have used. They carry
+on from 6 and need no decision from the owner.

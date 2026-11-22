@@ -451,9 +451,68 @@ pub mod verdigris {
     /// Where Verdigris's kernel32 is linked, with its export table at this
     /// very address. A Windows program's image must end below it.
     pub const KERNEL32_BASE: u64 = 0x0800_0000;
-    /// A Windows program's one capability: the log, where its standard
+    /// A Windows program's first capability: the log, where its standard
     /// output and error go.
     pub const LOG: usize = 0;
+    /// Its view of the files, send-only: [`view`](super::view)'s calls.
+    /// Absent, the program has no files at all.
+    pub const VIEW: usize = 1;
+    /// The page it shares with its view, for paths and what is read.
+    pub const PAGE: usize = 2;
+}
+
+/// A Windows program's view of the files (`verdigris/DESIGN.md` section 4),
+/// served by `fileview`, one task per view. The program holds the view's
+/// endpoint send-only and one page shared with the service; the service
+/// holds the real tree and the list of what the program may see, which
+/// the program never holds.
+///
+/// Every answer is `[error, value, 0, 0]` under the call's own label:
+/// `error` is a Windows error code (0 for none), as `GetLastError` gives
+/// it; what is not in the view is `ERROR_FILE_NOT_FOUND` (2) or
+/// `ERROR_PATH_NOT_FOUND` (3), as for a name that does not exist.
+pub mod view {
+    /// The endpoint it receives on.
+    pub const SERVE: usize = 0;
+    /// The real files: the archive, a blob.
+    pub const TREE: usize = 1;
+    /// The page it shares with the program.
+    pub const PAGE: usize = 2;
+    /// What the program may see, read-only: its own folder on the first
+    /// line, then one allowed path a line, `NUL` after the last.
+    pub const SPEC: usize = 3;
+    pub const LOG: usize = 4;
+    /// Where each call's reply capability goes.
+    pub const REPLY: usize = 5;
+    /// Memory to buy its heap from, and where the heap's capability goes.
+    pub const POOL: usize = 6;
+    pub const HEAP: usize = 7;
+    pub const HEAP_PAGES: usize = 32;
+
+    /// `[len, write, disposition, 0]`, the path in UTF-8 in the page's
+    /// first `len` bytes: open a file, as `CreateFileW`. `write` is 1 if
+    /// any right to change it was asked for. Answers the handle.
+    pub const OPEN: u64 = 1;
+    /// `[handle, len, 0, 0]`: up to `len` bytes (at most a page) from where
+    /// the handle is, into the page, and move on. Answers how many; 0 at
+    /// the end.
+    pub const READ: u64 = 2;
+    /// `[handle, 0, 0, 0]`: the file's size in bytes.
+    pub const SIZE: u64 = 3;
+    /// `[handle, 0, 0, 0]`: close it.
+    pub const CLOSE: u64 = 4;
+    /// The program is ending, sent, not called: the service ends too.
+    pub const DONE: u64 = 5;
+
+    /// Files a program may have open at once.
+    pub const HANDLES: usize = 16;
+    /// The longest path, in UTF-8 bytes.
+    pub const MOST_PATH: usize = 2048;
+    /// `ERROR_INVALID_HANDLE`, `ERROR_TOO_MANY_OPEN_FILES`,
+    /// `ERROR_FILENAME_EXCED_RANGE`: the service's own refusals.
+    pub const INVALID_HANDLE: u64 = 6;
+    pub const TOO_MANY_OPEN: u64 = 4;
+    pub const NAME_TOO_LONG: u64 = 206;
 }
 
 /// The USB host controller's driver, `xhci`: an xHCI controller, the

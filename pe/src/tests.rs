@@ -612,3 +612,43 @@ fn the_scripts_console_exe_loads_and_binds() {
     assert!(pe.bind(|dll, name| exports.find(dll, name)).is_ok());
 }
 
+
+/// The program phase 3's boot test runs, as `scripts/reader-exe.sh`
+/// assembles it: three sections, the last uninitialised, and eight
+/// imports, all bound to kernel32's table.
+#[test]
+fn the_scripts_reader_exe_loads_and_binds() {
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/reader-exe.sh");
+    let out = std::env::temp_dir().join(format!("corrode-reader-{}.exe", std::process::id()));
+    let status = std::process::Command::new("bash").arg(script).arg(&out).status().expect("bash runs");
+    assert!(status.success());
+    let file = std::fs::read(&out).expect("the script wrote it");
+    let _ = std::fs::remove_file(&out);
+    let pe = Pe::parse(&file, ALLOWED).expect("reader.exe is a valid program");
+    check_promises(&pe);
+    let names: Vec<_> = pe.imports().map(|import| import.name).collect();
+    let wanted: [&[u8]; 8] = [
+        b"CreateFileW",
+        b"ReadFile",
+        b"GetFileSize",
+        b"CloseHandle",
+        b"GetLastError",
+        b"GetStdHandle",
+        b"WriteFile",
+        b"ExitProcess",
+    ];
+    assert_eq!(names, wanted);
+    let entries: Vec<(&[u8], &[u8], u64)> = wanted
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (&b"kernel32.dll"[..], *name, 0x800_1000 + index as u64 * 0x100))
+        .collect();
+    let table = table(&entries);
+    let exports = exports::Exports::parse(&table).unwrap();
+    assert!(pe.bind(|dll, name| exports.find(dll, name)).is_ok());
+    // The buffer it reads into is writable and not code; its code is not
+    // writable.
+    let segments: Vec<_> = pe.segments().collect();
+    assert!(segments.iter().any(|segment| segment.writable && !segment.executable && segment.address == 0x403000));
+    assert!(segments.iter().filter(|segment| segment.executable).all(|segment| !segment.writable));
+}

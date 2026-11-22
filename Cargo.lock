@@ -57,6 +57,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "corrode-fileview"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+ "corrode-shell",
+ "corrode-view",
+]
+
+[[package]]
 name = "corrode-gfx"
 version = "0.0.1"
 dependencies = [
@@ -223,6 +232,13 @@ version = "0.0.1"
 dependencies = [
  "corrode-seal",
  "corrode-theme",
+]
+
+[[package]]
+name = "corrode-view"
+version = "0.0.1"
+dependencies = [
+ "corrode-shell",
 ]
 
 [[package]]
