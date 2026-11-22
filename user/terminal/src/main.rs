@@ -636,10 +636,10 @@ fn main() {
 /// the kernel says when it has ended, however it ended. One still
 /// running after ten seconds is stopped.
 fn win(path: &str, args: &[String], out: &mut Output) -> i32 {
-    use corrode_rt::abi::log;
+    use corrode_rt::win::{self, Ended, NotStarted};
 
     // The path, a line feed, and the arguments as Windows would have them
-    // quoted, sent ahead of `RUN` 32 bytes at a time.
+    // quoted.
     let mut text = format!("{path}\n");
     for (index, arg) in args.iter().enumerate() {
         if index > 0 {
@@ -647,88 +647,56 @@ fn win(path: &str, args: &[String], out: &mut Output) -> i32 {
         }
         text.push_str(&windows_quoted(arg));
     }
-    if text.len() > window::RUN_TEXT_MOST {
-        out.error("win: the command line is too long");
-        return 1;
-    }
-    for chunk in text.as_bytes().chunks(32) {
-        let mut bytes = [0u8; 32];
-        bytes[..chunk.len()].copy_from_slice(chunk);
-        let mut words = [0u64; 4];
-        for (word, part) in words.iter_mut().zip(bytes.as_chunks::<8>().0) {
-            *word = u64::from_le_bytes(*part);
-        }
-        let taken = corrode_rt::call(app::WINDOWS, corrode_rt::Message::new(window::RUN_TEXT, words), None);
-        if !taken.is_ok_and(|answer| answer.message.words[0] == 1) {
-            out.error("win: the desktop would not take the command line");
-            return 1;
-        }
-    }
-    let _ = corrode_rt::delete(app::PROGRAM);
-    let message = corrode_rt::Message::new(window::RUN, [0; 4]);
-    let answer = match corrode_rt::call(app::WINDOWS, message, Some(app::PROGRAM)) {
-        Ok(answer) => answer.message.words,
-        Err(error) => {
-            out.error(&format!("win: the desktop did not answer ({error:?})"));
-            return 1;
-        }
-    };
-    if answer[0] != 1 {
-        let why = match answer[1] {
-            2 => "no such file",
-            5 => "only the terminal may run one",
-            193 => "not a program Verdigris runs",
-            _ => "not started",
-        };
-        println!("win: {path}: {why}");
-        out.error(&format!("win: {path}: {why}"));
-        return 1;
-    }
     let name = corrode_shell::fs::name_of(path);
     let mut line = String::new();
     let mut lines = 0;
-    let status = loop {
-        let Ok(received) = corrode_rt::recv(app::PROGRAM, None, None) else {
-            out.error("win: its output was lost");
-            break 1;
-        };
-        let words = received.message.words;
-        let mut text = [0u8; 32];
-        for (chunk, word) in text.as_chunks_mut::<8>().0.iter_mut().zip(words) {
-            *chunk = word.to_le_bytes();
+    let ended = win::run(&text, |piece, ends| {
+        line.push_str(piece);
+        if ends {
+            println!("win: {name}: {line}");
+            out.line(&line);
+            line.clear();
+            lines += 1;
         }
-        let end = text.iter().position(|byte| *byte == 0).unwrap_or(text.len());
-        let text = core::str::from_utf8(&text[..end]).unwrap_or("?");
-        match received.message.label {
-            log::TEXT => line.push_str(text),
-            log::LINE => {
-                line.push_str(text);
-                println!("win: {name}: {line}");
-                out.line(&line);
-                line.clear();
-                lines += 1;
-            }
-            log::END => {
-                if !line.is_empty() {
-                    out.line(&line);
-                }
-                if words[0] == log::END_RUNNING {
-                    out.error(&format!("win: {name} is still running; no more of it is shown"));
-                    break 1;
-                }
-                if words[0] == log::END_STOPPED {
-                    println!("win: {name} ran 10 seconds and was stopped");
-                    out.error(&format!("win: {name} ran 10 seconds and was stopped"));
-                    break 1;
-                }
-                println!("win: {name} ended after {lines} lines");
-                break 0;
-            }
-            _ => {}
+    });
+    let ended = match ended {
+        Ok(ended) => ended,
+        Err(error @ NotStarted::Refused(_)) => {
+            println!("win: {path}: {}", error.why());
+            out.error(&format!("win: {path}: {}", error.why()));
+            return 1;
+        }
+        Err(NotStarted::NoAnswer(error)) => {
+            out.error(&format!("win: the desktop did not answer ({error:?})"));
+            return 1;
+        }
+        Err(error) => {
+            out.error(&format!("win: {}", error.why()));
+            return 1;
         }
     };
-    let _ = corrode_rt::delete(app::PROGRAM);
-    status
+    if !line.is_empty() {
+        out.line(&line);
+    }
+    match ended {
+        Ended::Ended => {
+            println!("win: {name} ended after {lines} lines");
+            0
+        }
+        Ended::StillRunning => {
+            out.error(&format!("win: {name} is still running; no more of it is shown"));
+            1
+        }
+        Ended::Stopped => {
+            println!("win: {name} ran 10 seconds and was stopped");
+            out.error(&format!("win: {name} ran 10 seconds and was stopped"));
+            1
+        }
+        Ended::Lost => {
+            out.error("win: its output was lost");
+            1
+        }
+    }
 }
 
 /// One argument as a Windows command line carries it: in quotes if it is

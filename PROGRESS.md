@@ -3200,6 +3200,57 @@ should.
   new one included), none FAIL, no unhandled trap; `./corrode test` 351
   passed; clippy at 33.
 
+## 92. Files runs a Windows program
+
+One of the open Verdigris items (section 76): Files starting a Windows
+program. Now Return on a `.exe`, or a second click, as for a folder,
+runs it. The desktop starts it exactly as for the terminal's `win`:
+seeing its own folder alone, output to an endpoint handed to the caller,
+the watcher saying when it ended and stopping it at 10 s. The preview
+shows how it ended ("Ended after 2 lines") over what it wrote, and keeps
+showing that while it stays selected; before it runs, the preview of a
+`.exe` says "A Windows program / Return runs it".
+
+- **corrode_rt::win** (new): the run protocol, moved out of the
+  terminal so both use one copy -- the text in 32-byte `RUN_TEXT` calls,
+  `RUN`, then the output until `log::END`, given to a callback a piece
+  at a time (the runtime has no allocator). `Ended` and `NotStarted`
+  say how it went; `NotStarted::why` is the text `win` printed before.
+  The terminal's `win` is now a caller of it, its messages unchanged.
+- **Kernel**: `runs_for` -- the terminal and Files may run one, each
+  named in the log ("started for Files"); anyone else is still refused.
+  abi `window::RUN`/`RUN_TEXT` documented as such.
+- **files-run-test** (new, in the suite): open Files from the dock, down
+  to /programs, in, to dir, in, to dir.exe, Return. Its two lines and
+  "ended after 2 lines" must reach the log, and the desktop must have
+  started it for Files seeing /programs/dir alone. With "files" taken
+  out of `runs_for` it FAILs ("not run: the desktop would not take the
+  command line"). build/files-run.png shows the preview.
+
+- **Choice:** Files waits while the program runs. The kernel can only
+  block on an endpoint (`SYS_WAIT` is for window events), and a
+  non-blocking receive is a new system call for one caller; the wait is
+  bounded at 10 s by the watcher, and "Running..." is drawn first.
+- **Choice:** the authority stays the caller's task name, as for the
+  terminal before: Files is started by the launcher as "files", and no
+  program can choose its own name. A capability for running programs,
+  handed to these two, would be the cleaner form; noted, not done.
+- **Choice:** no arguments from Files: Explorer gives a double-clicked
+  program none either.
+- Verified: the whole suite on both GPUs, 93 checks PASS on each (the
+  new one included), none FAIL, no unhandled trap; `./corrode test` 351
+  passed; clippy at 33 (two warnings in the new win.rs fixed, after which
+  win-test and files-run-test were run again on both GPUs: all PASS).
+- **Seen once:** one virtio boot in that suite (dock-menu-test's) had
+  202 of its 203 self-checks pass. Its log was overwritten before it
+  was read. Five reruns of it were clean; six boots with every host CPU
+  busy flipped one check once, the old `clock check: the monotonic
+  clock agrees with the PIT to 1%` -- the emulated PIT skews under host
+  load. The new IPC checks (section 90) passed in all of them. Left as
+  it is: loosening a clock check to quiet a loaded host would hide a
+  real drift too. The suite now keeps nothing per boot; worth keeping
+  each serial log next time.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -3365,7 +3416,10 @@ one task.
 15. [x] (section 91) A Windows program a compiler wrote: dir.exe, Rust built for
    x86_64-pc-windows-msvc and linked by rust-lld, run by `win` and
    checked in win-test on both GPUs.
-16. [ ] Wrap-up for the owner: what the vault run did, what to review and
+16. [x] (section 92) Files runs a Windows program: Return (or a second click) on a
+   `.exe` runs it seeing its own folder alone, and its output shows in
+   the preview. files-run-test, both GPUs.
+17. [ ] Wrap-up for the owner: what the vault run did, what to review and
    merge, what is still open. No code. Then stop the loop.
 
 Tasks 7-9 were added at 2026-11-22T03:10-06:00, by me (and 9, running a

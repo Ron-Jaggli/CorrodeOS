@@ -75,7 +75,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test fade-test usb-test pe-test verify-test vault-test rekey-test win-test grow-test zoom-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test fade-test usb-test pe-test verify-test vault-test rekey-test win-test files-run-test grow-test zoom-test
 .PHONY: all kernel user kernel32 iso vault-iso vault-disk run-vault run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -454,6 +454,30 @@ files-test: iso
 	    && echo "files-test: the title bar names the folder           PASS" \
 	    || echo "files-test: the title bar names the folder           FAIL"
 	@test -s build/files.ppm && pnmtopng build/files.ppm > build/files.png 2>/dev/null && rm -f build/files.ppm && echo "wrote build/files.png" || true
+
+# Open Files from the dock and run a Windows program from it: down four to
+# /programs, in, down to dir, in, down to dir.exe, Return. Its output is
+# in the preview (build/files-run.png) and the log; it saw its folder
+# alone, as for the terminal's `win`.
+files-run-test: iso
+	@rm -f build/files-run.ppm build/files-run.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move -84 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 2; \
+	   for key in down down down down ret down ret down ret; do echo "sendkey $$key"; sleep 0.6; done; sleep 3; \
+	   echo "screendump build/files-run.ppm"; sleep 2; echo quit ) \
+	  | timeout --foreground 90 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@tr -d '\r' < build/serial.log > build/files-run-lines.log
+	@grep -a "^files      : dir.exe\|^desktop    : /programs/dir" build/files-run-lines.log || echo "files-run-test: nothing from dir.exe"
+	@size=$$(stat -c %s $(DIR_EXE)) \
+	    && grep -aqxF 'desktop    : /programs/dir/dir.exe started for Files, seeing /programs/dir alone' build/files-run-lines.log \
+	    && grep -aqxF "files      : dir.exe: dir.exe  $$size" build/files-run-lines.log \
+	    && grep -aqxF "files      : dir.exe: 1 files, $$size bytes" build/files-run-lines.log \
+	    && grep -aqxF 'files      : dir.exe: ended after 2 lines' build/files-run-lines.log \
+	    && echo "files-run-test: Return on dir.exe ran it, its folder alone PASS" \
+	    || echo "files-run-test: Return on dir.exe ran it, its folder alone FAIL"
+	@test -s build/files-run.ppm && pnmtopng build/files-run.ppm > build/files-run.png 2>/dev/null && rm -f build/files-run.ppm && echo "wrote build/files-run.png" || true
 
 # Open a terminal from the dock, fill it with help twice, then turn the
 # wheel back four notches. build/scrollback.png shows older output with a

@@ -5,6 +5,10 @@
 //! it: its text, if it is text. Folders open with a click, or with Return;
 //! the arrows move the selection and Backspace goes up a level.
 //!
+//! A Windows program (`.exe`) opens the same way, and runs: the desktop
+//! starts it seeing its own folder alone, as the terminal's `win` does
+//! (`corrode_rt::win`), and the preview shows what it wrote.
+//!
 //! It reads the same archive the terminal does, through the same read-only
 //! capability, and can no more change it.
 
@@ -86,6 +90,24 @@ struct Browser {
     preview_top: usize,
     /// The sidebar's places: the root, then each directory in it.
     places: Vec<String>,
+    /// The Windows program last run, for the preview while it is selected.
+    ran: Option<Ran>,
+}
+
+/// A Windows program Files ran: what it wrote, and how it ended.
+struct Ran {
+    path: String,
+    output: String,
+    note: String,
+}
+
+/// Lines of a program's output kept for the preview.
+const OUTPUT_LINES: usize = 500;
+
+/// Whether `path` names a Windows program, as Explorer would run one.
+fn is_program(path: &str) -> bool {
+    let name = name_of(path).as_bytes();
+    name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(b".exe")
 }
 
 /// "/etc/motd" -> "motd"; "/" -> "/".
@@ -159,15 +181,60 @@ impl Browser {
         self.fs.get(path).is_some_and(|node| node.is_dir())
     }
 
-    /// Open the selected entry: into a folder, or nothing for a file, whose
-    /// preview is already showing.
+    /// Open the selected entry: into a folder, run a Windows program, or
+    /// nothing for another file, whose preview is already showing.
     fn activate(&mut self) {
         let Some(path) = self.selected.and_then(|index| self.entries.get(index)).cloned() else {
             return;
         };
         if self.is_dir(&path) {
             self.open(&path);
+        } else if is_program(&path) {
+            self.run(&path);
         }
+    }
+
+    /// Run the Windows program at `path` and keep what it writes. Files
+    /// waits while it runs -- the kernel can only block on its output --
+    /// which is at most 10 seconds: one still running then is stopped.
+    fn run(&mut self, path: &str) {
+        self.ran = Some(Ran {
+            path: String::from(path),
+            output: String::new(),
+            note: String::from("Running..."),
+        });
+        self.draw();
+        let name = name_of(path);
+        let mut output = String::new();
+        let mut line = String::new();
+        let mut lines = 0;
+        let ended = corrode_rt::win::run(&format!("{path}\n"), |piece, ends| {
+            line.push_str(piece);
+            if ends {
+                println!("{name}: {line}");
+                if lines < OUTPUT_LINES {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+                line.clear();
+                lines += 1;
+            }
+        });
+        output.push_str(&line);
+        use corrode_rt::win::Ended;
+        let note = match ended {
+            Ok(Ended::Ended) => format!("Ended after {lines} lines"),
+            Ok(Ended::Stopped) => String::from("Ran 10 seconds and was stopped"),
+            Ok(Ended::StillRunning) => String::from("Still running; no more is shown"),
+            Ok(Ended::Lost) => String::from("Its output was lost"),
+            Err(error) => format!("Not run: {}", error.why()),
+        };
+        println!("{name}: {}", note.to_ascii_lowercase());
+        self.ran = Some(Ran {
+            path: String::from(path),
+            output,
+            note,
+        });
     }
 
     fn list_width(&self) -> i32 {
@@ -239,20 +306,23 @@ impl Browser {
         // The preview.
         let preview = left + list;
         window.fill(preview, TOOLBAR, 1, height - TOOLBAR as u32, look.separator);
-        let chosen = self
-            .selected
-            .and_then(|index| self.entries.get(index))
-            .and_then(|path| self.fs.get(path));
+        let chosen_path = self.selected.and_then(|index| self.entries.get(index));
+        let chosen = chosen_path.and_then(|path| self.fs.get(path));
+        let ran = self.ran.as_ref().filter(|ran| chosen_path == Some(&ran.path));
         let room = (width as i32 - preview - 32).max(16) as u32;
         match chosen {
             Some(node) if !node.is_dir() => {
                 let x = preview + 16;
                 window.text(x, TOOLBAR + 12, &fit(node.name(), TITLE, room), TITLE, look.text);
                 let mut y = TOOLBAR + 14 + line_height(TITLE) as i32;
-                window.text(x, y, &size(node.data.len()), LABEL, look.secondary);
+                let (detail, body) = match ran {
+                    Some(ran) => (ran.note.clone(), Some(ran.output.as_str())),
+                    None => (size(node.data.len()), core::str::from_utf8(node.data).ok()),
+                };
+                window.text(x, y, &fit(&detail, LABEL, room), LABEL, look.secondary);
                 y += line_height(LABEL) as i32 + 10;
-                match core::str::from_utf8(node.data) {
-                    Ok(text) => {
+                match body {
+                    Some(text) => {
                         // The text on a sheet of paper.
                         let sheet = height as i32 - y - 12;
                         window.rounded(x - 4, y, room + 8, sheet.max(0) as u32, 6, look.paper);
@@ -271,7 +341,12 @@ impl Browser {
                         }
                         scroller(window, x + room as i32 - 1, y + 4, sheet - 8, self.preview_top, fits, total, &look);
                     }
-                    Err(_) => {
+                    None if is_program(node.name()) => {
+                        window.text(x, y, "A Windows program", LABEL, look.secondary);
+                        let y = y + line_height(LABEL) as i32 + 4;
+                        window.text(x, y, "Return runs it", LABEL, look.secondary);
+                    }
+                    None => {
                         window.text(x, y, "Not text: no preview", LABEL, look.secondary);
                     }
                 }
@@ -464,6 +539,7 @@ fn main() {
         top: 0,
         preview_top: 0,
         places,
+        ran: None,
     };
     browser.open("/");
     browser.draw();

@@ -2202,8 +2202,9 @@ fn serve(shell: bool) {
             continue;
         }
         if received.message.label == window::RUN_TEXT {
-            // Collected for the `RUN` after it, from the terminal alone.
-            let terminal = task::name_of(received.from) == Some("terminal");
+            // Collected for the `RUN` after it, from the terminal and Files
+            // alone.
+            let terminal = runs_for(received.from).is_some();
             if run_text.as_ref().is_none_or(|(from, _)| *from != received.from) {
                 run_text = Some((received.from, alloc::string::String::new()));
             }
@@ -2610,20 +2611,30 @@ fn passcode_of(words: [u64; 4]) -> corrode_theme::passcode::Code {
     code
 }
 
-/// `window::RUN`: the terminal runs a Windows program from the files. Its
-/// view is its own folder alone; its output goes to an endpoint the
-/// terminal is handed, to receive on; a watcher ends that output when the
-/// program ends, however it ends.
+/// Who may run a Windows program from the files (`window::RUN`): the
+/// terminal (`win`) and Files (opening one). As the log says it.
+fn runs_for(task: usize) -> Option<&'static str> {
+    match task::name_of(task)? {
+        "terminal" => Some("the terminal"),
+        "files" => Some("Files"),
+        _ => None,
+    }
+}
+
+/// `window::RUN`: the terminal or Files runs a Windows program from the
+/// files. Its view is its own folder alone; its output goes to an endpoint
+/// the caller is handed, to receive on; a watcher ends that output when
+/// the program ends, however it ends.
 fn run_windows(from: usize, text: &str) -> ([u64; 4], Option<(cap::CapPtr, cap::Rights)>) {
     const ACCESS_DENIED: u64 = 5;
     const FILE_NOT_FOUND: u64 = 2;
     const BAD_EXE_FORMAT: u64 = 193;
     let refuse = |code: u64| ([0, code, 0, 0], None);
 
-    if task::name_of(from) != Some("terminal") {
-        println!("desktop    : task {from} is not the terminal; it runs no program");
+    let Some(caller) = runs_for(from) else {
+        println!("desktop    : task {from} is not the terminal or Files; it runs no program");
         return refuse(ACCESS_DENIED);
-    }
+    };
     if vault::locked() {
         return refuse(FILE_NOT_FOUND);
     }
@@ -2679,7 +2690,7 @@ fn run_windows(from: usize, text: &str) -> ([u64; 4], Option<(cap::CapPtr, cap::
         arch::x86_64::without_interrupts(|| WATCHES.lock().push(Watch { watcher: id, program, server }));
     }
     start_all(&[Some(server), Some(program), watcher.filter(|_| watching)]);
-    println!("desktop    : {path} started for the terminal, seeing {folder} alone");
+    println!("desktop    : {path} started for {caller}, seeing {folder} alone");
     // What the run has cost so far: with the earlier runs' tasks given back
     // as this one was started, this stays level from run to run.
     let (objects, _) = memory::stats();
