@@ -25,9 +25,9 @@ rustc --edition 2024 --crate-type rlib --crate-name compiler_builtins "${flags[@
     --cfg 'feature="mem"' --cfg 'feature="arch"' --cfg mem_unaligned --cfg f16_enabled \
     --cap-lints allow -o "$tmp/libcompiler_builtins.rlib" \
     "$lib/compiler-builtins/compiler-builtins/src/lib.rs"
-# A fixed base and no relocations, as Verdigris loads it; no C runtime.
+# Linked as a linker links one by default: based at 0x1_4000_0000 with the
+# relocations to move it, which the loader does. No C runtime.
 rustc --edition 2021 --crate-type bin --crate-name dir "${flags[@]}" -L "$tmp" \
     -C linker=rust-lld -C link-arg=/ENTRY:start -C link-arg=/SUBSYSTEM:CONSOLE \
-    -C link-arg=/NODEFAULTLIB -C link-arg=/FIXED -C link-arg=/BASE:0x400000 \
-    -o "$tmp/dir.exe" "$here/verdigris/dir/src/main.rs"
+    -C link-arg=/NODEFAULTLIB -o "$tmp/dir.exe" "$here/verdigris/dir/src/main.rs"
 cp "$tmp/dir.exe" "$out"

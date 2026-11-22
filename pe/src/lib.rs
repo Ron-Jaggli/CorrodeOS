@@ -8,7 +8,10 @@
 //!
 //! What is accepted is narrow on purpose. A 64-bit (PE32+) x86-64
 //! executable, not a DLL, with page-sized section alignment, that fits at
-//! its preferred base inside the range the caller allows, whose sections lie
+//! its preferred base inside the range the caller allows -- or, if it
+//! carries base relocations, at the lowest base in that range that it fits
+//! at, every relocation then checked and applied (see [`Pe::fixups_in`],
+//! and below) -- whose sections lie
 //! inside the file and the image, in order, never both writable and
 //! executable, and whose entry point is in an executable section. It may
 //! import functions by name -- [`Pe::bind`] fills its import address table
@@ -21,6 +24,15 @@
 //! the kernel maps both kinds of program with the same code. The headers are
 //! a segment of their own, read-only at the image base, as Windows maps them:
 //! programs read them there.
+//!
+//! A linker gives a 64-bit program a base of `0x1_4000_0000` and the
+//! relocations to move it, unless told `/FIXED`; Windows moves nearly every
+//! program, to randomise where it is. Here a program is moved only when it
+//! must be, to the lowest base allowed: there is nothing yet to randomise
+//! against. Only `DIR64` relocations (and the padding entry) are taken,
+//! each inside a section and not across a page, the only kinds an x86-64
+//! linker writes; and the header's `ImageBase` is made the base it was
+//! loaded at, as Windows does.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -43,6 +55,7 @@ const SECTION_LEN: usize = 40;
 
 const MACHINE_AMD64: u16 = 0x8664;
 const PE32_PLUS: u16 = 0x20b;
+const RELOCS_STRIPPED: u16 = 0x0001;
 const EXECUTABLE_IMAGE: u16 = 0x0002;
 const DLL: u16 = 0x2000;
 
@@ -58,6 +71,7 @@ const DIRECTORIES: usize = 112;
 
 /// Data directories, by index.
 const IMPORTS: usize = 1;
+const RELOCATIONS: usize = 5;
 const TLS: usize = 9;
 const MAX_DIRECTORIES: usize = 16;
 
@@ -71,6 +85,10 @@ pub const MAX_IMPORTS: usize = 64;
 pub const MAX_NAME: usize = 63;
 const DESCRIPTOR_LEN: usize = 20;
 const BY_ORDINAL: u64 = 1 << 63;
+
+/// Base relocation types: padding, and a 64-bit address.
+const RELOCATION_PADDING: u16 = 0;
+const RELOCATION_DIR64: u16 = 10;
 
 const SCN_EXECUTE: u32 = 0x2000_0000;
 const SCN_WRITE: u32 = 0x8000_0000;
@@ -116,6 +134,11 @@ pub enum Error {
     Unresolved,
     /// It has thread-local storage, whose callbacks would have to run.
     ThreadLocalStorage,
+    /// It must be moved, and its relocation table does not hold together:
+    /// outside the file's sections, a block that runs past it or names an
+    /// unaligned page, a type other than `DIR64`, or an address outside a
+    /// section or across a page.
+    BadRelocations,
 }
 
 /// One function a program imports, and where its address goes.
@@ -141,6 +164,57 @@ pub struct Pe<'a> {
     entry: u64,
     segments: [Option<Segment<'a>>; corrode_elf::MAX_SEGMENTS],
     imports: [Option<Import<'a>>; MAX_IMPORTS],
+    /// Where it was loaded, and how far that is from where it asked to be.
+    base: u64,
+    delta: u64,
+    /// When it was moved, its relocation table, every entry checked; and
+    /// the address of the header's `ImageBase`.
+    relocations: &'a [u8],
+    base_field: u64,
+}
+
+/// Each address the base relocation table `table` names, for an image at
+/// `base`, given to `each`; padding skipped. Any other type, or a block
+/// that does not hold together, is [`Error::BadRelocations`].
+fn each_relocation(table: &[u8], base: u64, mut each: impl FnMut(u64) -> Result<(), Error>) -> Result<(), Error> {
+    let bad = |_| Error::BadRelocations;
+    let mut at = 0;
+    while at < table.len() {
+        let page = u32_at(table, at).map_err(bad)? as u64;
+        let size = u32_at(table, at + 4).map_err(bad)? as usize;
+        if size < 8 || !size.is_multiple_of(2) || !page.is_multiple_of(PAGE) {
+            return Err(Error::BadRelocations);
+        }
+        let end = at.checked_add(size).filter(|end| *end <= table.len()).ok_or(Error::BadRelocations)?;
+        for entry in table[at + 8..end].as_chunks::<2>().0 {
+            let entry = u16::from_le_bytes(*entry);
+            match entry >> 12 {
+                RELOCATION_PADDING => {}
+                RELOCATION_DIR64 => each(base + page + u64::from(entry & 0xfff))?,
+                _ => return Err(Error::BadRelocations),
+            }
+        }
+        at = end;
+    }
+    Ok(())
+}
+
+/// The eight bytes the file puts at `address`, zero past its bytes (a
+/// section's uninitialised end), as they are before a relocation.
+fn original(segments: &[Option<Segment<'_>>], address: u64) -> u64 {
+    let mut bytes = [0u8; 8];
+    for segment in segments.iter().flatten() {
+        let Some(offset) = address.checked_sub(segment.address) else {
+            continue;
+        };
+        if offset < segment.len {
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = segment.data.get(offset as usize + index).copied().unwrap_or(0);
+            }
+            break;
+        }
+    }
+    u64::from_le_bytes(bytes)
 }
 
 /// `len` bytes at `address`, if a section's file bytes hold them all.
@@ -252,8 +326,9 @@ fn u64_at(bytes: &[u8], at: usize) -> Result<u64, Error> {
 }
 
 impl<'a> Pe<'a> {
-    /// Check `bytes` is a program that may be loaded at its preferred base
-    /// with every byte of its image inside `allowed`, and describe it.
+    /// Check `bytes` is a program that may be loaded with every byte of its
+    /// image inside `allowed` -- at its preferred base, or moved to the
+    /// lowest base there if it carries relocations -- and describe it.
     pub fn parse(bytes: &'a [u8], allowed: Range<u64>) -> Result<Pe<'a>, Error> {
         if bytes.get(..2) != Some(DOS_MAGIC) {
             return Err(Error::NotPe);
@@ -307,6 +382,8 @@ impl<'a> Pe<'a> {
             Ok((u32_at(header, at)?, u32_at(header, at + 4)?))
         };
         let (import_table, import_len) = directory(IMPORTS)?;
+        let (relocation_table, relocation_len) = directory(RELOCATIONS)?;
+        let movable = characteristics & RELOCS_STRIPPED == 0 && relocation_len != 0;
         if directory(TLS)?.1 != 0 {
             return Err(Error::ThreadLocalStorage);
         }
@@ -314,10 +391,17 @@ impl<'a> Pe<'a> {
         if !base.is_multiple_of(BASE_ALIGNMENT) || image_len == 0 || !image_len.is_multiple_of(PAGE) {
             return Err(Error::Malformed);
         }
-        let image_end = base.checked_add(image_len).ok_or(Error::OutsideRange)?;
-        if base < allowed.start || image_end > allowed.end {
-            return Err(Error::OutsideRange);
-        }
+        let fits = |base: u64| base >= allowed.start && base.checked_add(image_len).is_some_and(|end| end <= allowed.end);
+        let preferred = base;
+        let base = if fits(preferred) {
+            preferred
+        } else {
+            let lowest = allowed.start.checked_next_multiple_of(BASE_ALIGNMENT);
+            match lowest {
+                Some(lowest) if movable && fits(lowest) => lowest,
+                _ => return Err(Error::OutsideRange),
+            }
+        };
         let table = optional + optional_len;
         let table_end = sections
             .checked_mul(SECTION_LEN)
@@ -402,10 +486,34 @@ impl<'a> Pe<'a> {
             read_imports(&segments, base, import_table as u64)?
         };
 
+        // Moved: every relocation must name eight bytes inside a section,
+        // in one page, before any is applied.
+        let relocations = if base == preferred {
+            &bytes[..0]
+        } else {
+            let table = file_at(&segments, base + relocation_table as u64, relocation_len as u64)
+                .map_err(|_| Error::BadRelocations)?;
+            each_relocation(table, base, |address| {
+                let inside = segments[1..].iter().flatten().any(|segment| {
+                    address >= segment.address && address + 8 <= segment.address + segment.len
+                });
+                if inside && address % PAGE <= PAGE - 8 {
+                    Ok(())
+                } else {
+                    Err(Error::BadRelocations)
+                }
+            })?;
+            table
+        };
+
         Ok(Pe {
             entry: base + entry_rva,
             segments,
             imports,
+            base,
+            delta: base.wrapping_sub(preferred),
+            relocations,
+            base_field: base + (optional + IMAGE_BASE) as u64,
         })
     }
 
@@ -431,6 +539,53 @@ impl<'a> Pe<'a> {
             });
         }
         Ok(fixups)
+    }
+
+    /// Where it is loaded: its preferred base, or where it was moved to.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// Whether it was moved from its preferred base.
+    pub fn moved(&self) -> bool {
+        self.delta != 0
+    }
+
+    /// The base it asked for.
+    pub fn preferred_base(&self) -> u64 {
+        self.base.wrapping_sub(self.delta)
+    }
+
+    /// How many addresses moving it changes: none if it was not moved.
+    pub fn relocations(&self) -> usize {
+        let mut count = 0;
+        let _ = each_relocation(self.relocations, self.base, |_| {
+            count += 1;
+            Ok(())
+        });
+        count
+    }
+
+    /// The fixups moving it puts in the page at `page`, given to `each`:
+    /// the header's `ImageBase` made the base it is at, and each address a
+    /// relocation names moved by as far as the image was. None if it was
+    /// not moved. Written before the page is mapped, as [`Pe::bind`]'s are,
+    /// and before them: an import's slot is the import's.
+    pub fn fixups_in(&self, page: u64, mut each: impl FnMut(Fixup)) {
+        if self.delta == 0 {
+            return;
+        }
+        if (page..page + PAGE).contains(&self.base_field) {
+            each(Fixup { address: self.base_field, value: self.base });
+        }
+        // Checked whole in `parse`, so nothing here can fail.
+        let _ = each_relocation(self.relocations, self.base, |address| {
+            if address & !(PAGE - 1) == page {
+                let value = original(&self.segments, address).wrapping_add(self.delta);
+                each(Fixup { address, value });
+            }
+            Ok(())
+        });
     }
 
     /// Where execution starts.

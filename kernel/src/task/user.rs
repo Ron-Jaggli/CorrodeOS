@@ -179,7 +179,7 @@ pub fn load(file: &[u8]) -> Result<Image, LoadError> {
     // As for an assembly program: the stack pointer a `call` would have
     // left, over a null return address. A compiled entry point expects
     // exactly that alignment.
-    build(elf.entry(), elf.segments(), &[], 8)
+    build(elf.entry(), elf.segments(), |_, _| {}, &[], 8)
 }
 
 /// Build a fresh address space from a Windows program: a PE file, checked
@@ -193,7 +193,7 @@ pub fn load(file: &[u8]) -> Result<Image, LoadError> {
 /// from its entry point instead of exiting faults, and is stopped.
 pub fn load_pe(file: &[u8]) -> Result<Image, LoadError> {
     let pe = Pe::parse(file, layout::IMAGE_BASE..layout::IMAGE_END).map_err(LoadError::Pe)?;
-    build(pe.entry(), pe.segments(), &[], 8 + 32)
+    build(pe.entry(), pe.segments(), |page, each| pe.fixups_in(page, each), &[], 8 + 32)
 }
 
 /// Build a fresh address space from a Windows program that imports from
@@ -223,17 +223,33 @@ pub fn load_windows(file: &[u8], kernel32: &[u8]) -> Result<Image, LoadError> {
     let fixups = pe
         .bind(|dll, name| exports.find(dll, name).filter(in_code))
         .map_err(LoadError::Pe)?;
-    build(pe.entry(), pe.segments().chain(runtime.segments()), &fixups, 8 + 32)
+    if pe.moved() {
+        crate::println!(
+            "verdigris  : moved from {:#x} to {:#x}, {} relocations",
+            pe.preferred_base(),
+            pe.base(),
+            pe.relocations()
+        );
+    }
+    build(
+        pe.entry(),
+        pe.segments().chain(runtime.segments()),
+        |page, each| pe.fixups_in(page, each),
+        &fixups,
+        8 + 32,
+    )
 }
 
 /// Map checked segments into a fresh address space with a stack, the
 /// stack pointer `below` bytes under the stack's top. Each fixup's eight
-/// bytes are written into its page before the page is mapped; the PE
-/// reader has checked each lies inside a segment and does not straddle
-/// two pages.
+/// bytes are written into its page before the page is mapped: first those
+/// `moved` gives for the page (a program loaded away from its preferred
+/// base), then `fixups`. The PE reader has checked each lies inside a
+/// segment and does not straddle two pages.
 fn build<'a>(
     entry: u64,
     segments: impl Iterator<Item = Segment<'a>>,
+    moved: impl Fn(u64, &mut dyn FnMut(Fixup)),
     fixups: &[Option<Fixup>],
     below: u64,
 ) -> Result<Image, LoadError> {
@@ -275,7 +291,7 @@ fn build<'a>(
                 // because both ends were clamped to this one.
                 unsafe { space.write_frame(frame.addr(), (from - page) as usize, source) };
             }
-            for fixup in fixups.iter().flatten() {
+            let mut write = |fixup: Fixup| {
                 if (page..page + PAGE - 7).contains(&fixup.address) {
                     // SAFETY: as above; the eight bytes end inside the page.
                     unsafe {
@@ -286,7 +302,9 @@ fn build<'a>(
                         )
                     };
                 }
-            }
+            };
+            moved(page, &mut write);
+            fixups.iter().flatten().for_each(|fixup| write(*fixup));
 
             if !space.map_4k(page, frame.addr(), flags) {
                 return Err(LoadError::OutOfMemory);

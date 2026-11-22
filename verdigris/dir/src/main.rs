@@ -48,6 +48,12 @@ extern "system" {
     fn GetLastError() -> u32;
 }
 
+/// The words of the total line, as a table of pointers: a compiler lays
+/// one out as absolute addresses, which the loader must move with the
+/// program (it is linked at 0x1_4000_0000 and loaded lower). Unmoved, they
+/// point at nothing, and the total line faults.
+static TOTAL: [&[u8]; 2] = [b" files, ", b" bytes"];
+
 /// Standard output, a line at a time, built up in a buffer.
 struct Out {
     line: [u8; 512],
@@ -179,10 +185,12 @@ extern "C" fn start() -> ! {
     let why = unsafe { GetLastError() };
     // SAFETY: the search is open.
     unsafe { FindClose(search) };
+    // Read through the table, not folded into the code.
+    let total = core::hint::black_box(&TOTAL);
     out.number(files);
-    out.text(b" files, ");
+    out.text(total[0]);
     out.number(bytes);
-    out.text(b" bytes");
+    out.text(total[1]);
     if why != ERROR_NO_MORE_FILES {
         out.text(b"; the listing stopped early, error ");
         out.number(u64::from(why));

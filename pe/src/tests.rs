@@ -182,7 +182,7 @@ fn what_it_would_need_is_refused_until_it_is_done() {
 fn the_image_must_fit_where_it_asks_to_go() {
     let good = hello();
     // Where a linker puts a 64-bit executable by default: outside the range,
-    // and nothing here can move it yet.
+    // and this one's relocations are stripped, so it cannot be moved.
     let mut file = good.clone();
     file[OPTIONAL + IMAGE_BASE..OPTIONAL + IMAGE_BASE + 8].copy_from_slice(&0x1_4000_0000u64.to_le_bytes());
     assert_eq!(refused(&file), Error::OutsideRange);
@@ -658,4 +658,168 @@ fn the_scripts_reader_exe_loads_and_binds() {
     let segments: Vec<_> = pe.segments().collect();
     assert!(segments.iter().any(|segment| segment.writable && !segment.executable && segment.address == 0x403000));
     assert!(segments.iter().filter(|segment| segment.executable).all(|segment| !segment.writable));
+}
+
+/// Where a linker puts a 64-bit program by default.
+const LINKED_AT: u64 = 0x1_4000_0000;
+
+/// A program linked at [`LINKED_AT`] with the relocations to move it: code
+/// at 0x1000; at 0x2000 data holding a pointer to itself at 8 and one to
+/// past its file bytes, into its zeroed end, at 0x40; at 0x3000 the base
+/// relocation table, one block for page 0x2000 with `entries`.
+fn relocatable(entries: &[u16]) -> Vec<u8> {
+    let mut data = vec![0u8; 16];
+    data[8..16].copy_from_slice(&(LINKED_AT + 0x2000).to_le_bytes());
+    let mut table = vec![];
+    table.extend_from_slice(&0x2000u32.to_le_bytes());
+    table.extend_from_slice(&(8 + 2 * entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        table.extend_from_slice(&entry.to_le_bytes());
+    }
+    let len = table.len() as u32;
+    let mut file = build(
+        0x1000,
+        0x4000,
+        &[
+            Section { rva: 0x1000, virtual_len: 16, raw: vec![0xcc; 16], flags: TEXT },
+            Section { rva: 0x2000, virtual_len: 0x100, raw: data, flags: DATA },
+            Section { rva: 0x3000, virtual_len: len, raw: table, flags: RDATA },
+        ],
+    );
+    file[OPTIONAL + IMAGE_BASE..OPTIONAL + IMAGE_BASE + 8].copy_from_slice(&LINKED_AT.to_le_bytes());
+    // An executable, large-address aware, relocations kept.
+    file[0x44 + 18..0x44 + 20].copy_from_slice(&0x0022u16.to_le_bytes());
+    put32(&mut file, OPTIONAL + DIRECTORIES + RELOCATIONS * 8, 0x3000);
+    put32(&mut file, OPTIONAL + DIRECTORIES + RELOCATIONS * 8 + 4, len);
+    file
+}
+
+const DIR64_AT_8: u16 = 0xa008;
+const DIR64_IN_BSS: u16 = 0xa040;
+const PADDING: u16 = 0;
+
+fn fixups(pe: &Pe, page: u64) -> Vec<Fixup> {
+    let mut all = vec![];
+    pe.fixups_in(page, |fixup| all.push(fixup));
+    all
+}
+
+#[test]
+fn a_program_with_relocations_is_moved_where_it_may_go() {
+    let file = relocatable(&[DIR64_AT_8, DIR64_IN_BSS, PADDING]);
+    let pe = Pe::parse(&file, ALLOWED).expect("moved, not refused");
+    check_promises(&pe);
+    assert!(pe.moved());
+    assert_eq!((pe.base(), pe.preferred_base()), (BASE, LINKED_AT));
+    assert_eq!(pe.relocations(), 2);
+    assert_eq!(pe.entry(), BASE + 0x1000);
+    let addresses: Vec<_> = pe.segments().map(|segment| segment.address).collect();
+    assert_eq!(addresses, [BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000]);
+    // The header's ImageBase says where it is.
+    let base_field = BASE + (OPTIONAL + IMAGE_BASE) as u64;
+    assert_eq!(fixups(&pe, BASE), [Fixup { address: base_field, value: BASE }]);
+    assert_eq!(fixups(&pe, BASE + 0x1000), []);
+    // The pointer moves with it; zeroed memory moves by as much from zero.
+    let delta = BASE.wrapping_sub(LINKED_AT);
+    assert_eq!(
+        fixups(&pe, BASE + 0x2000),
+        [
+            Fixup { address: BASE + 0x2008, value: BASE + 0x2000 },
+            Fixup { address: BASE + 0x2040, value: delta },
+        ]
+    );
+    // Moved to the lowest 64 KiB boundary the range allows.
+    let pe = Pe::parse(&file, 0x40_1000..0x1000_0000).expect("moved higher");
+    assert_eq!(pe.base(), 0x41_0000);
+    assert_eq!(fixups(&pe, 0x41_2000)[0], Fixup { address: 0x41_2008, value: 0x41_2000 });
+}
+
+#[test]
+fn a_program_that_fits_is_not_moved() {
+    let file = relocatable(&[DIR64_AT_8]);
+    let pe = Pe::parse(&file, 0x1_0000_0000..0x2_0000_0000).expect("loaded where it asked");
+    assert!(!pe.moved());
+    assert_eq!((pe.base(), pe.relocations()), (LINKED_AT, 0));
+    for page in [LINKED_AT, LINKED_AT + 0x2000] {
+        assert_eq!(fixups(&pe, page), []);
+    }
+}
+
+#[test]
+fn a_program_that_cannot_be_moved_is_refused() {
+    // Relocations stripped, as `/FIXED` marks them.
+    let mut file = relocatable(&[DIR64_AT_8]);
+    file[0x44 + 18..0x44 + 20].copy_from_slice(&0x0023u16.to_le_bytes());
+    assert_eq!(refused(&file), Error::OutsideRange);
+    // No table.
+    let mut file = relocatable(&[DIR64_AT_8]);
+    put32(&mut file, OPTIONAL + DIRECTORIES + RELOCATIONS * 8 + 4, 0);
+    assert_eq!(refused(&file), Error::OutsideRange);
+    // Too big for the range even at its start.
+    let file = relocatable(&[DIR64_AT_8]);
+    assert_eq!(Pe::parse(&file, 0x40_0000..0x40_3000).unwrap_err(), Error::OutsideRange);
+}
+
+#[test]
+fn relocation_tables_that_lie_are_refused() {
+    for (entries, why) in [
+        (&[0x3008u16][..], "HIGHLOW, a 32-bit type"),
+        (&[0xa000 | 0xffc], "across a page"),
+        (&[0xa000 | 0x0fc], "past the section's end"),
+        (&[0x1008], "HIGH"),
+    ] {
+        assert_eq!(refused(&relocatable(entries)), Error::BadRelocations, "{why}");
+    }
+    let good = relocatable(&[DIR64_AT_8]);
+    let directory = OPTIONAL + DIRECTORIES + RELOCATIONS * 8;
+    // Where `build` puts the third section's bytes: the table.
+    let block = 0x600;
+    for (at, value, why) in [
+        (block, 0x3000u32, "past the end of the table's own section"),
+        (block, 0x5000, "a page past the image"),
+        (block, 0x2001, "an unaligned page"),
+        (block, 0x0, "the headers' page"),
+        (block + 4, 6, "a block shorter than its header"),
+        (block + 4, 11, "a block of odd length"),
+        (block + 4, 12, "a block past the table"),
+        (directory, 0x5000, "a table outside every section"),
+        (directory + 4, 0x2000, "a table longer than its section"),
+    ] {
+        let mut file = good.clone();
+        put32(&mut file, at, value);
+        assert_eq!(refused(&file), Error::BadRelocations, "{why}");
+    }
+}
+
+#[test]
+fn random_damage_to_relocations_never_panics() {
+    let good = relocatable(&[DIR64_AT_8, DIR64_IN_BSS, PADDING]);
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for _ in 0..20_000 {
+        let mut file = good.clone();
+        for _ in 0..1 + next() % 4 {
+            // The table, or the directory that points at it.
+            let at = if next() % 4 == 0 {
+                OPTIONAL + DIRECTORIES + RELOCATIONS * 8 + (next() % 8) as usize
+            } else {
+                0x600 + (next() % 16) as usize
+            };
+            file[at] = next() as u8;
+        }
+        if let Ok(pe) = Pe::parse(&file, ALLOWED) {
+            check_promises(&pe);
+            for page in pe.segments().flat_map(|segment| segment.pages().step_by(0x1000)) {
+                pe.fixups_in(page, |fixup| {
+                    assert!(fixup.address % 0x1000 <= 0x1000 - 8, "across a page");
+                    assert!(pe.segments().any(|s| fixup.address >= s.address && fixup.address + 8 <= s.address + s.len));
+                });
+            }
+        }
+    }
 }

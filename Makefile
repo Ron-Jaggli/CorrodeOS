@@ -475,6 +475,7 @@ files-run-test: iso
 	    && grep -aqxF "files      : dir.exe: dir.exe  $$size" build/files-run-lines.log \
 	    && grep -aqxF "files      : dir.exe: 1 files, $$size bytes" build/files-run-lines.log \
 	    && grep -aqxF 'files      : dir.exe: ended after 2 lines' build/files-run-lines.log \
+	    && grep -aqE '^verdigris  : moved from 0x140000000 to 0x400000, [1-9][0-9]* relocations$$' build/files-run-lines.log \
 	    && echo "files-run-test: Return on dir.exe ran it, its folder alone PASS" \
 	    || echo "files-run-test: Return on dir.exe ran it, its folder alone FAIL"
 	@test -s build/files-run.ppm && pnmtopng build/files-run.ppm > build/files-run.png 2>/dev/null && rm -f build/files-run.ppm && echo "wrote build/files-run.png" || true
@@ -1620,6 +1621,9 @@ win-test: iso
 	    && grep -aqxF 'terminal   : win: dir.exe: dir: x*.txt: error 2' build/win-lines.log \
 	    && echo "win-test: a compiled program lists its folder      PASS" \
 	    || echo "win-test: a compiled program lists its folder      FAIL"
+	@test $$(grep -acE '^verdigris  : moved from 0x140000000 to 0x400000, [1-9][0-9]* relocations$$' build/win-lines.log) -eq 2 \
+	    && echo "win-test: it was moved from where its linker put it PASS" \
+	    || echo "win-test: it was moved from where its linker put it FAIL"
 	@grep -aqxF 'terminal   : win: /etc/motd: not a program Verdigris runs' build/win-lines.log \
 	    && echo "win-test: a file that is not a program is refused   PASS" \
 	    || echo "win-test: a file that is not a program is refused   FAIL"

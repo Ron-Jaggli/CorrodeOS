@@ -2689,12 +2689,14 @@ fn run_windows(from: usize, text: &str) -> ([u64; 4], Option<(cap::CapPtr, cap::
     if let (true, Some(id)) = (watching, watcher) {
         arch::x86_64::without_interrupts(|| WATCHES.lock().push(Watch { watcher: id, program, server }));
     }
-    start_all(&[Some(server), Some(program), watcher.filter(|_| watching)]);
-    println!("desktop    : {path} started for {caller}, seeing {folder} alone");
     // What the run has cost so far: with the earlier runs' tasks given back
-    // as this one was started, this stays level from run to run.
+    // as this one was set up, this stays level from run to run. Said before
+    // its tasks start, so nothing they take, and nothing they print, comes
+    // between.
     let (objects, _) = memory::stats();
+    println!("desktop    : {path} started for {caller}, seeing {folder} alone");
     println!("desktop    : {} frames free, {objects} memory objects", mm::frame::stats().0);
+    start_all(&[Some(server), Some(program), watcher.filter(|_| watching)]);
     // Received on, not sent to, and not passed on.
     ([1, 0, 0, 0], Some((SERVICE_SPARE_SLOT, cap::Rights::READ)))
 }

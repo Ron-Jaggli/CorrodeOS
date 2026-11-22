@@ -3251,6 +3251,61 @@ showing that while it stays selected; before it runs, the preview of a
   real drift too. The suite now keeps nothing per boot; worth keeping
   each serial log next time.
 
+## 93. A program is moved to where it may go
+
+Every Windows program so far was linked `/FIXED` at 0x400000, inside
+the range the loader allows. A linker left to itself puts a 64-bit
+program at 0x1_4000_0000 -- outside it -- with base relocations to move
+it, and Windows moves nearly every program. Now the loader does too.
+
+- **corrode-pe**: a program whose preferred base does not fit, and that
+  carries relocations (not `RELOCS_STRIPPED`, a non-empty directory 5),
+  is placed at the lowest 64 KiB boundary in the allowed range. Its
+  whole relocation table is checked in `parse` before anything is
+  mapped: only `DIR64` and padding entries; blocks that hold together,
+  on page-aligned pages; each address eight bytes inside a section and
+  not across a page (`Error::BadRelocations` otherwise). `fixups_in(page)`
+  then gives a page's fixups -- each address moved by the delta, from
+  the file's bytes or the zeroed end of a section -- and the header's
+  `ImageBase` set to the real base, as Windows does. `base`,
+  `preferred_base`, `moved`, `relocations` describe it.
+- **Kernel** (`task/user.rs`): `build` takes the moved program's fixups
+  per page, written before the import fixups, so an import slot is
+  always the import's; the log says `verdigris  : moved from 0x140000000
+  to 0x400000, 2 relocations`.
+- **dir.exe** is now linked the default way (no `/FIXED`, no `/BASE`):
+  7 KB, based at 0x1_4000_0000, two `DIR64` relocations. Its total line
+  reads its words through a static table of pointers, so it needs them:
+  with relocations not applied it faulted before the total, and win-test
+  FAILed. (Before that change it did not: its two relocated words were
+  on no path it took, which the first negative check showed.)
+- **win-test**: a new check, both dir.exe runs were moved; files-run-test
+  checks it too.
+- **Host tests** (+5): moved and the fixups right, including the header
+  and a pointer into zeroed memory; moved higher when the range starts
+  off a 64 KiB boundary; not moved when it fits; refused when stripped,
+  without a table, or too big; eight kinds of lying table refused; and
+  20 000 random damages to the table that never panic or yield a fixup
+  outside a section or across a page.
+
+Found on the way, and fixed: win-test's "memory objects stay as many"
+FAILed once dir.exe took a little longer to start. The desktop printed
+the run's memory after starting its tasks, and the file view started on
+another CPU first, took its memory, and printed between the two lines
+the check reads. It is now printed before the tasks start (`run_windows`).
+
+- **Choice:** moved only when it must be, to the lowest base allowed --
+  no randomising. There is no second program in a space to keep apart,
+  and nothing yet that knowing the address would help an attacker past.
+- **Choice:** a relocation across a page is refused, not split: the
+  loader writes each page before mapping it, and no x86-64 linker
+  writes one (pointers are 8-aligned).
+- **Choice:** the header's `ImageBase` is corrected. Windows does, and a
+  program reading it to find itself should find where it is.
+- Verified: the whole suite on both GPUs, 94 checks PASS on each (the
+  new one included), none FAIL, every boot's self-checks all PASS, no
+  unhandled trap; `./corrode test` 356 passed (5 new); clippy at 33.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -3419,7 +3474,10 @@ one task.
 16. [x] (section 92) Files runs a Windows program: Return (or a second click) on a
    `.exe` runs it seeing its own folder alone, and its output shows in
    the preview. files-run-test, both GPUs.
-17. [ ] Wrap-up for the owner: what the vault run did, what to review and
+17. [x] (section 93) A Windows program linked the default way -- at 0x1_4000_0000,
+   with relocations -- is moved and its relocations applied. Host
+   tests; dir.exe built that way, win-test and files-run-test.
+18. [ ] Wrap-up for the owner: what the vault run did, what to review and
    merge, what is still open. No code. Then stop the loop.
 
 Tasks 7-9 were added at 2026-11-22T03:10-06:00, by me (and 9, running a
