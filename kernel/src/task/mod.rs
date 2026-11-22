@@ -116,6 +116,11 @@ pub struct Task {
     /// because they *are* the kernel -- separating them would buy nothing, as
     /// they can already reach every byte of it by construction.
     pub space: Option<crate::mm::paging::Mapper>,
+    /// The program this task is part of: the id of the task that founded
+    /// it, its own id for a task that founded one (every task but a
+    /// thread). The tasks of one program share `space`, and [`reap`]
+    /// gives that space back only when the last of them has left.
+    pub program: usize,
     /// The kernel stack from `stack::allocate`, until [`reap`] gives it
     /// back. `None` for the tasks that run on a stack of their own.
     pub stack: Option<stack::Stack>,
@@ -233,6 +238,7 @@ pub fn init() {
             stopping: false,
             ending: Ending::Exited(0),
             gs_base: 0,
+            program: 0,
         }];
         let root = crate::mm::paging::kernel_root().unwrap_or(0);
         *guard = Some(Scheduler {
@@ -303,6 +309,7 @@ pub fn adopt_as_idle(cpu_index: usize, stack_top: u64) {
             stopping: false,
             ending: Ending::Exited(0),
             gs_base: 0,
+            program: id,
         });
 
         scheduler.current[cpu_index] = id;
@@ -420,11 +427,56 @@ pub fn spawn_windows(name: &'static str, file: &[u8], kernel32: &[u8]) -> Result
     spawn_inner(name, image.entry, Some(image), next_cpu()).ok_or(user::LoadError::OutOfMemory)
 }
 
+/// Start a second (third...) ring 3 task in the program `of` is part of:
+/// a thread. It shares the program's address space, runs on the CPU the
+/// program's tasks run on, starts at `entry` with its stack pointer at
+/// `stack_top`, `rcx` holding `argument` and its GS base at `gs_base`,
+/// and holds no capabilities. Not runnable until [`start`].
+///
+/// The stack and anything else it uses must already be mapped in the
+/// space: this maps nothing. None if `of` is no user task, or its program
+/// has already ended (no task of it holds the space any more).
+pub fn spawn_thread(
+    of: usize,
+    name: &'static str,
+    entry: u64,
+    stack_top: u64,
+    gs_base: u64,
+    argument: u64,
+) -> Option<usize> {
+    let (space, cpu, program) = x86_64::without_interrupts(|| {
+        let guard = SCHEDULER.lock();
+        let task = guard.as_ref()?.tasks.get(of)?;
+        Some((task.space?, task.cpu, task.program))
+    })?;
+    let image = user::Image { entry, stack_top, stack_guard: 0, space, gs_base };
+    // Same CPU, always: with no TLB shootdown, a thread elsewhere could
+    // keep using a translation the program had removed, and `left` only
+    // says that this one CPU has switched away.
+    spawn_task(name, entry, Some(image), cpu, Some(program), argument)
+}
+
 fn spawn_inner(
     name: &'static str,
     entry_rip: u64,
     image: Option<user::Image>,
     cpu_index: usize,
+) -> Option<usize> {
+    spawn_task(name, entry_rip, image, cpu_index, None, 0)
+}
+
+/// [`spawn_inner`], or with `thread_of` a task joining that program: in
+/// its space (which `image` must name), on its CPU, starting with `rcx`
+/// set to `argument`. Joining is decided under the scheduler lock: it
+/// fails if no task of the program still holds the space, so a space is
+/// never joined after [`reap`] has decided to give it back.
+fn spawn_task(
+    name: &'static str,
+    entry_rip: u64,
+    image: Option<user::Image>,
+    cpu_index: usize,
+    thread_of: Option<usize>,
+    argument: u64,
 ) -> Option<usize> {
     reap();
     let stack = stack::allocate()?;
@@ -476,7 +528,8 @@ fn spawn_inner(
             rdi: 0,
             rsi: 0,
             rdx: 0,
-            rcx: 0,
+            // Windows' first argument register; 0 for all but a thread.
+            rcx: argument,
             rbx: 0,
             rax: 0,
             // Never inspected on the way out; the stub just drops these two.
@@ -498,6 +551,16 @@ fn spawn_inner(
         let mut guard = SCHEDULER.lock();
         let scheduler = guard.as_mut()?;
         let id = scheduler.tasks.len();
+        if let Some(program) = thread_of {
+            let root = image.map(|image| image.space.root());
+            let held = scheduler
+                .tasks
+                .iter()
+                .any(|task| task.program == program && task.space.map(|space| space.root()) == root);
+            if root.is_none() || !held {
+                return None;
+            }
+        }
         scheduler.tasks.push(Task {
             id,
             name,
@@ -526,9 +589,14 @@ fn spawn_inner(
             stopping: false,
             ending: Ending::Exited(0),
             gs_base: image.map_or(0, |image| image.gs_base),
+            program: thread_of.unwrap_or(id),
         });
         Some(id)
-    })?;
+    });
+    let Some(id) = id else {
+        stack::release(stack);
+        return None;
+    };
 
     // Logged after the scheduler lock is dropped, deliberately. Printing takes
     // the console lock, and taking it underneath the scheduler lock would make
@@ -611,12 +679,30 @@ pub fn reap() -> usize {
         let Some(scheduler) = guard.as_mut() else {
             return;
         };
-        for task in scheduler.tasks.iter_mut().filter(|task| task.left) {
+        for index in 0..scheduler.tasks.len() {
+            let task = &mut scheduler.tasks[index];
+            if !task.left {
+                continue;
+            }
             if task.stack.is_none() && task.space.is_none() && task.cspace.occupied() == 0 {
                 continue;
             }
             let cspace = core::mem::replace(&mut task.cspace, CSpace::new(0));
-            taken.push((task.stack.take(), task.space.take(), cspace));
+            let (stack, space, program) = (task.stack.take(), task.space.take(), task.program);
+            // The space is the program's: it goes back only with the last
+            // task that holds it. One that has not left -- running,
+            // blocked, finished but still under its CPU -- keeps it; so
+            // does one that has left but is not reaped yet, and that one
+            // gives it back when its own turn in this loop comes. Decided
+            // under this lock, as joining is (`spawn_task`), so no thread
+            // can join a space after it is given back.
+            let space = space.filter(|space| {
+                !scheduler
+                    .tasks
+                    .iter()
+                    .any(|other| other.program == program && other.space.is_some_and(|it| it.root() == space.root()))
+            });
+            taken.push((stack, space, cspace));
         }
     });
     let mut freed = 0;
@@ -636,9 +722,11 @@ pub fn reap() -> usize {
         }
         if let Some(space) = space {
             crate::memory::forget_space(&space);
-            // SAFETY: `left` says its CPU has since installed another space,
-            // no other CPU ever ran it, and taking it out of the record means
-            // nothing will install or use it again.
+            // SAFETY: the last task of its program to hold it has left:
+            // `left` says that task's CPU, the only one any task of the
+            // program ran on, has since installed a space that is not this
+            // one (every task still on that CPU is of another program or
+            // the kernel), no other task holds it, and none can join it.
             freed += unsafe { space.release_user_half() };
         }
         if let Some(stack) = stack {

@@ -243,6 +243,7 @@ pub extern "C" fn kmain() -> ! {
     program_checks();
     verdigris::checks();
     orphan_checks();
+    thread_space_checks();
     #[cfg(not(feature = "user-test"))]
     {
         device_checks();
@@ -3004,6 +3005,149 @@ fn program_checks() {
     }
 }
 
+/// What the founder of [`program_pair`] leaves in its stack's top, for the
+/// thread's program to be seen reading the same memory.
+const PAIR_MARK: u64 = 0x7e4a_0001_5eed_c0de;
+
+/// Two ring 3 programs in one routine, for [`thread_space_checks`]. At +0
+/// the founder: a short jump (two bytes) over the thread's code, then it
+/// leaves [`PAIR_MARK`] 24 bytes under the stack's top and exits. At +2
+/// the thread: it counts, forever, in the word 16 under the top, until it
+/// is stopped. Neither touches its stack, so they share one safely.
+#[unsafe(naked)]
+extern "C" fn program_pair() {
+    core::arch::naked_asm!(
+        "jmp 3f",
+        "movabs rbx, {counter}",
+        "2:",
+        "inc qword ptr [rbx]",
+        "jmp 2b",
+        "3:",
+        "movabs rbx, {mark_at}",
+        "movabs rax, {mark}",
+        "mov [rbx], rax",
+        "mov rax, {exit}",
+        "xor rdi, rdi",
+        "int {gate}",
+        "ud2",
+        counter = const task::user::STACK_TOP - 16,
+        mark_at = const task::user::STACK_TOP - 24,
+        mark = const PAIR_MARK,
+        exit = const syscall::SYS_EXIT,
+        gate = const vectors::SYSCALL,
+    );
+}
+
+/// The eight bytes at `va` in `space`, read through the direct map, or
+/// None if nothing is mapped there.
+fn read_user_word(space: mm::paging::Mapper, va: u64) -> Option<u64> {
+    let hhdm = limine::HHDM.response.get()?.offset;
+    let phys = space.translate(va)?;
+    // SAFETY: a frame mapped in a live space, through the direct map;
+    // `va` is 8-aligned, so the word is inside one page. Read volatile:
+    // a thread may be writing it right now.
+    Some(unsafe { core::ptr::read_volatile((hhdm + phys) as *const u64) })
+}
+
+/// One run of a program of two tasks: the founder ends first, and the space
+/// must stay, with the thread still in it, until the thread ends too. Says
+/// whether each step held, and the frames reaping gave back.
+fn program_pair_run() -> ([bool; 6], usize) {
+    use task::user::STACK_TOP;
+    let mut held = [false; 6];
+    let wait = |id: usize| {
+        let deadline = time::now_ns() + 2_000_000_000;
+        while task::state_of(id) != Some(task::State::Finished) && time::now_ns() < deadline {
+            task::sleep_until(time::now_ns() + 5_000_000);
+        }
+        task::state_of(id) == Some(task::State::Finished)
+    };
+    // Its CPU leaves a finished task at a later tick, which on a quiet CPU
+    // can be a while; reap until the task's record lets its space go.
+    let reap_until_gone = |id: usize| {
+        let deadline = time::now_ns() + 2_000_000_000;
+        let mut freed = task::reap();
+        while task::space_of(id).is_some() && time::now_ns() < deadline {
+            task::sleep_until(time::now_ns() + 5_000_000);
+            freed += task::reap();
+        }
+        (freed, task::space_of(id).is_none())
+    };
+    // SAFETY: the routine's first byte, in the kernel's own image.
+    let short_jump = unsafe { *(program_pair as *const u8) } == 0xeb;
+    let entry = task::user::CODE_BASE + (program_pair as *const () as u64 & 0xfff);
+    let Some(founder) = task::spawn_user("founder", program_pair) else {
+        return (held, 0);
+    };
+    let Some(thread) = task::spawn_thread(founder, "thread", entry + 2, STACK_TOP - 8, 0, 0) else {
+        task::stop(founder);
+        start_all(&[Some(founder)]);
+        wait(founder);
+        reap_until_gone(founder);
+        return (held, 0);
+    };
+    let same_space = task::space_of(founder).map(|space| space.root()) == task::space_of(thread).map(|space| space.root());
+    held[0] = short_jump && same_space && task::cpu_of(founder) == task::cpu_of(thread);
+    start_all(&[Some(founder), Some(thread)]);
+
+    // The founder ends; its CPU leaves it; it is reaped, all but the space.
+    let founder_ended = wait(founder);
+    let (freed_early, founder_reaped) = reap_until_gone(founder);
+    held[1] = founder_ended
+        && founder_reaped
+        && freed_early == 0
+        && task::state_of(thread) != Some(task::State::Finished);
+
+    // The thread still runs in the space, which still holds what the
+    // founder wrote.
+    // A quiet CPU picks up a task made ready at its next tick, so the
+    // count is watched until it moves, not for a fixed while.
+    let space = task::space_of(thread);
+    let count = || space.and_then(|space| read_user_word(space, STACK_TOP - 16));
+    let first = count();
+    let deadline = time::now_ns() + 2_000_000_000;
+    while count() == first && time::now_ns() < deadline {
+        task::sleep_until(time::now_ns() + 5_000_000);
+    }
+    held[2] = matches!((first, count()), (Some(a), Some(b)) if b > a);
+    held[3] = space.and_then(|space| read_user_word(space, STACK_TOP - 24)) == Some(PAIR_MARK);
+
+    // The thread ends; with it the program; the space goes back.
+    task::stop(thread);
+    let thread_ended = wait(thread);
+    let (freed, thread_reaped) = reap_until_gone(thread);
+    held[4] = thread_ended && thread_reaped && freed > 0;
+    // A program that has ended cannot be joined.
+    held[5] = task::spawn_thread(founder, "late", entry + 2, STACK_TOP - 8, 0, 0).is_none()
+        && task::spawn_thread(thread, "late", entry + 2, STACK_TOP - 8, 0, 0).is_none();
+    (held, freed)
+}
+
+/// Threads, step 1 of `verdigris/THREADS.md`: a program is a group of
+/// tasks sharing one address space, given back when the last one leaves.
+/// Run twice: the first run carves the kernel stacks the second then
+/// reuses, so the second must end with the allocator exactly where it
+/// started.
+fn thread_space_checks() {
+    let (first, _) = program_pair_run();
+    task::reap();
+    let (free_before, _) = mm::frame::stats();
+    let (second, freed) = program_pair_run();
+    task::reap();
+    let (free_after, _) = mm::frame::stats();
+    println!(
+        "program    : two tasks, one space: {} frames given back with the last, {} free before, {} after",
+        freed, free_before, free_after
+    );
+    let both = |i: usize| first[i] && second[i];
+    check("program", "a second task joins a program's space and CPU", both(0));
+    check("program", "the first ends and the space is not given back", both(1));
+    check("program", "...the second still runs in it", both(2));
+    check("program", "...and reads what the first wrote", both(3));
+    check("program", "the last one's end gives the space back", both(4));
+    check("program", "an ended program cannot be joined", both(5));
+    check("program", "...and keeps no frame", free_after == free_before);
+}
 /// Where task 0 holds each check's endpoint while handing it out, and then
 /// no longer: a reader left in task 0 would keep the endpoint alive.
 const ORPHAN_ENDPOINT: cap::CapPtr = 78;
