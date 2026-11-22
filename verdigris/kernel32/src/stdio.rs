@@ -32,7 +32,10 @@ struct Stream {
     text: bool,
     at: usize,
     len: usize,
+    /// The view has nothing more (found by reading ahead, perhaps).
     end: bool,
+    /// A read the program asked for found nothing: what `feof` says.
+    eof: bool,
     error: bool,
     buffer: [u8; BUFFER],
 }
@@ -99,6 +102,7 @@ pub unsafe extern "win64" fn fopen(name: *const u8, mode: *const u8) -> *mut Fil
         at: 0,
         len: 0,
         end: false,
+        eof: false,
         error: false,
         buffer: [0; BUFFER],
     });
@@ -150,7 +154,10 @@ impl Stream {
 
     /// The next byte as the program reads it.
     fn next(&mut self) -> Option<u8> {
-        let byte = self.raw()?;
+        let Some(byte) = self.raw() else {
+            self.eof = true;
+            return None;
+        };
         if self.text && byte == b'\r' {
             // Look one ahead: kept unless a line feed follows.
             if self.at == self.len {
@@ -233,7 +240,7 @@ pub unsafe extern "win64" fn fread(into: *mut u8, size: usize, count: usize, fil
 }
 
 pub extern "win64" fn feof(file: *mut File) -> i32 {
-    stream_of(file).map_or(0, |stream| i32::from(stream.end && stream.at == stream.len))
+    stream_of(file).map_or(0, |stream| i32::from(stream.eof))
 }
 
 pub extern "win64" fn ferror(file: *mut File) -> i32 {

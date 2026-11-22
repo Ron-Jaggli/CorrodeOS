@@ -9,7 +9,7 @@
 use core::alloc::Layout;
 use core::ffi::c_void;
 
-use corrode_rt::abi::verdigris::{HEAP, HEAP_PIECES, PEB, POOL, START_ENTRY, START_TLS_CALLBACKS};
+use corrode_rt::abi::verdigris::{HEAP, HEAP_PIECES, PEB, POOL, POOL_PAGES, START_ENTRY, START_TLS_CALLBACKS};
 
 use crate::{exit_process, fail, set_last_error, One};
 
@@ -78,6 +78,8 @@ static PIECES: One<usize> = One::new(0);
 /// Pages in the first piece; each later one is at least as big as the last.
 const FIRST_PIECE: usize = 64;
 static LAST_PIECE: One<usize> = One::new(0);
+/// Pages the pieces so far took from the pool.
+static BOUGHT: One<usize> = One::new(0);
 
 /// Every block carries its size and alignment in the 16 bytes before it,
 /// so `free`, which is told only the address, can give it back.
@@ -86,20 +88,29 @@ const HEADER: usize = 16;
 /// Buy more memory for the heap from the pool, enough for `bytes`.
 pub fn grow(bytes: usize) -> bool {
     // SAFETY: one thread, and no reference outlives this function.
-    let (pieces, last) = unsafe { (PIECES.get(), LAST_PIECE.get()) };
+    let (pieces, last, bought) = unsafe { (PIECES.get(), LAST_PIECE.get(), BOUGHT.get()) };
     if *pieces == HEAP_PIECES {
         return false;
     }
-    let pages = (bytes + HEADER).div_ceil(4096) + 1;
-    let pages = pages.max(FIRST_PIECE).max(*last * 2);
-    match corrode_rt::heap::init(POOL, HEAP + *pieces, pages) {
-        Ok(_) => {
+    let needed = (bytes.saturating_add(HEADER)).div_ceil(4096) + 1;
+    let left = (POOL_PAGES as usize).saturating_sub(*bought);
+    if needed > left {
+        return false;
+    }
+    // Each piece twice the last, so a few pieces go far; but never more
+    // than the budget has left, so the last of it is not wasted.
+    let wanted = needed.max(FIRST_PIECE).max(*last * 2).min(left);
+    // If the pool takes something of its own for a piece, exactly what is
+    // needed may still fit.
+    for pages in [wanted, needed] {
+        if corrode_rt::heap::init(POOL, HEAP + *pieces, pages).is_ok() {
             *pieces += 1;
             *last = pages;
-            true
+            *bought += pages;
+            return true;
         }
-        Err(_) => false,
     }
+    false
 }
 
 /// `size` bytes, aligned to 16 (as Windows' heap and malloc give), or null.
@@ -178,6 +189,7 @@ pub unsafe fn resize(block: *mut u8, size: usize, zeroed: bool) -> *mut u8 {
 /// The one heap `GetProcessHeap` names.
 const PROCESS_HEAP: isize = 0x7000;
 const HEAP_ZERO_MEMORY: u32 = 0x8;
+const HEAP_REALLOC_IN_PLACE_ONLY: u32 = 0x10;
 
 pub extern "win64" fn get_process_heap() -> isize {
     PROCESS_HEAP
@@ -210,6 +222,16 @@ pub unsafe extern "win64" fn heap_free(heap: isize, _flags: u32, block: *mut u8)
 pub unsafe extern "win64" fn heap_re_alloc(heap: isize, flags: u32, block: *mut u8, size: usize) -> *mut u8 {
     if heap != PROCESS_HEAP || block.is_null() {
         return fail(ERROR_INVALID_PARAMETER, core::ptr::null_mut());
+    }
+    if flags & HEAP_REALLOC_IN_PLACE_ONLY != 0 {
+        // The block may not move: it stays where it is if it is already
+        // big enough, and the call fails, the block untouched, if not.
+        // SAFETY: the caller's promise.
+        let old = unsafe { size_of(block) };
+        if size <= old {
+            return block;
+        }
+        return fail(ERROR_NOT_ENOUGH_MEMORY, core::ptr::null_mut());
     }
     // SAFETY: the caller's promise.
     let new = unsafe { resize(block, size, flags & HEAP_ZERO_MEMORY != 0) };

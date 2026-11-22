@@ -468,9 +468,13 @@ pub unsafe extern "win64" fn vsnprintf(buffer: *mut u8, room: usize, text: *cons
             }
         })
     };
+    // Microsoft's rule: output that fits exactly is stored whole with no
+    // terminator, and its length returned; only longer output is -1.
     if count < room {
         // SAFETY: inside the buffer.
         unsafe { buffer.add(count).write(0) };
+        count as i32
+    } else if count == room {
         count as i32
     } else {
         -1
