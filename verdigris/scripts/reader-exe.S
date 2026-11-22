@@ -1,6 +1,6 @@
 # reader.exe: Verdigris's third phase, a Windows program that reads files.
 #
-# Assembled by GNU as into one flat file (scripts/reader-exe.sh): every
+# Assembled by GNU as into one flat file (verdigris/scripts/reader-exe.sh): every
 # section is placed at a file offset equal to its RVA (file alignment
 # 0x1000), so the assembler itself resolves every RVA and every
 # RIP-relative address. No Windows toolchain, no linker.

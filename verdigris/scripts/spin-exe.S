@@ -1,7 +1,7 @@
 # spin.exe: a Windows program that never ends, for the terminal's `win` to
 # stop (win-test). It says so, then loops in ring 3 for good.
 #
-# Built like reader.exe (scripts/reader-exe.sh spin.exe spin-exe.S): one
+# Built like reader.exe (verdigris/scripts/reader-exe.sh spin.exe spin-exe.S): one
 # flat file, every section at the file offset equal to its RVA. It imports
 # GetStdHandle and WriteFile from KERNEL32.dll.
 

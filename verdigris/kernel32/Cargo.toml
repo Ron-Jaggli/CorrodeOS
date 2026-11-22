@@ -12,4 +12,4 @@ bench = false
 
 [dependencies]
 corrode-rt = { path = "../../user/rt" }
-corrode-pe = { path = "../../pe" }
+corrode-pe = { path = "../pe" }

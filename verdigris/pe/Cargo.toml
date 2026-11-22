@@ -5,4 +5,4 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-corrode-elf = { path = "../elf" }
+corrode-elf = { path = "../../elf" }

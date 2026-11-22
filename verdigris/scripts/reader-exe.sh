@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Write reader.exe from scripts/reader-exe.S (or another program written
+# Write reader.exe from verdigris/scripts/reader-exe.S (or another program written
 # the same way, given as SOURCE, such as spin-exe.S): GNU as assembles the
 # whole PE file as one flat section, and objcopy takes its bytes out. See
 # the source for why no linker is needed.

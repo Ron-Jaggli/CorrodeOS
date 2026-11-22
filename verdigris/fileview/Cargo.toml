@@ -11,6 +11,6 @@ test = false
 bench = false
 
 [dependencies]
-corrode-rt = { path = "../rt" }
+corrode-rt = { path = "../../user/rt" }
 corrode-shell = { path = "../../shell" }
-corrode-view = { path = "../../verdigris/view" }
+corrode-view = { path = "../view" }

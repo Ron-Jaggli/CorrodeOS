@@ -29,5 +29,5 @@ rustc --edition 2024 --crate-type rlib --crate-name compiler_builtins "${flags[@
 # relocations to move it, which the loader does. No C runtime.
 rustc --edition 2021 --crate-type bin --crate-name dir "${flags[@]}" -L "$tmp" \
     -C linker=rust-lld -C link-arg=/ENTRY:start -C link-arg=/SUBSYSTEM:CONSOLE \
-    -C link-arg=/NODEFAULTLIB -o "$tmp/dir.exe" "$here/verdigris/dir/src/main.rs"
+    -C link-arg=/NODEFAULTLIB -o "$tmp/dir.exe" "$here/dir/src/main.rs"
 cp "$tmp/dir.exe" "$out"

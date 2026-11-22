@@ -349,6 +349,13 @@ shell/           a shell: pipes, lists, variables, globs, and ls/cat/grep/sort a
 root/            the files the terminal can read, packed into a tar at build time
 vault/           the vault: that tar sealed on the disk under the passcode, as data and tests
 heap/            the allocator: the kernel's heap and every program's
+verdigris/       Windows programs on CorrodeOS: its own README.md and DESIGN.md
+  pe/              reading a PE file, tested on the build host against liars
+  view/            the pruned view of the files a Windows program sees
+  fileview/        the ring 3 service that serves one program's view
+  kernel32/        Verdigris's kernel32, in Rust
+  dir/             dir.exe, a Windows program built by rustc and rust-lld
+  scripts/         the test programs, written byte by byte or assembled
   src/lib.rs       headers, BARs, capability lists, MSI, what a driver may write
   src/mcfg.rs      the ACPI table that says where configuration space is
 boot/limine.conf lets Limine find the kernel

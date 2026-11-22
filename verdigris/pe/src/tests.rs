@@ -18,7 +18,7 @@ const DATA: u32 = 0xc000_0040;
 
 /// Lay out a PE32+ executable: DOS header, PE header, optional header with
 /// sixteen empty directories, section table, then each section's bytes at
-/// the next 512-byte boundary. The same layout `scripts/hello-exe.sh` writes.
+/// the next 512-byte boundary. The same layout `verdigris/scripts/hello-exe.sh` writes.
 fn build(entry: u32, image_len: u32, sections: &[Section]) -> Vec<u8> {
     let mut file = vec![0u8; 0x200];
     file[..2].copy_from_slice(b"MZ");
@@ -333,7 +333,7 @@ fn random_damage_never_panics_and_never_breaks_a_promise() {
     assert!(accepted > 0);
 }
 
-/// The program the boot test runs, as `scripts/hello-exe.sh` writes it.
+/// The program the boot test runs, as `verdigris/scripts/hello-exe.sh` writes it.
 #[test]
 fn the_scripts_hello_exe_loads() {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/hello-exe.sh");
@@ -356,7 +356,7 @@ fn the_scripts_hello_exe_loads() {
 }
 
 /// A program importing `functions` from KERNEL32.dll: code at 0x1000, and
-/// at 0x2000 read-only data laid out as `scripts/console-exe.sh` lays it
+/// at 0x2000 read-only data laid out as `verdigris/scripts/console-exe.sh` lays it
 /// out -- the descriptor, a zero one, the lookup table at 0x40, the address
 /// table after it, then the DLL's name and each function's hint and name.
 fn importing(functions: &[&[u8]]) -> Vec<u8> {
@@ -593,7 +593,7 @@ fn random_damage_to_imports_never_panics() {
     }
 }
 
-/// The program phase 2's boot test runs, as `scripts/console-exe.sh`
+/// The program phase 2's boot test runs, as `verdigris/scripts/console-exe.sh`
 /// writes it.
 #[test]
 fn the_scripts_console_exe_loads_and_binds() {
@@ -613,7 +613,7 @@ fn the_scripts_console_exe_loads_and_binds() {
 }
 
 
-/// The program phase 3's boot test runs, as `scripts/reader-exe.sh`
+/// The program phase 3's boot test runs, as `verdigris/scripts/reader-exe.sh`
 /// assembles it: three sections, the last uninitialised, and fifteen
 /// imports, all bound to kernel32's table.
 #[test]

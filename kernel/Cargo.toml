@@ -20,7 +20,7 @@ corrode-pci = { path = "../pci" }
 corrode-abi = { path = "../abi" }
 corrode-elf = { path = "../elf" }
 corrode-vault = { path = "../vault" }
-corrode-pe = { path = "../pe" }
+corrode-pe = { path = "../verdigris/pe" }
 corrode-shell = { path = "../shell" }
 
 [features]

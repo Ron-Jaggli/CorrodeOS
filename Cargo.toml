@@ -8,7 +8,7 @@ members = [
     "pci",
     "abi",
     "elf",
-    "pe",
+    "verdigris/pe",
     "virtio",
     "nv",
     "input",
@@ -38,7 +38,7 @@ members = [
     "user/control",
     "user/lock",
     "user/menu",
-    "user/fileview",
+    "verdigris/fileview",
 ]
 
 [workspace.package]

@@ -2,7 +2,7 @@
 # report as Windows would (win-test). It says so, then reads address 0:
 # an access violation, 0xc0000005.
 #
-# Built like reader.exe (scripts/reader-exe.sh fault.exe fault-exe.S): one
+# Built like reader.exe (verdigris/scripts/reader-exe.sh fault.exe fault-exe.S): one
 # flat file, every section at the file offset equal to its RVA. It imports
 # GetStdHandle and WriteFile from KERNEL32.dll.
 

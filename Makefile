@@ -186,35 +186,35 @@ $(ROOT_TAR): $(ROOT_FILES) $(READER_EXE) $(SPIN_EXE) $(DIR_EXE) $(FAULT_EXE)
 # Verdigris's first Windows program, a PE file written byte by byte by a
 # script: no Windows toolchain. See verdigris/DESIGN.md.
 HELLO_EXE := build/hello.exe
-$(HELLO_EXE): scripts/hello-exe.sh
+$(HELLO_EXE): verdigris/scripts/hello-exe.sh
 	@mkdir -p build
-	bash scripts/hello-exe.sh $@
+	bash verdigris/scripts/hello-exe.sh $@
 
 # Phase 2: a console program that calls kernel32, and Verdigris's kernel32,
 # linked at its own address by its own script -- so built apart from the
 # user programs, which share user/user.ld.
 CONSOLE_EXE := build/console.exe
-$(CONSOLE_EXE): scripts/console-exe.sh
+$(CONSOLE_EXE): verdigris/scripts/console-exe.sh
 	@mkdir -p build
-	bash scripts/console-exe.sh $@
+	bash verdigris/scripts/console-exe.sh $@
 
 # Phase 3: a program that reads files through its view, assembled whole --
 # headers and all -- by GNU as.
-$(READER_EXE): scripts/reader-exe.sh scripts/reader-exe.S
+$(READER_EXE): verdigris/scripts/reader-exe.sh verdigris/scripts/reader-exe.S
 	@mkdir -p build
-	bash scripts/reader-exe.sh $@
+	bash verdigris/scripts/reader-exe.sh $@
 
-$(DIR_EXE): scripts/dir-exe.sh verdigris/dir/src/main.rs
+$(DIR_EXE): verdigris/scripts/dir-exe.sh verdigris/dir/src/main.rs
 	@mkdir -p build
-	bash scripts/dir-exe.sh $@
+	bash verdigris/scripts/dir-exe.sh $@
 
-$(SPIN_EXE): scripts/reader-exe.sh scripts/spin-exe.S
+$(SPIN_EXE): verdigris/scripts/reader-exe.sh verdigris/scripts/spin-exe.S
 	@mkdir -p build
-	bash scripts/reader-exe.sh $@ spin-exe.S
+	bash verdigris/scripts/reader-exe.sh $@ spin-exe.S
 
-$(FAULT_EXE): scripts/reader-exe.sh scripts/fault-exe.S
+$(FAULT_EXE): verdigris/scripts/reader-exe.sh verdigris/scripts/fault-exe.S
 	@mkdir -p build
-	bash scripts/reader-exe.sh $@ fault-exe.S
+	bash verdigris/scripts/reader-exe.sh $@ fault-exe.S
 
 KERNEL32_TARGET := target/verdigris
 KERNEL32 := $(KERNEL32_TARGET)/x86_64-unknown-none/release/kernel32
