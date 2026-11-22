@@ -2756,14 +2756,14 @@ extern "C" fn watch_program() {
             let _ = ipc::send(WATCH_VIEW, ipc::Message { label: view::DONE, words: [0; 4] }, None);
         }
     }
-    let how = if stopped {
-        log::END_STOPPED
-    } else if ended {
-        log::END_ENDED
-    } else {
-        log::END_RUNNING
+    let (how, detail) = match (ended, task::ending_of(watch.program)) {
+        _ if stopped => (log::END_STOPPED, 0),
+        (true, Some(task::Ending::Exited(code))) => (log::END_ENDED, u64::from(code)),
+        (true, Some(task::Ending::Faulted(vector))) => (log::END_FAULTED, u64::from(vector)),
+        (true, _) => (log::END_STOPPED, 0),
+        (false, _) => (log::END_RUNNING, 0),
     };
-    let _ = ipc::send(WATCH_OUTPUT, ipc::Message { label: log::END, words: [how, 0, 0, 0] }, None);
+    let _ = ipc::send(WATCH_OUTPUT, ipc::Message { label: log::END, words: [how, detail, 0, 0] }, None);
 }
 
 /// Which task proved the passcode for a change, and until when.

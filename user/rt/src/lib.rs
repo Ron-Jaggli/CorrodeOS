@@ -231,8 +231,20 @@ pub fn yield_now() {
 
 /// Stop, for good.
 pub fn exit() -> ! {
+    exit_with(0)
+}
+
+/// End this task, saying `code`: what a Windows program's `ExitProcess`
+/// gives, and the kernel passes on to whoever ran it.
+pub fn exit_with(code: u32) -> ! {
     loop {
-        sys::call(abi::SYS_EXIT, sys::Args::NONE);
+        sys::call(
+            abi::SYS_EXIT,
+            sys::Args {
+                rdi: u64::from(code),
+                ..sys::Args::NONE
+            },
+        );
         // Only reached on a kernel with no such call. Still never return:
         // there is nothing under `_start` to return to.
         yield_now();

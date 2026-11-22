@@ -591,12 +591,12 @@ unsafe extern "win64" fn write_file(
 
 /// End the program. A line still waiting for its end goes out first, and
 /// the view, if it has one, is told it can end too.
-extern "win64" fn exit_process(_code: u32) -> ! {
+extern "win64" fn exit_process(code: u32) -> ! {
     if PENDING.waiting() {
         PENDING.flush(LINE);
     }
     let _ = send(VIEW, Message::new(view::DONE, [0; 4]));
-    corrode_rt::exit()
+    corrode_rt::exit_with(code)
 }
 
 /// One entry of the export table, laid out as `corrode_pe::exports` reads it.

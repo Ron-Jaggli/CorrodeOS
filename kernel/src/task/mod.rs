@@ -126,6 +126,19 @@ pub struct Task {
     /// Asked to stop ([`stop`]): finished by its CPU at a tick that finds
     /// it in ring 3.
     pub stopping: bool,
+    /// How it finished, once it has.
+    pub ending: Ending,
+}
+
+/// How a task finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ending {
+    /// It exited, saying this code (0 for a kernel task that returned).
+    Exited(u32),
+    /// It faulted in ring 3, on this exception vector, and was stopped.
+    Faulted(u8),
+    /// It was asked to stop ([`stop`]) and was.
+    Stopped,
 }
 
 /// Slots per capability space.
@@ -214,6 +227,7 @@ pub fn init() {
             stack: None,
             left: false,
             stopping: false,
+            ending: Ending::Exited(0),
         }];
         let root = crate::mm::paging::kernel_root().unwrap_or(0);
         *guard = Some(Scheduler {
@@ -282,6 +296,7 @@ pub fn adopt_as_idle(cpu_index: usize, stack_top: u64) {
             stack: None,
             left: false,
             stopping: false,
+            ending: Ending::Exited(0),
         });
 
         scheduler.current[cpu_index] = id;
@@ -503,6 +518,7 @@ fn spawn_inner(
             stack: Some(stack),
             left: false,
             stopping: false,
+            ending: Ending::Exited(0),
         });
         Some(id)
     })?;
@@ -657,9 +673,9 @@ pub fn stop(id: usize) -> bool {
     })
 }
 
-/// Mark the task on this CPU finished, and say which it was.
+/// Mark the task on this CPU finished, `how`, and say which it was.
 ///
-/// For a task that has asked to stop, or has faulted in ring 3 and is being
+/// For a task that has asked to exit, or has faulted in ring 3 and is being
 /// stopped. The caller is in a trap handler on that task's kernel stack and
 /// must hand back somebody else's frame straight afterwards: this only
 /// changes what the scheduler will pick.
@@ -667,7 +683,7 @@ pub fn stop(id: usize) -> bool {
 /// Nothing the task held is reclaimed -- not its frames, not its stack, not
 /// its capabilities -- and a task blocked on it stays blocked. Those are the
 /// same gaps as everywhere else, met from a new direction.
-pub fn finish_current() -> Option<(usize, &'static str)> {
+pub fn finish_current(how: Ending) -> Option<(usize, &'static str)> {
     x86_64::without_interrupts(|| {
         let this_cpu = cpu::index();
         let mut guard = SCHEDULER.lock();
@@ -675,6 +691,7 @@ pub fn finish_current() -> Option<(usize, &'static str)> {
         let current = scheduler.current[this_cpu];
         let task = scheduler.tasks.get_mut(current)?;
         task.state = State::Finished;
+        task.ending = how;
         Some((task.id, task.name))
     })
 }
@@ -746,6 +763,7 @@ pub fn on_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
         let cs = unsafe { (*(task.saved_rsp as *const TrapFrame)).cs };
         if cs & 3 == 3 && matches!(task.state, State::Ready | State::Running) {
             task.state = State::Finished;
+            task.ending = Ending::Stopped;
         }
     }
 
@@ -905,6 +923,15 @@ pub fn current_id() -> Option<usize> {
 /// Whether a task is new, runnable, blocked or finished.
 pub fn state_of(id: usize) -> Option<State> {
     x86_64::without_interrupts(|| Some(SCHEDULER.lock().as_ref()?.tasks.get(id)?.state))
+}
+
+/// How a task finished, if it has.
+pub fn ending_of(id: usize) -> Option<Ending> {
+    x86_64::without_interrupts(|| {
+        let guard = SCHEDULER.lock();
+        let task = guard.as_ref()?.tasks.get(id)?;
+        (task.state == State::Finished).then_some(task.ending)
+    })
 }
 
 /// What a task is called.

@@ -12,8 +12,10 @@ use crate::{Error, Message};
 /// How a program that started came to the end of its output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ended {
-    /// It ended, by exiting or by a fault.
-    Ended,
+    /// It exited, with this exit code.
+    Exited(u32),
+    /// It faulted, on this exception vector, and was stopped.
+    Faulted(u8),
     /// It was still running when no more of it was shown.
     StillRunning,
     /// It ran 10 seconds and was stopped.
@@ -92,7 +94,8 @@ pub fn run(text: &str, mut each: impl FnMut(&str, bool)) -> Result<Ended, NotSta
                 break match words[0] {
                     log::END_RUNNING => Ended::StillRunning,
                     log::END_STOPPED => Ended::Stopped,
-                    _ => Ended::Ended,
+                    log::END_FAULTED => Ended::Faulted(words[1] as u8),
+                    _ => Ended::Exited(words[1] as u32),
                 };
             }
             _ => {}
@@ -100,6 +103,19 @@ pub fn run(text: &str, mut each: impl FnMut(&str, bool)) -> Result<Ended, NotSta
     };
     let _ = crate::delete(app::PROGRAM);
     Ok(ended)
+}
+
+/// A fault as Windows names the exception, and the exception code, which
+/// is also the exit code Windows gives a program it ended for one.
+pub fn exception(vector: u8) -> (&'static str, u32) {
+    match vector {
+        0 => ("integer divide by zero", 0xc000_0094),
+        3 => ("breakpoint", 0x8000_0003),
+        6 => ("illegal instruction", 0xc000_001d),
+        13 | 14 => ("access violation", 0xc000_0005),
+        17 => ("misaligned data", 0x8000_0002),
+        _ => ("unknown exception", 0xc000_0001),
+    }
 }
 
 /// 32 bytes as four little-endian words.

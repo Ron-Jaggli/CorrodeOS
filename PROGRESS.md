@@ -3306,6 +3306,45 @@ the check reads. It is now printed before the tasks start (`run_windows`).
   new one included), none FAIL, every boot's self-checks all PASS, no
   unhandled trap; `./corrode test` 356 passed (5 new); clippy at 33.
 
+## 95. How a program ended is told
+
+`win` said "ended after N lines" whether a program exited with 0,
+exited with an error, or faulted and was stopped. Now it says which.
+
+- **Kernel**: each task keeps an `Ending` -- `Exited(code)`, `Faulted(vector)`,
+  `Stopped` -- set where it finishes: `SYS_EXIT` (its code is now the
+  low 32 bits of `rdi`), the ring 3 fault path in `idt.rs`, and the tick
+  that stops a task. `task::ending_of`. The watcher puts it in the
+  output's `log::END`: `END_ENDED` with the exit code in word 1, or the
+  new `END_FAULTED` with the vector.
+- **kernel32**: `ExitProcess(code)` passes its code on
+  (`corrode_rt::exit_with`; `exit` is `exit_with(0)`).
+- **corrode_rt::win**: `Ended::Exited(code)` and `Ended::Faulted(vector)`;
+  `exception(vector)` names a fault as Windows does, with its exception
+  code -- which Windows also makes the exit code of a program it ends
+  for one: 0xc0000005 access violation (#PF, #GP), 0xc0000094 divide by
+  zero, 0xc000001d illegal instruction, 0x80000003 breakpoint,
+  0x80000002 misaligned data.
+- **Terminal**: `win: dir.exe ended after 1 lines, exit code 1`;
+  `win: fault.exe faulted: access violation (0xc0000005), after 1
+  lines`. An exit of 0 reads as before. **Files** says the same in the
+  preview's note.
+- **fault.exe** (scripts/fault-exe.S, at /programs/fault): says
+  "reading address 0", then does.
+- **win-test**: dir.exe's run that finds nothing must end with exit
+  code 1, and fault.exe's run must be told as an access violation. With
+  the watcher reporting every end as "ended, 0" (as before), both FAIL.
+
+- **Choice:** the kernel reports the vector, and the Windows name and
+  code are made in user space (`corrode_rt::win`): the kernel knows
+  nothing of Windows, and an ELF program's faults are the same events.
+- **Choice:** a stopped program's exit code is not invented; "ran 10
+  seconds and was stopped" as before.
+- Verified: the whole suite on both GPUs, 95 checks PASS on each (the
+  new one included), none FAIL, every boot's self-checks all PASS, no
+  unhandled trap (fault.exe's fault is a task fault, reported and
+  stopped); `./corrode test` 356 passed; clippy at 33.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -3477,7 +3516,9 @@ one task.
 17. [x] (section 93) A Windows program linked the default way -- at 0x1_4000_0000,
    with relocations -- is moved and its relocations applied. Host
    tests; dir.exe built that way, win-test and files-run-test.
-18. [ ] Wrap-up for the owner: what the vault run did, what to review and
+18. [x] (section 95) How a Windows program ended is told: its exit code, or the
+   fault, named as Windows names it; fault.exe; win-test, both GPUs.
+19. [ ] Wrap-up for the owner: what the vault run did, what to review and
    merge, what is still open. No code. Then stop the loop.
 
 Tasks 7-9 were added at 2026-11-22T03:10-06:00, by me (and 9, running a

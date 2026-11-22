@@ -223,7 +223,12 @@ impl Browser {
         output.push_str(&line);
         use corrode_rt::win::Ended;
         let note = match ended {
-            Ok(Ended::Ended) => format!("Ended after {lines} lines"),
+            Ok(Ended::Exited(0)) => format!("Ended after {lines} lines"),
+            Ok(Ended::Exited(code)) => format!("Ended after {lines} lines, exit code {code}"),
+            Ok(Ended::Faulted(vector)) => {
+                let (what, code) = corrode_rt::win::exception(vector);
+                format!("Faulted: {what} ({code:#x})")
+            }
             Ok(Ended::Stopped) => String::from("Ran 10 seconds and was stopped"),
             Ok(Ended::StillRunning) => String::from("Still running; no more is shown"),
             Ok(Ended::Lost) => String::from("Its output was lost"),

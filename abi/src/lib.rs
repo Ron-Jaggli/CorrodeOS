@@ -72,7 +72,9 @@ pub const SYS_CONFIG_READ: u64 = 10;
 /// Write one. Needs WRITE, and the register has to be one a driver may
 /// write. `rsi` is the offset, `rdx` the width, `r10` the value.
 pub const SYS_CONFIG_WRITE: u64 = 11;
-/// Stop, for good. Takes nothing and does not return.
+/// Stop, for good. `rdi`'s low 32 bits are the exit code, passed on to
+/// whoever ran the task (a Windows program's `ExitProcess`). Does not
+/// return.
 pub const SYS_EXIT: u64 = 12;
 /// Where one page of a memory capability is in physical memory, for telling
 /// a device. Needs WRITE. `rsi` is the page; the address comes back in `rdx`.
@@ -427,16 +429,19 @@ pub mod log {
     pub const TEXT: u64 = 1;
     pub const LINE: u64 = 2;
     /// The kernel, to whoever reads a program's output: it has ended, after
-    /// its last line. Word 0 says how: [`END_ENDED`], [`END_STOPPED`] or
-    /// [`END_RUNNING`]. The log itself ignores it.
+    /// its last line. Word 0 says how: [`END_ENDED`], [`END_FAULTED`],
+    /// [`END_STOPPED`] or [`END_RUNNING`]; word 1 is then its exit code, or
+    /// the exception vector it faulted on. The log itself ignores it.
     pub const END: u64 = 3;
-    /// It ended by itself (or faulted).
+    /// It exited by itself, with the exit code in word 1.
     pub const END_ENDED: u64 = 0;
     /// It was still running when the kernel stopped waiting, and could not
     /// be stopped: it was waiting in the kernel.
     pub const END_RUNNING: u64 = 1;
     /// It was still running at the deadline, and the kernel stopped it.
     pub const END_STOPPED: u64 = 2;
+    /// It faulted, on the exception vector in word 1, and was stopped.
+    pub const END_FAULTED: u64 = 3;
     /// Bytes in one message.
     pub const CAPACITY: usize = 32;
 }

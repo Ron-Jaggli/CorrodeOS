@@ -19,6 +19,9 @@ Windows programs (Verdigris):
                      win /programs/reader/reader.exe one "two three"
                      win /programs/dir/dir.exe *.exe
                      One that never ends is stopped after 10 seconds.
+                     An exit code other than 0 is said, and so is a
+                     fault, as Windows names it:
+                     win /programs/fault/fault.exe
 
 Things that need permission first (see capabilities.txt):
     ps       the running tasks             grant ps

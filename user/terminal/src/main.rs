@@ -679,9 +679,20 @@ fn win(path: &str, args: &[String], out: &mut Output) -> i32 {
         out.line(&line);
     }
     match ended {
-        Ended::Ended => {
+        Ended::Exited(0) => {
             println!("win: {name} ended after {lines} lines");
             0
+        }
+        Ended::Exited(code) => {
+            println!("win: {name} ended after {lines} lines, exit code {code}");
+            out.error(&format!("win: {name} ended after {lines} lines, exit code {code}"));
+            1
+        }
+        Ended::Faulted(vector) => {
+            let (what, code) = win::exception(vector);
+            println!("win: {name} faulted: {what} ({code:#x}), after {lines} lines");
+            out.error(&format!("win: {name} faulted: {what} ({code:#x})"));
+            1
         }
         Ended::StillRunning => {
             out.error(&format!("win: {name} is still running; no more of it is shown"));

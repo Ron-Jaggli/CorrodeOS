@@ -754,7 +754,8 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame) -> *mut TrapFrame {
     crate::println!("rbp {:#018x}  r8  {:#018x}", frame_ref.rbp, frame_ref.r8);
 
     if from_user {
-        if let Some((id, task)) = crate::task::finish_current() {
+        // `vector < 32`, checked above.
+        if let Some((id, task)) = crate::task::finish_current(crate::task::Ending::Faulted(vector as u8)) {
             crate::println!("stopped    : task {id} ({task}); everything else carries on");
         }
         // The frame is abandoned where it lies. The scheduler hands back

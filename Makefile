@@ -166,16 +166,19 @@ ROOT_TAR := build/root.tar
 READER_EXE := build/reader.exe
 SPIN_EXE := build/spin.exe
 DIR_EXE := build/dir.exe
+FAULT_EXE := build/fault.exe
 ROOT_FILES := $(shell find root 2>/dev/null)
 # With reader.exe at /programs/reader, spin.exe (which never ends) at
-# /programs/spin and dir.exe (compiled, not assembled) at /programs/dir,
-# for the terminal's `win`: after
+# /programs/spin, fault.exe (which faults) at /programs/fault and dir.exe
+# (compiled, not assembled) at /programs/dir, for the terminal's `win`:
+# after
 # every other top folder, so none of them moves in Files.
-$(ROOT_TAR): $(ROOT_FILES) $(READER_EXE) $(SPIN_EXE) $(DIR_EXE)
+$(ROOT_TAR): $(ROOT_FILES) $(READER_EXE) $(SPIN_EXE) $(DIR_EXE) $(FAULT_EXE)
 	@mkdir -p build
 	@rm -rf build/root_staged && cp -r root build/root_staged
 	@mkdir -p build/root_staged/programs/reader && cp $(READER_EXE) build/root_staged/programs/reader/reader.exe
 	@mkdir -p build/root_staged/programs/spin && cp $(SPIN_EXE) build/root_staged/programs/spin/spin.exe
+	@mkdir -p build/root_staged/programs/fault && cp $(FAULT_EXE) build/root_staged/programs/fault/fault.exe
 	@mkdir -p build/root_staged/programs/dir && cp $(DIR_EXE) build/root_staged/programs/dir/dir.exe
 	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
 	    --mtime=@0 --mode=u+rw,go+r,go-w -C build/root_staged -cf $@ .
@@ -208,6 +211,10 @@ $(DIR_EXE): scripts/dir-exe.sh verdigris/dir/src/main.rs
 $(SPIN_EXE): scripts/reader-exe.sh scripts/spin-exe.S
 	@mkdir -p build
 	bash scripts/reader-exe.sh $@ spin-exe.S
+
+$(FAULT_EXE): scripts/reader-exe.sh scripts/fault-exe.S
+	@mkdir -p build
+	bash scripts/reader-exe.sh $@ fault-exe.S
 
 KERNEL32_TARGET := target/verdigris
 KERNEL32 := $(KERNEL32_TARGET)/x86_64-unknown-none/release/kernel32
@@ -1573,6 +1580,8 @@ WIN_SPIN_KEYS := w i n spc slash p r o g r a m s slash s p i n slash s p i n dot
 # pattern nothing matches.
 WIN_DIR_KEYS := w i n spc slash p r o g r a m s slash d i r slash d i r dot e x e ret
 WIN_DIR_NONE_KEYS := up spc x shift-8 dot t x t ret
+# fault.exe, which reads address 0.
+WIN_FAULT_KEYS := w i n spc slash p r o g r a m s slash f a u l t slash f a u l t dot e x e ret
 # Frames a `win` run may keep once the next one has started: none. Its
 # tasks are given back, and so is the memory it and its view shared.
 WIN_RUN_FRAMES ?= 0
@@ -1592,8 +1601,9 @@ win-test: iso
 	   for key in up up ret; do echo "sendkey $$key"; sleep 0.12; done; sleep 2.5; \
 	   for key in $(WIN_DIR_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 2.5; \
 	   for key in $(WIN_DIR_NONE_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 2.5; \
+	   for key in $(WIN_FAULT_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 2.5; \
 	   echo "screendump build/win.ppm"; sleep 1; echo quit ) \
-	  | timeout --foreground 200 qemu-system-x86_64 $(QEMU_COMMON) \
+	  | timeout --foreground 210 qemu-system-x86_64 $(QEMU_COMMON) \
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
 	@tr -d '\r' < build/serial.log > build/win-lines.log
 	@grep -a "^terminal   : win\|^desktop    : /programs\|^desktop    : task" build/win-lines.log || echo "win-test: nothing from win"
@@ -1619,8 +1629,13 @@ win-test: iso
 	    && grep -aqxF "terminal   : win: dir.exe: dir.exe  $$size" build/win-lines.log \
 	    && grep -aqxF "terminal   : win: dir.exe: 1 files, $$size bytes" build/win-lines.log \
 	    && grep -aqxF 'terminal   : win: dir.exe: dir: x*.txt: error 2' build/win-lines.log \
+	    && grep -aqxF 'terminal   : win: dir.exe ended after 1 lines, exit code 1' build/win-lines.log \
 	    && echo "win-test: a compiled program lists its folder      PASS" \
 	    || echo "win-test: a compiled program lists its folder      FAIL"
+	@grep -aqxF 'terminal   : win: fault.exe: reading address 0' build/win-lines.log \
+	    && grep -aqxF 'terminal   : win: fault.exe faulted: access violation (0xc0000005), after 1 lines' build/win-lines.log \
+	    && echo "win-test: a fault is told as Windows tells it      PASS" \
+	    || echo "win-test: a fault is told as Windows tells it      FAIL"
 	@test $$(grep -acE '^verdigris  : moved from 0x140000000 to 0x400000, [1-9][0-9]* relocations$$' build/win-lines.log) -eq 2 \
 	    && echo "win-test: it was moved from where its linker put it PASS" \
 	    || echo "win-test: it was moved from where its linker put it FAIL"

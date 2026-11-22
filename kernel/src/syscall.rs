@@ -386,7 +386,8 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
         }
 
         SYS_EXIT => {
-            task::finish_current();
+            // The code is the low 32 bits of rdi: a Windows exit code.
+            task::finish_current(task::Ending::Exited(frame.rdi as u32));
             return task::on_tick(frame as *mut TrapFrame);
         }
 
