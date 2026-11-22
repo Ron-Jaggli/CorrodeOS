@@ -2,9 +2,11 @@
 //! terminal's `win` and Files both do: the text sent ahead of `RUN`, then
 //! the program's output read line by line until the kernel says it ended.
 //!
-//! The window server takes `RUN` from the terminal and Files alone, starts
-//! the program seeing its own folder, and hands back the endpoint its
-//! output goes to. That lands in `app::PROGRAM`, deleted again at the end.
+//! The window server takes `RUN` on its runner's endpoint alone
+//! (`app::RUNNER`, which the terminal and Files are given with the files),
+//! starts the program seeing its own folder, and hands back the endpoint
+//! its output goes to. That lands in `app::PROGRAM`, deleted again at the
+//! end.
 
 use crate::abi::{app, log, window};
 use crate::{Error, Message};
@@ -34,7 +36,7 @@ pub enum NotStarted {
     /// The call to the window server failed.
     NoAnswer(Error),
     /// The window server said no, with a Windows error number: 2, no such
-    /// file; 5, the caller may not run one; 193, not a program.
+    /// file; 5, the caller holds no runner endpoint; 193, not a program.
     Refused(u64),
 }
 
@@ -46,7 +48,7 @@ impl NotStarted {
             NotStarted::NotTaken => "the desktop would not take the command line",
             NotStarted::NoAnswer(_) => "the desktop did not answer",
             NotStarted::Refused(2) => "no such file",
-            NotStarted::Refused(5) => "only the terminal and Files may run one",
+            NotStarted::Refused(5) => "this program may not run one",
             NotStarted::Refused(193) => "not a program Verdigris runs",
             NotStarted::Refused(_) => "not started",
         }
@@ -63,13 +65,13 @@ pub fn run(text: &str, mut each: impl FnMut(&str, bool)) -> Result<Ended, NotSta
     for chunk in text.as_bytes().chunks(32) {
         let mut bytes = [0u8; 32];
         bytes[..chunk.len()].copy_from_slice(chunk);
-        let taken = crate::call(app::WINDOWS, Message::new(window::RUN_TEXT, words_of(&bytes)), None);
+        let taken = crate::call(app::RUNNER, Message::new(window::RUN_TEXT, words_of(&bytes)), None);
         if !taken.is_ok_and(|answer| answer.message.words[0] == 1) {
             return Err(NotStarted::NotTaken);
         }
     }
     let _ = crate::delete(app::PROGRAM);
-    let answer = crate::call(app::WINDOWS, Message::new(window::RUN, [0; 4]), Some(app::PROGRAM))
+    let answer = crate::call(app::RUNNER, Message::new(window::RUN, [0; 4]), Some(app::PROGRAM))
         .map_err(NotStarted::NoAnswer)?
         .message
         .words;

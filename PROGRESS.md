@@ -3345,6 +3345,55 @@ exited with an error, or faulted and was stopped. Now it says which.
   unhandled trap (fault.exe's fault is a task fault, reported and
   stopped); `./corrode test` 356 passed; clippy at 33.
 
+## 96. Running a program is a capability, not a name
+
+Since section 85 the window server ran a Windows program for a caller
+whose task was *named* "terminal" (and "files" since section 92). The
+kernel's own rule says otherwise: a message's sender is "information,
+not authority" (`ipc::Received::from`). It was also open to a nuisance:
+any program could send `RUN_TEXT` and so reset the text the terminal
+was collecting between its `RUN_TEXT` calls and its `RUN`.
+
+Now it is a capability, in the shape the desktop shell already has:
+
+- **The runner** (`runner_server`, `Serves::Runner`): a third task of
+  the window server, on an endpoint of its own (bootstrap's slot 81),
+  taking every window call and, alone, `RUN_TEXT` and `RUN`. On the
+  window server's and the shell's endpoints `RUN_TEXT` keeps nothing and
+  answers 0, and `RUN` answers 5 (access denied), logged.
+- **Who holds it**: the launcher hands `app::RUNNER` (slot 10),
+  send-only, with the files -- `start_app` grants it wherever it grants
+  `app::FILES`, so the terminal and Files, and no other program.
+- **The log with GRANT**, which a run hands to its view, moves from the
+  window server to the runner: the window server holds less than it did.
+- **corrode_rt::win** calls the runner. `run_for` names the caller in
+  the log ("started for Files") and decides nothing.
+
+- **Verified negative:** with `corrode_rt::win` calling the plain window
+  endpoint, which every app holds, win-test's runs and files-run-test
+  all FAIL (nothing is taken there).
+
+Found on the way, and fixed: win-test's frames check reads the
+"started" line and the "frames free" line after it, and on this build
+the terminal's echo of its next command came between them twice, from
+another CPU. Both lines are now one print, which holds the console
+lock for the whole of it.
+
+- **Choice:** the runner goes with the files rather than being a
+  parameter of its own: only the programs that may read the files may
+  run programs from them, and `start_app` stays at seven parameters.
+- **Choice:** a third task rather than a flag on the window server's
+  endpoint: an endpoint is the unit the kernel gives rights to, and the
+  shell set the pattern.
+- Verified, partly: the suite was stopped at the owner's word before it
+  finished. Default GPU, all 95 checks PASS; virtio, 70 of 95 run, all
+  PASS, none FAIL; no unhandled trap. One default boot (menu-test) had
+  the clock-against-PIT self-check FAIL once, the same flake as in
+  section 92, read this time from the kept serial log. win-test and
+  files-run-test, the two that run programs, passed on the default GPU
+  in the suite and in the runs above. `./corrode test` 356 passed;
+  clippy at 33. Committed at the owner's word, without the virtio half.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -3518,7 +3567,10 @@ one task.
    tests; dir.exe built that way, win-test and files-run-test.
 18. [x] (section 95) How a Windows program ended is told: its exit code, or the
    fault, named as Windows names it; fault.exe; win-test, both GPUs.
-19. [ ] Wrap-up for the owner: what the vault run did, what to review and
+19. [x] (section 96) The right to run a Windows program is a capability, not a task
+   name: a runner endpoint handed with the files; RUN and RUN_TEXT
+   taken there alone; win-test and files-run-test, both GPUs.
+20. [ ] Wrap-up for the owner: what the vault run did, what to review and
    merge, what is still open. No code. Then stop the loop.
 
 Tasks 7-9 were added at 2026-11-22T03:10-06:00, by me (and 9, running a

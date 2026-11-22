@@ -2064,6 +2064,9 @@ const LAUNCHER_ENDPOINT: cap::CapPtr = 65;
 /// caller's own windows, for the few programs that are the desktop.
 /// Clear of the pool slots just below it (66-69).
 const SHELL_ENDPOINT: cap::CapPtr = 80;
+/// The runner's: the window server's calls that run a Windows program from
+/// the files (`window::RUN`), for the programs given the files.
+const RUNNER_ENDPOINT: cap::CapPtr = 81;
 /// The sealers: Settings' and the lock screen's, each with a key of its own
 /// in the secure core. 70 and up, clear of the pool's (66-69) and of the
 /// disk's (82-91, in `store`).
@@ -2096,6 +2099,8 @@ const LAUNCHER_SHELL_SLOT: cap::CapPtr = 7;
 /// The sealers, to hand Settings and the lock screen, one each.
 const LAUNCHER_SETTINGS_SEALER: cap::CapPtr = 8;
 const LAUNCHER_LOCK_SEALER: cap::CapPtr = 9;
+/// The runner's endpoint, handed with the files.
+const LAUNCHER_RUNNER_SLOT: cap::CapPtr = 10;
 
 fn desktop_check(name: &str, ok: bool) {
     check("desktop", name, ok);
@@ -2108,20 +2113,38 @@ fn desktop_check(name: &str, ok: bool) {
 /// show it to the renderer. Placing the window, and everything after, is the
 /// painter's: this task only makes them.
 extern "C" fn window_server() {
-    serve(false);
+    serve(Serves::Windows);
 }
 
 /// The desktop shell: the same calls, and those that reach past the
 /// caller's windows, for whoever holds its endpoint.
 extern "C" fn shell_server() {
-    serve(true);
+    serve(Serves::Shell);
+}
+
+/// The runner: the same calls, and `window::RUN`, for whoever holds its
+/// endpoint -- the programs given the files to read.
+extern "C" fn runner_server() {
+    serve(Serves::Runner);
+}
+
+/// Which endpoint a window server task answers on, and so which calls it
+/// takes beyond the ones every window does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Serves {
+    Windows,
+    /// `window::SHELL_ONLY`.
+    Shell,
+    /// `window::RUN_TEXT` and `RUN`.
+    Runner,
 }
 
 /// Answer window calls on the endpoint in this task's service slot. Only
 /// the shell's takes `window::SHELL_ONLY`; the window server's answers
 /// those with `window::DENIED`, so holding a window is not holding the
 /// desktop.
-fn serve(shell: bool) {
+fn serve(serves: Serves) {
+    let (shell, runner) = (serves == Serves::Shell, serves == Serves::Runner);
     use corrode_abi::window;
 
     // `window::RUN_TEXT` so far: whose, and what.
@@ -2202,22 +2225,31 @@ fn serve(shell: bool) {
             continue;
         }
         if received.message.label == window::RUN_TEXT {
-            // Collected for the `RUN` after it, from the terminal and Files
-            // alone.
-            let terminal = runs_for(received.from).is_some();
-            if run_text.as_ref().is_none_or(|(from, _)| *from != received.from) {
+            // Collected for the `RUN` after it, on the runner's endpoint
+            // alone: anywhere else nothing is kept, so no other program can
+            // spoil a run between its text and its `RUN`.
+            if runner && run_text.as_ref().is_none_or(|(from, _)| *from != received.from) {
                 run_text = Some((received.from, alloc::string::String::new()));
             }
             let raw = passcode_of(words);
             let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
             let taken = match (&mut run_text, core::str::from_utf8(&raw[..end])) {
-                (Some((_, text)), Ok(part)) if terminal && text.len() + part.len() <= window::RUN_TEXT_MOST => {
+                (Some((_, text)), Ok(part)) if runner && text.len() + part.len() <= window::RUN_TEXT_MOST => {
                     text.push_str(part);
                     1
                 }
                 _ => 0,
             };
             let answer = ipc::Message { label: window::RUN_TEXT, words: [taken, 0, 0, 0] };
+            let _ = ipc::reply(SERVICE_REPLY_SLOT, answer, None);
+            continue;
+        }
+        if received.message.label == window::RUN && !runner {
+            println!(
+                "desktop    : refused to run a program for task {}: it holds no runner capability",
+                received.from
+            );
+            let answer = ipc::Message { label: window::RUN, words: [0, 5, 0, 0] };
             let _ = ipc::reply(SERVICE_REPLY_SLOT, answer, None);
             continue;
         }
@@ -2487,8 +2519,11 @@ fn start_app(
     if let Some(slot) = launcher_slot {
         cap::grant(id, slot, app::LAUNCHER, Rights::WRITE)?;
     }
+    // Running a program from the files goes with the files: only the
+    // launcher hands them out, and holds the runner's endpoint to give with.
     if let Some(slot) = files_slot {
         cap::grant(id, slot, app::FILES, Rights::READ)?;
+        cap::grant(id, LAUNCHER_RUNNER_SLOT, app::RUNNER, Rights::WRITE)?;
     }
     if let Some(slot) = shell_slot {
         cap::grant(id, slot, app::SHELL, Rights::WRITE)?;
@@ -2528,6 +2563,13 @@ fn start_desktop() {
         && cap::mint(
             0,
             SHELL_ENDPOINT,
+            Object::Endpoint(ipc::Endpoint::new()),
+            Rights::ALL,
+        )
+        .is_ok()
+        && cap::mint(
+            0,
+            RUNNER_ENDPOINT,
             Object::Endpoint(ipc::Endpoint::new()),
             Rights::ALL,
         )
@@ -2573,19 +2615,23 @@ fn start_desktop() {
 
     let server = task::spawn("windows", window_server);
     let shell = task::spawn("shell", shell_server);
+    let runner = task::spawn("runner", runner_server);
     let launcher_task = task::spawn("launcher", launcher);
     let granted = server.is_some_and(|id| {
         cap::grant(id, WINDOWS_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
-            // For the views of the programs the terminal runs (`window::RUN`).
-            && cap::grant(id, LOG_ENDPOINT, SERVICE_LOG_SLOT, Rights::WRITE_GRANT).is_ok()
     }) && shell.is_some_and(|id| {
         cap::grant(id, SHELL_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
+    }) && runner.is_some_and(|id| {
+        cap::grant(id, RUNNER_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
+            // For the views of the programs it runs (`window::RUN`).
+            && cap::grant(id, LOG_ENDPOINT, SERVICE_LOG_SLOT, Rights::WRITE_GRANT).is_ok()
     }) && launcher_task.is_some_and(|id| {
         cap::grant(id, LAUNCHER_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
             && cap::grant(id, WINDOWS_ENDPOINT, LAUNCHER_WINDOWS_SLOT, Rights::ALL).is_ok()
             && cap::grant(id, LOG_ENDPOINT, LAUNCHER_LOG_SLOT, Rights::ALL).is_ok()
             && cap::grant(id, LAUNCHER_ENDPOINT, LAUNCHER_SELF_SLOT, Rights::ALL).is_ok()
             && cap::grant(id, SHELL_ENDPOINT, LAUNCHER_SHELL_SLOT, Rights::ALL).is_ok()
+            && cap::grant(id, RUNNER_ENDPOINT, LAUNCHER_RUNNER_SLOT, Rights::ALL).is_ok()
             && cap::grant(id, SETTINGS_SEALER, LAUNCHER_SETTINGS_SEALER, Rights::ALL).is_ok()
             && cap::grant(id, LOCK_SEALER, LAUNCHER_LOCK_SEALER, Rights::ALL).is_ok()
     });
@@ -2599,7 +2645,7 @@ fn start_desktop() {
     if let Some(id) = server {
         WINDOW_SERVER.store(id, Ordering::Release);
     }
-    start_all(&[server, shell, launcher_task]);
+    start_all(&[server, shell, runner, launcher_task]);
 }
 
 /// A passcode as `window::UNLOCK` and the change calls carry it.
@@ -2611,30 +2657,28 @@ fn passcode_of(words: [u64; 4]) -> corrode_theme::passcode::Code {
     code
 }
 
-/// Who may run a Windows program from the files (`window::RUN`): the
-/// terminal (`win`) and Files (opening one). As the log says it.
-fn runs_for(task: usize) -> Option<&'static str> {
-    match task::name_of(task)? {
-        "terminal" => Some("the terminal"),
-        "files" => Some("Files"),
-        _ => None,
+/// Whom a program was run for, as the log says it. Information, not
+/// authority: holding the runner's endpoint is what lets a task run one.
+fn run_for(task: usize) -> &'static str {
+    match task::name_of(task) {
+        Some("terminal") => "the terminal",
+        Some("files") => "Files",
+        Some(name) => name,
+        None => "a task that has gone",
     }
 }
 
-/// `window::RUN`: the terminal or Files runs a Windows program from the
-/// files. Its view is its own folder alone; its output goes to an endpoint
-/// the caller is handed, to receive on; a watcher ends that output when
-/// the program ends, however it ends.
+/// `window::RUN`, on the runner's endpoint: a program given the files --
+/// the terminal, Files -- runs a Windows program from them. Its view is
+/// its own folder alone; its output goes to an endpoint the caller is
+/// handed, to receive on; a watcher ends that output when the program
+/// ends, however it ends.
 fn run_windows(from: usize, text: &str) -> ([u64; 4], Option<(cap::CapPtr, cap::Rights)>) {
-    const ACCESS_DENIED: u64 = 5;
     const FILE_NOT_FOUND: u64 = 2;
     const BAD_EXE_FORMAT: u64 = 193;
     let refuse = |code: u64| ([0, code, 0, 0], None);
 
-    let Some(caller) = runs_for(from) else {
-        println!("desktop    : task {from} is not the terminal or Files; it runs no program");
-        return refuse(ACCESS_DENIED);
-    };
+    let caller = run_for(from);
     if vault::locked() {
         return refuse(FILE_NOT_FOUND);
     }
@@ -2690,12 +2734,15 @@ fn run_windows(from: usize, text: &str) -> ([u64; 4], Option<(cap::CapPtr, cap::
         arch::x86_64::without_interrupts(|| WATCHES.lock().push(Watch { watcher: id, program, server }));
     }
     // What the run has cost so far: with the earlier runs' tasks given back
-    // as this one was set up, this stays level from run to run. Said before
-    // its tasks start, so nothing they take, and nothing they print, comes
-    // between.
+    // as this one was set up, this stays level from run to run. Taken before
+    // its tasks start, so nothing they take is in it; and said in one print
+    // with the line before, so nothing any other task prints comes between.
     let (objects, _) = memory::stats();
-    println!("desktop    : {path} started for {caller}, seeing {folder} alone");
-    println!("desktop    : {} frames free, {objects} memory objects", mm::frame::stats().0);
+    println!(
+        "desktop    : {path} started for {caller}, seeing {folder} alone\n\
+         desktop    : {} frames free, {objects} memory objects",
+        mm::frame::stats().0
+    );
     start_all(&[Some(server), Some(program), watcher.filter(|_| watching)]);
     // Received on, not sent to, and not passed on.
     ([1, 0, 0, 0], Some((SERVICE_SPARE_SLOT, cap::Rights::READ)))
