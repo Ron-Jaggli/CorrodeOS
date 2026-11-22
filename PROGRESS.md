@@ -3394,6 +3394,120 @@ lock for the whole of it.
   in the suite and in the runs above. `./corrode test` 356 passed;
   clippy at 33. Committed at the owner's word, without the virtio half.
 
+## 97. Wrap-up of the vault run
+
+The owner asked for the kernel checked rather than encrypted, the root
+directory encrypted on the disk, for me to make the decisions, and to
+keep at it for 15 hours. Done on branch `vault`, off `verdigris`, from
+2026-11-21 23:40 to 2026-11-22 12:00 (CST), in 19 tasks; stopped there
+at the owner's word, 2 h 40 min before the cap. Nothing was
+committed to main or desktop-glass, and kernel/src/input.rs's
+uncommitted change is untouched.
+
+**What changed, task by task**
+
+| # | Commit | What | Scored test |
+|---|--------|------|-------------|
+| 1 | 69513c3 | Limine checks the hash of every file it loads; the config's own hash is built into Limine | `verify-test` |
+| 2 | 54044f1 | The root directory sealed on the disk under the passcode (PBKDF2-SHA-256, AES-128-CCM); lock screen first; no files until the passcode is given | `vault-test` |
+| 3 | 42c08fd | Passcodes of 4 to 32 characters: letters, digits, symbols | `vault-test` |
+| 4 | 4d1c74e | Change the passcode in Settings: sealed again into the other slot, header written last | `rekey-test` |
+| 5 | b39eea0 | README: making and booting a vault, what it does and does not protect against | -- |
+| 6 | a80ccc6 | Windows programs read files through a pruned view | `pe-test` |
+| 7 | e4f665b | ... and search directories | `pe-test` |
+| 8 | a0ae275 | ... with a current directory, and only `C:\` paths given out | `pe-test` |
+| 9 | be1ef9d | `win PATH` in the terminal: a Windows program from the files, seeing its own folder alone | `win-test` |
+| 10 | 72b96fa | A finished task gives back its stack, its memory and its capabilities | `win-test` |
+| 11 | 07c030b | Shared memory goes back when nothing holds or maps it | `win-test` |
+| 12 | 481f7ab | `win PATH ARGS` and `GetCommandLineW` | `win-test` |
+| 13 | 3b4133e | A program still running at `win`'s 10 s deadline is stopped | `win-test` |
+| 14 | 12c09a5 | A call to a server that has ended is refused, not waited on for good | boot self-checks |
+| 15 | 5bcf747 | dir.exe: a Windows program written in Rust and linked by rust-lld, not by hand | `win-test` |
+| 16 | 39f238f | Files runs a `.exe`: Return on it, its output in the preview | `files-run-test` |
+| 17 | c67f07d | A program linked the default way (at 0x1_4000_0000) is moved, its relocations applied | `win-test`, host tests |
+| 18 | 6e17662 | How a program ended is told: its exit code, or its fault as Windows names it | `win-test` |
+| 19 | 4382f25 | Running a Windows program is a capability (a runner endpoint given with the files), not a task name | `win-test`, `files-run-test` |
+
+Every commit but the last had the whole suite pass on both GPUs (95
+checks each at the end, up from 63 before the run); the last was stopped
+with 165 of 190 run, all PASS (section 96). Each had `./corrode test` (356 host tests
+at the end, 333 after the first task), and clippy at its 33 warnings,
+none new.
+
+**How to try it**
+
+```sh
+./corrode vault-disk VAULT_PASSCODE=Rust4ever   # seal root/ into build/vault.img
+./corrode run-vault                             # boot it; the lock screen asks
+```
+
+Then in the terminal: `win /programs/dir/dir.exe`, or open Files, go to
+programs > dir, select dir.exe and press Return.
+
+**What to review before merging** (`git log verdigris..vault`)
+
+- **The disk has two writers** now: the theme and the vault. The driver
+  refuses the vault's write for the theme's sector, and one call at a
+  time goes through `store::alone` (section 80).
+- **The window server holds more than it did**: a send-only capability
+  to the disk driver, to seal the vault again when Settings changes the
+  passcode (section 80); and the log with GRANT, to hand to the views of
+  the programs it runs (section 85).
+- **Kernel stacks are 32 KiB**, up from 16 (section 85).
+- **Memory is given back now** (sections 86, 87, 89, 90), where before
+  nothing ever was. That changes what every task's end does. The rules:
+  a task is reaped only after its own CPU has left it; a memory object
+  only when no capability names it and no space maps it; a task is
+  stopped only in ring 3; a reaped server's unanswered callers are
+  refused. What the kernel maps for itself is never given back.
+- **Who may run a Windows program** is a capability (section 96): the
+  runner endpoint, which the launcher gives with the files. The window
+  server is now three tasks: windows, shell, runner.
+- **`SYS_EXIT` now reads `rdi`** as the exit code, and each task
+  records how it ended (section 95). Any program that calls it with
+  junk in `rdi` merely reports a junk code.
+- **The PE loader moves programs** (section 93): the relocation table
+  is untrusted input read in ring 0. It is checked whole before use and
+  fuzzed on the build host.
+- **dir.exe's build uses `RUSTC_BOOTSTRAP=1`**, in scripts/dir-exe.sh
+  only, to build `core` for the Windows target offline (section 91).
+- `verify-test` shows Limine refuses changed files. On real hardware the
+  chain starts with Secure Boot signing Limine, which is not set up here.
+
+**Still open, none blocking**
+
+- The opened files stay in memory until shutdown; locking does not seal
+  them again. Doing so means programs lose files they have open: a
+  logout, not a lock. The vault is read-only while running.
+- No recovery code and no TPM: a forgotten passcode loses the files, as
+  the README says.
+- Verdigris: where a person's allowlists are kept; a Windows program
+  that faults cannot be unwound (`.pdata` is ignored); no
+  randomised base. DESIGN.md's six earlier open decisions are unchanged
+  (section 76).
+- A live server that never answers still keeps its caller waiting
+  (section 90). Files waits while a program it ran runs, up to 10 s.
+- Command-line quoting is the simple form (section 88).
+- One boot self-check, the clock-against-PIT check, can flip under a
+  heavily loaded host (sections 92, 96).
+- Task 19's virtio half of the suite was not run to the end.
+
+**Verdigris, honestly**: built into the system and tested, not yet a
+Windows. A program loads, is moved and linked by the kernel, runs as an
+ordinary task seeing its own folder alone, is stopped if it hangs, and
+is told how it ended. But kernel32 has 16 functions, there is no C
+runtime, no other DLL, no threads, TLS or exceptions, no input and no
+windows: small console programs only. The next step is a minimal C
+runtime and more of kernel32, so an ordinary compiled console program
+runs.
+
+**Verdigris as a project of its own** (planned, not done): it is spread
+over `verdigris/`, `pe/`, `user/fileview`, `corrode_rt::win` and about
+400 lines of kernel/src/main.rs. Moving `pe` and `fileview` under
+`verdigris/` and the kernel's part into one kernel/src/verdigris.rs
+would make it one subtree that needs only CorrodeOS's `abi` and `rt`.
+It cannot leave CorrodeOS: it speaks CorrodeOS's IPC and capabilities.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -3570,7 +3684,8 @@ one task.
 19. [x] (section 96) The right to run a Windows program is a capability, not a task
    name: a runner endpoint handed with the files; RUN and RUN_TEXT
    taken there alone; win-test and files-run-test, both GPUs.
-20. [ ] Wrap-up for the owner: what the vault run did, what to review and
+20. [x] (section 97) Wrap-up for the owner. The run stopped here, at
+   12:00, at the owner's word.: what the vault run did, what to review and
    merge, what is still open. No code. Then stop the loop.
 
 Tasks 7-9 were added at 2026-11-22T03:10-06:00, by me (and 9, running a
