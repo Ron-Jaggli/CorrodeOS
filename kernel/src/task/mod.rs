@@ -128,6 +128,10 @@ pub struct Task {
     pub stopping: bool,
     /// How it finished, once it has.
     pub ending: Ending,
+    /// Its GS base while it runs: a Windows program's TEB, else 0. Written
+    /// on every switch, so no task ever runs with another's. The kernel
+    /// itself never uses GS.
+    gs_base: u64,
 }
 
 /// How a task finished.
@@ -228,6 +232,7 @@ pub fn init() {
             left: false,
             stopping: false,
             ending: Ending::Exited(0),
+            gs_base: 0,
         }];
         let root = crate::mm::paging::kernel_root().unwrap_or(0);
         *guard = Some(Scheduler {
@@ -297,6 +302,7 @@ pub fn adopt_as_idle(cpu_index: usize, stack_top: u64) {
             left: false,
             stopping: false,
             ending: Ending::Exited(0),
+            gs_base: 0,
         });
 
         scheduler.current[cpu_index] = id;
@@ -519,6 +525,7 @@ fn spawn_inner(
             left: false,
             stopping: false,
             ending: Ending::Exited(0),
+            gs_base: image.map_or(0, |image| image.gs_base),
         });
         Some(id)
     })?;
@@ -825,6 +832,13 @@ pub fn on_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
         // SAFETY: every general CPU enables SSE before its first task, and
         // each image is INITIAL or one `fxsave` wrote.
         unsafe { x86_64::fpu::switch(&mut from.fpu, &to.fpu) };
+        // Always written, never skipped when it looks unchanged: a program
+        // may have zeroed its own by loading a segment selector, and the
+        // next task to use the same TEB address must still find it.
+        //
+        // SAFETY: IA32_GS_BASE takes any canonical address; a TEB is one,
+        // and the kernel never reads through GS.
+        unsafe { x86_64::write_gs_base(to.gs_base) };
     }
     scheduler.tasks[next].state = State::Running;
 

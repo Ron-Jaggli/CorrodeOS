@@ -152,6 +152,22 @@ unsafe fn write_msr(msr: u32, value: u64) {
     }
 }
 
+/// `IA32_GS_BASE`: where `gs:[0]` points. The kernel never uses GS, so
+/// this is ring 3's alone: a Windows program's TEB, or 0.
+const IA32_GS_BASE: u32 = 0xc000_0101;
+
+/// Point GS at `base` for whatever runs next on this CPU. Ring 3 cannot set
+/// it itself: `CR4.FSGSBASE` stays off, so `wrgsbase` is an invalid opcode,
+/// and loading a selector only ever zeroes it.
+///
+/// # Safety
+/// `base` must be canonical, or the write faults.
+pub unsafe fn write_gs_base(base: u64) {
+    // SAFETY: the register exists on every x86-64 CPU; the caller
+    // guarantees the value is canonical.
+    unsafe { write_msr(IA32_GS_BASE, base) };
+}
+
 /// Turn on the two protections our page tables rely on.
 ///
 /// * `EFER.NXE` makes bit 63 of a page table entry mean "no execute". Without

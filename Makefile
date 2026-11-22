@@ -167,19 +167,21 @@ READER_EXE := build/reader.exe
 SPIN_EXE := build/spin.exe
 DIR_EXE := build/dir.exe
 FAULT_EXE := build/fault.exe
+HELLO_C_EXE := build/hello-c.exe
 ROOT_FILES := $(shell find root 2>/dev/null)
 # With reader.exe at /programs/reader, spin.exe (which never ends) at
 # /programs/spin, fault.exe (which faults) at /programs/fault and dir.exe
 # (compiled, not assembled) at /programs/dir, for the terminal's `win`:
 # after
 # every other top folder, so none of them moves in Files.
-$(ROOT_TAR): $(ROOT_FILES) $(READER_EXE) $(SPIN_EXE) $(DIR_EXE) $(FAULT_EXE)
+$(ROOT_TAR): $(ROOT_FILES) $(READER_EXE) $(SPIN_EXE) $(DIR_EXE) $(FAULT_EXE) $(HELLO_C_EXE)
 	@mkdir -p build
 	@rm -rf build/root_staged && cp -r root build/root_staged
 	@mkdir -p build/root_staged/programs/reader && cp $(READER_EXE) build/root_staged/programs/reader/reader.exe
 	@mkdir -p build/root_staged/programs/spin && cp $(SPIN_EXE) build/root_staged/programs/spin/spin.exe
 	@mkdir -p build/root_staged/programs/fault && cp $(FAULT_EXE) build/root_staged/programs/fault/fault.exe
 	@mkdir -p build/root_staged/programs/dir && cp $(DIR_EXE) build/root_staged/programs/dir/dir.exe
+	@mkdir -p build/root_staged/programs/c && cp $(HELLO_C_EXE) build/root_staged/programs/c/hello.exe
 	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
 	    --mtime=@0 --mode=u+rw,go+r,go-w -C build/root_staged -cf $@ .
 
@@ -207,6 +209,13 @@ $(READER_EXE): verdigris/scripts/reader-exe.sh verdigris/scripts/reader-exe.S
 $(DIR_EXE): verdigris/scripts/dir-exe.sh verdigris/dir/src/main.rs
 	@mkdir -p build
 	bash verdigris/scripts/dir-exe.sh $@
+
+# A C program compiled the ordinary way, by mingw-w64's gcc with no flags of
+# Verdigris's: it imports msvcrt.dll and kernel32.dll and starts through
+# mingw's own start-up code. A test program only; Verdigris is Rust.
+$(HELLO_C_EXE): verdigris/c/hello.c
+	@mkdir -p build
+	x86_64-w64-mingw32-gcc -O2 -o $@ $<
 
 $(SPIN_EXE): verdigris/scripts/reader-exe.sh verdigris/scripts/spin-exe.S
 	@mkdir -p build
@@ -1582,6 +1591,11 @@ WIN_DIR_KEYS := w i n spc slash p r o g r a m s slash d i r slash d i r dot e x 
 WIN_DIR_NONE_KEYS := up spc x shift-8 dot t x t ret
 # fault.exe, which reads address 0.
 WIN_FAULT_KEYS := w i n spc slash p r o g r a m s slash f a u l t slash f a u l t dot e x e ret
+# hello.exe, a C program compiled by mingw-w64's gcc (verdigris/c/hello.c):
+# through msvcrt.dll's start-up, with arguments, then without.
+WIN_C_KEYS := w i n spc slash p r o g r a m s slash c slash h e l l o dot e x e \
+              spc o n e spc shift-apostrophe t w o spc t h r e e shift-apostrophe ret
+WIN_C_BARE_KEYS := w i n spc slash p r o g r a m s slash c slash h e l l o dot e x e ret
 # Frames a `win` run may keep once the next one has started: none. Its
 # tasks are given back, and so is the memory it and its view shared.
 WIN_RUN_FRAMES ?= 0
@@ -1602,8 +1616,10 @@ win-test: iso
 	   for key in $(WIN_DIR_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 2.5; \
 	   for key in $(WIN_DIR_NONE_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 2.5; \
 	   for key in $(WIN_FAULT_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 2.5; \
+	   for key in $(WIN_C_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 3; \
+	   for key in $(WIN_C_BARE_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 3; \
 	   echo "screendump build/win.ppm"; sleep 1; echo quit ) \
-	  | timeout --foreground 210 qemu-system-x86_64 $(QEMU_COMMON) \
+	  | timeout --foreground 240 qemu-system-x86_64 $(QEMU_COMMON) \
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
 	@tr -d '\r' < build/serial.log > build/win-lines.log
 	@grep -a "^terminal   : win\|^desktop    : /programs\|^desktop    : task" build/win-lines.log || echo "win-test: nothing from win"
@@ -1636,7 +1652,25 @@ win-test: iso
 	    && grep -aqxF 'terminal   : win: fault.exe faulted: access violation (0xc0000005), after 1 lines' build/win-lines.log \
 	    && echo "win-test: a fault is told as Windows tells it      PASS" \
 	    || echo "win-test: a fault is told as Windows tells it      FAIL"
-	@test $$(grep -acE '^verdigris  : moved from 0x140000000 to 0x400000, [1-9][0-9]* relocations$$' build/win-lines.log) -eq 2 \
+	@c='terminal   : win: hello.exe: '; \
+	grep -aqxF "$${c}hello from C: 3 arguments" build/win-lines.log \
+	    && grep -aqxF "$${c}argv[0] = [C:\hello.exe]" build/win-lines.log \
+	    && grep -aqxF "$${c}argv[1] = [one]" build/win-lines.log \
+	    && grep -aqxF "$${c}argv[2] = [two three]" build/win-lines.log \
+	    && grep -aqxF 'terminal   : win: hello.exe ended after 9 lines, exit code 2' build/win-lines.log \
+	    && grep -aqxF "$${c}hello from C: 1 arguments" build/win-lines.log \
+	    && grep -aqxF 'terminal   : win: hello.exe ended after 7 lines' build/win-lines.log \
+	    && echo "win-test: a C program gets argc, argv and its exit code PASS" \
+	    || echo "win-test: a C program gets argc, argv and its exit code FAIL"
+	@c='terminal   : win: hello.exe: '; \
+	test $$(grep -acxF "$${c}printf:    42|-7   |003.1|beef|ok" build/win-lines.log) -eq 2 \
+	    && test $$(grep -acxF "$${c}fprintf: +7 4000000000 0002.500 1.234568e+04 0.0001 Z    ab xy %" build/win-lines.log) -eq 2 \
+	    && test $$(grep -acxF "$${c}heap: malloc and free, calloc zeroed yes, last byte 64" build/win-lines.log) -eq 2 \
+	    && test $$(grep -acxF "$${c}thread-local: 42" build/win-lines.log) -eq 2 \
+	    && test $$(grep -acxF "$${c}atexit ran" build/win-lines.log) -eq 2 \
+	    && echo "win-test: ...and its C runtime prints, allocates, exits PASS" \
+	    || echo "win-test: ...and its C runtime prints, allocates, exits FAIL"
+	@test $$(grep -acE '^verdigris  : moved from 0x140000000 to 0x400000, [1-9][0-9]* relocations$$' build/win-lines.log) -eq 4 \
 	    && echo "win-test: it was moved from where its linker put it PASS" \
 	    || echo "win-test: it was moved from where its linker put it FAIL"
 	@grep -aqxF 'terminal   : win: /etc/motd: not a program Verdigris runs' build/win-lines.log \

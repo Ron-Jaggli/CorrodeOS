@@ -29,6 +29,12 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+mod format;
+mod msvcrt;
+mod process;
+
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
@@ -70,6 +76,32 @@ const WRITE_RIGHTS: u32 = 0x4000_0000 // GENERIC_WRITE
     | 0x0000_0004 // FILE_APPEND_DATA
     | 0x0000_0002; // FILE_WRITE_DATA
 
+/// A value only the program's one thread touches (CorrodeOS has no ring 3
+/// threads yet), so it needs no lock. Each use is short and keeps no
+/// reference past its call.
+pub(crate) struct One<T>(UnsafeCell<T>);
+
+// SAFETY: one thread, as above.
+unsafe impl<T> Sync for One<T> {}
+
+impl<T> One<T> {
+    pub(crate) const fn new(value: T) -> Self {
+        One(UnsafeCell::new(value))
+    }
+
+    /// # Safety
+    /// No other reference to the value is alive.
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) unsafe fn get(&self) -> &mut T {
+        // SAFETY: the caller's promise.
+        unsafe { &mut *self.0.get() }
+    }
+
+    pub(crate) fn as_ptr(&self) -> *mut T {
+        self.0.get()
+    }
+}
+
 /// `GetLastError`'s number: one thread, so one number.
 static LAST_ERROR: AtomicU32 = AtomicU32::new(0);
 
@@ -77,7 +109,7 @@ extern "win64" fn get_last_error() -> u32 {
     LAST_ERROR.load(Ordering::Relaxed)
 }
 
-extern "win64" fn set_last_error(code: u32) {
+pub(crate) extern "win64" fn set_last_error(code: u32) {
     LAST_ERROR.store(code, Ordering::Relaxed);
 }
 
@@ -166,7 +198,7 @@ unsafe fn path_to_page(name: *const u16) -> Result<usize, u32> {
 
 /// Fail with `code`, as a Windows call does: the number for
 /// `GetLastError`, and `value` returned.
-fn fail<T>(code: u32, value: T) -> T {
+pub(crate) fn fail<T>(code: u32, value: T) -> T {
     set_last_error(code);
     value
 }
@@ -463,6 +495,9 @@ extern "win64" fn close_handle(handle: isize) -> i32 {
     if matches!(handle, STDIN | STDOUT | STDERR) {
         return 1;
     }
+    if let Some(closed) = process::close_semaphore(handle) {
+        return closed;
+    }
     let Some(file) = file_of(handle) else {
         return fail(ERROR_INVALID_HANDLE, 0);
     };
@@ -479,7 +514,7 @@ const STD_ERROR_HANDLE: u32 = -12i32 as u32;
 
 /// The command line, as the program was started with it. Empty for a
 /// program given no view.
-extern "win64" fn get_command_line_w() -> *const u16 {
+pub(crate) extern "win64" fn get_command_line_w() -> *const u16 {
     let _ = page();
     COMMAND_LINE.0.get().cast::<u16>()
 }
@@ -589,9 +624,17 @@ unsafe extern "win64" fn write_file(
     1
 }
 
+/// Standard output (1) or error (2): the C runtime's streams write here,
+/// as `WriteFile` does.
+pub(crate) fn write_out(_which: i32, bytes: &[u8]) {
+    for byte in bytes {
+        PENDING.push(*byte);
+    }
+}
+
 /// End the program. A line still waiting for its end goes out first, and
 /// the view, if it has one, is told it can end too.
-extern "win64" fn exit_process(code: u32) -> ! {
+pub(crate) extern "win64" fn exit_process(code: u32) -> ! {
     if PENDING.waiting() {
         PENDING.flush(LINE);
     }
@@ -631,22 +674,35 @@ const fn field<const N: usize>(text: &[u8]) -> [u8; N] {
     out
 }
 
-const fn export(name: &[u8], function: *const ()) -> Export {
+const fn export_from(dll: &[u8], name: &[u8], function: *const ()) -> Export {
     Export {
-        dll: field(b"kernel32.dll"),
+        dll: field(dll),
         name: field(name),
         function,
     }
 }
 
-/// What this kernel32 offers, at `KERNEL32_BASE` (see `kernel32.ld`).
+const fn export(name: &[u8], function: *const ()) -> Export {
+    export_from(b"kernel32.dll", name, function)
+}
+
+const fn crt(name: &[u8], function: *const ()) -> Export {
+    export_from(b"msvcrt.dll", name, function)
+}
+
+const EXPORT_COUNT: usize = 96;
+
+/// What Verdigris's DLLs offer, at `KERNEL32_BASE` (see `kernel32.ld`):
+/// kernel32's functions, msvcrt's functions and variables, and the start
+/// routine every Windows program begins in.
 #[used]
 #[link_section = ".verdigris.exports"]
-static EXPORTS: Table<16> = Table {
+static EXPORTS: Table<EXPORT_COUNT> = Table {
     magic: MAGIC,
-    count: 16,
+    count: EXPORT_COUNT as u32,
     size: ENTRY as u32,
     entries: [
+        export_from(b"verdigris", b"start", process::start as *const ()),
         export(b"GetStdHandle", get_std_handle as *const ()),
         export(b"WriteFile", write_file as *const ()),
         export(b"ExitProcess", exit_process as *const ()),
@@ -663,5 +719,84 @@ static EXPORTS: Table<16> = Table {
         export(b"SetCurrentDirectoryW", set_current_directory_w as *const ()),
         export(b"GetFullPathNameW", get_full_path_name_w as *const ()),
         export(b"GetCommandLineW", get_command_line_w as *const ()),
+        export(b"GetProcessHeap", process::get_process_heap as *const ()),
+        export(b"HeapAlloc", process::heap_alloc as *const ()),
+        export(b"HeapFree", process::heap_free as *const ()),
+        export(b"HeapReAlloc", process::heap_re_alloc as *const ()),
+        export(b"TlsAlloc", process::tls_alloc as *const ()),
+        export(b"TlsGetValue", process::tls_get_value as *const ()),
+        export(b"TlsSetValue", process::tls_set_value as *const ()),
+        export(b"TlsFree", process::tls_free as *const ()),
+        export(b"InitializeCriticalSection", process::initialize_critical_section as *const ()),
+        export(b"EnterCriticalSection", process::enter_critical_section as *const ()),
+        export(b"LeaveCriticalSection", process::leave_critical_section as *const ()),
+        export(b"DeleteCriticalSection", process::delete_critical_section as *const ()),
+        export(b"GetStartupInfoA", process::get_startup_info_a as *const ()),
+        export(b"SetUnhandledExceptionFilter", process::set_unhandled_exception_filter as *const ()),
+        export(b"VirtualQuery", process::virtual_query as *const ()),
+        export(b"VirtualProtect", process::virtual_protect as *const ()),
+        export(b"Sleep", process::sleep as *const ()),
+        export(b"QueryPerformanceCounter", process::query_performance_counter as *const ()),
+        export(b"CreateSemaphoreW", process::create_semaphore_w as *const ()),
+        export(b"ReleaseSemaphore", process::release_semaphore as *const ()),
+        export(b"WaitForSingleObject", process::wait_for_single_object as *const ()),
+        export(b"QueryPerformanceFrequency", process::query_performance_frequency as *const ()),
+        export(b"GetACP", process::get_acp as *const ()),
+        export(b"IsDBCSLeadByteEx", process::is_dbcs_lead_byte_ex as *const ()),
+        export(b"MultiByteToWideChar", process::multi_byte_to_wide_char as *const ()),
+        export(b"WideCharToMultiByte", process::wide_char_to_multi_byte as *const ()),
+        crt(b"_fmode", &raw const msvcrt::MSVCRT_FMODE as *const ()),
+        crt(b"_commode", &raw const msvcrt::MSVCRT_COMMODE as *const ()),
+        crt(b"__initenv", &raw const msvcrt::MSVCRT_INITENV as *const ()),
+        crt(b"_acmdln", &raw const msvcrt::MSVCRT_ACMDLN as *const ()),
+        crt(b"__getmainargs", msvcrt::getmainargs as *const ()),
+        crt(b"_initterm", msvcrt::initterm as *const ()),
+        crt(b"_onexit", msvcrt::onexit as *const ()),
+        crt(b"atexit", msvcrt::atexit as *const ()),
+        crt(b"exit", msvcrt::exit as *const ()),
+        crt(b"_exit", msvcrt::exit_now as *const ()),
+        crt(b"_cexit", msvcrt::cexit as *const ()),
+        crt(b"_amsg_exit", msvcrt::amsg_exit as *const ()),
+        crt(b"abort", msvcrt::abort as *const ()),
+        crt(b"_errno", msvcrt::errno as *const ()),
+        crt(b"_lock", msvcrt::lock as *const ()),
+        crt(b"_unlock", msvcrt::lock as *const ()),
+        crt(b"__set_app_type", msvcrt::set_app_type as *const ()),
+        crt(b"__setusermatherr", msvcrt::setusermatherr as *const ()),
+        crt(b"__C_specific_handler", msvcrt::c_specific_handler as *const ()),
+        crt(b"signal", msvcrt::signal as *const ()),
+        crt(b"___lc_codepage_func", msvcrt::lc_codepage as *const ()),
+        crt(b"___mb_cur_max_func", msvcrt::mb_cur_max as *const ()),
+        crt(b"localeconv", msvcrt::localeconv as *const ()),
+        crt(b"strerror", msvcrt::strerror as *const ()),
+        crt(b"__iob_func", msvcrt::iob_func as *const ()),
+        crt(b"fputc", msvcrt::fputc as *const ()),
+        crt(b"putc", msvcrt::fputc as *const ()),
+        crt(b"putchar", msvcrt::putchar as *const ()),
+        crt(b"fwrite", msvcrt::fwrite as *const ()),
+        crt(b"fputs", msvcrt::fputs as *const ()),
+        crt(b"puts", msvcrt::puts as *const ()),
+        crt(b"fflush", msvcrt::fflush as *const ()),
+        crt(b"printf", msvcrt::printf as *const ()),
+        crt(b"fprintf", msvcrt::fprintf as *const ()),
+        crt(b"sprintf", msvcrt::sprintf as *const ()),
+        crt(b"_snprintf", msvcrt::snprintf as *const ()),
+        crt(b"vprintf", msvcrt::vprintf as *const ()),
+        crt(b"vfprintf", msvcrt::vfprintf as *const ()),
+        crt(b"vsprintf", msvcrt::vsprintf as *const ()),
+        crt(b"_vsnprintf", msvcrt::vsnprintf as *const ()),
+        crt(b"malloc", msvcrt::malloc as *const ()),
+        crt(b"calloc", msvcrt::calloc as *const ()),
+        crt(b"realloc", msvcrt::realloc as *const ()),
+        crt(b"free", msvcrt::free as *const ()),
+        crt(b"memcpy", msvcrt::memcpy as *const ()),
+        crt(b"memmove", msvcrt::memmove as *const ()),
+        crt(b"memset", msvcrt::memset as *const ()),
+        crt(b"memcmp", msvcrt::memcmp as *const ()),
+        crt(b"strlen", msvcrt::strlen as *const ()),
+        crt(b"wcslen", msvcrt::wcslen as *const ()),
+        crt(b"strncmp", msvcrt::strncmp as *const ()),
+        crt(b"strcmp", msvcrt::strcmp as *const ()),
+        crt(b"strcpy", msvcrt::strcpy as *const ()),
     ],
 };

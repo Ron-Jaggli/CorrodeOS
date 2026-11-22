@@ -13,21 +13,30 @@ how it was built.
 
 ## What runs today
 
-Small console programs. A program loads, is moved if it was linked
-elsewhere, has its imports bound by the kernel, runs in ring 3 seeing its
-own folder as `C:\`, is stopped if it runs past 10 s, and is told how it
-ended (its exit code, or its fault named as Windows names it).
+Console programs, including C programs compiled the ordinary way by
+mingw-w64's gcc (`verdigris/c/hello.c`, a test program). A program
+loads, is moved if it was linked elsewhere, has its imports bound by the
+kernel, and starts in kernel32 as on Windows: its TLS callbacks run, then
+its entry, and what that returns is its exit code. It runs in ring 3 seeing
+its own folder as `C:\`, reads its TEB and PEB through `gs` as Windows code
+does, is stopped if it runs past 10 s, and is told how it ended.
 
-- **kernel32**, 16 functions: `GetStdHandle`, `WriteFile`, `ExitProcess`,
-  `GetCommandLineW`, `CreateFileW`, `ReadFile`, `GetFileSize`,
-  `CloseHandle`, `GetLastError`, `SetLastError`, `FindFirstFileW`,
-  `FindNextFileW`, `FindClose`, `GetCurrentDirectoryW`,
-  `SetCurrentDirectoryW`, `GetFullPathNameW`.
-- **Not yet**: a C runtime, other DLLs, threads, TLS, the TEB and PEB,
-  exceptions, memory allocation, writing files, input, windows.
+- **kernel32**: start-up, files through the view (`CreateFileW`,
+  `ReadFile`, `FindFirstFileW` and the rest), standard output, the command
+  line, the process heap, thread-local slots, critical sections and
+  semaphores (for one thread), UTF-8 code-page conversion, `Sleep` and the
+  performance counter. 42 functions.
+- **msvcrt**, in Rust: what a mingw-built program's start-up and a console
+  program use: `__getmainargs` (Microsoft's argument rules), `_initterm`,
+  `atexit`/`exit`, the standard streams, the `printf` family (its own
+  formatter), `malloc`/`free`, strings, the C locale. 53 functions and
+  variables.
+- **Not yet**: threads, exceptions (a fault ends the program), other DLLs
+  and `LoadLibrary`, writing files, `stdin`, wildcard arguments, windows.
 
-From the CorrodeOS terminal: `win /programs/dir/dir.exe` (or `win PATH
-ARGS`). In Files, select a `.exe` and press Return.
+From the CorrodeOS terminal: `win /programs/c/hello.exe one "two three"`,
+or `win /programs/dir/dir.exe`. In Files, select a `.exe` and press
+Return.
 
 ## Layout
 
@@ -43,6 +52,7 @@ verdigris/
   kernel32/        Verdigris's kernel32, in Rust (a CorrodeOS image at a
                    fixed address carrying an export table, not a PE DLL yet)
   dir/             dir.exe, a test program built by rustc and rust-lld
+  c/               hello.c, a test program built by mingw-w64's gcc
   scripts/         the other test programs: hello.exe and console.exe written
                    byte by byte, reader/spin/fault.exe assembled by GNU as,
                    and dir-exe.sh
@@ -53,8 +63,10 @@ Outside this folder, in CorrodeOS, and staying there:
 - `kernel/src/verdigris.rs`: the boot checks for phases 1 to 3, starting a
   program with its view (`start_windows`), `window::RUN` (`run_windows`),
   and the watcher that reports how a program ended.
-- `kernel/src/task/user.rs`: loading a PE (`load_pe`). It shares its image
-  building with the ELF loader, so it lives beside it.
+- `kernel/src/task/user.rs`: loading a PE (`load_pe`, `load_windows`: the
+  TEB, PEB and TLS block too). It shares its image building with the ELF
+  loader, so it lives beside it. A task's GS base is kept per task in
+  `kernel/src/task/mod.rs`.
 - `abi/src/lib.rs`: `verdigris` (slots and addresses) and `view` (the
   view's calls).
 - `user/rt/src/win.rs`: the run protocol the terminal and Files use.

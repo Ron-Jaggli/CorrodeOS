@@ -8,7 +8,7 @@
 //! The allocator is `corrode-heap`, the same one the kernel uses.
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use corrode_heap::Heap;
 
@@ -52,7 +52,22 @@ struct Global;
 // was given and takes them back by the same layout.
 unsafe impl GlobalAlloc for Global {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        HEAP.with(|heap| unsafe { heap.alloc(layout) })
+        let block = HEAP.with(|heap| unsafe { heap.alloc(layout) });
+        if !block.is_null() {
+            return block;
+        }
+        // Out of room: a program that said how to grow its heap gets one
+        // more try after growing it. Called outside the heap's flag, since
+        // growing adds to the heap.
+        let grow = GROW.load(Ordering::Relaxed);
+        if grow != 0 {
+            // SAFETY: only `on_empty` stores here, and it stores a `Grow`.
+            let grow: Grow = unsafe { core::mem::transmute(grow) };
+            if grow(layout.size().saturating_add(layout.align())) {
+                return HEAP.with(|heap| unsafe { heap.alloc(layout) });
+            }
+        }
+        core::ptr::null_mut()
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -83,6 +98,19 @@ pub fn init(pool: usize, into: usize, pages: usize) -> Result<usize> {
     // Nothing else in this program knows the address.
     HEAP.with(|heap| unsafe { heap.add_region(mapping.address as usize, mapping.len) });
     Ok(mapping.len)
+}
+
+/// How a program grows its heap when an allocation finds no room: given the
+/// bytes wanted, it adds at least that much (with [`init`]) and says if it
+/// did.
+pub type Grow = fn(usize) -> bool;
+
+static GROW: AtomicUsize = AtomicUsize::new(0);
+
+/// Grow the heap with `grow` whenever an allocation finds no room, rather
+/// than fail it.
+pub fn on_empty(grow: Grow) {
+    GROW.store(grow as usize, Ordering::Relaxed);
 }
 
 /// Bytes free and bytes in all, for a program that wants to say.

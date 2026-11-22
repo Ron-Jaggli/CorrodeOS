@@ -44,7 +44,7 @@ const PAGE: u64 = 4096;
 
 /// Most sections a program may have: the headers take one more segment of
 /// `corrode-elf`'s eight.
-pub const MAX_SECTIONS: usize = corrode_elf::MAX_SEGMENTS - 1;
+pub const MAX_SECTIONS: usize = 32;
 
 const DOS_MAGIC: &[u8; 2] = b"MZ";
 const PE_MAGIC: &[u8; 4] = b"PE\0\0";
@@ -79,8 +79,11 @@ const MAX_DIRECTORIES: usize = 16;
 const BASE_ALIGNMENT: u64 = 0x1_0000;
 
 /// Most DLLs a program may import from, and functions in all.
-pub const MAX_DLLS: usize = 8;
-pub const MAX_IMPORTS: usize = 64;
+pub const MAX_DLLS: usize = 64;
+pub const MAX_IMPORTS: usize = 4096;
+/// Most bytes of thread-local storage a program may ask for: its template
+/// and the zeroes after it.
+pub const MAX_TLS: u64 = 64 * 1024;
 /// Longest DLL or function name read, without its terminating zero.
 pub const MAX_NAME: usize = 63;
 const DESCRIPTOR_LEN: usize = 20;
@@ -132,8 +135,10 @@ pub enum Error {
     ImportByOrdinal,
     /// A function the exports given to [`Pe::bind`] do not have.
     Unresolved,
-    /// It has thread-local storage, whose callbacks would have to run.
-    ThreadLocalStorage,
+    /// A thread-local storage directory that does not hold together: its
+    /// template outside the file's sections, too big, or its index slot
+    /// outside the image or not zero.
+    BadTls,
     /// It must be moved, and its relocation table does not hold together:
     /// outside the file's sections, a block that runs past it or names an
     /// unaligned page, a type other than `DIR64`, or an address outside a
@@ -151,6 +156,18 @@ pub struct Import<'a> {
     pub slot: u64,
 }
 
+/// A program's thread-local storage, as its TLS directory describes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tls<'a> {
+    /// What each thread's block starts as.
+    pub template: &'a [u8],
+    /// The block's whole length: the template, then zeroes.
+    pub len: u64,
+    /// Where, once loaded, its zero-ended array of callbacks is; 0 for none.
+    /// The array's entries are addresses in the image, moved with it.
+    pub callbacks: u64,
+}
+
 /// An 8-byte value to write at an address before the page is mapped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fixup {
@@ -162,8 +179,10 @@ pub struct Fixup {
 #[derive(Clone, Copy, Debug)]
 pub struct Pe<'a> {
     entry: u64,
-    segments: [Option<Segment<'a>>; corrode_elf::MAX_SEGMENTS],
-    imports: [Option<Import<'a>>; MAX_IMPORTS],
+    segments: [Option<Segment<'a>>; MAX_SECTIONS + 1],
+    /// Where its import directory is, checked whole in `parse`; 0 for none.
+    import_table: u64,
+    tls: Option<Tls<'a>>,
     /// Where it was loaded, and how far that is from where it asked to be.
     base: u64,
     delta: u64,
@@ -256,8 +275,8 @@ fn read_imports<'a>(
     segments: &[Option<Segment<'a>>],
     base: u64,
     table: u64,
-) -> Result<[Option<Import<'a>>; MAX_IMPORTS], Error> {
-    let mut imports = [None; MAX_IMPORTS];
+    mut each: impl FnMut(Import<'a>),
+) -> Result<(), Error> {
     let mut count = 0;
     for index in 0.. {
         let at = base + table + (index * DESCRIPTOR_LEN) as u64;
@@ -303,11 +322,58 @@ fn read_imports<'a>(
             if !slot.is_multiple_of(8) || holder.is_none_or(|segment| segment.executable) {
                 return Err(Error::BadImports);
             }
-            imports[count] = Some(Import { dll, name, slot });
+            each(Import { dll, name, slot });
             count += 1;
         }
     }
-    Ok(imports)
+    Ok(())
+}
+
+/// Read the TLS directory at `directory` (an address), for an image at
+/// `base` that asked to be at `preferred`. Its fields are addresses at the
+/// preferred base.
+fn read_tls<'a>(
+    segments: &[Option<Segment<'a>>],
+    base: u64,
+    preferred: u64,
+    directory: u64,
+) -> Result<Tls<'a>, Error> {
+    let bad = |_| Error::BadTls;
+    let fields = file_at(segments, directory, 40).map_err(bad)?;
+    let here = |va: u64| -> Result<u64, Error> {
+        va.checked_sub(preferred).and_then(|rva| rva.checked_add(base)).ok_or(Error::BadTls)
+    };
+    let (start, end) = (u64_at(fields, 0).map_err(bad)?, u64_at(fields, 8).map_err(bad)?);
+    let (index, callbacks) = (u64_at(fields, 16).map_err(bad)?, u64_at(fields, 24).map_err(bad)?);
+    let zero_fill = u32_at(fields, 32).map_err(bad)? as u64;
+    let template_len = end.checked_sub(start).ok_or(Error::BadTls)?;
+    let len = template_len.checked_add(zero_fill).filter(|len| *len <= MAX_TLS).ok_or(Error::BadTls)?;
+    let template = if template_len == 0 {
+        &[][..]
+    } else {
+        file_at(segments, here(start)?, template_len).map_err(bad)?
+    };
+    // Windows writes the program's TLS index (always 0 here: one module
+    // has TLS) into this slot. Linkers leave it 0, so it is only checked.
+    let index = here(index)?;
+    let inside = |address: u64, len: u64| {
+        segments[1..].iter().flatten().any(|segment| {
+            address >= segment.address && address.saturating_add(len) <= segment.address + segment.len
+        })
+    };
+    if !inside(index, 4) || original(segments, index) as u32 != 0 {
+        return Err(Error::BadTls);
+    }
+    let callbacks = if callbacks == 0 {
+        0
+    } else {
+        let at = here(callbacks)?;
+        if !inside(at, 8) || !at.is_multiple_of(8) {
+            return Err(Error::BadTls);
+        }
+        at
+    };
+    Ok(Tls { template, len, callbacks })
 }
 
 fn u16_at(bytes: &[u8], at: usize) -> Result<u16, Error> {
@@ -384,9 +450,7 @@ impl<'a> Pe<'a> {
         let (import_table, import_len) = directory(IMPORTS)?;
         let (relocation_table, relocation_len) = directory(RELOCATIONS)?;
         let movable = characteristics & RELOCS_STRIPPED == 0 && relocation_len != 0;
-        if directory(TLS)?.1 != 0 {
-            return Err(Error::ThreadLocalStorage);
-        }
+        let (tls_table, tls_len) = directory(TLS)?;
 
         if !base.is_multiple_of(BASE_ALIGNMENT) || image_len == 0 || !image_len.is_multiple_of(PAGE) {
             return Err(Error::Malformed);
@@ -417,7 +481,7 @@ impl<'a> Pe<'a> {
             return Err(Error::SectionCount);
         }
 
-        let mut segments = [None; corrode_elf::MAX_SEGMENTS];
+        let mut segments = [None; MAX_SECTIONS + 1];
         segments[0] = Some(Segment {
             address: base,
             len: headers_len,
@@ -480,10 +544,16 @@ impl<'a> Pe<'a> {
         if !entry_ok {
             return Err(Error::EntryNotExecutable);
         }
-        let imports = if import_len == 0 {
-            [None; MAX_IMPORTS]
+        let import_table = if import_len == 0 {
+            0
         } else {
-            read_imports(&segments, base, import_table as u64)?
+            read_imports(&segments, base, import_table as u64, |_| {})?;
+            import_table as u64
+        };
+        let tls = if tls_len == 0 {
+            None
+        } else {
+            Some(read_tls(&segments, base, preferred, base + tls_table as u64)?)
         };
 
         // Moved: every relocation must name eight bytes inside a section,
@@ -509,7 +579,8 @@ impl<'a> Pe<'a> {
         Ok(Pe {
             entry: base + entry_rva,
             segments,
-            imports,
+            import_table,
+            tls,
             base,
             delta: base.wrapping_sub(preferred),
             relocations,
@@ -517,28 +588,49 @@ impl<'a> Pe<'a> {
         })
     }
 
-    /// Every function the program imports.
-    pub fn imports(&self) -> impl Iterator<Item = Import<'a>> + '_ {
-        self.imports.iter().flatten().copied()
+    /// Every function the program imports, given to `each`.
+    pub fn each_import(&self, each: impl FnMut(Import<'a>)) {
+        if self.import_table != 0 {
+            // Checked whole in `parse`, so nothing here can fail.
+            let _ = read_imports(&self.segments, self.base, self.import_table, each);
+        }
+    }
+
+    /// How many functions it imports.
+    pub fn import_count(&self) -> usize {
+        let mut count = 0;
+        self.each_import(|_| count += 1);
+        count
+    }
+
+    /// Its thread-local storage, if it has any.
+    pub fn tls(&self) -> Option<Tls<'a>> {
+        self.tls
     }
 
     /// Fill the import address table: `resolve` gives each import's address
     /// from the DLL's name and the function's, or `None` if it has no such
     /// function, which refuses the program ([`Error::Unresolved`]). The
     /// fixups are to be written before the pages are mapped.
+    ///
+    /// Each fixup goes to `each`; on an error some may already have gone,
+    /// so a caller keeps them until it has `Ok`.
     pub fn bind(
         &self,
         mut resolve: impl FnMut(&[u8], &[u8]) -> Option<u64>,
-    ) -> Result<[Option<Fixup>; MAX_IMPORTS], Error> {
-        let mut fixups = [None; MAX_IMPORTS];
-        for (fixup, import) in fixups.iter_mut().zip(self.imports()) {
-            let value = resolve(import.dll, import.name).ok_or(Error::Unresolved)?;
-            *fixup = Some(Fixup {
-                address: import.slot,
-                value,
-            });
-        }
-        Ok(fixups)
+        mut each: impl FnMut(Fixup),
+    ) -> Result<(), Error> {
+        let mut result = Ok(());
+        self.each_import(|import| {
+            if result.is_err() {
+                return;
+            }
+            match resolve(import.dll, import.name) {
+                Some(value) => each(Fixup { address: import.slot, value }),
+                None => result = Err(Error::Unresolved),
+            }
+        });
+        result
     }
 
     /// Where it is loaded: its preferred base, or where it was moved to.

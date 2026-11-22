@@ -20,7 +20,9 @@ const DATA: u32 = 0xc000_0040;
 /// sixteen empty directories, section table, then each section's bytes at
 /// the next 512-byte boundary. The same layout `verdigris/scripts/hello-exe.sh` writes.
 fn build(entry: u32, image_len: u32, sections: &[Section]) -> Vec<u8> {
-    let mut file = vec![0u8; 0x200];
+    // The headers: 512 bytes, or more when the section table needs them.
+    let headers = (0x44 + COFF_LEN + 240 + sections.len() * SECTION_LEN).div_ceil(0x200) * 0x200;
+    let mut file = vec![0u8; headers];
     file[..2].copy_from_slice(b"MZ");
     file[LFANEW..LFANEW + 4].copy_from_slice(&0x40u32.to_le_bytes());
     file[0x40..0x44].copy_from_slice(b"PE\0\0");
@@ -40,7 +42,7 @@ fn build(entry: u32, image_len: u32, sections: &[Section]) -> Vec<u8> {
     put32(&mut file, SECTION_ALIGNMENT, 0x1000);
     put32(&mut file, FILE_ALIGNMENT, 0x200);
     put32(&mut file, SIZE_OF_IMAGE, image_len);
-    put32(&mut file, SIZE_OF_HEADERS, 0x200);
+    put32(&mut file, SIZE_OF_HEADERS, headers as u32);
     // The console subsystem.
     file[optional + 68..optional + 70].copy_from_slice(&3u16.to_le_bytes());
     put32(&mut file, DIRECTORY_COUNT, 16);
@@ -162,8 +164,9 @@ fn what_it_would_need_is_refused_until_it_is_done() {
     put32(&mut file, OPTIONAL + DIRECTORIES + IMPORTS * 8 + 4, 40);
     assert_eq!(refused(&file), Error::BadImports);
     let mut file = good.clone();
+    // A TLS directory that is not one (it points at the headers).
     put32(&mut file, OPTIONAL + DIRECTORIES + TLS * 8 + 4, 40);
-    assert_eq!(refused(&file), Error::ThreadLocalStorage);
+    assert_eq!(refused(&file), Error::BadTls);
     // The same directories past the count the file declares are not read.
     let mut file = good.clone();
     put32(&mut file, OPTIONAL + DIRECTORY_COUNT, 1);
@@ -226,10 +229,14 @@ fn sections_that_lie_are_refused() {
     let mut file = good.clone();
     file[0x44 + 2..0x44 + 4].copy_from_slice(&0u16.to_le_bytes());
     assert_eq!(refused(&file), Error::SectionCount);
-    // Eight: with headers long enough to hold their table.
+    // One more than allowed: with headers long enough to hold their table.
     let mut file = good.clone();
-    file[0x44 + 2..0x44 + 4].copy_from_slice(&8u16.to_le_bytes());
-    put32(&mut file, OPTIONAL + SIZE_OF_HEADERS, 0x400);
+    let count = MAX_SECTIONS as u16 + 1;
+    file[0x44 + 2..0x44 + 4].copy_from_slice(&count.to_le_bytes());
+    put32(&mut file, OPTIONAL + SIZE_OF_HEADERS, 0x800);
+    if file.len() < 0x800 {
+        file.resize(0x800, 0);
+    }
     assert_eq!(refused(&file), Error::SectionCount);
     // So many the table runs past the headers.
     let mut file = good.clone();
@@ -390,7 +397,7 @@ fn importing_from(dlls: usize, functions: &[&[u8]]) -> Vec<u8> {
     let len = rdata.len() as u32;
     let mut file = build(
         0x1000,
-        0x3000,
+        0x2000 + len.div_ceil(0x1000).max(1) * 0x1000,
         &[
             Section { rva: 0x1000, virtual_len: 16, raw: vec![0xcc; 16], flags: TEXT },
             Section { rva: 0x2000, virtual_len: len, raw: rdata, flags: RDATA },
@@ -432,7 +439,7 @@ fn kernel32() -> Vec<u8> {
 fn imports_are_read_by_name() {
     let file = importing(&CONSOLE);
     let pe = Pe::parse(&file, ALLOWED).expect("a valid program");
-    let imports: Vec<_> = pe.imports().collect();
+    let imports: Vec<_> = imports(&pe);
     assert_eq!(imports.len(), 3);
     for (index, import) in imports.iter().enumerate() {
         assert_eq!(import.dll, b"KERNEL32.dll");
@@ -447,9 +454,8 @@ fn imports_bind_to_exports() {
     let pe = Pe::parse(&file, ALLOWED).unwrap();
     let table = kernel32();
     let exports = exports::Exports::parse(&table).expect("a table");
-    let fixups = pe.bind(|dll, name| exports.find(dll, name)).expect("all bound");
-    let fixups: Vec<_> = fixups.iter().flatten().copied().collect();
-    assert_eq!(
+    let fixups = bind(&pe, |dll, name| exports.find(dll, name)).expect("all bound");
+        assert_eq!(
         fixups,
         [
             Fixup { address: BASE + 0x2060, value: 0x800_1000 },
@@ -460,7 +466,7 @@ fn imports_bind_to_exports() {
     // Something kernel32 does not have refuses the whole program.
     let file = importing(&[b"GetStdHandle", b"CreateThread"]);
     let pe = Pe::parse(&file, ALLOWED).unwrap();
-    assert_eq!(pe.bind(|dll, name| exports.find(dll, name)).unwrap_err(), Error::Unresolved);
+    assert_eq!(bind(&pe, |dll, name| exports.find(dll, name)).unwrap_err(), Error::Unresolved);
     // Function names match exactly; DLL names without regard to case.
     assert_eq!(exports.find(b"KERNEL32.DLL", b"WriteFile"), Some(0x800_1100));
     assert_eq!(exports.find(b"kernel32.dll", b"writefile"), None);
@@ -525,15 +531,18 @@ fn import_tables_that_lie_are_refused() {
 
 #[test]
 fn too_many_imports_are_refused() {
-    let names: Vec<Vec<u8>> = (0..65).map(|i| format!("F{i}").into_bytes()).collect();
+    let names: Vec<Vec<u8>> = (0..=MAX_IMPORTS).map(|i| format!("F{i}").into_bytes()).collect();
     let many: Vec<&[u8]> = names.iter().map(|n| n.as_slice()).collect();
-    assert!(Pe::parse(&importing(&many[..64]), ALLOWED).is_ok());
+    let file = importing(&many[..MAX_IMPORTS]);
+    let pe = Pe::parse(&file, ALLOWED).expect("the most imports allowed");
+    assert_eq!(pe.import_count(), MAX_IMPORTS);
     assert_eq!(refused(&importing(&many)), Error::TooManyImports);
-    // Nine DLLs refused; eight, with three functions each, allowed.
-    assert_eq!(refused(&importing_from(9, &CONSOLE)), Error::TooManyImports);
-    let file = importing_from(8, &CONSOLE);
-    let pe = Pe::parse(&file, ALLOWED).expect("eight DLLs");
-    assert_eq!(pe.imports().count(), 24);
+    // One DLL more than allowed is refused; the most, three functions
+    // each, allowed.
+    assert_eq!(refused(&importing_from(MAX_DLLS + 1, &CONSOLE)), Error::TooManyImports);
+    let file = importing_from(MAX_DLLS, &CONSOLE);
+    let pe = Pe::parse(&file, ALLOWED).expect("the most DLLs");
+    assert_eq!(pe.import_count(), 3 * MAX_DLLS);
 }
 
 #[test]
@@ -580,9 +589,9 @@ fn random_damage_to_imports_never_panics() {
         }
         if let Ok(pe) = Pe::parse(&file, ALLOWED) {
             check_promises(&pe);
-            if let Ok(fixups) = pe.bind(|dll, name| exports.find(dll, name)) {
+            if let Ok(fixups) = bind(&pe, |dll, name| exports.find(dll, name)) {
                 // Every slot written is 8-aligned, in the image, not in code.
-                for fixup in fixups.iter().flatten() {
+                for fixup in fixups.iter() {
                     assert_eq!(fixup.address % 8, 0);
                     assert!(pe.segments().skip(1).any(|s| !s.executable
                         && fixup.address >= s.address
@@ -605,11 +614,11 @@ fn the_scripts_console_exe_loads_and_binds() {
     let _ = std::fs::remove_file(&out);
     let pe = Pe::parse(&file, ALLOWED).expect("console.exe is a valid program");
     check_promises(&pe);
-    let names: Vec<_> = pe.imports().map(|import| import.name).collect();
+    let names: Vec<_> = imports(&pe).iter().map(|import| import.name).collect();
     assert_eq!(names, CONSOLE);
     let table = kernel32();
     let exports = exports::Exports::parse(&table).unwrap();
-    assert!(pe.bind(|dll, name| exports.find(dll, name)).is_ok());
+    assert!(bind(&pe, |dll, name| exports.find(dll, name)).is_ok());
 }
 
 
@@ -626,7 +635,7 @@ fn the_scripts_reader_exe_loads_and_binds() {
     let _ = std::fs::remove_file(&out);
     let pe = Pe::parse(&file, ALLOWED).expect("reader.exe is a valid program");
     check_promises(&pe);
-    let names: Vec<_> = pe.imports().map(|import| import.name).collect();
+    let names: Vec<_> = imports(&pe).iter().map(|import| import.name).collect();
     let wanted: [&[u8]; 15] = [
         b"CreateFileW",
         b"ReadFile",
@@ -652,7 +661,7 @@ fn the_scripts_reader_exe_loads_and_binds() {
         .collect();
     let table = table(&entries);
     let exports = exports::Exports::parse(&table).unwrap();
-    assert!(pe.bind(|dll, name| exports.find(dll, name)).is_ok());
+    assert!(bind(&pe, |dll, name| exports.find(dll, name)).is_ok());
     // The buffer it reads into is writable and not code; its code is not
     // writable.
     let segments: Vec<_> = pe.segments().collect();
@@ -822,4 +831,108 @@ fn random_damage_to_relocations_never_panics() {
             }
         }
     }
+}
+
+/// Every import, in order.
+fn imports<'a>(pe: &Pe<'a>) -> Vec<Import<'a>> {
+    let mut all = Vec::new();
+    pe.each_import(|import| all.push(import));
+    all
+}
+
+/// Every fixup binding gives, or why it failed.
+fn bind(pe: &Pe<'_>, resolve: impl FnMut(&[u8], &[u8]) -> Option<u64>) -> Result<Vec<Fixup>, Error> {
+    let mut all = Vec::new();
+    pe.bind(resolve, |fixup| all.push(fixup)).map(|()| all)
+}
+
+/// A program with thread-local storage: its TLS directory at 0x2000, a
+/// 16-byte template at 0x2100, the index slot at 0x2200 and a callback
+/// array at 0x2208 naming its code. `change` damages the read-only data.
+fn with_tls(change: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let mut rdata = vec![0u8; 0x220];
+    let fields: [u64; 4] = [BASE + 0x2100, BASE + 0x2110, BASE + 0x2200, BASE + 0x2208];
+    for (i, field) in fields.iter().enumerate() {
+        rdata[i * 8..i * 8 + 8].copy_from_slice(&field.to_le_bytes());
+    }
+    rdata[32..36].copy_from_slice(&32u32.to_le_bytes());
+    rdata[0x100..0x110].copy_from_slice(b"template, 16 by.");
+    rdata[0x208..0x210].copy_from_slice(&(BASE + 0x1000).to_le_bytes());
+    change(&mut rdata);
+    let len = rdata.len() as u32;
+    let mut file = build(
+        0x1000,
+        0x3000,
+        &[
+            Section { rva: 0x1000, virtual_len: 16, raw: vec![0xcc; 16], flags: TEXT },
+            Section { rva: 0x2000, virtual_len: len, raw: rdata, flags: RDATA },
+        ],
+    );
+    put32(&mut file, OPTIONAL + DIRECTORIES + TLS * 8, 0x2000);
+    put32(&mut file, OPTIONAL + DIRECTORIES + TLS * 8 + 4, 40);
+    file
+}
+
+#[test]
+fn thread_local_storage_is_read() {
+    let file = with_tls(|_| {});
+    let pe = Pe::parse(&file, ALLOWED).expect("a program with TLS");
+    let tls = pe.tls().expect("its TLS");
+    assert_eq!(tls.template, b"template, 16 by.");
+    assert_eq!(tls.len, 16 + 32);
+    assert_eq!(tls.callbacks, BASE + 0x2208);
+    // None without a directory.
+    assert_eq!(Pe::parse(&hello(), ALLOWED).unwrap().tls(), None);
+    // Moved: the callback array moves with the image; its entries are
+    // relocations' business, not the directory's.
+    let moved = Pe::parse(&file, 0x80_0000..0x1000_0000);
+    assert!(moved.is_err(), "no relocations, so it cannot be moved");
+}
+
+#[test]
+fn thread_local_storage_that_lies_is_refused() {
+    // An index slot that is not zero.
+    assert_eq!(refused(&with_tls(|r| r[0x200] = 1)), Error::BadTls);
+    // An index slot outside the image.
+    assert_eq!(refused(&with_tls(|r| r[16..24].copy_from_slice(&(BASE + 0x9000).to_le_bytes()))), Error::BadTls);
+    // A template that ends before it starts, or lies outside the file.
+    assert_eq!(refused(&with_tls(|r| r[8..16].copy_from_slice(&(BASE + 0x20f0).to_le_bytes()))), Error::BadTls);
+    assert_eq!(refused(&with_tls(|r| r[8..16].copy_from_slice(&(BASE + 0x2900).to_le_bytes()))), Error::BadTls);
+    // An address below the base.
+    assert_eq!(refused(&with_tls(|r| r[0..8].copy_from_slice(&0x1000u64.to_le_bytes()))), Error::BadTls);
+    // More storage than allowed.
+    assert_eq!(refused(&with_tls(|r| r[32..36].copy_from_slice(&(MAX_TLS as u32).to_le_bytes()))), Error::BadTls);
+    // A callback array that is not aligned, or not in the image.
+    assert_eq!(refused(&with_tls(|r| r[24..32].copy_from_slice(&(BASE + 0x2204).to_le_bytes()))), Error::BadTls);
+    assert_eq!(refused(&with_tls(|r| r[24..32].copy_from_slice(&(BASE + 0x8000).to_le_bytes()))), Error::BadTls);
+    // Random damage to the directory never panics.
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for _ in 0..20_000 {
+        let file = with_tls(|r| {
+            for _ in 0..1 + next() % 3 {
+                let at = (next() % 40) as usize;
+                r[at] = next() as u8;
+            }
+        });
+        if let Ok(pe) = Pe::parse(&file, ALLOWED) {
+            let tls = pe.tls().expect("still a TLS directory");
+            assert!(tls.len <= MAX_TLS && tls.template.len() as u64 <= tls.len);
+        }
+    }
+}
+
+#[test]
+fn many_sections_are_allowed() {
+    let sections: Vec<Section> = (0..MAX_SECTIONS as u32)
+        .map(|i| Section { rva: 0x1000 * (i + 1), virtual_len: 8, raw: vec![0xcc; 8], flags: if i == 0 { TEXT } else { RDATA } })
+        .collect();
+    let file = build(0x1000, 0x1000 * (MAX_SECTIONS as u32 + 1), &sections);
+    let pe = Pe::parse(&file, ALLOWED).expect("32 sections");
+    assert_eq!(pe.segments().count(), MAX_SECTIONS + 1);
 }

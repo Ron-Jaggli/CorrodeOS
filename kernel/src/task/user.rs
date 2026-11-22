@@ -71,6 +71,9 @@ pub struct Image {
     pub stack_guard: u64,
     /// The address space all of the above live in.
     pub space: Mapper,
+    /// What the task's GS base is while it runs: a Windows program's TEB,
+    /// 0 for everything else.
+    pub gs_base: u64,
 }
 
 /// Build a fresh address space holding one program and one stack.
@@ -92,6 +95,7 @@ pub fn create(entry: u64) -> Option<Image> {
         stack_top: STACK_TOP - 8,
         stack_guard: STACK_GUARD,
         space,
+        gs_base: 0,
     })
 }
 
@@ -207,12 +211,15 @@ pub fn load_pe(file: &[u8]) -> Result<Image, LoadError> {
 /// in read-only data, as linkers put it, and nothing is ever made writable
 /// to fill it in. An import kernel32 does not have refuses the program.
 pub fn load_windows(file: &[u8], kernel32: &[u8]) -> Result<Image, LoadError> {
-    let base = corrode_abi::verdigris::KERNEL32_BASE;
-    let pe = Pe::parse(file, layout::IMAGE_BASE..base).map_err(LoadError::Pe)?;
-    let runtime = Elf::parse(kernel32, base..layout::IMAGE_END).map_err(LoadError::Format)?;
+    use corrode_abi::verdigris::{
+        KERNEL32_BASE, PEB, START_ENTRY, START_TLS_CALLBACKS, TEB, TEB_PAGES, TLS_BLOCK, TLS_VECTOR,
+    };
+    let pe = Pe::parse(file, layout::IMAGE_BASE..KERNEL32_BASE).map_err(LoadError::Pe)?;
+    // kernel32 ends below the TEB, which is the kernel's to lay out.
+    let runtime = Elf::parse(kernel32, KERNEL32_BASE..TEB).map_err(LoadError::Format)?;
     let exports = runtime
         .segments()
-        .find(|segment| segment.address == base && !segment.writable && !segment.executable)
+        .find(|segment| segment.address == KERNEL32_BASE && !segment.writable && !segment.executable)
         .and_then(|segment| Exports::parse(segment.data))
         .ok_or(LoadError::NoExports)?;
     let in_code = |address: &u64| {
@@ -220,8 +227,20 @@ pub fn load_windows(file: &[u8], kernel32: &[u8]) -> Result<Image, LoadError> {
             segment.executable && (segment.address..segment.address + segment.len).contains(address)
         })
     };
-    let fixups = pe
-        .bind(|dll, name| exports.find(dll, name).filter(in_code))
+    // An import names a function in kernel32's code or, as msvcrt's
+    // `_fmode` and `_acmdln` are, a variable in its data: either way an
+    // address inside kernel32, never the program's or anyone else's.
+    let in_runtime = |address: &u64| {
+        runtime
+            .segments()
+            .any(|segment| (segment.address..segment.address + segment.len).contains(address))
+    };
+    // The program starts in kernel32 (Windows' loader does the same), which
+    // runs its TLS callbacks, then calls its entry and ends it with what
+    // the entry returns.
+    let start = exports.find(b"verdigris", b"start").filter(in_code).ok_or(LoadError::NoExports)?;
+    let mut fixups = alloc::vec::Vec::new();
+    pe.bind(|dll, name| exports.find(dll, name).filter(in_runtime), |fixup| fixups.push(Some(fixup)))
         .map_err(LoadError::Pe)?;
     if pe.moved() {
         crate::println!(
@@ -231,13 +250,41 @@ pub fn load_windows(file: &[u8], kernel32: &[u8]) -> Result<Image, LoadError> {
             pe.relocations()
         );
     }
-    build(
-        pe.entry(),
-        pe.segments().chain(runtime.segments()),
+    let tls = pe.tls();
+    // The TEB and PEB: zeroed pages of the program's own, with the fields
+    // Windows code reads without asking written before they are mapped.
+    let stack_base = STACK_BOTTOM + PROGRAM_STACK_PAGES * PAGE;
+    for (address, value) in [
+        (TEB + 0x08, stack_base),   // NT_TIB.StackBase: one past the top
+        (TEB + 0x10, STACK_BOTTOM), // NT_TIB.StackLimit
+        (TEB + 0x30, TEB),          // NT_TIB.Self
+        (TEB + 0x58, if tls.is_some() { TLS_VECTOR } else { 0 }), // ThreadLocalStoragePointer
+        (TEB + 0x60, PEB),          // ProcessEnvironmentBlock
+        (PEB + 0x10, pe.base()),    // ImageBaseAddress
+        (START_ENTRY, pe.entry()),
+        (START_TLS_CALLBACKS, tls.map_or(0, |tls| tls.callbacks)),
+        (TLS_VECTOR, TLS_BLOCK),
+    ] {
+        fixups.push(Some(Fixup { address, value }));
+    }
+    let blocks = Segment { address: TEB, len: (TEB_PAGES + 1) * PAGE, data: &[], writable: true, executable: false };
+    // The one thread's TLS block, made from the program's template.
+    let tls_block = tls.filter(|tls| tls.len > 0).map(|tls| Segment {
+        address: TLS_BLOCK,
+        len: tls.len,
+        data: tls.template,
+        writable: true,
+        executable: false,
+    });
+    let mut image = build(
+        start,
+        pe.segments().chain(runtime.segments()).chain(core::iter::once(blocks)).chain(tls_block),
         |page, each| pe.fixups_in(page, each),
         &fixups,
         8 + 32,
-    )
+    )?;
+    image.gs_base = TEB;
+    Ok(image)
 }
 
 /// Map checked segments into a fresh address space with a stack, the
@@ -319,5 +366,6 @@ fn build<'a>(
         stack_top: STACK_BOTTOM + PROGRAM_STACK_PAGES * PAGE - below,
         stack_guard: STACK_GUARD,
         space,
+        gs_base: 0,
     })
 }

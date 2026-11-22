@@ -313,8 +313,9 @@ fn console_checks() {
         .and_then(|segment| corrode_pe::exports::Exports::parse(segment.data));
     let hhdm = limine::HHDM.response.get().map(|response| response.offset);
     let bound = exports.zip(hhdm).is_some_and(|(exports, hhdm)| {
-        pe.imports().count() == 3
-            && pe.imports().all(|import| {
+        let mut all = true;
+        pe.each_import(|import| {
+            all &= {
                 let expected = exports.find(import.dll, import.name);
                 let held = space.translate(import.slot).map(|physical| {
                     // SAFETY: the frame is the task's, mapped by the direct
@@ -322,7 +323,9 @@ fn console_checks() {
                     unsafe { ((physical + hhdm) as *const u64).read_volatile() }
                 });
                 expected.is_some() && held == expected
-            })
+            };
+        });
+        all && pe.import_count() == 3
     });
     verdigris_check("its imports are bound into kernel32's code", bound);
 
@@ -399,8 +402,8 @@ fn view_checks() {
         cap::slots_used(server) == Some(6),
     );
     verdigris_check(
-        "reader.exe holds its view and page, not the files",
-        cap::slots_used(reader) == Some(3),
+        "reader.exe holds its view, page and heap, not the files",
+        cap::slots_used(reader) == Some(4),
     );
     start_all(&[Some(server), Some(reader)]);
     let finished = |id| task::state_of(id) == Some(task::State::Finished);
@@ -510,7 +513,16 @@ fn start_windows(
     let given = made
         && cap::grant(program, slots.output, verdigris::LOG, cap::Rights::WRITE).is_ok()
         && cap::grant(program, slots.view, verdigris::VIEW, cap::Rights::WRITE).is_ok()
-        && cap::grant(program, slots.page, verdigris::PAGE, cap::Rights::READ_WRITE).is_ok();
+        && cap::grant(program, slots.page, verdigris::PAGE, cap::Rights::READ_WRITE).is_ok()
+        // A heap to grow into, as a native program has: a budget of pages,
+        // none taken until kernel32 asks.
+        && cap::issue_to(
+            program,
+            verdigris::POOL,
+            cap::Object::Pool(core::sync::atomic::AtomicU64::new(verdigris::POOL_PAGES)),
+            cap::Rights::READ_WRITE,
+        )
+        .is_ok();
     if !(served && given) {
         return Err("its capabilities could not be handed out");
     }

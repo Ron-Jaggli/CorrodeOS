@@ -501,6 +501,34 @@ pub mod verdigris {
     pub const VIEW: usize = 1;
     /// The page it shares with its view, for paths and what is read.
     pub const PAGE: usize = 2;
+    /// Memory to buy its heap from (`malloc`, `HeapAlloc`): a budget of
+    /// [`POOL_PAGES`], taken only as the heap grows.
+    pub const POOL: usize = 3;
+    pub const POOL_PAGES: u64 = 4096;
+    /// Where each piece of the heap's memory goes, from this slot up to
+    /// `HEAP + HEAP_PIECES - 1`.
+    pub const HEAP: usize = 4;
+    pub const HEAP_PIECES: usize = 8;
+
+    /// The thread environment block, two pages, read through `gs` as on
+    /// Windows (`gs:[0x30]` is its own address). The kernel writes its
+    /// stack bounds, its own address and the PEB's before it is mapped,
+    /// and points the task's GS base at it. Above kernel32, below the
+    /// image range's end.
+    pub const TEB: u64 = 0x0f00_0000;
+    pub const TEB_PAGES: u64 = 2;
+    /// The process environment block, one page, after the TEB.
+    pub const PEB: u64 = TEB + TEB_PAGES * 4096;
+    /// What kernel32's start routine needs, written by the kernel in the
+    /// PEB's unused second half: the program's entry point, and its TLS
+    /// callbacks (a zero-ended array of addresses; 0 for none).
+    pub const START_ENTRY: u64 = PEB + 0x800;
+    pub const START_TLS_CALLBACKS: u64 = PEB + 0x808;
+    /// The program's TLS vector (`TEB.ThreadLocalStoragePointer`): one
+    /// entry, its block, for TLS index 0.
+    pub const TLS_VECTOR: u64 = PEB + 0x900;
+    /// Its thread-local storage block: the template, then zeroes.
+    pub const TLS_BLOCK: u64 = PEB + 4096;
 }
 
 /// A Windows program's view of the files (`verdigris/DESIGN.md` section 4),

@@ -28,3 +28,10 @@ ENV LIMINE_DIR=/opt/limine
 # Cargo writes here; bind-mounted source stays the only writable project path.
 ENV CARGO_HOME=/usr/local/cargo
 WORKDIR /src
+
+# Verdigris's C test programs: a Windows C compiler, mingw-w64's gcc, whose
+# programs import from msvcrt.dll as most mingw-built programs do. Its own
+# layer, last, so adding it rebuilt nothing above it.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc-mingw-w64-x86-64-win32 \
+    && rm -rf /var/lib/apt/lists/*
