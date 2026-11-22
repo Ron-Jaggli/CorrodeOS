@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 
 use corrode_rt::abi::view::{
     CLOSE, DONE, HANDLES, HEAP, HEAP_PAGES, INVALID_HANDLE, LOG, MOST_PATH, NAME_TOO_LONG, NEXT, NO_MORE_FILES, OPEN,
-    PAGE, POOL, READ, REPLY, SEARCH, SERVE, SIZE, SPEC, TOO_MANY_OPEN, TREE,
+    PAGE, POOL, READ, REPLY, SEARCH, SERVE, SIZE, SPEC, TOO_MANY_OPEN, TREE, GET_DIR, SET_DIR, FULL_PATH,
 };
 use corrode_rt::{identify, map, println, recv, reply, Message};
 use corrode_shell::fs::{Fs, Node};
@@ -47,6 +47,13 @@ fn path_in(page: &[u8], len: u64) -> Result<String, u64> {
     }
     let copied = Vec::from(&page[..len]);
     String::from_utf8(copied).map_err(|_| corrode_view::Error::FileNotFound.code() as u64)
+}
+
+/// `text` into the page, answering its length.
+fn to_page(page: &mut [u8], text: &str) -> [u64; 3] {
+    let len = text.len().min(page.len());
+    page[..len].copy_from_slice(&text.as_bytes()[..len]);
+    [len as u64, 0, 0]
 }
 
 /// The first free handle, holding `open`.
@@ -104,6 +111,8 @@ fn main() {
     let view = View::new(&folder, &allowed);
     println!("C:\\ is {}, {} allowed beside {folder}", view.root(), allowed.len());
 
+    // Relative paths start here: the program's own folder, until it says.
+    let mut cwd = String::from(view.home());
     let mut open: [Option<Open>; HANDLES] = [const { None }; HANDLES];
     loop {
         let received = match recv(SERVE, None, Some(REPLY)) {
@@ -121,13 +130,22 @@ fn main() {
         let answer: Result<[u64; 3], u64> = match label {
             OPEN => path_in(page, words[0]).and_then(|path| {
                 let node = view
-                    .open(&fs, view.home(), &path, words[1] != 0, words[2] as u32)
+                    .open(&fs, &cwd, &path, words[1] != 0, words[2] as u32)
                     .map_err(|error| error.code() as u64)?;
                 keep(&mut open, Open::File { node, at: 0 })
             }),
             SEARCH => path_in(page, words[0]).and_then(|path| {
-                let found = view.search(&fs, view.home(), &path).map_err(|error| error.code() as u64)?;
+                let found = view.search(&fs, &cwd, &path).map_err(|error| error.code() as u64)?;
                 keep(&mut open, Open::Search { found, at: 0 })
+            }),
+            SET_DIR => path_in(page, words[0]).and_then(|path| {
+                cwd = view.change_dir(&fs, &cwd, &path).map_err(|error| error.code() as u64)?;
+                Ok([0; 3])
+            }),
+            GET_DIR => Ok(to_page(page, &view.windows_path(&cwd))),
+            FULL_PATH => path_in(page, words[0]).and_then(|path| {
+                let full = view.full_path(&cwd, &path).map_err(|error| error.code() as u64)?;
+                Ok(to_page(page, &full))
             }),
             READ | SIZE | NEXT | CLOSE => match open.get_mut(words[0] as usize).and_then(Option::as_mut) {
                 None => Err(INVALID_HANDLE),

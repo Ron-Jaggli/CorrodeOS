@@ -512,6 +512,16 @@ pub mod view {
     /// UTF-8 in the page. Answers `[0, name's length, size, 1 if a
     /// directory]`, or `ERROR_NO_MORE_FILES` (18) after the last.
     pub const NEXT: u64 = 7;
+    /// `[0, 0, 0, 0]`: the current directory, as a `C:\` path in the
+    /// page. Answers its length. It starts as the program's own folder.
+    pub const GET_DIR: u64 = 8;
+    /// `[len, 0, 0, 0]`, a path in the page: make it the current
+    /// directory, which relative paths in every call start from.
+    pub const SET_DIR: u64 = 9;
+    /// `[len, 0, 0, 0]`, a path in the page: replaced by its full `C:\`
+    /// form, as `GetFullPathNameW` gives it. Answers the length. Asks
+    /// nothing of the files: whether the name is there is not said.
+    pub const FULL_PATH: u64 = 10;
 
     /// Files a program may have open at once.
     pub const HANDLES: usize = 16;

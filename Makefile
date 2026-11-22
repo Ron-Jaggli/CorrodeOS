@@ -324,7 +324,7 @@ pe-test: iso
 	grep -aqxF "reader.exe : keys.txt: $$keys" build/pe-lines.log \
 	    && grep -aqxF "reader.exe : c:/Etc/MOTD: $$motd" build/pe-lines.log \
 	    && grep -aqxF "reader.exe : ..\..\etc\motd: $$motd" build/pe-lines.log \
-	    && test $$(grep -acxF "reader.exe : GetFileSize and the next ReadFile agree" build/pe-lines.log) -eq 3 \
+	    && test $$(grep -acxF "reader.exe : GetFileSize and the next ReadFile agree" build/pe-lines.log) -eq 4 \
 	    && echo "pe-test: reader.exe reads what it may, any spelling  PASS" \
 	    || echo "pe-test: reader.exe reads what it may, any spelling  FAIL"
 	@grep -aqxF 'reader.exe : C:\etc\desktop.conf: not there (2, ERROR_FILE_NOT_FOUND)' build/pe-lines.log \
@@ -349,6 +349,28 @@ pe-test: iso
 	    && grep -aqxF 'reader.exe : C:\home\*: not there (3, ERROR_PATH_NOT_FOUND)' build/pe-lines.log \
 	    && echo "pe-test: ...and finds a hidden name as a missing one PASS" \
 	    || echo "pe-test: ...and finds a hidden name as a missing one FAIL"
+	@# The current directory: moved, followed by a relative open, shown and
+	@# made full only as C:\ paths.
+	@motd=$$(head -1 root/etc/motd); \
+	grep -aqxF 'reader.exe : current directory: C:\docs' build/pe-lines.log \
+	    && grep -aqxF 'reader.exe : SetCurrentDirectoryW(..\etc): done' build/pe-lines.log \
+	    && grep -aqxF 'reader.exe : current directory: C:\etc' build/pe-lines.log \
+	    && grep -aqxF "reader.exe : motd: $$motd" build/pe-lines.log \
+	    && grep -aqxF 'reader.exe : GetFullPathNameW(..\home\hello.txt): C:\home\hello.txt, file part hello.txt' build/pe-lines.log \
+	    && grep -aqxF 'reader.exe : GetFullPathNameW(..\..\..\x): C:\x, file part x' build/pe-lines.log \
+	    && grep -aqxF 'reader.exe : SetCurrentDirectoryW(C:\home): not there (2, ERROR_FILE_NOT_FOUND)' build/pe-lines.log \
+	    && grep -aqxF 'reader.exe : SetCurrentDirectoryW(C:\etc\motd): not a directory (267, ERROR_DIRECTORY)' build/pe-lines.log \
+	    && grep -aqxF 'reader.exe : current directory: C:\' build/pe-lines.log \
+	    && echo "pe-test: the current directory moves inside the view PASS" \
+	    || echo "pe-test: the current directory moves inside the view FAIL"
+	@# Every path it was given -- current directories, full paths -- is a
+	@# C:\ path; a real one would start with `/`.
+	@given=$$(grep -aE '^reader.exe : (current directory|GetFullPathNameW\([^)]*\)): ' build/pe-lines.log \
+	          | sed 's/^[^:]*: [^:]*: //'); \
+	test $$(printf '%s\n' "$$given" | grep -c .) -eq 5 \
+	    && ! printf '%s\n' "$$given" | grep -vq '^C:\\[^/]*$$' \
+	    && echo "pe-test: ...and every path it is given is a C:\ one PASS" \
+	    || echo "pe-test: ...and every path it is given is a C:\ one FAIL"
 
 # Boot, let the kernel settle, then dump the framebuffer through the QEMU
 # monitor. This is how we verify the renderer actually put pixels where it

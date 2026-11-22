@@ -49,6 +49,8 @@ pub enum Error {
     WriteProtect,
     /// A creation disposition Windows does not have.
     InvalidParameter,
+    /// A file, where a directory was asked for (`ERROR_DIRECTORY`).
+    NotADirectory,
 }
 
 impl Error {
@@ -60,6 +62,7 @@ impl Error {
             Error::AccessDenied => 5,
             Error::WriteProtect => 19,
             Error::InvalidParameter => 87,
+            Error::NotADirectory => 267,
         }
     }
 }
@@ -335,6 +338,50 @@ impl View {
             return Err(Error::FileNotFound);
         }
         Ok(found)
+    }
+
+    /// A real path in the view as the program is shown it: `C:\` and the
+    /// names below the view's root. Where the view sits in the real tree
+    /// is never in it.
+    pub fn windows_path(&self, real: &str) -> String {
+        let below = real.strip_prefix(self.root.as_str()).unwrap_or("");
+        let mut out = String::from("C:");
+        for name in parts(below) {
+            out.push('\\');
+            out.push_str(name);
+        }
+        if out.len() == 2 {
+            out.push('\\');
+        }
+        out
+    }
+
+    /// `GetFullPathNameW`: `path` made absolute against `cwd` and cleaned,
+    /// as a `C:\` path. Like Windows, it asks nothing of the tree: a name
+    /// that is not there gets a full path too, so it says nothing about
+    /// what exists. A trailing `\` is kept.
+    pub fn full_path(&self, cwd: &str, path: &str) -> Result<String, Error> {
+        let names = self.names(cwd, path)?;
+        let mut out = String::from("C:");
+        for name in &names {
+            out.push('\\');
+            out.push_str(name);
+        }
+        if names.is_empty() || (path.ends_with(['\\', '/']) && path.len() > 1) {
+            out.push('\\');
+        }
+        Ok(out)
+    }
+
+    /// `SetCurrentDirectoryW`: the real directory `path` names, to be the
+    /// new `cwd`. Hidden and missing alike fail as for a missing name; a
+    /// file is `ERROR_DIRECTORY`.
+    pub fn change_dir(&self, fs: &Fs<'_>, cwd: &str, path: &str) -> Result<String, Error> {
+        let node = self.find(fs, cwd, path)?;
+        if !node.is_dir() {
+            return Err(Error::NotADirectory);
+        }
+        Ok(node.path.clone())
     }
 
     /// The names a directory shows, for `path` naming one.

@@ -10,8 +10,10 @@
 # ExitProcess from KERNEL32.dll. For each path in its first table it opens
 # the file, reads it, and writes the file's first line to standard output;
 # for each in its second it searches, and writes each name found (a
-# directory's with a `\` after it). When a call fails it says which error
-# GetLastError gave. The kernel starts it in /docs, allowed /etc/motd
+# directory's with a `\` after it). Last it moves its current directory
+# and asks for full paths (GetCurrentDirectoryW, SetCurrentDirectoryW,
+# GetFullPathNameW). When a call fails it says which error GetLastError
+# gave. The kernel starts it in /docs, allowed /etc/motd
 # besides, so what it may see and what it may not are both on the lists.
 
         .intel_syntax noprefix
@@ -75,7 +77,8 @@ optional_end:
         .org base + 0x1000
         .set buffer, base + 0x3000      # 4 KiB for a read, then 4 KiB more
         .set found, buffer              # or a WIN32_FIND_DATAW,
-        .set line, buffer + 1024        # and a name to write
+        .set line, buffer + 1024        # and a name to write,
+        .set dirbuf, buffer + 2048      # and a path to be given
 
 code:
         # On entry rsp is 8 below a 16-byte boundary.
@@ -94,6 +97,26 @@ code:
         mov r8d, say_\n\()_end - say_\n
         call list
         .endr
+
+        # The current directory, and full paths from it.
+        .macro step label, routine
+        lea rcx, [rip + say_\label]
+        mov edx, say_\label\()_end - say_\label
+        call put
+        lea rcx, [rip + path_\label]
+        mov edx, 0x80000000             # GENERIC_READ, for show
+        call \routine
+        .endm
+        step d1, cwd
+        step d2, cd
+        step d3, cwd
+        step d4, show
+        step d5, full
+        step d6, full
+        step d7, cd
+        step d8, cd
+        step d9, cd
+        step d10, cwd
         xor ecx, ecx
         call [rip + ExitProcess]
         ud2
@@ -193,7 +216,7 @@ failed_closing:
         call [rip + CloseHandle]
 failed:
         call [rip + GetLastError]
-        .irp code, 2, 3, 5, 18, 19
+        .irp code, 2, 3, 5, 18, 19, 267
         cmp eax, \code
         jne 1f
         lea rcx, [rip + error_\code]
@@ -205,6 +228,7 @@ failed:
         mov edx, error_other_end - error_other
 said:
         call put
+back:
         add rsp, 0x48
         pop r12
         pop rdi
@@ -232,26 +256,11 @@ list_next:
         mov rcx, rsi
         mov rdx, rdi
         call put
-        lea rcx, [rip + found + 44]     # the name, UTF-16, to bytes
-        lea rdx, [rip + line]
-        xor eax, eax
-list_copy:
-        movzx r8d, word ptr [rcx + rax * 2]
-        test r8d, r8d
-        jz list_copied
-        mov [rdx + rax], r8b
-        inc rax
-        jmp list_copy
-list_copied:
-        test dword ptr [rip + found], 0x10   # FILE_ATTRIBUTE_DIRECTORY
-        jz 1f
-        mov byte ptr [rdx + rax], 0x5c
-        inc rax
-1:      mov byte ptr [rdx + rax], 10
-        inc rax
-        mov rcx, rdx
-        mov rdx, rax
-        call put
+        lea rcx, [rip + found + 44]
+        mov edx, [rip + found]
+        and edx, 0x10                   # FILE_ATTRIBUTE_DIRECTORY: a `\`
+        xor r8d, r8d
+        call put_name
         mov rcx, r12
         lea rdx, [rip + found]
         call [rip + FindNextFileW]
@@ -264,6 +273,94 @@ list_failed:
         mov rdx, rdi
         call put
         jmp failed
+
+# put_name(rcx = UTF-16 text, edx = nonzero for a `\` after it, r8d =
+# nonzero to leave the line open): to standard output, as bytes.
+put_name:
+        push rbx
+        sub rsp, 0x20                   # 8 + 8 + 0x20: aligned for calls
+        mov ebx, r8d
+        lea r8, [rip + line]
+        xor eax, eax
+1:      movzx r9d, word ptr [rcx + rax * 2]
+        test r9d, r9d
+        jz 2f
+        mov [r8 + rax], r9b
+        inc rax
+        cmp eax, 1000
+        jb 1b
+2:      test edx, edx
+        jz 3f
+        mov byte ptr [r8 + rax], 0x5c
+        inc rax
+3:      test ebx, ebx
+        jnz 4f
+        mov byte ptr [r8 + rax], 10
+        inc rax
+4:      mov rcx, r8
+        mov rdx, rax
+        call put
+        add rsp, 0x20
+        pop rbx
+        ret
+
+# The steps below share show's frame, so they end through its paths.
+        .macro frame
+        push rbx
+        push rsi
+        push rdi
+        push r12
+        sub rsp, 0x48
+        .endm
+
+# cwd: the current directory.
+cwd:
+        frame
+        mov ecx, 260
+        lea rdx, [rip + dirbuf]
+        call [rip + GetCurrentDirectoryW]
+        test eax, eax
+        jz failed
+        lea rcx, [rip + dirbuf]
+        xor edx, edx
+        xor r8d, r8d
+        call put_name
+        jmp back
+
+# cd(rcx = UTF-16 path): make it the current directory.
+cd:
+        frame
+        call [rip + SetCurrentDirectoryW]
+        test eax, eax
+        jz failed
+        lea rcx, [rip + done]
+        mov edx, done_end - done
+        jmp said
+
+# full(rcx = UTF-16 path): its full path, and where its last name starts.
+full:
+        frame
+        mov edx, 260
+        lea r8, [rip + dirbuf]
+        lea r9, [rsp + 0x38]            # the file part
+        call [rip + GetFullPathNameW]
+        test eax, eax
+        jz failed
+        lea rcx, [rip + dirbuf]
+        xor edx, edx
+        mov r8d, 1
+        call put_name
+        lea rcx, [rip + part]
+        mov edx, part_end - part
+        call put
+        mov rcx, [rsp + 0x38]
+        test rcx, rcx
+        jnz 1f
+        lea rcx, [rip + none]
+1:      xor edx, edx
+        xor r8d, r8d
+        call put_name
+        jmp back
 code_end:
 
 # --- .rdata, at 0x2000 ---------------------------------------------------
@@ -276,19 +373,19 @@ imports_end:
 
         .balign 8, 0
 lookup:
-        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, FindFirstFileW, FindNextFileW, FindClose, GetStdHandle, WriteFile, ExitProcess
+        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, FindFirstFileW, FindNextFileW, FindClose, GetCurrentDirectoryW, SetCurrentDirectoryW, GetFullPathNameW, GetStdHandle, WriteFile, ExitProcess
         .quad hint_\name - base
         .endr
         .quad 0
 iat:
-        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, FindFirstFileW, FindNextFileW, FindClose, GetStdHandle, WriteFile, ExitProcess
+        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, FindFirstFileW, FindNextFileW, FindClose, GetCurrentDirectoryW, SetCurrentDirectoryW, GetFullPathNameW, GetStdHandle, WriteFile, ExitProcess
 \name:  .quad hint_\name - base
         .endr
         .quad 0
 iat_end:
 
 dll:    .asciz "KERNEL32.dll"
-        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, FindFirstFileW, FindNextFileW, FindClose, GetStdHandle, WriteFile, ExitProcess
+        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, FindFirstFileW, FindNextFileW, FindClose, GetCurrentDirectoryW, SetCurrentDirectoryW, GetFullPathNameW, GetStdHandle, WriteFile, ExitProcess
         .balign 2, 0
 hint_\name:
         .short 0
@@ -334,6 +431,17 @@ path_\n:
         listing 14, "C:\\etc\\desktop.c*", "C:\\etc\\desktop.c*"
         listing 15, "C:\\home\\*", "C:\\home\\*"
 
+        listing d1, "current directory", ""
+        listing d2, "SetCurrentDirectoryW(..\\etc)", "..\\etc"
+        listing d3, "current directory", ""
+        listing d4, "motd", "motd"
+        listing d5, "GetFullPathNameW(..\\home\\hello.txt)", "..\\home\\hello.txt"
+        listing d6, "GetFullPathNameW(..\\..\\..\\x)", "..\\..\\..\\x"
+        listing d7, "SetCurrentDirectoryW(C:\\home)", "C:\\home"
+        listing d8, "SetCurrentDirectoryW(C:\\etc\\motd)", "C:\\etc\\motd"
+        listing d9, "SetCurrentDirectoryW(C:/)", "C:/"
+        listing d10, "current directory", ""
+
 agrees: .ascii "GetFileSize and the next ReadFile agree\n"
 agrees_end:
 disagrees:
@@ -347,6 +455,14 @@ error_5: .ascii "refused (5, ERROR_ACCESS_DENIED)\n"
 error_5_end:
 error_18: .ascii "no more (18, ERROR_NO_MORE_FILES)\n"
 error_18_end:
+error_267: .ascii "not a directory (267, ERROR_DIRECTORY)\n"
+error_267_end:
+done:   .ascii "done\n"
+done_end:
+part:   .ascii ", file part "
+part_end:
+none:   .string16 "(none)"
+        .short 0
 error_19: .ascii "read-only (19, ERROR_WRITE_PROTECT)\n"
 error_19_end:
 error_other: .ascii "failed some other way\n"

@@ -2789,6 +2789,63 @@ directory and finds only what its view shows.
   before, plus pe-test's two), none FAIL, no unhandled trap, no boot
   self-check failing; `./corrode test` 349 passed; clippy at 33.
 
+## 84. Verdigris: the current directory, and full paths
+
+`GetCurrentDirectoryW`, `SetCurrentDirectoryW` and `GetFullPathNameW`. A
+program has a current directory inside its view, relative paths in every
+call follow it, and every path it is given is a `C:\` path. Where its
+view sits in the real tree is never in one.
+
+- **`corrode-view`**:
+  - `windows_path` shows a real path as `C:\` plus the names below the
+    view's root.
+  - `full_path` makes a path absolute and clean against the current
+    directory. Like Windows it asks nothing of the tree, so it says
+    nothing about what exists: a hidden name gets a full path exactly as
+    a missing one does. A trailing `\` is kept.
+  - `change_dir` moves only to a directory the view shows. Hidden and
+    missing fail alike; a file is `ERROR_DIRECTORY` (267).
+  - 2 host tests more, 12 in all. One checks that the real root's own
+    name never appears.
+- **`fileview`** keeps the current directory, starting at the program's
+  own folder. `GET_DIR` (8), `SET_DIR` (9) and `FULL_PATH` (10) are new;
+  `OPEN` and `SEARCH` now resolve against the current directory.
+- **kernel32**: the three calls, with Windows' buffer rule: the length
+  written without its zero, or, if it does not fit, the room needed with
+  it and nothing written. `GetFullPathNameW` also gives where the last
+  name starts, or null if the path ends in `\`.
+- **reader.exe** ends with ten steps. A shared `put_name` routine now
+  writes UTF-16 names for both searches and paths:
+
+  ```
+  current directory: C:\docs
+  SetCurrentDirectoryW(..\etc): done
+  current directory: C:\etc
+  motd: Welcome to CorrodeOS. ...          (a relative open, from C:\etc)
+  GetFullPathNameW(..\home\hello.txt): C:\home\hello.txt, file part hello.txt
+  GetFullPathNameW(..\..\..\x): C:\x, file part x
+  SetCurrentDirectoryW(C:\home): not there (2, ERROR_FILE_NOT_FOUND)
+  SetCurrentDirectoryW(C:\etc\motd): not a directory (267, ERROR_DIRECTORY)
+  SetCurrentDirectoryW(C:/): done
+  current directory: C:\
+  ```
+
+- **pe-test** gained two scored lines (10 in all):
+  - the steps above, exactly;
+  - every path the program was given starts with `C:\` and holds no
+    `/`. Checked to fail when one log line is changed to `/etc`.
+
+- **Choice:** the current directory lives in the view's service, not in
+  kernel32. The service is what resolves paths, so it is the one that
+  must agree with them. kernel32 stays free of path rules.
+- **Choice:** `GetFullPathNameW` is answered by the service from strings
+  alone, as Windows does. It names `C:\home\hello.txt` though `/home` is
+  hidden, exactly as for a name that does not exist, so it tells the
+  program nothing.
+- Verified: the whole suite on both GPUs, 83 checks PASS on each (81
+  before, plus pe-test's two), none FAIL, no unhandled trap, no boot
+  self-check failing; `./corrode test` 351 passed; clippy at 33.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -2927,12 +2984,17 @@ one task.
    GetFileSize), only what it was allowed, anything else absent.
 7. [x] (section 83) Verdigris: FindFirstFileW, FindNextFileW and FindClose through the
    view -- a listing shows only what the view shows; pe-test.
-8. [ ] Verdigris: GetCurrentDirectoryW, SetCurrentDirectoryW and
+8. [x] (section 84) Verdigris: GetCurrentDirectoryW, SetCurrentDirectoryW and
    GetFullPathNameW -- `C:\` paths only, never where the view sits in the
    real tree; a relative open follows the current directory; pe-test.
-9. [ ] Wrap-up for the owner: what the vault run did, what to review and
+9. [ ] `win PATH` in the terminal runs a Windows program from the files:
+   its view is its own folder alone, its standard output comes back to the
+   terminal; reader.exe packed into the files at /apps/reader; a scored
+   boot test, both GPUs.
+10. [ ] Wrap-up for the owner: what the vault run did, what to review and
    merge, what is still open. No code. Then stop the loop.
 
-Tasks 7-9 were added at 2026-11-22T03:10-06:00, by me: 1-6 were done with
+Tasks 7-9 were added at 2026-11-22T03:10-06:00, by me (and 9, running a
+program from the terminal, at 04:05, the wrap-up moving to 10): 1-6 were done with
 11.5 of the 15 hours left, which the owner asked to have used. They carry
 on from 6 and need no decision from the owner.

@@ -232,8 +232,9 @@ fn errors_are_windows_numbers() {
         Error::AccessDenied.code(),
         Error::WriteProtect.code(),
         Error::InvalidParameter.code(),
+        Error::NotADirectory.code(),
     ];
-    assert_eq!(codes, [2, 3, 5, 19, 87]);
+    assert_eq!(codes, [2, 3, 5, 19, 87, 267]);
 }
 
 #[test]
@@ -291,5 +292,53 @@ fn a_search_finds_only_what_the_view_shows() {
         assert_eq!(names(r"save.dat\*"), Err(Error::PathNotFound));
         // No pattern at all.
         assert_eq!(names(r"C:\root\"), Err(Error::FileNotFound));
+    });
+}
+
+#[test]
+fn paths_are_shown_from_c_never_from_the_real_root() {
+    let view = View::new(ROBOT, &["/apps/shared/fonts"]);
+    assert_eq!(view.root(), "/apps");
+    assert_eq!(view.windows_path("/apps"), r"C:\");
+    assert_eq!(view.windows_path("/apps/robot"), r"C:\robot");
+    assert_eq!(view.windows_path("/apps/shared/fonts/mono.ttf"), r"C:\shared\fonts\mono.ttf");
+    let full = |path: &str| view.full_path(ROBOT, path).unwrap();
+    assert_eq!(full("save.dat"), r"C:\robot\save.dat");
+    assert_eq!(full(r"..\shared\fonts"), r"C:\shared\fonts");
+    assert_eq!(full(r"..\..\..\x"), r"C:\x");
+    assert_eq!(full(r"C:\"), r"C:\");
+    assert_eq!(full("."), r"C:\robot");
+    assert_eq!(full(r"AppData\"), r"C:\robot\AppData\");
+    assert_eq!(full("c:/a/./b/../c"), r"C:\a\c");
+    // Whether a name is there or hidden changes nothing.
+    assert_eq!(full(r"C:\other\other.exe"), r"C:\other\other.exe");
+    assert_eq!(full(r"C:\nothing\at.all"), r"C:\nothing\at.all");
+    // And the real tree above the root is never named.
+    assert_eq!(full(r"..\..\.."), r"C:\");
+    assert_eq!(full(r"\.."), r"C:\");
+    // `apps` is the real root's name, not a name in C:\.
+    assert_eq!(full(r"C:\..\apps"), r"C:\apps");
+    assert_eq!(view.full_path(ROBOT, r"D:\x"), Err(Error::PathNotFound));
+}
+
+#[test]
+fn the_current_directory_moves_only_inside_the_view() {
+    with(TREE, |fs| {
+        let view = View::new(ROBOT, &["/root/dih/robot.txt"]);
+        let cd = |cwd: &str, path: &str| view.change_dir(fs, cwd, path);
+        assert_eq!(cd(ROBOT, "AppData").as_deref(), Ok("/apps/robot/AppData"));
+        assert_eq!(cd(ROBOT, r"..\..\root\DIH").as_deref(), Ok("/root/dih"));
+        assert_eq!(cd(ROBOT, r"C:\").as_deref(), Ok("/"));
+        // Then relative paths follow it.
+        let dih = cd(ROBOT, r"C:\root\dih").unwrap();
+        let open = view.open(fs, &dih, "robot.txt", false, OPEN_EXISTING).map(|node| node.path.as_str());
+        assert_eq!(open, Ok("/root/dih/robot.txt"));
+        assert_eq!(view.full_path(&dih, "robot.txt").unwrap(), r"C:\root\dih\robot.txt");
+        assert_eq!(view.search(fs, &dih, "*").unwrap().len(), 3);
+        // Not into what is hidden, as not into what is missing; not into a file.
+        assert_eq!(cd(ROBOT, r"C:\root\keys"), cd(ROBOT, r"C:\root\keyz"));
+        assert_eq!(cd(ROBOT, r"C:\etc"), Err(Error::FileNotFound));
+        assert_eq!(cd(ROBOT, "save.dat"), Err(Error::NotADirectory));
+        assert_eq!(cd(ROBOT, r"D:\"), Err(Error::PathNotFound));
     });
 }

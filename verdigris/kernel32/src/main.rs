@@ -7,7 +7,9 @@
 //! out as log lines under its name.
 //!
 //! Files: `CreateFileW`, `ReadFile`, `GetFileSize`, `CloseHandle`, and the
-//! search calls `FindFirstFileW`, `FindNextFileW` and `FindClose`, through
+//! search calls `FindFirstFileW`, `FindNextFileW` and `FindClose`, and the
+//! current directory and full paths (`GetCurrentDirectoryW`,
+//! `SetCurrentDirectoryW`, `GetFullPathNameW`, always `C:\` paths), through
 //! the program's view (`verdigris::VIEW`), when it was given one. Paths go
 //! to the view's service in the page the two share (`verdigris::PAGE`),
 //! and what is read comes back in it; the service decides what the program
@@ -242,6 +244,101 @@ unsafe extern "win64" fn get_file_size(handle: isize, high: *mut u32) -> u32 {
         }
         Err(code) => fail(code, INVALID_FILE_SIZE),
     }
+}
+
+/// A `C:\` path the view put in the page, `len` bytes of UTF-8, into a
+/// program's buffer of `room` UTF-16 units, as Windows' string calls do:
+/// the units written, without the zero; or, if it does not fit with its
+/// zero, the room it needs, zero included, and nothing written. With it,
+/// the unit after the last `\`, for `GetFullPathNameW`'s file part.
+///
+/// # Safety
+/// `buffer` is null or has room for `room` units.
+unsafe fn page_to_buffer(len: u64, room: u32, buffer: *mut u16) -> (u32, Option<usize>) {
+    let Some(page) = page() else {
+        return (0, None);
+    };
+    let text = core::str::from_utf8(&page[..(len as usize).min(page.len())]).unwrap_or("");
+    let units = text.encode_utf16().count();
+    if buffer.is_null() || units + 1 > room as usize {
+        return (units as u32 + 1, None);
+    }
+    let mut after_slash = None;
+    for (at, unit) in text.encode_utf16().enumerate() {
+        // SAFETY: the caller's promise; `at < units < room`.
+        unsafe { buffer.add(at).write_unaligned(unit) };
+        if unit == u16::from(b'\\') {
+            after_slash = Some(at + 1);
+        }
+    }
+    // SAFETY: as above; `units < room`.
+    unsafe { buffer.add(units).write_unaligned(0) };
+    (units as u32, after_slash.filter(|at| *at < units))
+}
+
+/// The current directory, a `C:\` path, into `buffer` (see
+/// [`page_to_buffer`] for what is returned). 0 if it cannot be had.
+///
+/// # Safety
+/// `buffer` is null or has room for `room` units.
+unsafe extern "win64" fn get_current_directory_w(room: u32, buffer: *mut u16) -> u32 {
+    match ask(view::GET_DIR, [0; 4]) {
+        // SAFETY: the caller's promise.
+        Ok(len) => unsafe { page_to_buffer(len, room, buffer) }.0,
+        Err(code) => fail(code, 0),
+    }
+}
+
+/// Make `path` the current directory. Only a directory the view shows.
+///
+/// # Safety
+/// `path` is a zero-ended UTF-16 string.
+unsafe extern "win64" fn set_current_directory_w(path: *const u16) -> i32 {
+    // SAFETY: the caller's promise.
+    let len = match unsafe { path_to_page(path) } {
+        Ok(len) => len,
+        Err(code) => return fail(code, 0),
+    };
+    match ask(view::SET_DIR, [len as u64, 0, 0, 0]) {
+        Ok(_) => 1,
+        Err(code) => fail(code, 0),
+    }
+}
+
+/// `name` made absolute and clean, a `C:\` path, into `buffer`; and, if
+/// `file_part` is not null, where in it the last name starts (null if it
+/// ends with `\`). Nothing is asked of the files.
+///
+/// # Safety
+/// `name` is a zero-ended UTF-16 string, `buffer` null or with room for
+/// `room` units, `file_part` null or writable.
+unsafe extern "win64" fn get_full_path_name_w(
+    name: *const u16,
+    room: u32,
+    buffer: *mut u16,
+    file_part: *mut *mut u16,
+) -> u32 {
+    // SAFETY: the caller's promise.
+    let len = match unsafe { path_to_page(name) } {
+        Ok(len) => len,
+        Err(code) => return fail(code, 0),
+    };
+    let full = match ask(view::FULL_PATH, [len as u64, 0, 0, 0]) {
+        Ok(full) => full,
+        Err(code) => return fail(code, 0),
+    };
+    // SAFETY: the caller's promise.
+    let (count, last) = unsafe { page_to_buffer(full, room, buffer) };
+    if !file_part.is_null() {
+        let part = match last {
+            // SAFETY: inside what was just written.
+            Some(at) if count < room => unsafe { buffer.add(at) },
+            _ => core::ptr::null_mut(),
+        };
+        // SAFETY: the caller's promise.
+        unsafe { file_part.write_unaligned(part) };
+    }
+    count
 }
 
 /// `WIN32_FIND_DATAW`'s fields, by byte offset.
@@ -519,9 +616,9 @@ const fn export(name: &[u8], function: *const ()) -> Export {
 /// What this kernel32 offers, at `KERNEL32_BASE` (see `kernel32.ld`).
 #[used]
 #[link_section = ".verdigris.exports"]
-static EXPORTS: Table<12> = Table {
+static EXPORTS: Table<15> = Table {
     magic: MAGIC,
-    count: 12,
+    count: 15,
     size: ENTRY as u32,
     entries: [
         export(b"GetStdHandle", get_std_handle as *const ()),
@@ -536,5 +633,8 @@ static EXPORTS: Table<12> = Table {
         export(b"FindFirstFileW", find_first_file_w as *const ()),
         export(b"FindNextFileW", find_next_file_w as *const ()),
         export(b"FindClose", find_close as *const ()),
+        export(b"GetCurrentDirectoryW", get_current_directory_w as *const ()),
+        export(b"SetCurrentDirectoryW", set_current_directory_w as *const ()),
+        export(b"GetFullPathNameW", get_full_path_name_w as *const ()),
     ],
 };
