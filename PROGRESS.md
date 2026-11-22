@@ -2622,6 +2622,31 @@ under the passcode, instead of on the boot medium.
   self-checks with a vault count one more; `./corrode test` 338 passed;
   clippy at 33.
 
+## 81. The vault in the README
+
+- README gained "Your files, encrypted: the vault", before customizing the
+  desktop: how to seal `root/` into a disk (`vault-disk`,
+  `VAULT_PASSCODE`, `VAULT_IMG`) and boot it (`run-vault`); what happens
+  at boot, step by step (Limine's hashes, lock screen first, PBKDF2 and
+  AES-CCM, the tries limit, files after); changing the passcode in
+  Settings and why a failed write loses nothing; and what it protects
+  against and what it does not.
+- Not covered, said plainly: the opened files stay in memory until shutdown
+  (locking does not seal them again); the vault is read-only while
+  running; no TPM, no recovery code, so a forgotten passcode loses the
+  files; AES-NI needed; the theme sector is not encrypted.
+- The layout list names `vault/` and `scripts/seal-iso.sh`, and virtio-blk's
+  line says it writes the vault's sectors too; the command list gained
+  verify-test, vault-test and rekey-test.
+- Checked: `NO_KVM=1 QEMU_EXTRA='-cpu max'` does open the vault under TCG
+  (QEMU_EXTRA comes after ACCEL, so its -cpu wins). vault-test's later
+  checks are timed for KVM and miss under TCG; they are not run that
+  way.
+
+- **Choice:** the guessing cost is stated in plain terms (four digits: hours;
+  a long passcode with letters: out of reach) rather than as a table of
+  rates, since the rate depends on the attacker's hardware.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -2753,7 +2778,7 @@ one task.
    lock screen, in desktop.conf and in `vault-disk`.
 4. [x] (section 80) Change the passcode from Settings: the vault re-sealed under the
    new one, fresh salt and nonce, written to the disk.
-5. [ ] README: how to make and boot a vault, and what it does and does not
+5. [x] (section 81) README: how to make and boot a vault, and what it does and does not
    protect against.
 6. [ ] Verdigris phase 3: a Windows program reads files through the
    pruned view DESIGN.md specifies (CreateFileW, ReadFile, CloseHandle,

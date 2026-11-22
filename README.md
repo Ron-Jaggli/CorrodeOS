@@ -63,6 +63,9 @@ Then:
 ./corrode user-test   # boot and prove ring 3 cannot read kernel memory
 ./corrode input-test  # boot, type and move the mouse through QEMU, check what arrived
 ./corrode terminal-test # boot, open the terminal, edit and recall lines, read a file, to build/terminal.png
+./corrode verify-test # boot ISOs with a changed kernel, program and config: each refused
+./corrode vault-test  # the files sealed on the disk: lock screen first, wrong passcode, changed byte
+./corrode rekey-test  # change the passcode in Settings; the next boot takes only the new one
 ./corrode check       # cargo check
 ./corrode test        # render, text, gfx, pci, elf, virtio, nv, input, heap, line and shell unit tests, on the build host
 ./corrode specimen    # draw a sheet of the typeface to build/specimen.png
@@ -76,6 +79,63 @@ so the build genuinely doesn't need it), `MACHINE=pc` for QEMU's older board
 with no PCI Express, `GPU=virtio` to give QEMU a virtio GPU instead of its
 plain VGA (the compositor's frames then go through a ring 3 driver), and
 `QEMU_EXTRA='-device …'` to plug emulated devices in for one run.
+
+## Your files, encrypted: the vault
+
+Normally the files the terminal and Files see (`root/`, packed as a tar)
+ride on the ISO, readable by anyone who has it. With a vault they live on
+the disk instead, encrypted under your passcode, and the ISO carries only
+the kernel and the programs.
+
+```sh
+./corrode vault-disk VAULT_PASSCODE=Rust4ever   # seal root/ into build/vault.img
+./corrode run-vault                             # boot it
+```
+
+`VAULT_IMG=path` seals into another image. A passcode is 4 to 32
+printable characters: letters, digits and symbols, but no space and no
+`#`.
+
+What happens at boot:
+
+1. Limine checks every file it loads (the kernel and each program) against
+   a hash in its config, and the config against a hash built into Limine
+   itself. Anything changed after the build stops the boot. `verify-test`
+   proves it.
+2. The kernel finds the vault on the disk and puts the lock screen up first.
+   No program gets any files.
+3. The right passcode makes the key (PBKDF2-HMAC-SHA-256, 200 000 rounds)
+   and opens the files (AES-128-CCM). A wrong one, or a disk with a single
+   changed byte, opens nothing. Three wrong tries cost a 30-second wait.
+4. Then the terminal and Files get the files, and that passcode locks the
+   screen from then on.
+
+To change it, open Settings and use the last row, **Passcode**: the current
+passcode, then the new one twice. The files are encrypted again under the
+new one, written beside the old copy. The header that says which copy is
+current is written last, so a failure partway through still leaves the
+old passcode working.
+
+What it protects against, and what it doesn't:
+
+- **Someone with the disk** sees only ciphertext. How long that holds
+  depends on the passcode: four digits fall to a few hours of guessing,
+  while a long passcode with letters is far out of reach.
+- **Someone who swaps the boot medium** can't boot a changed kernel past
+  Limine's check, and a disk with a vault never takes its files from the
+  boot medium. Limine itself is the part that has to be trusted; on real
+  hardware, Secure Boot with your own key signs it.
+- **Not covered yet:**
+  - The opened files stay in memory until shutdown. Locking the screen
+    stops people at the keyboard; it does not encrypt them again.
+  - The files are read-only: the vault is sealed whole by `vault-disk`,
+    and changes made while running are not written back.
+  - There is no TPM and no recovery code. A forgotten passcode means the
+    files are gone.
+  - The CPU needs AES-NI. Without KVM, QEMU's plain `qemu64` model has
+    none; `NO_KVM=1 QEMU_EXTRA='-cpu max' ./corrode run-vault` emulates it.
+  - The theme kept in the disk's first sector is not encrypted. It is
+    only colours.
 
 ## Customizing the desktop
 
@@ -276,7 +336,7 @@ user/            ring 3 programs, each an ELF file loaded as a Limine module
   menu/            the right-click menus, for the desktop and dock icons
   fault/           a program that faults on purpose
   virtio-gpu/      a display driver: the compositor's frames, on a virtio GPU
-  virtio-blk/      the settings store: the theme, kept in a virtio disk's first sector
+  virtio-blk/      the disk: the theme in its first sector, and the vault's sectors for the kernel
   blob-reader/     reads 32 MiB it was handed at boot, and says what was in it
   nvidia/          NVIDIA stage one: identify the card, read its VBIOS, change nothing
   user.ld          where a program's segments go
@@ -287,12 +347,14 @@ input/           scancodes and mouse packets to key presses and movements
 line/            a prompt's line: cursor, history, Ctrl chords, Tab completion
 shell/           a shell: pipes, lists, variables, globs, and ls/cat/grep/sort and kin
 root/            the files the terminal can read, packed into a tar at build time
+vault/           the vault: that tar sealed on the disk under the passcode, as data and tests
 heap/            the allocator: the kernel's heap and every program's
   src/lib.rs       headers, BARs, capability lists, MSI, what a driver may write
   src/mcfg.rs      the ACPI table that says where configuration space is
 boot/limine.conf lets Limine find the kernel
 docker/          the build environment
-scripts/         check-image.sh — guards against orphan sections
+scripts/         seal-iso.sh — packs every ISO with Limine checking a hash of each file
+                 check-image.sh — guards against orphan sections
                  flash-usb.sh — write a FEATURES=hw-log ISO to a USB stick, checking hard first
                  fetch-firmware.sh — NVIDIA GSP firmware into firmware/, never committed
 ```
