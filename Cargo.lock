@@ -91,6 +91,7 @@ dependencies = [
  "corrode-pe",
  "corrode-render",
  "corrode-seal",
+ "corrode-shell",
  "corrode-text",
  "corrode-theme",
  "corrode-vault",

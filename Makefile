@@ -75,7 +75,7 @@ QEMU_FLAGS  := $(QEMU_COMMON) -serial stdio
 VNC_DISPLAY ?= 0
 
 
-.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test fade-test usb-test pe-test verify-test vault-test rekey-test grow-test zoom-test
+.PHONY: input-test terminal-test close-test dock-test minimize-test settings-test churn-test shortcut-test resize-test files-test scrollback-test switcher-test cursor-test search-test reveal-test notify-test control-test lock-test snap-test history-test keys-test menu-test dock-menu-test title-test dock-windows-test double-click-test tile-test show-desktop-test shell-test magnify-test magnify-setting-test store-test passcode-test passcode-hash seal-test surfaces-test fade-test usb-test pe-test verify-test vault-test rekey-test win-test grow-test zoom-test
 .PHONY: all kernel user kernel32 iso vault-iso vault-disk run-vault run run-gui boot-test fault-test wx-test stack-test user-test screenshot specimen engine-shot check test fmt clippy clean-artifacts
 
 all: iso
@@ -163,11 +163,16 @@ FIRMWARE := $(shell find firmware -type f -name '*.bin' 2>/dev/null | sort)
 # bootloader loads like any other module. Sorted, with owners and times
 # fixed, so the same tree always makes the same bytes.
 ROOT_TAR := build/root.tar
+READER_EXE := build/reader.exe
 ROOT_FILES := $(shell find root 2>/dev/null)
-$(ROOT_TAR): $(ROOT_FILES)
+# With reader.exe at /programs/reader, for the terminal's `win`: after
+# every other top folder, so none of them moves in Files.
+$(ROOT_TAR): $(ROOT_FILES) $(READER_EXE)
 	@mkdir -p build
+	@rm -rf build/root_staged && cp -r root build/root_staged
+	@mkdir -p build/root_staged/programs/reader && cp $(READER_EXE) build/root_staged/programs/reader/reader.exe
 	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
-	    --mtime=@0 --mode=u+rw,go+r,go-w -C root -cf $@ .
+	    --mtime=@0 --mode=u+rw,go+r,go-w -C build/root_staged -cf $@ .
 
 # Verdigris's first Windows program, a PE file written byte by byte by a
 # script: no Windows toolchain. See verdigris/DESIGN.md.
@@ -186,7 +191,6 @@ $(CONSOLE_EXE): scripts/console-exe.sh
 
 # Phase 3: a program that reads files through its view, assembled whole --
 # headers and all -- by GNU as.
-READER_EXE := build/reader.exe
 $(READER_EXE): scripts/reader-exe.sh scripts/reader-exe.S
 	@mkdir -p build
 	bash scripts/reader-exe.sh $@
@@ -1516,6 +1520,44 @@ close-test: iso
 # complete, arrows to edit mid-line and to recall history, Ctrl+U to throw a
 # line away, and a pipe that reads one of the files from root/.
 # build/terminal.png shows what it made of it.
+# Windows programs from the terminal (`win`): reader.exe by its full path;
+# again from its folder, by a relative one; and a file that is not a
+# program. Run from its folder it sees that folder alone, so of all it
+# looks for, only itself is there. build/win.png is the terminal after.
+WIN_KEYS := w i n spc slash p r o g r a m s slash r e a d e r slash r e a d e r dot e x e ret
+WIN_AGAIN_KEYS := c d spc slash p r o g r a m s slash r e a d e r ret \
+                  w i n spc r e a d e r dot e x e ret
+WIN_BAD_KEYS := w i n spc slash e t c slash m o t d ret
+win-test: iso
+	@rm -f build/win.ppm build/win.png
+	@( sleep $(SHOT_DELAY); \
+	   echo "mouse_move 120 -80"; sleep 0.2; \
+	   echo "mouse_move -250 -150"; sleep 0.2; echo "mouse_move -250 -150"; sleep 0.2; \
+	   echo "mouse_move -80 0"; sleep 0.5; \
+	   echo "mouse_button 1"; sleep 0.3; echo "mouse_button 0"; sleep 2; \
+	   for key in $(WIN_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 3; \
+	   for key in $(WIN_AGAIN_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 3; \
+	   for key in $(WIN_BAD_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 1.5; \
+	   echo "screendump build/win.ppm"; sleep 1; echo quit ) \
+	  | timeout --foreground 120 qemu-system-x86_64 $(QEMU_COMMON) \
+	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
+	@tr -d '\r' < build/serial.log > build/win-lines.log
+	@grep -a "^terminal   : win\|^desktop    : /programs\|^desktop    : task" build/win-lines.log || echo "win-test: nothing from win"
+	@test $$(grep -acxF 'desktop    : /programs/reader/reader.exe started for the terminal, seeing /programs/reader alone' build/win-lines.log) -eq 2 \
+	    && test $$(grep -acE '^terminal   : win: reader.exe ended after [0-9]+ lines$$' build/win-lines.log) -eq 2 \
+	    && echo "win-test: the terminal ran it twice, to its end      PASS" \
+	    || echo "win-test: the terminal ran it twice, to its end      FAIL"
+	@grep -aqxF 'terminal   : win: reader.exe: C:\*: reader.exe' build/win-lines.log \
+	    && grep -aqxF 'terminal   : win: reader.exe: current directory: C:\' build/win-lines.log \
+	    && grep -aqxF 'terminal   : win: reader.exe: keys.txt: not there (2, ERROR_FILE_NOT_FOUND)' build/win-lines.log \
+	    && grep -aqxF 'terminal   : win: reader.exe: c:/Etc/MOTD: not there (3, ERROR_PATH_NOT_FOUND)' build/win-lines.log \
+	    && echo "win-test: its output came back; it saw its folder alone PASS" \
+	    || echo "win-test: its output came back; it saw its folder alone FAIL"
+	@grep -aqxF 'terminal   : win: /etc/motd: not a program Verdigris runs' build/win-lines.log \
+	    && echo "win-test: a file that is not a program is refused   PASS" \
+	    || echo "win-test: a file that is not a program is refused   FAIL"
+	@test -s build/win.ppm && pnmtopng build/win.ppm > build/win.png 2>/dev/null && rm -f build/win.ppm; true
+
 TERMINAL_KEYS ?= e c tab h i ret \
                  u n a m e spc minus a ret \
                  u tab ctrl-u \

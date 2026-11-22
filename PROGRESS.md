@@ -2846,6 +2846,76 @@ view sits in the real tree is never in one.
   before, plus pe-test's two), none FAIL, no unhandled trap, no boot
   self-check failing; `./corrode test` 351 passed; clippy at 33.
 
+## 85. `win PATH`: Windows programs from the terminal
+
+The terminal runs a Windows program out of the files: `win
+/programs/reader/reader.exe`, or `win reader.exe` from its folder. The
+program sees its own folder as `C:\` and nothing else. What it writes
+comes back to the terminal, line by line, until it ends.
+
+- **The files** now hold reader.exe at `/programs/reader/reader.exe`. It
+  is staged into `build/root.tar` next to `root/` (the source tree is
+  untouched), so a vault sealed from the tar carries it too.
+- **`window::RUN` (87)**, the terminal only. Its four words carry an
+  absolute path of up to 32 bytes, packed like the passcode calls. The
+  window server:
+  - refuses while the vault is locked, and refuses anything that is not a
+    file in the opened tree (2) or not a PE Verdigris loads (193);
+  - starts the program and a `fileview` for it, the allowlist holding the
+    program's folder alone;
+  - makes a fresh endpoint for the program's output. The program gets it
+    as its LOG (send-only); the terminal gets it in the answer, receive-
+    only, at `app::PROGRAM` (9).
+- **A watcher** (`win-watch`, a kernel task, one per run) waits for the
+  program to finish, for at most 10 s. If the view is still running a
+  second after the program ended (it faulted, so it never sent `DONE`),
+  the watcher ends the view itself. Then it sends `log::END` (3) on the
+  output, after the last line: word 0 is 0 if it ended, 1 if it was
+  still running.
+- **The log server** now ignores labels other than `TEXT` and `LINE`, so
+  `END` and anything later never print as text.
+- **`start_windows`** is the one way the kernel starts a Windows program
+  with its view: both the boot check (`view_checks`, unchanged output)
+  and `RUN` use it. The view's capabilities go through slots the caller
+  names, since a boot-time slot cannot be used again per run.
+- **Kernel stacks are 32 KiB** (were 16). The first `win` took a double
+  fault: the PE reader keeps its 64-entry import table on the stack, and
+  the window server's stack was already deep. `Rights::WRITE_GRANT` is
+  new, for the log the window server passes on to each view.
+- **The terminal**: `win PATH` (in `help`), relative paths from the
+  current directory; `/docs/commands.txt` lists it.
+- **win-test** (in the suite), three scored lines:
+  - the full path and then, after `cd /programs/reader`, the relative
+    one each run reader.exe to its end (twice: started, and "ended after
+    N lines");
+  - its output reaches the terminal, and it saw its folder alone: `C:\*`
+    lists only `reader.exe`; `keys.txt` and `c:/Etc/MOTD` are not there;
+    its current directory is `C:\`;
+  - `win /etc/motd` is refused as not a program.
+  - build/win.png is the terminal after the three.
+
+- **Choice:** `/programs/reader`, not `/apps/reader` as the task said.
+  `apps` would sort first among the top folders and move every entry in
+  Files, which several tests click by position; `programs` sorts after
+  `home`, so nothing moves.
+- **Choice:** the output is the program's own `LOG` capability pointed at
+  a fresh endpoint, not a new kernel32 handle. kernel32 already writes
+  every line there, so a program needs no change, and the terminal holds
+  only the receiving end: it cannot send as the program, and the program
+  cannot read what the terminal reads.
+- **Choice:** the end of a run comes from the kernel (a watcher), not
+  from kernel32's `ExitProcess`. A program that faults never calls it,
+  and the terminal must not wait forever on one that hangs: 10 s, then
+  "still running; no more of it is shown".
+- **Choice:** the terminal waits for the run (the prompt comes back when
+  it ends), as a shell does for a program run in the foreground.
+- **Open:** each run spawns three tasks whose stacks are never reclaimed
+  (task/stack.rs says so). Fine for a session's worth of `win`, not for
+  thousands.
+- Verified: the whole suite on both GPUs, 86 checks PASS on each (83
+  before, plus win-test's three), none FAIL, no unhandled trap, no boot
+  self-check failing; `./corrode test` 351 passed; clippy at 33.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -2987,10 +3057,11 @@ one task.
 8. [x] (section 84) Verdigris: GetCurrentDirectoryW, SetCurrentDirectoryW and
    GetFullPathNameW -- `C:\` paths only, never where the view sits in the
    real tree; a relative open follows the current directory; pe-test.
-9. [ ] `win PATH` in the terminal runs a Windows program from the files:
+9. [x] (section 85) `win PATH` in the terminal runs a Windows program from the files:
    its view is its own folder alone, its standard output comes back to the
-   terminal; reader.exe packed into the files at /apps/reader; a scored
-   boot test, both GPUs.
+   terminal; reader.exe packed into the files at /apps/reader (put at
+   /programs/reader instead; section 85 says why); a scored boot test,
+   both GPUs.
 10. [ ] Wrap-up for the owner: what the vault run did, what to review and
    merge, what is still open. No code. Then stop the loop.
 

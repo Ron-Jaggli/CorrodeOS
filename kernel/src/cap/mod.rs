@@ -62,6 +62,9 @@ impl Rights {
     /// May use, and may pass on. The combination a task needs to be able to
     /// hand a capability to somebody else.
     pub const READ_GRANT: Rights = Rights(0b101);
+    /// To send, and to pass that on: a log a kernel service hands to the
+    /// programs it starts.
+    pub const WRITE_GRANT: Rights = Rights(0b110);
     pub const ALL: Rights = Rights(0b111);
 
     /// Interpret raw bits as a **mask**, for a narrowing operation.

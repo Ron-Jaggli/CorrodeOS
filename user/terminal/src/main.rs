@@ -60,7 +60,7 @@ const SLOTS: usize = 16;
 
 /// The terminal's own commands, how to call them, and what they do. The
 /// shell lists them in `help` after its own.
-const COMMANDS: [About; 12] = [
+const COMMANDS: [About; 13] = [
     ("clear", "", "start with an empty window (or Ctrl+L)"),
     ("history", "", "the lines typed so far"),
     ("uptime", "", "time since the machine started"),
@@ -71,6 +71,7 @@ const COMMANDS: [About; 12] = [
     ("notify", "TEXT", "show TEXT as a notification"),
     ("quit", "APP", "try to close APP's windows (the terminal may not)"),
     ("seal", "", "try to seal with the secure core (the terminal may not)"),
+    ("win", "PATH", "run a Windows program; it sees its own folder alone"),
     ("about", "", "what this is"),
     ("exit", "", "close this terminal"),
 ];
@@ -202,7 +203,7 @@ impl Terminal {
             }
             Outcome::ClearScreen => self.lines.clear(),
             Outcome::Complete => {
-                let names = self.shell.names(&System::new(&[]));
+                let names = self.shell.names(&System::new(&[], "/"));
                 let choices = self.editor.complete(&names);
                 if !choices.is_empty() {
                     self.say(&choices.join("  "), QUIET);
@@ -225,8 +226,8 @@ impl Terminal {
     fn run(&mut self, line: &str) {
         println!("$ {}", line);
         self.say(&format!("{PROMPT_TEXT}{line}"), QUIET);
-        let mut system = System::new(self.editor.history());
         let folder = String::from(self.shell.cwd());
+        let mut system = System::new(self.editor.history(), &folder);
         let printed = self.shell.run(line, &self.fs, &mut system);
         if self.shell.cwd() != folder {
             corrode_ui::subtitle(self.shell.cwd());
@@ -256,15 +257,18 @@ impl Terminal {
 /// here for it to do once the line has run.
 struct System<'a> {
     history: &'a [String],
+    /// Where relative paths start, for `win`.
+    cwd: &'a str,
     clear: bool,
     sleep: Option<u64>,
     exit: bool,
 }
 
 impl<'a> System<'a> {
-    fn new(history: &'a [String]) -> Self {
+    fn new(history: &'a [String], cwd: &'a str) -> Self {
         System {
             history,
+            cwd,
             clear: false,
             sleep: None,
             exit: false,
@@ -391,6 +395,13 @@ impl Host for System<'_> {
                 }
                 1
             }
+            "win" => match rest.first() {
+                None => {
+                    out.error("win: which program");
+                    1
+                }
+                Some(path) => win(&corrode_shell::fs::resolve(self.cwd, path), out),
+            },
             "about" => {
                 out.line("CorrodeOS terminal: a ring 3 program holding a window,");
                 out.line("a pool of memory, the log and the boot medium's files,");
@@ -617,3 +628,84 @@ fn main() {
         terminal.draw();
     }
 }
+
+/// `win PATH`: run the Windows program at `PATH` in the files, and show
+/// what it writes, line by line, until it ends. The desktop starts it
+/// (`window::RUN`) seeing its own folder alone, and hands this terminal
+/// the endpoint its output goes to; the kernel says when it has ended,
+/// however it ended, or after ten seconds that it is still running.
+fn win(path: &str, out: &mut Output) -> i32 {
+    use corrode_rt::abi::log;
+
+    let mut bytes = [0u8; 32];
+    if path.len() > bytes.len() {
+        out.error("win: the path is longer than 32 bytes, all the call carries");
+        return 1;
+    }
+    bytes[..path.len()].copy_from_slice(path.as_bytes());
+    let mut words = [0u64; 4];
+    for (word, chunk) in words.iter_mut().zip(bytes.as_chunks::<8>().0) {
+        *word = u64::from_le_bytes(*chunk);
+    }
+    let _ = corrode_rt::delete(app::PROGRAM);
+    let message = corrode_rt::Message::new(window::RUN, words);
+    let answer = match corrode_rt::call(app::WINDOWS, message, Some(app::PROGRAM)) {
+        Ok(answer) => answer.message.words,
+        Err(error) => {
+            out.error(&format!("win: the desktop did not answer ({error:?})"));
+            return 1;
+        }
+    };
+    if answer[0] != 1 {
+        let why = match answer[1] {
+            2 => "no such file",
+            5 => "only the terminal may run one",
+            193 => "not a program Verdigris runs",
+            _ => "not started",
+        };
+        println!("win: {path}: {why}");
+        out.error(&format!("win: {path}: {why}"));
+        return 1;
+    }
+    let name = corrode_shell::fs::name_of(path);
+    let mut line = String::new();
+    let mut lines = 0;
+    let status = loop {
+        let Ok(received) = corrode_rt::recv(app::PROGRAM, None, None) else {
+            out.error("win: its output was lost");
+            break 1;
+        };
+        let words = received.message.words;
+        let mut text = [0u8; 32];
+        for (chunk, word) in text.as_chunks_mut::<8>().0.iter_mut().zip(words) {
+            *chunk = word.to_le_bytes();
+        }
+        let end = text.iter().position(|byte| *byte == 0).unwrap_or(text.len());
+        let text = core::str::from_utf8(&text[..end]).unwrap_or("?");
+        match received.message.label {
+            log::TEXT => line.push_str(text),
+            log::LINE => {
+                line.push_str(text);
+                println!("win: {name}: {line}");
+                out.line(&line);
+                line.clear();
+                lines += 1;
+            }
+            log::END => {
+                if !line.is_empty() {
+                    out.line(&line);
+                }
+                if words[0] == 1 {
+                    out.error(&format!("win: {name} is still running; no more of it is shown"));
+                    break 1;
+                }
+                println!("win: {name} ended after {lines} lines");
+                break 0;
+            }
+            _ => {}
+        }
+    };
+    let _ = corrode_rt::delete(app::PROGRAM);
+    status
+}
+

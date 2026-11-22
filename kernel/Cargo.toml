@@ -21,6 +21,7 @@ corrode-abi = { path = "../abi" }
 corrode-elf = { path = "../elf" }
 corrode-vault = { path = "../vault" }
 corrode-pe = { path = "../pe" }
+corrode-shell = { path = "../shell" }
 
 [features]
 # Deliberately take a page fault at the end of boot to exercise the trap

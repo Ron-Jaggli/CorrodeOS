@@ -1919,6 +1919,10 @@ extern "C" fn log_server() {
                 partial.len() - 1
             }
         };
+        // Only text: `log::END` and anything else are for other readers.
+        if !matches!(received.message.label, log::TEXT | log::LINE) {
+            continue;
+        }
         let line = &mut partial[index].1;
         if line.len() + text.len() <= LOG_LINE_MAX {
             line.push_str(text);
@@ -2074,6 +2078,12 @@ const WINDOW_SURFACES: cap::CapPtr = 96;
 const SERVICE_ENDPOINT_SLOT: cap::CapPtr = 0;
 const SERVICE_REPLY_SLOT: cap::CapPtr = 1;
 const SERVICE_SPARE_SLOT: cap::CapPtr = 2;
+/// The window server's: the log, send-only, to hand the views of the
+/// programs the terminal runs; and where a run's view endpoint and page are
+/// while they are handed out.
+const SERVICE_LOG_SLOT: cap::CapPtr = 5;
+const SERVICE_VIEW_SLOT: cap::CapPtr = 6;
+const SERVICE_PAGE_SLOT: cap::CapPtr = 7;
 /// The launcher also holds what it gives the programs it starts.
 const LAUNCHER_WINDOWS_SLOT: cap::CapPtr = 3;
 const LAUNCHER_LOG_SLOT: cap::CapPtr = 4;
@@ -2187,6 +2197,14 @@ fn serve(shell: bool) {
             let label = received.message.label;
             let answer = change_passcode(received.from, label, words);
             let _ = ipc::reply(SERVICE_REPLY_SLOT, ipc::Message { label, words: answer }, None);
+            continue;
+        }
+        if received.message.label == window::RUN {
+            let (answer, transfer) = run_windows(received.from, words);
+            let _ = ipc::reply(SERVICE_REPLY_SLOT, ipc::Message { label: window::RUN, words: answer }, transfer);
+            for slot in [SERVICE_SPARE_SLOT, SERVICE_VIEW_SLOT, SERVICE_PAGE_SLOT] {
+                let _ = cap::delete(slot);
+            }
             continue;
         }
         if received.message.label == window::NOTIFY {
@@ -2535,6 +2553,8 @@ fn start_desktop() {
     let launcher_task = task::spawn("launcher", launcher);
     let granted = server.is_some_and(|id| {
         cap::grant(id, WINDOWS_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
+            // For the views of the programs the terminal runs (`window::RUN`).
+            && cap::grant(id, LOG_ENDPOINT, SERVICE_LOG_SLOT, Rights::WRITE_GRANT).is_ok()
     }) && shell.is_some_and(|id| {
         cap::grant(id, SHELL_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
     }) && launcher_task.is_some_and(|id| {
@@ -2566,6 +2586,121 @@ fn passcode_of(words: [u64; 4]) -> corrode_theme::passcode::Code {
         *bytes = word.to_le_bytes();
     }
     code
+}
+
+/// `window::RUN`: the terminal runs a Windows program from the files. Its
+/// view is its own folder alone; its output goes to an endpoint the
+/// terminal is handed, to receive on; a watcher ends that output when the
+/// program ends, however it ends.
+fn run_windows(from: usize, words: [u64; 4]) -> ([u64; 4], Option<(cap::CapPtr, cap::Rights)>) {
+    const ACCESS_DENIED: u64 = 5;
+    const FILE_NOT_FOUND: u64 = 2;
+    const BAD_EXE_FORMAT: u64 = 193;
+    let refuse = |code: u64| ([0, code, 0, 0], None);
+
+    if task::name_of(from) != Some("terminal") {
+        println!("desktop    : task {from} is not the terminal; it runs no program");
+        return refuse(ACCESS_DENIED);
+    }
+    if vault::locked() {
+        return refuse(FILE_NOT_FOUND);
+    }
+    let Some((tree, module)) = vault::root() else {
+        return refuse(FILE_NOT_FOUND);
+    };
+    let raw = passcode_of(words);
+    let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
+    let Ok(path) = core::str::from_utf8(&raw[..end]) else {
+        return refuse(FILE_NOT_FOUND);
+    };
+    let Ok(fs) = corrode_shell::fs::Fs::from_tar(module.bytes) else {
+        return refuse(FILE_NOT_FOUND);
+    };
+    let Some(exe) = fs.get(path).filter(|node| !node.is_dir()) else {
+        return refuse(FILE_NOT_FOUND);
+    };
+    let folder = corrode_shell::fs::parent_of(path).unwrap_or("/");
+    // A task's name lives as long as the task: the file's name, cut short.
+    let name: alloc::string::String = corrode_shell::fs::name_of(path).chars().take(15).collect();
+    let name: &'static str = alloc::boxed::Box::leak(name.into_boxed_str());
+
+    let output = cap::issue(SERVICE_SPARE_SLOT, cap::Object::Endpoint(ipc::Endpoint::new()), cap::Rights::ALL);
+    let slots = Slots {
+        view: SERVICE_VIEW_SLOT,
+        page: SERVICE_PAGE_SLOT,
+        output: SERVICE_SPARE_SLOT,
+        log: SERVICE_LOG_SLOT,
+    };
+    let started = output
+        .map_err(|_| "no endpoint for its output")
+        .and_then(|_| start_windows(name, exe.data, folder, &[], tree, &slots));
+    let (program, server) = match started {
+        Ok(started) => started,
+        Err(why) => {
+            println!("desktop    : {path} was not started: {why}");
+            return refuse(BAD_EXE_FORMAT);
+        }
+    };
+    let watcher = task::spawn("win-watch", watch_program);
+    let watching = watcher.is_some_and(|id| {
+        cap::grant(id, SERVICE_SPARE_SLOT, WATCH_OUTPUT, cap::Rights::WRITE).is_ok()
+            && cap::grant(id, SERVICE_VIEW_SLOT, WATCH_VIEW, cap::Rights::WRITE).is_ok()
+    });
+    if let (true, Some(id)) = (watching, watcher) {
+        arch::x86_64::without_interrupts(|| WATCHES.lock().push(Watch { watcher: id, program, server }));
+    }
+    start_all(&[Some(server), Some(program), watcher.filter(|_| watching)]);
+    println!("desktop    : {path} started for the terminal, seeing {folder} alone");
+    // Received on, not sent to, and not passed on.
+    ([1, 0, 0, 0], Some((SERVICE_SPARE_SLOT, cap::Rights::READ)))
+}
+
+/// A program the terminal ran, and the task watching it.
+struct Watch {
+    watcher: usize,
+    program: usize,
+    server: usize,
+}
+
+static WATCHES: SpinLock<alloc::vec::Vec<Watch>> = SpinLock::new(alloc::vec::Vec::new());
+/// A watcher's capabilities: the program's output and its view, send-only.
+const WATCH_OUTPUT: cap::CapPtr = 0;
+const WATCH_VIEW: cap::CapPtr = 1;
+/// How long the terminal is shown a program's output.
+const RUN_WAIT_NS: u64 = 10_000_000_000;
+
+/// Wait for one program the terminal ran to end, then say so on its
+/// output, after its last line. A program that faulted never told its view
+/// to end; this does.
+extern "C" fn watch_program() {
+    use corrode_abi::{log, view};
+
+    let me = task::current_id().unwrap_or(usize::MAX);
+    let watch = arch::x86_64::without_interrupts(|| {
+        let mut watches = WATCHES.lock();
+        let at = watches.iter().position(|watch| watch.watcher == me)?;
+        Some(watches.swap_remove(at))
+    });
+    let Some(watch) = watch else {
+        return;
+    };
+    let finished = |id| task::state_of(id) == Some(task::State::Finished);
+    let deadline = time::now_ns() + RUN_WAIT_NS;
+    while !finished(watch.program) && time::now_ns() < deadline {
+        task::sleep_until(time::now_ns() + 20_000_000);
+    }
+    let ended = finished(watch.program);
+    if ended {
+        // Given a moment: a program that exited told its view itself.
+        let grace = time::now_ns() + 1_000_000_000;
+        while !finished(watch.server) && time::now_ns() < grace {
+            task::sleep_until(time::now_ns() + 10_000_000);
+        }
+        if !finished(watch.server) {
+            let _ = ipc::send(WATCH_VIEW, ipc::Message { label: view::DONE, words: [0; 4] }, None);
+        }
+    }
+    let _ = ipc::send(WATCH_OUTPUT, ipc::Message { label: log::END, words: [u64::from(!ended), 0, 0, 0] }, None);
 }
 
 /// Which task proved the passcode for a change, and until when.
@@ -3114,78 +3249,32 @@ const READER_ALLOWED: &str = "/etc/motd";
 /// what is read. What it may read and what is not there for it is in the
 /// log; `pe-test` reads it.
 fn view_checks() {
-    use corrode_abi::{verdigris, view};
-
-    let (Some(program), Some(kernel32), Some(service)) = (
-        modules::find("reader.exe"),
-        modules::find("kernel32"),
-        modules::find("fileview"),
-    ) else {
-        println!("verdigris  : no reader.exe, kernel32 or fileview module was loaded");
+    let Some(program) = modules::find("reader.exe") else {
+        println!("verdigris  : no reader.exe module was loaded");
         return;
     };
     let Some((tree, _)) = vault::root() else {
         println!("verdigris  : no files on the boot medium (a vault keeps them); reader.exe is not run");
         return;
     };
-    let (Some(page), Some(list)) = (memory::create(1, false), memory::create(1, true)) else {
-        verdigris_check("make the view's page and list", false);
-        return;
-    };
-    // The list, written where only the view will map it, read-only.
-    if let Some((at, len)) = memory::in_kernel(list) {
-        let text = [READER_FOLDER.as_bytes(), b"\n", READER_ALLOWED.as_bytes(), b"\n"];
-        let mut offset = 0;
-        for part in text {
-            let part = &part[..part.len().min(len - offset)];
-            // SAFETY: the kernel's own mapping of the object, `len` bytes,
-            // which no task has been given yet.
-            unsafe { core::ptr::copy_nonoverlapping(part.as_ptr(), at.add(offset), part.len()) };
-            offset += part.len();
-        }
-    }
-    let (reader, server) = match (
-        task::spawn_windows("reader.exe", program.bytes, kernel32.bytes),
-        task::spawn_program("fileview", service.bytes),
-    ) {
-        (Ok(reader), Ok(server)) => (reader, server),
-        (reader, server) => {
-            println!("verdigris  : reader.exe or its view was not loaded: {reader:?} {server:?}");
+    let slots = Slots { view: VIEW_ENDPOINT, page: VIEW_PAGE, output: LOG_ENDPOINT, log: LOG_ENDPOINT };
+    let started = start_windows("reader.exe", program.bytes, READER_FOLDER, &[READER_ALLOWED], tree, &slots);
+    let (reader, server) = match started {
+        Ok(started) => started,
+        Err(why) => {
+            println!("verdigris  : reader.exe and its view were not started: {why}");
             verdigris_check("load a Windows program and its view", false);
             return;
         }
     };
-
-    let minted = cap::mint(0, VIEW_ENDPOINT, cap::Object::Endpoint(ipc::Endpoint::new()), cap::Rights::ALL).is_ok()
-        && cap::mint(0, VIEW_PAGE, cap::Object::Memory(page), cap::Rights::ALL).is_ok();
-    let served = minted
-        && cap::grant(server, VIEW_ENDPOINT, view::SERVE, cap::Rights::READ).is_ok()
-        && cap::grant(server, VIEW_PAGE, view::PAGE, cap::Rights::READ_WRITE).is_ok()
-        && cap::grant(server, LOG_ENDPOINT, view::LOG, cap::Rights::WRITE).is_ok()
-        && cap::issue_to(server, view::TREE, cap::Object::Blob(tree), cap::Rights::READ).is_ok()
-        && cap::issue_to(server, view::SPEC, cap::Object::Memory(list), cap::Rights::READ).is_ok()
-        && cap::issue_to(
-            server,
-            view::POOL,
-            cap::Object::Pool(core::sync::atomic::AtomicU64::new(view::HEAP_PAGES as u64)),
-            cap::Rights::READ_WRITE,
-        )
-        .is_ok();
     verdigris_check(
         "the view holds the files, its list, page and log",
-        served && cap::slots_used(server) == Some(6),
+        cap::slots_used(server) == Some(6),
     );
-    let given = minted
-        && cap::grant(reader, LOG_ENDPOINT, verdigris::LOG, cap::Rights::WRITE).is_ok()
-        && cap::grant(reader, VIEW_ENDPOINT, verdigris::VIEW, cap::Rights::WRITE).is_ok()
-        && cap::grant(reader, VIEW_PAGE, verdigris::PAGE, cap::Rights::READ_WRITE).is_ok();
     verdigris_check(
         "reader.exe holds its view and page, not the files",
-        given && cap::slots_used(reader) == Some(3),
+        cap::slots_used(reader) == Some(3),
     );
-    if !served || !given {
-        return;
-    }
     start_all(&[Some(server), Some(reader)]);
     let finished = |id| task::state_of(id) == Some(task::State::Finished);
     let deadline = time::now_ns() + 5_000_000_000;
@@ -3196,6 +3285,81 @@ fn view_checks() {
         "it reads through its view; the view ends with it",
         finished(reader) && finished(server),
     );
+}
+
+/// Where in the caller's own capability space `start_windows` puts the
+/// view's endpoint and page while it hands them out (the caller deletes
+/// them after), and the endpoint, held with GRANT, where the program's
+/// output goes.
+struct Slots {
+    view: cap::CapPtr,
+    page: cap::CapPtr,
+    output: cap::CapPtr,
+    /// The log, for the view's own lines, held with GRANT.
+    log: cap::CapPtr,
+}
+
+/// Make a Windows program and its view (`fileview`), not started: the
+/// program at `exe`, seeing `folder` and `allowed` of the files in module
+/// `tree`. The program holds its output endpoint, its view send-only and
+/// the page they share; the view holds the files, the list, its endpoint,
+/// the page, the log and a pool. Nothing else.
+fn start_windows(
+    name: &'static str,
+    exe: &[u8],
+    folder: &str,
+    allowed: &[&str],
+    tree: usize,
+    slots: &Slots,
+) -> Result<(usize, usize), &'static str> {
+    use corrode_abi::{verdigris, view};
+
+    let (Some(kernel32), Some(service)) = (modules::find("kernel32"), modules::find("fileview")) else {
+        return Err("no kernel32 or fileview module");
+    };
+    let (Some(page), Some(list)) = (memory::create(1, false), memory::create(1, true)) else {
+        return Err("no memory for the view");
+    };
+    // The list, written where only the view will map it, read-only.
+    let Some((at, len)) = memory::in_kernel(list) else {
+        return Err("no memory for the view");
+    };
+    let mut offset = 0;
+    for part in core::iter::once(folder).chain(allowed.iter().copied()) {
+        for bytes in [part.as_bytes(), b"\n"] {
+            let bytes = &bytes[..bytes.len().min(len - offset)];
+            // SAFETY: the kernel's own mapping of the object, `len` bytes,
+            // which no task has been given yet.
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), at.add(offset), bytes.len()) };
+            offset += bytes.len();
+        }
+    }
+    let program = task::spawn_windows(name, exe, kernel32.bytes).map_err(|_| "not a program Verdigris runs")?;
+    let server = task::spawn_program("fileview", service.bytes).map_err(|_| "the view would not load")?;
+
+    let made = cap::issue(slots.view, cap::Object::Endpoint(ipc::Endpoint::new()), cap::Rights::ALL).is_ok()
+        && cap::issue(slots.page, cap::Object::Memory(page), cap::Rights::ALL).is_ok();
+    let served = made
+        && cap::grant(server, slots.view, view::SERVE, cap::Rights::READ).is_ok()
+        && cap::grant(server, slots.page, view::PAGE, cap::Rights::READ_WRITE).is_ok()
+        && cap::grant(server, slots.log, view::LOG, cap::Rights::WRITE).is_ok()
+        && cap::issue_to(server, view::TREE, cap::Object::Blob(tree), cap::Rights::READ).is_ok()
+        && cap::issue_to(server, view::SPEC, cap::Object::Memory(list), cap::Rights::READ).is_ok()
+        && cap::issue_to(
+            server,
+            view::POOL,
+            cap::Object::Pool(core::sync::atomic::AtomicU64::new(view::HEAP_PAGES as u64)),
+            cap::Rights::READ_WRITE,
+        )
+        .is_ok();
+    let given = made
+        && cap::grant(program, slots.output, verdigris::LOG, cap::Rights::WRITE).is_ok()
+        && cap::grant(program, slots.view, verdigris::VIEW, cap::Rights::WRITE).is_ok()
+        && cap::grant(program, slots.page, verdigris::PAGE, cap::Rights::READ_WRITE).is_ok();
+    if !(served && given) {
+        return Err("its capabilities could not be handed out");
+    }
+    Ok((program, server))
 }
 
 /// Bootstrap's capability to the test blob, and the endpoint its reader

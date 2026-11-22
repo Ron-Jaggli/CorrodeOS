@@ -23,8 +23,10 @@ const STACK_AREA_BASE: u64 = 0xffff_c000_0000_0000;
 
 const PAGE: u64 = 4096;
 
-/// 16 KiB of usable stack per task.
-const STACK_PAGES: u64 = 4;
+/// 32 KiB of usable stack per task. 16 KiB was enough until a kernel
+/// service (the window server, for the terminal's `win`) loaded a Windows
+/// program: the PE reader keeps its import table, 64 entries, on the stack.
+const STACK_PAGES: u64 = 8;
 /// One unmapped page below each stack.
 const GUARD_PAGES: u64 = 1;
 

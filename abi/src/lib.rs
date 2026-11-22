@@ -222,6 +222,8 @@ pub mod app {
     /// For Settings and the lock screen only: a sealer, with a key of the
     /// program's own that never leaves the secure core.
     pub const SEAL: usize = 8;
+    /// Where the terminal's `win` takes a program's output endpoint.
+    pub const PROGRAM: usize = 9;
 
     /// Pages in each program's pool.
     pub const POOL_PAGES: u64 = 256;
@@ -352,6 +354,14 @@ pub mod window {
     /// passcode. The vault is sealed again under it on the disk. The
     /// answer's word 0 is 1 if it was.
     pub const PASSCODE_SET: u64 = 86;
+    /// The terminal only: run the Windows program at the absolute path
+    /// carried in the four words (up to 32 bytes, zero-padded), from the
+    /// files. Its view is its own folder alone. The answer's word 0 is 1 if
+    /// it started, with the program's output endpoint to receive on:
+    /// [`log`](super::log) messages, then [`log::END`](super::log::END).
+    /// Otherwise word 1 is a Windows error number (2, the file is not
+    /// there; 193, `ERROR_BAD_EXE_FORMAT`).
+    pub const RUN: u64 = 87;
     /// The calls only the shell endpoint takes.
     pub const SHELL_ONLY: [u64; 6] = [SET_THEME, QUIT, LIST, RAISE, HISTORY, CONTEXT];
 
@@ -407,6 +417,10 @@ pub mod layout {
 pub mod log {
     pub const TEXT: u64 = 1;
     pub const LINE: u64 = 2;
+    /// The kernel, to whoever reads a program's output: it has ended, after
+    /// its last line. Word 0 is 0 if it ended, 1 if it was still running
+    /// when the kernel stopped waiting. The log itself ignores it.
+    pub const END: u64 = 3;
     /// Bytes in one message.
     pub const CAPACITY: usize = 32;
 }

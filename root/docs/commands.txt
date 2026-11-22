@@ -13,6 +13,10 @@ The shell:
 The system:
     uname uptime free caps whoami about sleep exit
 
+Windows programs (Verdigris):
+    win PATH  run one; it sees its own folder as C:\ and nothing else
+              win /programs/reader/reader.exe
+
 Things that need permission first (see capabilities.txt):
     ps       the running tasks             grant ps
     kill ID  stop a task                   grant kill ID
