@@ -115,7 +115,7 @@ clippy:
 HOST_TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
 
 test:
-	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci -p corrode-elf -p corrode-pe -p corrode-virtio -p corrode-nv -p corrode-input -p corrode-heap -p corrode-line -p corrode-shell -p corrode-theme -p corrode-seal -p corrode-vault -p corrode-view --target $(HOST_TARGET)
+	cargo test -p corrode-render -p corrode-text -p corrode-gfx -p corrode-pci -p corrode-elf -p corrode-pe -p corrode-virtio -p corrode-nv -p corrode-input -p corrode-heap -p corrode-line -p corrode-shell -p corrode-theme -p corrode-seal -p corrode-vault -p corrode-view -p corrode-crt-tests --target $(HOST_TARGET)
 
 # What a title bar of glass costs the software renderer, built optimised.
 glass-bench:
@@ -168,13 +168,17 @@ SPIN_EXE := build/spin.exe
 DIR_EXE := build/dir.exe
 FAULT_EXE := build/fault.exe
 HELLO_C_EXE := build/hello-c.exe
+# The C test corpus: each program checks itself against values written by
+# hand, prints "NAME: N of M checks passed", and exits with its failures.
+C_TESTS := args printf heap files strings
+C_TEST_EXES := $(C_TESTS:%=build/c/%.exe)
 ROOT_FILES := $(shell find root 2>/dev/null)
 # With reader.exe at /programs/reader, spin.exe (which never ends) at
 # /programs/spin, fault.exe (which faults) at /programs/fault and dir.exe
 # (compiled, not assembled) at /programs/dir, for the terminal's `win`:
 # after
 # every other top folder, so none of them moves in Files.
-$(ROOT_TAR): $(ROOT_FILES) $(READER_EXE) $(SPIN_EXE) $(DIR_EXE) $(FAULT_EXE) $(HELLO_C_EXE)
+$(ROOT_TAR): $(ROOT_FILES) $(READER_EXE) $(SPIN_EXE) $(DIR_EXE) $(FAULT_EXE) $(HELLO_C_EXE) $(C_TEST_EXES) verdigris/c/lines.txt
 	@mkdir -p build
 	@rm -rf build/root_staged && cp -r root build/root_staged
 	@mkdir -p build/root_staged/programs/reader && cp $(READER_EXE) build/root_staged/programs/reader/reader.exe
@@ -182,6 +186,7 @@ $(ROOT_TAR): $(ROOT_FILES) $(READER_EXE) $(SPIN_EXE) $(DIR_EXE) $(FAULT_EXE) $(H
 	@mkdir -p build/root_staged/programs/fault && cp $(FAULT_EXE) build/root_staged/programs/fault/fault.exe
 	@mkdir -p build/root_staged/programs/dir && cp $(DIR_EXE) build/root_staged/programs/dir/dir.exe
 	@mkdir -p build/root_staged/programs/c && cp $(HELLO_C_EXE) build/root_staged/programs/c/hello.exe
+	@cp $(C_TEST_EXES) verdigris/c/lines.txt build/root_staged/programs/c/
 	tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
 	    --mtime=@0 --mode=u+rw,go+r,go-w -C build/root_staged -cf $@ .
 
@@ -216,6 +221,14 @@ $(DIR_EXE): verdigris/scripts/dir-exe.sh verdigris/dir/src/main.rs
 $(HELLO_C_EXE): verdigris/c/hello.c
 	@mkdir -p build
 	x86_64-w64-mingw32-gcc -O2 -s -o $@ $<
+
+# The corpus. __USE_MINGW_ANSI_STDIO=0 keeps printf and the rest msvcrt's
+# (mingw would link its own formatter); -fno-builtin keeps gcc from working
+# string calls out itself, so they reach msvcrt.
+build/c/%.exe: verdigris/c/%.c verdigris/c/check.h
+	@mkdir -p build/c
+	x86_64-w64-mingw32-gcc -O2 -s -fno-builtin -Wall -Wextra -Wno-format -Wno-stringop-truncation \
+	    -D__USE_MINGW_ANSI_STDIO=0 -o $@ $<
 
 $(SPIN_EXE): verdigris/scripts/reader-exe.sh verdigris/scripts/spin-exe.S
 	@mkdir -p build
@@ -1596,6 +1609,15 @@ WIN_FAULT_KEYS := w i n spc slash p r o g r a m s slash f a u l t slash f a u l 
 WIN_C_KEYS := w i n spc slash p r o g r a m s slash c slash h e l l o dot e x e \
               spc o n e spc shift-apostrophe t w o spc t h r e e shift-apostrophe ret
 WIN_C_BARE_KEYS := w i n spc slash p r o g r a m s slash c slash h e l l o dot e x e ret
+# The corpus (verdigris/c): args.exe with arguments that take Windows'
+# whole quoting rule (an empty one, a backslash before a quote, one at the
+# end, quotes inside), typed with the shell's single quotes:
+#   win /programs/c/args.exe plain 'two words' '' 'a\"b' 'C:\dir name\' 'say "hi"' 7
+WIN_ARGS_KEYS := w i n spc slash p r o g r a m s slash c slash a r g s dot e x e spc p l a i n spc apostrophe t w o spc w o r d s apostrophe \
+                 spc apostrophe apostrophe spc apostrophe a backslash shift-apostrophe b apostrophe \
+                 spc apostrophe shift-c shift-semicolon backslash d i r spc n a m e backslash apostrophe \
+                 spc apostrophe s a y spc shift-apostrophe h i shift-apostrophe apostrophe spc 7 ret
+WIN_CORPUS_KEYS := $(foreach p,args printf heap files strings,w i n spc slash p r o g r a m s slash c slash $(shell echo $(p) | sed 's/./& /g') dot e x e ret)
 # Frames a `win` run may keep once the next one has started: none. Its
 # tasks are given back, and so is the memory it and its view shared.
 WIN_RUN_FRAMES ?= 0
@@ -1618,8 +1640,10 @@ win-test: iso
 	   for key in $(WIN_FAULT_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 2.5; \
 	   for key in $(WIN_C_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 3; \
 	   for key in $(WIN_C_BARE_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 3; \
+	   for key in $(WIN_ARGS_KEYS); do echo "sendkey $$key"; sleep 0.12; done; sleep 3; \
+	   for key in $(WIN_CORPUS_KEYS); do echo "sendkey $$key"; sleep 0.12; [ $$key = ret ] && sleep 4; done; \
 	   echo "screendump build/win.ppm"; sleep 1; echo quit ) \
-	  | timeout --foreground 240 qemu-system-x86_64 $(QEMU_COMMON) \
+	  | timeout --foreground 360 qemu-system-x86_64 $(QEMU_COMMON) \
 	      -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
 	@tr -d '\r' < build/serial.log > build/win-lines.log
 	@grep -a "^terminal   : win\|^desktop    : /programs\|^desktop    : task" build/win-lines.log || echo "win-test: nothing from win"
@@ -1670,7 +1694,18 @@ win-test: iso
 	    && test $$(grep -acxF "$${c}atexit ran" build/win-lines.log) -eq 2 \
 	    && echo "win-test: ...and its C runtime prints, allocates, exits PASS" \
 	    || echo "win-test: ...and its C runtime prints, allocates, exits FAIL"
-	@test $$(grep -acE '^verdigris  : moved from 0x140000000 to 0x400000, [1-9][0-9]* relocations$$' build/win-lines.log) -eq 4 \
+	@w='terminal   : win: '; \
+	grep -aqxF "$${w}args.exe: args: 9 of 9 checks passed" build/win-lines.log \
+	    && grep -aqE "^$${w}args.exe ended after [0-9]+ lines, exit code 7$$" build/win-lines.log \
+	    && grep -aqxF "$${w}args.exe: args: 2 of 2 checks passed" build/win-lines.log \
+	    && echo "win-test: args.exe: Windows' quoting whole, and exit codes PASS" \
+	    || echo "win-test: args.exe: Windows' quoting whole, and exit codes FAIL"
+	@w='terminal   : win: '; for n in printf heap files strings; do \
+	  grep -aqE "^$${w}$$n.exe: $$n: ([1-9][0-9]*) of \1 checks passed$$" build/win-lines.log \
+	    && grep -aqE "^$${w}$$n.exe ended after [0-9]+ lines$$" build/win-lines.log \
+	    && echo "win-test: $$n.exe: every check passed, exit code 0  PASS" \
+	    || { echo "win-test: $$n.exe: every check passed, exit code 0  FAIL"; grep -aE "^$${w}$$n.exe(: FAIL|: $$n:| ended)" build/win-lines.log | head -8; }; done
+	@test $$(grep -acE '^verdigris  : moved from 0x140000000 to 0x400000, [1-9][0-9]* relocations$$' build/win-lines.log) -eq 10 \
 	    && echo "win-test: it was moved from where its linker put it PASS" \
 	    || echo "win-test: it was moved from where its linker put it FAIL"
 	@grep -aqxF 'terminal   : win: /etc/motd: not a program Verdigris runs' build/win-lines.log \

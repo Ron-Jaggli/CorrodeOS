@@ -12,16 +12,13 @@
 
 use alloc::string::String;
 
-use corrode_rt::abi::verdigris::PEB;
+// Where the kernel leaves the wall clock: seconds since 1970, and the
+// monotonic nanosecond they were read at. Both 0 when there is no clock.
+use corrode_rt::abi::verdigris::{PEB, WALL_AT, WALL_UNIX};
 
 use crate::text::split;
 use crate::{fail, file_of, get_command_line_w, set_last_error, One, STDERR, STDIN, STDOUT};
 
-/// Where the kernel leaves the wall clock: seconds since 1970, and the
-/// monotonic nanosecond they were read at. Both 0 when there is no clock.
-/// (abi `verdigris::WALL_UNIX` and `WALL_AT`, at the same addresses.)
-const WALL_UNIX: u64 = PEB + 0x810;
-const WALL_AT: u64 = PEB + 0x818;
 
 /// 100-nanosecond intervals from 1601 (a `FILETIME`'s epoch) to 1970.
 const FILETIME_1970: u64 = 116_444_736_000_000_000;
