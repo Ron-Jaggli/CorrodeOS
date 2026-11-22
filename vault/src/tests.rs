@@ -145,8 +145,8 @@ fn seal_the_root() {
     let disk = std::env::var("VAULT_DISK").expect("VAULT_DISK names the disk image");
     let passcode = std::env::var("VAULT_PASSCODE").expect("VAULT_PASSCODE is the passcode");
     assert!(
-        (4..=8).contains(&passcode.len()) && passcode.bytes().all(|b| b.is_ascii_digit()),
-        "the lock screen takes a passcode of 4 to 8 digits"
+        corrode_theme::passcode::allowed(passcode.as_bytes()),
+        "a passcode is 4 to 32 printable characters, no space and no #"
     );
     let mut data = std::fs::read(&tar).expect("read the tar");
     let mut random = [0u8; 16 + NONCE];

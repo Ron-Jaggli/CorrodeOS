@@ -2544,6 +2544,32 @@ under the passcode, instead of on the boot medium.
   before, 195/202 with a vault; no unhandled trap; `./corrode test` 338
   passed; clippy at 33.
 
+## 79. Longer passcodes: letters, up to 32
+
+- A passcode is 4 to 32 printable ASCII characters, with no space and no
+  `#` (`corrode_theme::passcode::allowed`; `#` would start a comment in
+  desktop.conf, a space could not be told from the end of the line). The
+  type is `passcode::Code`, 32 bytes NUL-padded; `chars` gives the
+  characters, as `digits` gave digits.
+- `window::UNLOCK` carries the code in all four words; all four zero asks
+  only whether there is a passcode (a passcode is never empty), where word
+  1 = 1 used to. `corrode_ui::try_passcode` never sends an empty code.
+- The lock screen takes any allowed character the keyboard gives
+  (Shift included), up to 32, and shows at most ten dots: what fits the
+  button, which also keeps a long passcode's length to itself.
+- `vault-disk` takes any allowed passcode. `vault-test` now seals with
+  `Rust4ever` and types it with `shift-r`; passcode-test still types
+  digits. desktop.conf's comment and the README say what is allowed.
+- Host tests: the config takes letters and 32 characters and refuses 33,
+  spaces, `#`, a tab and non-ASCII; hashing matches a 32-character
+  passcode and refuses it with one letter's case changed.
+- **Choice:** printable ASCII only. The keyboard path gives ASCII; a
+  passcode that cannot be typed on the lock screen would lock it for good.
+- Verified: the whole suite on both GPUs, 73 checks PASS on each, none
+  FAIL, no unhandled trap; then, after two clippy fixes (`as_chunks`),
+  vault-test, passcode-test and lock-test again on both GPUs; `./corrode
+  test` 338 passed; clippy at 33.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -2671,7 +2697,7 @@ one task.
 2. [x] (section 78) The vault: the root directory sealed on the disk under the
    passcode, a boot medium without it, the lock screen at boot; files only
    after the right passcode; `vault-test`.
-3. [ ] Longer passcodes: up to 32 characters, letters and digits, on the
+3. [x] (section 79) Longer passcodes: up to 32 characters, letters and digits, on the
    lock screen, in desktop.conf and in `vault-disk`.
 4. [ ] Change the passcode from Settings: the vault re-sealed under the
    new one, fresh salt and nonce, written to the disk.

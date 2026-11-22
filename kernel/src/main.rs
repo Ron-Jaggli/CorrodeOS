@@ -2157,11 +2157,15 @@ fn serve(shell: bool) {
             let answer = if !from_lock {
                 println!("desktop    : task {} is not the lock screen; no passcode tries", received.from);
                 [0, 0, 0, 0]
-            } else if words[1] == 1 {
+            } else if words == [0; 4] {
                 [!look::has_passcode() as u64, 0, 0, 0]
             } else {
                 let was_sealed = vault::locked();
-                match look::try_passcode(words[0].to_le_bytes(), time::now_ns()) {
+                let mut code = [0u8; corrode_theme::passcode::MOST];
+                for (bytes, word) in code.as_chunks_mut::<8>().0.iter_mut().zip(words) {
+                    *bytes = word.to_le_bytes();
+                }
+                match look::try_passcode(code, time::now_ns()) {
                     Ok(right) => {
                         if !right {
                             println!("desktop    : a wrong passcode from task {}", received.from);

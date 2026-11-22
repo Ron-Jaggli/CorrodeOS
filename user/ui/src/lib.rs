@@ -488,19 +488,26 @@ pub fn grow(width: u32, height: u32) -> bool {
 
 /// Whether the lock screen has to ask for a passcode.
 pub fn passcode_needed() -> bool {
-    corrode_rt::call(app::WINDOWS, Message::new(window::UNLOCK, [0, 1, 0, 0]), None)
+    corrode_rt::call(app::WINDOWS, Message::new(window::UNLOCK, [0; 4]), None)
         .is_ok_and(|answer| answer.message.words[0] == 0)
 }
 
 /// Is `code` the passcode? `Ok(true)` or `Ok(false)`, or `Err(seconds)`
 /// to wait after too many wrong tries.
 pub fn try_passcode(code: &str) -> core::result::Result<bool, u64> {
-    let mut bytes = [0u8; 8];
+    let mut bytes = [0u8; 32];
     for (slot, byte) in bytes.iter_mut().zip(code.bytes()) {
         *slot = byte;
     }
-    let word = u64::from_le_bytes(bytes);
-    match corrode_rt::call(app::WINDOWS, Message::new(window::UNLOCK, [word, 0, 0, 0]), None) {
+    let mut words = [0u64; 4];
+    for (word, chunk) in words.iter_mut().zip(bytes.as_chunks::<8>().0) {
+        *word = u64::from_le_bytes(*chunk);
+    }
+    if words == [0; 4] {
+        // That would only ask whether there is a passcode.
+        return Ok(false);
+    }
+    match corrode_rt::call(app::WINDOWS, Message::new(window::UNLOCK, words), None) {
         Ok(answer) if answer.message.words[1] > 0 => Err(answer.message.words[1]),
         Ok(answer) => Ok(answer.message.words[0] == 1),
         Err(_) => Ok(false),

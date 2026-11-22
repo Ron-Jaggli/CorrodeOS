@@ -117,7 +117,7 @@ typo cannot break the desktop. The file explains every key; in short:
 | `animation_speed` | percent, `0` for none | Every animation's pace |
 | `timezone` | `UTC`, `+5`, `-8`, `+05:30` | The menu bar clock's offset from the machine's (UTC) clock |
 | `clock` | `24h` `12h` | The menu bar clock's hours |
-| `passcode` | 4 to 8 digits, or the hash `./corrode passcode-hash` writes | The lock screen (Alt+L) asks for it. Only the desktop checks it; three wrong tries in a row and it waits 30 s. `./corrode passcode-hash` rewrites digits in the clear as a salted PBKDF2 hash, so the ISO no longer shows them; 4 to 8 digits are still few enough to guess offline, so it keeps a passer-by out, not a thief |
+| `passcode` | 4 to 32 printable characters (letters, digits, symbols; no space, no `#`), or the hash `./corrode passcode-hash` writes | The lock screen (Alt+L) asks for it. Only the desktop checks it; three wrong tries in a row and it waits 30 s. `./corrode passcode-hash` rewrites one in the clear as a salted PBKDF2 hash, so the ISO no longer shows it. A few digits are easy to guess offline and keep a passer-by out, not a thief; a long one with letters is what holds up when someone has the files. With a vault (below) the vault's passcode is the lock screen's |
 
 A preset plus a line or two is usually all you need:
 

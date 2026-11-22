@@ -324,9 +324,10 @@ pub mod window {
     /// one only the shell endpoint does, from a program that lacks it.
     pub const DENIED: u64 = 81;
     /// A call, from the lock screen and only it -- from anyone else the
-    /// answer is always no -- is this the passcode? Word 0 is up to
-    /// eight ASCII digits, little-endian, NUL-padded. Word 1 is 1 to ask
-    /// only whether there is a passcode at all, which costs no try. The
+    /// answer is always no -- is this the passcode? Words 0..4 are its up
+    /// to 32 ASCII characters, little-endian, NUL-padded. All four zero
+    /// asks only whether there is a passcode at all, which costs no try
+    /// (a passcode is never empty). The
     /// answer's word 0 is 1 for yes (or for no passcode set) and 0 for no;
     /// word 1 is how many seconds until another try is taken, after too
     /// many wrong ones.

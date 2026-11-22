@@ -1258,7 +1258,7 @@ vault-iso: iso
 	@echo "built $(VAULT_ISO): the kernel and programs, no files"
 
 vault-disk: $(ROOT_TAR)
-	@test -n "$(VAULT_PASSCODE)" || { echo "vault-disk: give VAULT_PASSCODE=<4 to 8 digits>"; exit 1; }
+	@test -n "$(VAULT_PASSCODE)" || { echo "vault-disk: give VAULT_PASSCODE=<4 to 32 characters>"; exit 1; }
 	@VAULT_TAR=$(CURDIR)/$(ROOT_TAR) VAULT_DISK=$(abspath $(VAULT_IMG)) VAULT_PASSCODE=$(VAULT_PASSCODE) \
 	    cargo test -q --release -p corrode-vault --target $(HOST_TARGET) seal_the_root \
 	    -- --ignored --nocapture 2>&1 | grep '^vault-disk' \
@@ -1268,27 +1268,29 @@ run-vault: vault-iso
 	@test -f $(VAULT_IMG) || { echo "run-vault: no $(VAULT_IMG); make one with vault-disk"; exit 1; }
 	qemu-system-x86_64 $(subst $(ISO),$(VAULT_ISO),$(QEMU_FLAGS)) $(call store_flags,$(VAULT_IMG))
 
-# A fresh vault sealed with 2468 and booted from the vault ISO. The lock
-# screen must be up at boot with no files given to anyone; 1111 is
-# refused; 2468 opens it, and a terminal from the dock then has files
-# (build/vault-locked.png at boot, build/vault.png after). A second boot
-# of a copy with one sealed byte changed: 2468 opens nothing.
+# A fresh vault sealed with Rust4ever -- letters, a capital, a digit -- and
+# booted from the vault ISO. The lock screen must be up at boot with no
+# files given to anyone; 1111 is refused; Rust4ever, typed with Shift for
+# the R, opens it, and a terminal from the dock then has files
+# (build/vault-locked.png at boot, build/vault.png after). A second boot of
+# a copy with one sealed byte changed: Rust4ever opens nothing.
 VAULT_TEST_IMG := build/vault-test.img
+VAULT_TEST_KEYS := shift-r u s t 4 e v e r ret
 vault-test: vault-iso
 	@rm -f $(VAULT_TEST_IMG) build/vault-bad.img build/vault*.ppm build/vault*.png build/vault-*.log
-	@$(MAKE) -s vault-disk VAULT_IMG=$(VAULT_TEST_IMG) VAULT_PASSCODE=2468
+	@$(MAKE) -s vault-disk VAULT_IMG=$(VAULT_TEST_IMG) VAULT_PASSCODE=Rust4ever
 	@cp $(VAULT_TEST_IMG) build/vault-bad.img && printf '\x5a' \
 	    | dd of=build/vault-bad.img bs=1 seek=$$((4096 + 512 + 700)) conv=notrunc status=none
 	@( sleep $(SHOT_DELAY); sleep 1; echo "screendump build/vault-locked.ppm"; sleep 0.5; \
 	   for key in 1 1 1 1 ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 2; \
-	   for key in 2 4 6 8 ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 3; \
+	   for key in $(VAULT_TEST_KEYS); do echo "sendkey $$key"; sleep 0.15; done; sleep 3; \
 	   echo "mouse_move -28 179"; sleep 0.2; echo "mouse_move 0 179"; sleep 0.5; \
 	   echo "mouse_button 1"; sleep 0.2; echo "mouse_button 0"; sleep 3; \
 	   echo "screendump build/vault.ppm"; sleep 1; echo quit ) \
 	  | timeout --foreground 90 qemu-system-x86_64 $(subst $(ISO),$(VAULT_ISO),$(QEMU_COMMON)) \
 	      $(call store_flags,$(VAULT_TEST_IMG)) -serial file:build/serial.log -monitor stdio > /dev/null 2>&1 || true
 	@( sleep $(SHOT_DELAY); sleep 1; \
-	   for key in 2 4 6 8 ret; do echo "sendkey $$key"; sleep 0.15; done; sleep 3; echo quit ) \
+	   for key in $(VAULT_TEST_KEYS); do echo "sendkey $$key"; sleep 0.15; done; sleep 3; echo quit ) \
 	  | timeout --foreground 90 qemu-system-x86_64 $(subst $(ISO),$(VAULT_ISO),$(QEMU_COMMON)) \
 	      $(call store_flags,build/vault-bad.img) -serial file:build/vault-bad.log -monitor stdio > /dev/null 2>&1 || true
 	@grep -ahE "^(vault|files|lock) " build/serial.log | grep -v PASS || echo "vault-test: nothing from the vault"

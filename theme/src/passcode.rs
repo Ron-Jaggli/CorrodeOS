@@ -7,11 +7,13 @@
 //! ever keeps a hash.
 //!
 //! PBKDF2 with HMAC-SHA-256 (RFC 8018), written here because Corrode takes
-//! nothing from crates.io. A passcode of 4 to 8 digits has at most 10^8
-//! values, so no hash makes one safe from someone who has the file: the
-//! iterations make each guess cost something, and the salt stops one table
-//! of guesses serving every machine. The lock screen's limit on tries is
-//! what protects it from someone at the keyboard.
+//! nothing from crates.io. A passcode is 4 to 32 printable characters
+//! ([`allowed`]). Four digits have 10^4 values, and no hash makes those
+//! safe from someone who has the file: the iterations make each guess cost
+//! something, and the salt stops one table of guesses serving every
+//! machine. Length and letters are what make one hard to guess offline;
+//! the lock screen's limit on tries is what protects a short one from
+//! someone at the keyboard.
 
 use core::fmt;
 
@@ -25,15 +27,39 @@ pub const MAX_ITERATIONS: u32 = 1_000_000;
 
 const PREFIX: &str = "pbkdf2-sha256$";
 
+/// The fewest and most characters a passcode has. The most is what the
+/// lock screen's call carries: four words.
+pub const FEWEST: usize = 4;
+pub const MOST: usize = 32;
+
+/// A passcode as the lock screen sends it: its characters, NUL-padded.
+pub type Code = [u8; MOST];
+
+/// Whether `text` can be a passcode: 4 to 32 printable ASCII characters,
+/// with no space (it could not be told from the end of the line) and no
+/// `#` (it would start a comment in desktop.conf).
+pub fn allowed(text: &[u8]) -> bool {
+    (FEWEST..=MOST).contains(&text.len()) && text.iter().all(|&byte| byte.is_ascii_graphic() && byte != b'#')
+}
+
+/// `text` as the lock screen would send it, if it can be a passcode.
+pub fn code(text: &[u8]) -> Option<Code> {
+    allowed(text).then(|| {
+        let mut code = [0u8; MOST];
+        code[..text.len()].copy_from_slice(text);
+        code
+    })
+}
+
 /// A passcode as desktop.conf gives it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stored {
-    /// 4 to 8 ASCII digits, NUL-padded: an old config, or a hand-written one.
-    Plain([u8; 8]),
+    /// In the clear: an old config, or a hand-written one.
+    Plain(Code),
     Hashed(Hashed),
 }
 
-/// A salted PBKDF2-HMAC-SHA-256 of the digits.
+/// A salted PBKDF2-HMAC-SHA-256 of the passcode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hashed {
     pub iterations: u32,
@@ -42,15 +68,15 @@ pub struct Hashed {
 }
 
 impl Hashed {
-    /// Hash `code`, digits NUL-padded as the lock screen sends them.
-    pub fn new(code: [u8; 8], salt: [u8; 16], iterations: u32) -> Self {
-        Self { iterations, salt, hash: pbkdf2(digits(&code), &salt, iterations) }
+    /// Hash `code`, NUL-padded as the lock screen sends it.
+    pub fn new(code: Code, salt: [u8; 16], iterations: u32) -> Self {
+        Self { iterations, salt, hash: pbkdf2(chars(&code), &salt, iterations) }
     }
 
     /// Is `code` the passcode? Every byte of the hash is compared, whatever
     /// the first difference.
-    pub fn matches(&self, code: [u8; 8]) -> bool {
-        let tried = pbkdf2(digits(&code), &self.salt, self.iterations);
+    pub fn matches(&self, code: Code) -> bool {
+        let tried = pbkdf2(chars(&code), &self.salt, self.iterations);
         tried.iter().zip(self.hash).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
     }
 
@@ -77,8 +103,8 @@ impl fmt::Display for Hashed {
     }
 }
 
-/// The digits of a NUL-padded code, as the lock screen sends it.
-pub fn digits(code: &[u8; 8]) -> &[u8] {
+/// The characters of a NUL-padded code, as the lock screen sends it.
+pub fn chars(code: &Code) -> &[u8] {
     let len = code.iter().position(|&byte| byte == 0).unwrap_or(code.len());
     &code[..len]
 }
@@ -308,18 +334,24 @@ mod tests {
     #[test]
     fn the_right_code_matches_and_no_other() {
         let salt = *b"a salt, sixteen!";
-        let stored = Hashed::new(*b"2468\0\0\0\0", salt, 1_000);
-        assert!(stored.matches(*b"2468\0\0\0\0"));
-        for wrong in [*b"2469\0\0\0\0", *b"24680\0\0\0", *b"246\0\0\0\0\0", [0; 8], *b"86422468"] {
+        let code = |text: &[u8]| code(text).unwrap();
+        let stored = Hashed::new(code(b"2468"), salt, 1_000);
+        assert!(stored.matches(code(b"2468")));
+        for wrong in [code(b"2469"), code(b"24680"), code(b"Rust4ever"), [0; MOST], code(b"86422468")] {
             assert!(!stored.matches(wrong), "{wrong:?}");
         }
-        // Another salt, another hash for the same digits.
-        assert_ne!(Hashed::new(*b"2468\0\0\0\0", *b"another salt!!!!", 1_000).hash, stored.hash);
+        // Another salt, another hash for the same passcode.
+        assert_ne!(Hashed::new(code(b"2468"), *b"another salt!!!!", 1_000).hash, stored.hash);
+        // Letters, and the longest there is.
+        let long = code(b"Correct-Horse-Battery-Staple-42!");
+        let stored = Hashed::new(long, salt, 1_000);
+        assert!(stored.matches(long));
+        assert!(!stored.matches(code(b"correct-Horse-Battery-Staple-42!")));
     }
 
     #[test]
     fn a_hashed_line_reads_back_as_written() {
-        let stored = Hashed::new(*b"87654321", [7; 16], 2_000);
+        let stored = Hashed::new(code(b"87654321").unwrap(), [7; 16], 2_000);
         let line = stored.to_string();
         assert!(line.starts_with("pbkdf2-sha256$2000$0707"), "{line}");
         assert_eq!(Hashed::parse(&line), Some(stored));

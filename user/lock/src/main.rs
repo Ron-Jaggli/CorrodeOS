@@ -4,9 +4,10 @@
 //! It opens a cover window, which the desktop puts above everything and
 //! gives every key and click, so nothing behind it can be used. Without a
 //! passcode, Return or a click on the unlock button takes it away. With
-//! one (`passcode =` in /etc/desktop.conf), the digits typed are put to the
-//! desktop, which alone knows the passcode, and only a yes unlocks; after
-//! three wrong tries the desktop takes no more for half a minute.
+//! one (`passcode =` in /etc/desktop.conf, or the vault's), what is typed --
+//! 4 to 32 printable characters -- is put to the desktop, which alone knows
+//! the passcode, and only a yes unlocks; after three wrong tries the
+//! desktop takes no more for half a minute.
 
 #![no_std]
 #![no_main]
@@ -30,7 +31,11 @@ const BUTTON: (u32, u32) = (220, 32);
 /// Return and Backspace, by scancode.
 const KEY_ENTER: u8 = 0x1c;
 const KEY_BACKSPACE: u8 = 0x0e;
-const MOST_DIGITS: usize = 8;
+/// The most characters a passcode has (`corrode_theme::passcode::MOST`).
+const MOST: usize = 32;
+/// The most dots shown: as many as fit the button. More characters show
+/// no more dots, which also keeps a long passcode's length to itself.
+const MOST_DOTS: usize = 10;
 const DOT: u32 = 10;
 
 struct Clock {
@@ -106,8 +111,8 @@ fn draw(window: &mut Window, clock: &Clock) -> u64 {
     } else if clock.typed.is_empty() {
         centre(window, hy, "Enter passcode", HINT, text);
     } else {
-        // A dot for each digit, never the digit.
-        let count = clock.typed.len() as u32;
+        // A dot for each character, never the character.
+        let count = clock.typed.len().min(MOST_DOTS) as u32;
         let span = count * DOT + (count - 1) * DOT;
         let mut x = bx + (BUTTON.0 - span) as i32 / 2;
         let y = by + (BUTTON.1 - DOT) as i32 / 2;
@@ -233,12 +238,18 @@ fn main() {
                 clock.typed.pop();
                 next = draw(&mut window, &clock);
             }
+            // Printable, no space and no `#`: what a passcode can hold
+            // (`corrode_theme::passcode::allowed`).
             Event::Key {
-                text: Some(digit @ '0'..='9'),
+                text: Some(character),
                 pressed: true,
                 ..
-            } if clock.passcode && clock.typed.len() < MOST_DIGITS => {
-                clock.typed.push(digit);
+            } if clock.passcode
+                && clock.typed.len() < MOST
+                && character.is_ascii_graphic()
+                && character != '#' =>
+            {
+                clock.typed.push(character);
                 clock.said = None;
                 next = draw(&mut window, &clock);
             }

@@ -92,7 +92,7 @@ pub fn has_passcode() -> bool {
 /// Is `code` the passcode? `Some(true)` or `Some(false)`, or `None` with
 /// the seconds to wait if too many wrong tries came just before. With no
 /// passcode set, anything is right.
-pub fn try_passcode(code: [u8; 8], now: u64) -> Result<bool, u64> {
+pub fn try_passcode(code: passcode::Code, now: u64) -> Result<bool, u64> {
     let sealed = crate::vault::locked();
     let passcode = without_interrupts(|| *PASSCODE.lock());
     if passcode.is_none() && !sealed {
@@ -112,7 +112,7 @@ pub fn try_passcode(code: [u8; 8], now: u64) -> Result<bool, u64> {
         // The vault's passcode is the one that opens it, whatever
         // desktop.conf says.
         _ if sealed => {
-            let opened = crate::vault::unlock(passcode::digits(&code));
+            let opened = crate::vault::unlock(passcode::chars(&code));
             if opened {
                 opened_vault(code);
             }
@@ -138,7 +138,7 @@ pub fn try_passcode(code: [u8; 8], now: u64) -> Result<bool, u64> {
 /// The vault opened with `code`. Its files' desktop.conf gives the look
 /// (unless the disk kept one), and `code`, hashed, is the lock screen's
 /// passcode from now on: what opened the files locks the screen.
-fn opened_vault(code: [u8; 8]) {
+fn opened_vault(code: passcode::Code) {
     let kept = KEPT.load(Ordering::Acquire);
     let theme = crate::vault::root()
         .and_then(|(_, module)| corrode_theme::find_in_tar(module.bytes, "etc/desktop.conf"))

@@ -559,7 +559,8 @@ pub fn color(text: &str) -> Option<Color> {
 }
 
 /// The lock screen's passcode, from a config file's `passcode = ` line:
-/// either 4 to 8 digits in the clear, or the salted hash
+/// either 4 to 32 characters in the clear ([`passcode::allowed`]), or the
+/// salted hash
 /// `./corrode passcode-hash` writes (see [`passcode`](mod@passcode)).
 /// `None` if there is no such line, or it is neither (a passcode that
 /// cannot be typed on the lock screen's keys would lock the screen for
@@ -572,12 +573,7 @@ pub fn passcode(text: &str) -> Option<passcode::Stored> {
     if let Some(hashed) = passcode::Hashed::parse(value) {
         return Some(passcode::Stored::Hashed(hashed));
     }
-    if !(4..=8).contains(&value.len()) || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let mut code = [0u8; 8];
-    code[..value.len()].copy_from_slice(value.as_bytes());
-    Some(passcode::Stored::Plain(code))
+    passcode::code(value.as_bytes()).map(passcode::Stored::Plain)
 }
 
 /// The last `passcode =` line: where its value starts in `text`, and the
@@ -715,15 +711,24 @@ mod tests {
     }
 
     #[test]
-    fn a_passcode_is_four_to_eight_digits() {
+    fn a_passcode_is_four_to_thirty_two_characters() {
         use passcode::Stored::Plain;
-        assert_eq!(passcode("passcode = 1234\n"), Some(Plain(*b"1234\0\0\0\0")));
-        assert_eq!(passcode("# lock\npasscode=87654321 # mine\n"), Some(Plain(*b"87654321")));
+        let code = |text: &[u8]| passcode::code(text).unwrap();
+        assert_eq!(passcode("passcode = 1234\n"), Some(Plain(code(b"1234"))));
+        assert_eq!(passcode("# lock\npasscode=87654321 # mine\n"), Some(Plain(code(b"87654321"))));
+        assert_eq!(passcode("passcode = Rust4ever!\n"), Some(Plain(code(b"Rust4ever!"))));
+        let longest = "passcode = abcdefghijklmnopqrstuvwxyz012345\n";
+        assert_eq!(passcode(longest), Some(Plain(code(b"abcdefghijklmnopqrstuvwxyz012345"))));
         // The last one wins, as for every other key.
-        assert_eq!(passcode("passcode = 1111\npasscode = 2222\n"), Some(Plain(*b"2222\0\0\0\0")));
-        for bad in ["", "passcode = 123", "passcode = 123456789", "passcode = 12a4", "passcode ="] {
+        assert_eq!(passcode("passcode = 1111\npasscode = 2222\n"), Some(Plain(code(b"2222"))));
+        let too_long = "passcode = abcdefghijklmnopqrstuvwxyz0123456";
+        for bad in ["", "passcode = 123", too_long, "passcode = two words", "passcode = é123", "passcode ="] {
             assert_eq!(passcode(bad), None, "{bad:?}");
         }
+        // `#` starts a comment, so what is before it is the passcode.
+        assert_eq!(passcode("passcode = ab#cdef\n"), None);
+        assert_eq!(passcode::code(b"ab#cd"), None);
+        assert_eq!(passcode::code(b"ab\tcd"), None);
         // And the theme does not take it as anything.
         assert_eq!(Theme::parse("passcode = 1234\n"), Theme::default());
     }
@@ -731,7 +736,8 @@ mod tests {
     #[test]
     fn a_plain_passcode_becomes_a_hash_and_nothing_else_changes() {
         let config = "accent = #e2643a\n# passcode = 1111\npasscode = 2468 # mine\nclock = 12h\n";
-        let hashed = passcode::Hashed::new(*b"2468\0\0\0\0", *b"a salt, sixteen!", 1_000);
+        let code = |text: &[u8]| passcode::code(text).unwrap();
+        let hashed = passcode::Hashed::new(code(b"2468"), *b"a salt, sixteen!", 1_000);
         let mut out = String::new();
         with_hashed_passcode(config, &hashed, &mut out).unwrap();
         assert_eq!(out, format!("accent = #e2643a\n# passcode = 1111\npasscode = {hashed} # mine\nclock = 12h\n"));
@@ -740,8 +746,9 @@ mod tests {
             panic!("{out}");
         };
         assert_eq!(read, hashed);
-        assert!(read.matches(*b"2468\0\0\0\0"));
-        assert!(!read.matches(*b"1111\0\0\0\0"));
+        assert!(read.matches(code(b"2468")));
+        assert!(!read.matches(code(b"1111")));
+        assert!(!read.matches(code(b"24680")));
         assert_eq!(Theme::parse(&out), Theme::parse(config));
         // A hash is not hashed again, and no passcode is no change.
         assert_eq!(with_hashed_passcode(&out, &hashed, &mut String::new()), None);
