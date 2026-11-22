@@ -71,6 +71,52 @@ pub const OPEN_EXISTING: u32 = 3;
 pub const OPEN_ALWAYS: u32 = 4;
 pub const TRUNCATE_EXISTING: u32 = 5;
 
+/// One entry a search finds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Found {
+    pub name: String,
+    pub dir: bool,
+    pub size: u64,
+}
+
+/// Whether `name` matches a Windows wildcard `pattern`: `*` any run of
+/// characters, `?` one, the rest without regard to ASCII case. `*.*`
+/// matches every name, with a dot or without, as on Windows. Greedy with
+/// one point to go back to, so a pattern of many stars costs no more than
+/// its length times the name's.
+pub fn wildcard(pattern: &str, name: &str) -> bool {
+    let pattern = if pattern == "*.*" { "*" } else { pattern };
+    let (pattern, name) = (pattern.as_bytes(), name.as_bytes());
+    let (mut p, mut n) = (0, 0);
+    let mut back: Option<(usize, usize)> = None;
+    while n < name.len() {
+        match pattern.get(p) {
+            Some(b'*') => {
+                back = Some((p, n));
+                p += 1;
+            }
+            Some(b'?') => {
+                p += 1;
+                n += 1;
+            }
+            Some(c) if c.eq_ignore_ascii_case(&name[n]) => {
+                p += 1;
+                n += 1;
+            }
+            _ => match back {
+                // The last star takes one more character.
+                Some((star, from)) => {
+                    p = star + 1;
+                    n = from + 1;
+                    back = Some((star, from + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|c| *c == b'*')
+}
+
 /// What one program may see.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct View {
@@ -249,6 +295,46 @@ impl View {
             return Err(Error::AccessDenied);
         }
         Ok(node)
+    }
+
+    /// `FindFirstFileW`: the entries a pattern finds, in order. The last
+    /// name of `path` is the pattern (`C:\etc\*`, `*.txt`); the rest names
+    /// the directory, which must be in the view (or it is
+    /// `ERROR_PATH_NOT_FOUND`, hidden or missing alike). A directory other
+    /// than the root shows `.` and `..` first, as on Windows. Nothing
+    /// found is `ERROR_FILE_NOT_FOUND`.
+    pub fn search(&self, fs: &Fs<'_>, cwd: &str, path: &str) -> Result<Vec<Found>, Error> {
+        let path: String = path.chars().map(|c| if c == '/' { '\\' } else { c }).collect();
+        let (dir, pattern) = match path.rfind('\\') {
+            Some(at) => (&path[..=at], &path[at + 1..]),
+            None if path.as_bytes().get(1) == Some(&b':') => (&path[..2], &path[2..]),
+            None => ("", path.as_str()),
+        };
+        if pattern.is_empty() {
+            return Err(Error::FileNotFound);
+        }
+        let dir = match self.find(fs, cwd, if dir.is_empty() { "." } else { dir }) {
+            Ok(dir) if dir.is_dir() => dir,
+            Ok(_) | Err(_) => return Err(Error::PathNotFound),
+        };
+        let mut found = Vec::new();
+        if self.root_in(fs).is_some_and(|root| root.path != dir.path) {
+            for dots in [".", ".."] {
+                found.push(Found { name: String::from(dots), dir: true, size: 0 });
+            }
+        }
+        for node in self.shown(fs, &dir.path) {
+            found.push(Found {
+                name: String::from(node.name()),
+                dir: node.is_dir(),
+                size: if node.is_dir() { 0 } else { node.data.len() as u64 },
+            });
+        }
+        found.retain(|entry| wildcard(pattern, &entry.name));
+        if found.is_empty() {
+            return Err(Error::FileNotFound);
+        }
+        Ok(found)
     }
 
     /// The names a directory shows, for `path` naming one.

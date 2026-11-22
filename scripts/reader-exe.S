@@ -6,11 +6,13 @@
 # RIP-relative address. No Windows toolchain, no linker.
 #
 # It imports CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError,
-# GetStdHandle, WriteFile and ExitProcess from KERNEL32.dll, and for each
-# path in its table opens the file, reads it, and writes the file's first
-# line to standard output -- or, when the open fails, which error
+# FindFirstFileW, FindNextFileW, FindClose, GetStdHandle, WriteFile and
+# ExitProcess from KERNEL32.dll. For each path in its first table it opens
+# the file, reads it, and writes the file's first line to standard output;
+# for each in its second it searches, and writes each name found (a
+# directory's with a `\` after it). When a call fails it says which error
 # GetLastError gave. The kernel starts it in /docs, allowed /etc/motd
-# besides, so what it may read and what it may not are both on the list.
+# besides, so what it may see and what it may not are both on the lists.
 
         .intel_syntax noprefix
         .text
@@ -72,6 +74,8 @@ optional_end:
 # --- .text, at 0x1000 ----------------------------------------------------
         .org base + 0x1000
         .set buffer, base + 0x3000      # 4 KiB for a read, then 4 KiB more
+        .set found, buffer              # or a WIN32_FIND_DATAW,
+        .set line, buffer + 1024        # and a name to write
 
 code:
         # On entry rsp is 8 below a 16-byte boundary.
@@ -83,6 +87,12 @@ code:
         lea rcx, [rip + path_\n]
         mov edx, [rip + access_\n]
         call show
+        .endr
+        .irp n, 10, 11, 12, 13, 14, 15
+        lea rcx, [rip + path_\n]
+        lea rdx, [rip + say_\n]
+        mov r8d, say_\n\()_end - say_\n
+        call list
         .endr
         xor ecx, ecx
         call [rip + ExitProcess]
@@ -183,7 +193,7 @@ failed_closing:
         call [rip + CloseHandle]
 failed:
         call [rip + GetLastError]
-        .irp code, 2, 3, 5, 19
+        .irp code, 2, 3, 5, 18, 19
         cmp eax, \code
         jne 1f
         lea rcx, [rip + error_\code]
@@ -201,6 +211,59 @@ said:
         pop rsi
         pop rbx
         ret
+
+# list(rcx = UTF-16 pattern, rdx = what to say first, r8 = its length):
+# each name a search finds, a line each, then why it ended. Its frame is
+# show's, so it ends through show's error path.
+list:
+        push rbx
+        push rsi
+        push rdi
+        push r12
+        sub rsp, 0x48
+        mov rsi, rdx
+        mov rdi, r8
+        lea rdx, [rip + found]
+        call [rip + FindFirstFileW]
+        cmp rax, -1
+        je list_failed
+        mov r12, rax
+list_next:
+        mov rcx, rsi
+        mov rdx, rdi
+        call put
+        lea rcx, [rip + found + 44]     # the name, UTF-16, to bytes
+        lea rdx, [rip + line]
+        xor eax, eax
+list_copy:
+        movzx r8d, word ptr [rcx + rax * 2]
+        test r8d, r8d
+        jz list_copied
+        mov [rdx + rax], r8b
+        inc rax
+        jmp list_copy
+list_copied:
+        test dword ptr [rip + found], 0x10   # FILE_ATTRIBUTE_DIRECTORY
+        jz 1f
+        mov byte ptr [rdx + rax], 0x5c
+        inc rax
+1:      mov byte ptr [rdx + rax], 10
+        inc rax
+        mov rcx, rdx
+        mov rdx, rax
+        call put
+        mov rcx, r12
+        lea rdx, [rip + found]
+        call [rip + FindNextFileW]
+        test eax, eax
+        jnz list_next
+        mov rcx, r12                    # the end: say why, as for a failure
+        call [rip + FindClose]
+list_failed:
+        mov rcx, rsi
+        mov rdx, rdi
+        call put
+        jmp failed
 code_end:
 
 # --- .rdata, at 0x2000 ---------------------------------------------------
@@ -213,19 +276,19 @@ imports_end:
 
         .balign 8, 0
 lookup:
-        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, GetStdHandle, WriteFile, ExitProcess
+        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, FindFirstFileW, FindNextFileW, FindClose, GetStdHandle, WriteFile, ExitProcess
         .quad hint_\name - base
         .endr
         .quad 0
 iat:
-        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, GetStdHandle, WriteFile, ExitProcess
+        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, FindFirstFileW, FindNextFileW, FindClose, GetStdHandle, WriteFile, ExitProcess
 \name:  .quad hint_\name - base
         .endr
         .quad 0
 iat_end:
 
 dll:    .asciz "KERNEL32.dll"
-        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, GetStdHandle, WriteFile, ExitProcess
+        .irp name, CreateFileW, ReadFile, GetFileSize, CloseHandle, GetLastError, FindFirstFileW, FindNextFileW, FindClose, GetStdHandle, WriteFile, ExitProcess
         .balign 2, 0
 hint_\name:
         .short 0
@@ -255,6 +318,22 @@ access_\n:
         case 8, "D:\\etc\\motd", "D:\\etc\\motd"
         case 9, "C:\\docs", "C:\\docs"
 
+        .macro listing n, say, path
+say_\n: .ascii "\say: "
+say_\n\()_end:
+        .balign 2, 0
+path_\n:
+        .string16 "\path"
+        .short 0
+        .endm
+
+        listing 10, "C:\\*", "C:\\*"
+        listing 11, "C:\\etc\\*", "C:\\etc\\*"
+        listing 12, "c:/docs/*.TXT", "c:/docs/*.TXT"
+        listing 13, "C:\\etc\\m?td", "C:\\etc\\m?td"
+        listing 14, "C:\\etc\\desktop.c*", "C:\\etc\\desktop.c*"
+        listing 15, "C:\\home\\*", "C:\\home\\*"
+
 agrees: .ascii "GetFileSize and the next ReadFile agree\n"
 agrees_end:
 disagrees:
@@ -266,6 +345,8 @@ error_3: .ascii "not there (3, ERROR_PATH_NOT_FOUND)\n"
 error_3_end:
 error_5: .ascii "refused (5, ERROR_ACCESS_DENIED)\n"
 error_5_end:
+error_18: .ascii "no more (18, ERROR_NO_MORE_FILES)\n"
+error_18_end:
 error_19: .ascii "read-only (19, ERROR_WRITE_PROTECT)\n"
 error_19_end:
 error_other: .ascii "failed some other way\n"

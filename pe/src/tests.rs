@@ -614,7 +614,7 @@ fn the_scripts_console_exe_loads_and_binds() {
 
 
 /// The program phase 3's boot test runs, as `scripts/reader-exe.sh`
-/// assembles it: three sections, the last uninitialised, and eight
+/// assembles it: three sections, the last uninitialised, and eleven
 /// imports, all bound to kernel32's table.
 #[test]
 fn the_scripts_reader_exe_loads_and_binds() {
@@ -627,12 +627,15 @@ fn the_scripts_reader_exe_loads_and_binds() {
     let pe = Pe::parse(&file, ALLOWED).expect("reader.exe is a valid program");
     check_promises(&pe);
     let names: Vec<_> = pe.imports().map(|import| import.name).collect();
-    let wanted: [&[u8]; 8] = [
+    let wanted: [&[u8]; 11] = [
         b"CreateFileW",
         b"ReadFile",
         b"GetFileSize",
         b"CloseHandle",
         b"GetLastError",
+        b"FindFirstFileW",
+        b"FindNextFileW",
+        b"FindClose",
         b"GetStdHandle",
         b"WriteFile",
         b"ExitProcess",

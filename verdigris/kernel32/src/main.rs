@@ -6,7 +6,8 @@
 //! capability (`corrode_abi::verdigris::LOG`): what a program writes comes
 //! out as log lines under its name.
 //!
-//! Files: `CreateFileW`, `ReadFile`, `GetFileSize` and `CloseHandle`, through
+//! Files: `CreateFileW`, `ReadFile`, `GetFileSize`, `CloseHandle`, and the
+//! search calls `FindFirstFileW`, `FindNextFileW` and `FindClose`, through
 //! the program's view (`verdigris::VIEW`), when it was given one. Paths go
 //! to the view's service in the page the two share (`verdigris::PAGE`),
 //! and what is read comes back in it; the service decides what the program
@@ -44,12 +45,15 @@ const STDERR: isize = 0x12;
 const INVALID_HANDLE_VALUE: isize = -1;
 /// A file's handle is this plus the view's number for it.
 const FILE_HANDLES: isize = 0x100;
+/// A search's handle is this plus the view's number for it.
+const SEARCH_HANDLES: isize = 0x200;
 
 /// `GetLastError`'s numbers that this file gives itself.
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_FILENAME_EXCED_RANGE: u32 = 206;
+const ERROR_INVALID_PARAMETER: u32 = 87;
 
 /// Rights to change a file, any of which makes an open a write.
 const WRITE_RIGHTS: u32 = 0x4000_0000 // GENERIC_WRITE
@@ -97,11 +101,46 @@ fn ask(label: u64, words: [u64; 4]) -> Result<u64, u32> {
     }
 }
 
+/// The view's number for a handle in the range from `first`, if it is one.
+fn in_range(handle: isize, first: isize) -> Option<u64> {
+    (first..first + view::HANDLES as isize)
+        .contains(&handle)
+        .then(|| (handle - first) as u64)
+}
+
 /// The view's number for a file handle, if it is one.
 fn file_of(handle: isize) -> Option<u64> {
-    (FILE_HANDLES..FILE_HANDLES + view::HANDLES as isize)
-        .contains(&handle)
-        .then(|| (handle - FILE_HANDLES) as u64)
+    in_range(handle, FILE_HANDLES)
+}
+
+/// The view's number for a search handle, if it is one.
+fn search_of(handle: isize) -> Option<u64> {
+    in_range(handle, SEARCH_HANDLES)
+}
+
+/// A zero-ended UTF-16 path, as UTF-8 in the shared page: its length, or
+/// the Windows error. An unpaired surrogate is U+FFFD.
+///
+/// # Safety
+/// `name` is null or points at a zero-ended UTF-16 string.
+unsafe fn path_to_page(name: *const u16) -> Result<usize, u32> {
+    if name.is_null() {
+        return Err(ERROR_FILE_NOT_FOUND);
+    }
+    let page = page().ok_or(ERROR_FILE_NOT_FOUND)?;
+    let units = (0..).map(|i| {
+        // SAFETY: the caller's promise; read only up to the zero.
+        unsafe { name.add(i).read_unaligned() }
+    });
+    let mut len = 0;
+    for character in char::decode_utf16(units.take_while(|unit| *unit != 0)) {
+        let character = character.unwrap_or(char::REPLACEMENT_CHARACTER);
+        if len + character.len_utf8() > view::MOST_PATH {
+            return Err(ERROR_FILENAME_EXCED_RANGE);
+        }
+        len += character.encode_utf8(&mut page[len..]).len();
+    }
+    Ok(len)
 }
 
 /// Fail with `code`, as a Windows call does: the number for
@@ -125,26 +164,11 @@ unsafe extern "win64" fn create_file_w(
     _flags: u32,
     _template: isize,
 ) -> isize {
-    if name.is_null() {
-        return fail(ERROR_FILE_NOT_FOUND, INVALID_HANDLE_VALUE);
-    }
-    let Some(page) = page() else {
-        return fail(ERROR_FILE_NOT_FOUND, INVALID_HANDLE_VALUE);
+    // SAFETY: the caller's promise.
+    let len = match unsafe { path_to_page(name) } {
+        Ok(len) => len,
+        Err(code) => return fail(code, INVALID_HANDLE_VALUE),
     };
-    // UTF-16 to UTF-8, into the page. An unpaired surrogate is U+FFFD.
-    let units = (0..).map(|i| {
-        // SAFETY: the caller's promise; read only up to the zero.
-        unsafe { name.add(i).read_unaligned() }
-    });
-    let units = units.take_while(|unit| *unit != 0);
-    let mut len = 0;
-    for character in char::decode_utf16(units) {
-        let character = character.unwrap_or(char::REPLACEMENT_CHARACTER);
-        if len + character.len_utf8() > view::MOST_PATH {
-            return fail(ERROR_FILENAME_EXCED_RANGE, INVALID_HANDLE_VALUE);
-        }
-        len += character.encode_utf8(&mut page[len..]).len();
-    }
     let write = u64::from(access & WRITE_RIGHTS != 0);
     match ask(view::OPEN, [len as u64, write, disposition as u64, 0]) {
         Ok(file) => {
@@ -217,6 +241,104 @@ unsafe extern "win64" fn get_file_size(handle: isize, high: *mut u32) -> u32 {
             size as u32
         }
         Err(code) => fail(code, INVALID_FILE_SIZE),
+    }
+}
+
+/// `WIN32_FIND_DATAW`'s fields, by byte offset.
+const FIND_ATTRIBUTES: usize = 0;
+const FIND_SIZE_HIGH: usize = 28;
+const FIND_SIZE_LOW: usize = 32;
+const FIND_NAME: usize = 44;
+const FIND_NAME_UNITS: usize = 260;
+const FIND_DATA_LEN: usize = 592;
+const FILE_ATTRIBUTE_READONLY: u32 = 0x01;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+
+/// The next entry of a search, into `data`: false, with the error set, if
+/// there is none.
+///
+/// # Safety
+/// `data` is a writable `WIN32_FIND_DATAW`.
+unsafe fn next_found(search: u64, data: *mut u8) -> bool {
+    let Some(page) = page() else {
+        return fail(ERROR_INVALID_HANDLE, false);
+    };
+    let answer = match call(VIEW, Message::new(view::NEXT, [search, 0, 0, 0]), None) {
+        Ok(answer) if answer.message.words[0] == 0 => answer.message.words,
+        Ok(answer) => return fail(answer.message.words[0] as u32, false),
+        Err(_) => return fail(ERROR_INVALID_HANDLE, false),
+    };
+    let [_, len, size, dir] = answer;
+    let mut record = [0u8; FIND_DATA_LEN];
+    // Nothing in the view can be written: files say so.
+    let attributes = if dir == 1 { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_READONLY };
+    record[FIND_ATTRIBUTES..FIND_ATTRIBUTES + 4].copy_from_slice(&attributes.to_le_bytes());
+    record[FIND_SIZE_HIGH..FIND_SIZE_HIGH + 4].copy_from_slice(&((size >> 32) as u32).to_le_bytes());
+    record[FIND_SIZE_LOW..FIND_SIZE_LOW + 4].copy_from_slice(&(size as u32).to_le_bytes());
+    // The name, UTF-8 to UTF-16, cut to fit with its zero.
+    let name = core::str::from_utf8(&page[..(len as usize).min(page.len())]).unwrap_or("?");
+    let mut at = FIND_NAME;
+    for unit in name.encode_utf16().take(FIND_NAME_UNITS - 1) {
+        record[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+        at += 2;
+    }
+    // SAFETY: the caller's promise.
+    unsafe { core::ptr::copy_nonoverlapping(record.as_ptr(), data, FIND_DATA_LEN) };
+    true
+}
+
+/// Search a directory: the last name of `name` is the pattern. The first
+/// entry goes into `data`, and the handle gives the rest.
+///
+/// # Safety
+/// `name` is a zero-ended UTF-16 string and `data` a writable
+/// `WIN32_FIND_DATAW`, as the Windows contract says.
+unsafe extern "win64" fn find_first_file_w(name: *const u16, data: *mut u8) -> isize {
+    if data.is_null() {
+        return fail(ERROR_INVALID_PARAMETER, INVALID_HANDLE_VALUE);
+    }
+    // SAFETY: the caller's promise.
+    let len = match unsafe { path_to_page(name) } {
+        Ok(len) => len,
+        Err(code) => return fail(code, INVALID_HANDLE_VALUE),
+    };
+    let search = match ask(view::SEARCH, [len as u64, 0, 0, 0]) {
+        Ok(search) => search,
+        Err(code) => return fail(code, INVALID_HANDLE_VALUE),
+    };
+    // SAFETY: the caller's promise. A search finds at least one entry.
+    if !unsafe { next_found(search, data) } {
+        let _ = ask(view::CLOSE, [search, 0, 0, 0]);
+        return INVALID_HANDLE_VALUE;
+    }
+    set_last_error(0);
+    SEARCH_HANDLES + search as isize
+}
+
+/// The next entry of a search. False with `ERROR_NO_MORE_FILES` after the
+/// last.
+///
+/// # Safety
+/// `data` is a writable `WIN32_FIND_DATAW`.
+unsafe extern "win64" fn find_next_file_w(handle: isize, data: *mut u8) -> i32 {
+    let Some(search) = search_of(handle) else {
+        return fail(ERROR_INVALID_HANDLE, 0);
+    };
+    if data.is_null() {
+        return fail(ERROR_INVALID_PARAMETER, 0);
+    }
+    // SAFETY: the caller's promise.
+    i32::from(unsafe { next_found(search, data) })
+}
+
+/// End a search.
+extern "win64" fn find_close(handle: isize) -> i32 {
+    let Some(search) = search_of(handle) else {
+        return fail(ERROR_INVALID_HANDLE, 0);
+    };
+    match ask(view::CLOSE, [search, 0, 0, 0]) {
+        Ok(_) => 1,
+        Err(code) => fail(code, 0),
     }
 }
 
@@ -397,9 +519,9 @@ const fn export(name: &[u8], function: *const ()) -> Export {
 /// What this kernel32 offers, at `KERNEL32_BASE` (see `kernel32.ld`).
 #[used]
 #[link_section = ".verdigris.exports"]
-static EXPORTS: Table<9> = Table {
+static EXPORTS: Table<12> = Table {
     magic: MAGIC,
-    count: 9,
+    count: 12,
     size: ENTRY as u32,
     entries: [
         export(b"GetStdHandle", get_std_handle as *const ()),
@@ -411,5 +533,8 @@ static EXPORTS: Table<9> = Table {
         export(b"CloseHandle", close_handle as *const ()),
         export(b"GetLastError", get_last_error as *const ()),
         export(b"SetLastError", set_last_error as *const ()),
+        export(b"FindFirstFileW", find_first_file_w as *const ()),
+        export(b"FindNextFileW", find_next_file_w as *const ()),
+        export(b"FindClose", find_close as *const ()),
     ],
 };

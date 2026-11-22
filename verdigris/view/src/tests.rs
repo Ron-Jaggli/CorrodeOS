@@ -235,3 +235,61 @@ fn errors_are_windows_numbers() {
     ];
     assert_eq!(codes, [2, 3, 5, 19, 87]);
 }
+
+#[test]
+fn wildcards_match_as_windows_does() {
+    for (pattern, name) in [
+        ("*", "robot.exe"),
+        ("*.*", "AppData"),
+        ("*.exe", "ROBOT.EXE"),
+        ("r?bot.*", "robot.exe"),
+        ("*o*o*", "robot.exe"),
+        ("save.dat", "Save.Dat"),
+        ("**", ""),
+    ] {
+        assert!(wildcard(pattern, name), "{pattern} {name}");
+    }
+    for (pattern, name) in [("*.exe", "save.dat"), ("?", ""), ("r?bot", "rbot"), ("save", "save.dat"), ("*.", "a.b")] {
+        assert!(!wildcard(pattern, name), "{pattern} {name}");
+    }
+    // Many stars against a long name that does not match: quick, not
+    // exponential.
+    let long = "a".repeat(2000);
+    assert!(!wildcard(&std::format!("{}b", "*a".repeat(100)), &long));
+}
+
+#[test]
+fn a_search_finds_only_what_the_view_shows() {
+    with(TREE, |fs| {
+        let view = View::new(ROBOT, &["/root/dih/robot.txt", "/apps/shared/fonts"]);
+        let names = |path: &str| {
+            view.search(fs, ROBOT, path)
+                .map(|found| found.iter().map(|entry| entry.name.clone()).collect::<StdVec<_>>())
+        };
+        // The root has no dots; every other directory does.
+        assert_eq!(names(r"C:\*").unwrap(), ["apps", "root"]);
+        assert_eq!(names(r"C:\root\*").unwrap(), [".", "..", "dih"]);
+        assert_eq!(names(r"C:\root\dih\*.*").unwrap(), [".", "..", "robot.txt"]);
+        assert_eq!(names(r"\apps\*").unwrap(), [".", "..", "robot", "shared"]);
+        assert_eq!(names("*").unwrap(), [".", "..", "AppData", "robot.exe", "save.dat"]);
+        assert_eq!(names("C:*.DAT").unwrap(), ["save.dat"]);
+        assert_eq!(names(r"c:/apps/shared/*").unwrap(), [".", "..", "fonts"]);
+        // A name without wildcards finds itself, in any case.
+        assert_eq!(names(r"C:\ROOT\DIH\ROBOT.TXT").unwrap(), ["robot.txt"]);
+        // Sizes and kinds.
+        let found = view.search(fs, ROBOT, "save.dat").unwrap();
+        assert_eq!(found, [Found { name: "save.dat".into(), dir: false, size: 20 }]);
+        assert!(view.search(fs, ROBOT, r"C:\apps").unwrap()[0].dir);
+        // Hidden and missing alike.
+        assert_eq!(names(r"C:\root\dih\diary.txt"), Err(Error::FileNotFound));
+        assert_eq!(names(r"C:\root\dih\nothing.txt"), Err(Error::FileNotFound));
+        assert_eq!(names(r"C:\root\dih\d*"), Err(Error::FileNotFound));
+        assert_eq!(names(r"C:\root\keys\*"), Err(Error::PathNotFound));
+        assert_eq!(names(r"C:\root\keyz\*"), Err(Error::PathNotFound));
+        assert_eq!(names(r"C:\etc\*"), Err(Error::PathNotFound));
+        assert_eq!(names(r"D:\*"), Err(Error::PathNotFound));
+        assert_eq!(names(r"save.dat\*"), Err(Error::PathNotFound));
+        // No pattern at all.
+        assert_eq!(names(r"C:\root\"), Err(Error::FileNotFound));
+    });
+}

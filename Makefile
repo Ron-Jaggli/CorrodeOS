@@ -336,6 +336,19 @@ pe-test: iso
 	@grep -aqxF 'reader.exe : C:\etc\motd, to write: read-only (19, ERROR_WRITE_PROTECT)' build/pe-lines.log \
 	    && echo "pe-test: ...and nothing it sees can be written       PASS" \
 	    || echo "pe-test: ...and nothing it sees can be written       FAIL"
+	@# Listings: each search's names on one line, then why it ended.
+	@listed() { grep -aF "reader.exe : $$1: " build/pe-lines.log | sed 's/.*: //' | tr '\n' ' '; }; \
+	end='no more (18, ERROR_NO_MORE_FILES) '; \
+	test "$$(listed 'C:\*')" = "docs\ etc\ $$end" \
+	    && test "$$(listed 'C:\etc\*')" = ".\ ..\ motd $$end" \
+	    && test "$$(listed 'c:/docs/*.TXT')" = "$$(cd root/docs && LC_ALL=C ls *.txt | tr '\n' ' ')$$end" \
+	    && test "$$(listed 'C:\etc\m?td')" = "motd $$end" \
+	    && echo "pe-test: a search shows only what the view shows    PASS" \
+	    || echo "pe-test: a search shows only what the view shows    FAIL"
+	@grep -aqxF 'reader.exe : C:\etc\desktop.c*: not there (2, ERROR_FILE_NOT_FOUND)' build/pe-lines.log \
+	    && grep -aqxF 'reader.exe : C:\home\*: not there (3, ERROR_PATH_NOT_FOUND)' build/pe-lines.log \
+	    && echo "pe-test: ...and finds a hidden name as a missing one PASS" \
+	    || echo "pe-test: ...and finds a hidden name as a missing one FAIL"
 
 # Boot, let the kernel settle, then dump the framebuffer through the QEMU
 # monitor. This is how we verify the renderer actually put pixels where it

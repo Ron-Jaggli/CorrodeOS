@@ -467,7 +467,8 @@ pub mod verdigris {
 /// holds the real tree and the list of what the program may see, which
 /// the program never holds.
 ///
-/// Every answer is `[error, value, 0, 0]` under the call's own label:
+/// Every answer is `[error, value, 0, 0]` under the call's own label
+/// (`NEXT`'s has two values more):
 /// `error` is a Windows error code (0 for none), as `GetLastError` gives
 /// it; what is not in the view is `ERROR_FILE_NOT_FOUND` (2) or
 /// `ERROR_PATH_NOT_FOUND` (3), as for a name that does not exist.
@@ -503,6 +504,14 @@ pub mod view {
     pub const CLOSE: u64 = 4;
     /// The program is ending, sent, not called: the service ends too.
     pub const DONE: u64 = 5;
+    /// `[len, 0, 0, 0]`, a path whose last name is a pattern (`*`, `?`) in
+    /// the page, as `FindFirstFileW` takes it: search, and answer a
+    /// handle to what was found. `CLOSE` closes it.
+    pub const SEARCH: u64 = 6;
+    /// `[handle, 0, 0, 0]`: the next entry a search found, its name in
+    /// UTF-8 in the page. Answers `[0, name's length, size, 1 if a
+    /// directory]`, or `ERROR_NO_MORE_FILES` (18) after the last.
+    pub const NEXT: u64 = 7;
 
     /// Files a program may have open at once.
     pub const HANDLES: usize = 16;
@@ -513,6 +522,7 @@ pub mod view {
     pub const INVALID_HANDLE: u64 = 6;
     pub const TOO_MANY_OPEN: u64 = 4;
     pub const NAME_TOO_LONG: u64 = 206;
+    pub const NO_MORE_FILES: u64 = 18;
 }
 
 /// The USB host controller's driver, `xhci`: an xHCI controller, the

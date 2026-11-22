@@ -20,21 +20,40 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use corrode_rt::abi::view::{
-    CLOSE, DONE, HANDLES, HEAP, HEAP_PAGES, INVALID_HANDLE, LOG, MOST_PATH, NAME_TOO_LONG, OPEN, PAGE, POOL, READ,
-    REPLY, SERVE, SIZE, SPEC, TOO_MANY_OPEN, TREE,
+    CLOSE, DONE, HANDLES, HEAP, HEAP_PAGES, INVALID_HANDLE, LOG, MOST_PATH, NAME_TOO_LONG, NEXT, NO_MORE_FILES, OPEN,
+    PAGE, POOL, READ, REPLY, SEARCH, SERVE, SIZE, SPEC, TOO_MANY_OPEN, TREE,
 };
 use corrode_rt::{identify, map, println, recv, reply, Message};
 use corrode_shell::fs::{Fs, Node};
-use corrode_view::View;
+use corrode_view::{Found, View};
 
 corrode_rt::entry!(main);
 
 const PAGE_LEN: usize = 4096;
 
-/// An open file: what it is, and how far it has been read.
-struct Open<'f, 'a> {
-    node: &'f Node<'a>,
-    at: usize,
+/// A handle: an open file and how far it has been read, or what a search
+/// found and how many of those were handed out.
+enum Open<'f, 'a> {
+    File { node: &'f Node<'a>, at: usize },
+    Search { found: Vec<Found>, at: usize },
+}
+
+/// A path the program put in the page, copied out first: the page is the
+/// program's to change.
+fn path_in(page: &[u8], len: u64) -> Result<String, u64> {
+    let len = len as usize;
+    if len > MOST_PATH.min(PAGE_LEN) {
+        return Err(NAME_TOO_LONG);
+    }
+    let copied = Vec::from(&page[..len]);
+    String::from_utf8(copied).map_err(|_| corrode_view::Error::FileNotFound.code() as u64)
+}
+
+/// The first free handle, holding `open`.
+fn keep<'f, 'a>(handles: &mut [Option<Open<'f, 'a>>], open: Open<'f, 'a>) -> Result<[u64; 3], u64> {
+    let handle = handles.iter().position(Option::is_none).ok_or(TOO_MANY_OPEN)?;
+    handles[handle] = Some(open);
+    Ok([handle as u64, 0, 0])
 }
 
 /// Map a capability's memory as bytes, or say why not.
@@ -99,48 +118,47 @@ fn main() {
         if label == DONE {
             return;
         }
-        let answer: Result<u64, u64> = match label {
-            OPEN => {
-                let len = words[0] as usize;
-                if len > MOST_PATH.min(PAGE_LEN) {
-                    Err(NAME_TOO_LONG)
-                } else {
-                    // Copied first: the page is the program's to change.
-                    let copied = Vec::from(&page[..len]);
-                    match core::str::from_utf8(&copied) {
-                        Err(_) => Err(corrode_view::Error::FileNotFound.code() as u64),
-                        Ok(path) => match view.open(&fs, view.home(), path, words[1] != 0, words[2] as u32) {
-                            Err(error) => Err(error.code() as u64),
-                            Ok(node) => match open.iter().position(Option::is_none) {
-                                None => Err(TOO_MANY_OPEN),
-                                Some(handle) => {
-                                    open[handle] = Some(Open { node, at: 0 });
-                                    Ok(handle as u64)
-                                }
-                            },
-                        },
-                    }
-                }
-            }
-            READ | SIZE | CLOSE => match open.get_mut(words[0] as usize).and_then(Option::as_mut) {
+        let answer: Result<[u64; 3], u64> = match label {
+            OPEN => path_in(page, words[0]).and_then(|path| {
+                let node = view
+                    .open(&fs, view.home(), &path, words[1] != 0, words[2] as u32)
+                    .map_err(|error| error.code() as u64)?;
+                keep(&mut open, Open::File { node, at: 0 })
+            }),
+            SEARCH => path_in(page, words[0]).and_then(|path| {
+                let found = view.search(&fs, view.home(), &path).map_err(|error| error.code() as u64)?;
+                keep(&mut open, Open::Search { found, at: 0 })
+            }),
+            READ | SIZE | NEXT | CLOSE => match open.get_mut(words[0] as usize).and_then(Option::as_mut) {
                 None => Err(INVALID_HANDLE),
-                Some(file) if label == READ => {
-                    let from = file.at.min(file.node.data.len());
-                    let take = (words[1] as usize).min(PAGE_LEN).min(file.node.data.len() - from);
-                    page[..take].copy_from_slice(&file.node.data[from..from + take]);
-                    file.at = from + take;
-                    Ok(take as u64)
-                }
-                Some(file) if label == SIZE => Ok(file.node.data.len() as u64),
-                Some(_) => {
+                Some(_) if label == CLOSE => {
                     open[words[0] as usize] = None;
-                    Ok(0)
+                    Ok([0; 3])
                 }
+                Some(Open::File { node, at }) if label == READ => {
+                    let from = (*at).min(node.data.len());
+                    let take = (words[1] as usize).min(PAGE_LEN).min(node.data.len() - from);
+                    page[..take].copy_from_slice(&node.data[from..from + take]);
+                    *at = from + take;
+                    Ok([take as u64, 0, 0])
+                }
+                Some(Open::File { node, .. }) if label == SIZE => Ok([node.data.len() as u64, 0, 0]),
+                Some(Open::Search { found, at }) if label == NEXT => match found.get(*at) {
+                    None => Err(NO_MORE_FILES),
+                    Some(entry) => {
+                        let name = entry.name.as_bytes();
+                        let len = name.len().min(PAGE_LEN);
+                        page[..len].copy_from_slice(&name[..len]);
+                        *at += 1;
+                        Ok([len as u64, entry.size, u64::from(entry.dir)])
+                    }
+                },
+                Some(_) => Err(INVALID_HANDLE),
             },
             _ => Err(INVALID_HANDLE),
         };
         let words = match answer {
-            Ok(value) => [0, value, 0, 0],
+            Ok([a, b, c]) => [0, a, b, c],
             Err(error) => [error, 0, 0, 0],
         };
         if identify(REPLY).is_ok() {

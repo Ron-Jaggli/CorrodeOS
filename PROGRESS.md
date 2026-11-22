@@ -2732,6 +2732,63 @@ absent, exactly as a name that does not exist (DESIGN.md section 4).
   self-checks 194 (three more); `./corrode test` 347 passed (8 view tests,
   one more pe test); clippy at 33.
 
+## 83. Verdigris: searching a directory through the view
+
+`FindFirstFileW`, `FindNextFileW` and `FindClose`: a Windows program lists a
+directory and finds only what its view shows.
+
+- **`corrode-view`**:
+  - `View::search` takes the last name of a path as the pattern and the
+    rest as the directory. The directory must be in the view; hidden and
+    missing alike are `ERROR_PATH_NOT_FOUND`.
+  - Directories other than `C:\` show `.` and `..` first, as on Windows.
+    Nothing found is `ERROR_FILE_NOT_FOUND`.
+  - `wildcard` matches `*` and `?` without regard to ASCII case, with
+    `*.*` matching every name. It is greedy with one point to go back to,
+    so many stars cost length times length, never exponential (a test
+    has 100 stars against a 2000-character name).
+  - 2 host tests more, 10 in all.
+- **`fileview`**: `SEARCH` (6) keeps what was found under a handle from
+  the same table as files. `NEXT` (7) puts the next name in the page and
+  answers its length, size and kind, or `ERROR_NO_MORE_FILES` (18).
+  `CLOSE` closes either kind.
+- **kernel32**:
+  - The three calls fill `WIN32_FIND_DATAW`: attributes, size, and the
+    name UTF-8 to UTF-16, cut to 259 units.
+  - Search handles are 0x200 and up, apart from file handles, so
+    `CloseHandle` and `FindClose` each refuse the other's.
+  - The path-to-page conversion is one function for both opens and
+    searches.
+- **reader.exe** searches six patterns and writes each name found, a
+  directory's with `\`:
+
+  ```
+  C:\*:            docs\  etc\                                then no more (18)
+  C:\etc\*:        .\  ..\  motd                              then no more (18)
+  c:/docs/*.TXT:   capabilities.txt  commands.txt  keys.txt   then no more (18)
+  C:\etc\m?td:     motd                                       then no more (18)
+  C:\etc\desktop.c*:  not there (2)
+  C:\home\*:       not there (3)
+  ```
+
+  `/README` and `/home` are real but absent from `C:\`. In `C:\etc`,
+  `desktop.conf` and `os-release` are absent too, and a pattern that
+  matches only a hidden name finds nothing, as one that matches nothing
+  does.
+- pe-test gained two scored lines (8 in all): each search's names exactly,
+  then the hidden-as-missing cases.
+
+- **Choice:** files found by a search carry `FILE_ATTRIBUTE_READONLY`,
+  since nothing in a view can be written today; directories carry
+  `FILE_ATTRIBUTE_DIRECTORY`. Times are zero: the archive's are all
+  the epoch (the build packs with `--mtime=@0`).
+- **Choice:** one handle table in the service for files and searches, with
+  kernel32 keeping their numbers apart. A program cannot read a search or
+  search a file.
+- Verified: the whole suite on both GPUs, 81 checks PASS on each (79
+  before, plus pe-test's two), none FAIL, no unhandled trap, no boot
+  self-check failing; `./corrode test` 349 passed; clippy at 33.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -2868,7 +2925,7 @@ one task.
 6. [x] (section 82) Verdigris phase 3: a Windows program reads files through the
    pruned view DESIGN.md specifies (CreateFileW, ReadFile, CloseHandle,
    GetFileSize), only what it was allowed, anything else absent.
-7. [ ] Verdigris: FindFirstFileW, FindNextFileW and FindClose through the
+7. [x] (section 83) Verdigris: FindFirstFileW, FindNextFileW and FindClose through the
    view -- a listing shows only what the view shows; pe-test.
 8. [ ] Verdigris: GetCurrentDirectoryW, SetCurrentDirectoryW and
    GetFullPathNameW -- `C:\` paths only, never where the view sits in the
