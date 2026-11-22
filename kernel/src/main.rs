@@ -2656,7 +2656,8 @@ fn run_windows(from: usize, words: [u64; 4]) -> ([u64; 4], Option<(cap::CapPtr, 
     println!("desktop    : {path} started for the terminal, seeing {folder} alone");
     // What the run has cost so far: with the earlier runs' tasks given back
     // as this one was started, this stays level from run to run.
-    println!("desktop    : {} frames free", mm::frame::stats().0);
+    let (objects, _) = memory::stats();
+    println!("desktop    : {} frames free, {objects} memory objects", mm::frame::stats().0);
     // Received on, not sent to, and not passed on.
     ([1, 0, 0, 0], Some((SERVICE_SPARE_SLOT, cap::Rights::READ)))
 }
@@ -3293,6 +3294,15 @@ fn view_checks() {
     );
 }
 
+/// Runs its closure when dropped: for what must happen on every way out.
+struct Defer<F: FnMut()>(F);
+
+impl<F: FnMut()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
 /// Where in the caller's own capability space `start_windows` puts the
 /// view's endpoint and page while it hands them out (the caller deletes
 /// them after), and the endpoint, held with GRANT, where the program's
@@ -3323,20 +3333,28 @@ fn start_windows(
     let (Some(kernel32), Some(service)) = (modules::find("kernel32"), modules::find("fileview")) else {
         return Err("no kernel32 or fileview module");
     };
-    let (Some(page), Some(list)) = (memory::create(1, false), memory::create(1, true)) else {
+    let (Some(page), Some(list)) = (memory::create(1, false), memory::create(1, false)) else {
         return Err("no memory for the view");
     };
-    // The list, written where only the view will map it, read-only.
-    let Some((at, len)) = memory::in_kernel(list) else {
+    // Neither is the kernel's to keep: each goes when the program and its
+    // view no longer hold or map it, and the capabilities below are made
+    // first, so neither can go before.
+    let _let_go = Defer(|| {
+        memory::let_go(page);
+        memory::let_go(list);
+    });
+    // The list, written through the direct map before the view maps it,
+    // read-only. One page: what does not fit is left out.
+    let Some(frame) = memory::frame_of(list, 0) else {
         return Err("no memory for the view");
     };
     let mut offset = 0;
     for part in core::iter::once(folder).chain(allowed.iter().copied()) {
         for bytes in [part.as_bytes(), b"\n"] {
-            let bytes = &bytes[..bytes.len().min(len - offset)];
-            // SAFETY: the kernel's own mapping of the object, `len` bytes,
-            // which no task has been given yet.
-            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), at.add(offset), bytes.len()) };
+            let bytes = &bytes[..bytes.len().min(4096 - offset)];
+            // SAFETY: the object's frame, which no task has been given yet;
+            // `offset + bytes.len()` stays within the page.
+            mm::paging::with_kernel_mapper(|mapper| unsafe { mapper.write_frame(frame, offset, bytes) });
             offset += bytes.len();
         }
     }
@@ -3344,13 +3362,13 @@ fn start_windows(
     let server = task::spawn_program("fileview", service.bytes).map_err(|_| "the view would not load")?;
 
     let made = cap::issue(slots.view, cap::Object::Endpoint(ipc::Endpoint::new()), cap::Rights::ALL).is_ok()
-        && cap::issue(slots.page, cap::Object::Memory(page), cap::Rights::ALL).is_ok();
+        && cap::issue(slots.page, cap::Object::Memory(memory::hold(page)), cap::Rights::ALL).is_ok();
     let served = made
         && cap::grant(server, slots.view, view::SERVE, cap::Rights::READ).is_ok()
         && cap::grant(server, slots.page, view::PAGE, cap::Rights::READ_WRITE).is_ok()
         && cap::grant(server, slots.log, view::LOG, cap::Rights::WRITE).is_ok()
         && cap::issue_to(server, view::TREE, cap::Object::Blob(tree), cap::Rights::READ).is_ok()
-        && cap::issue_to(server, view::SPEC, cap::Object::Memory(list), cap::Rights::READ).is_ok()
+        && cap::issue_to(server, view::SPEC, cap::Object::Memory(memory::hold(list)), cap::Rights::READ).is_ok()
         && cap::issue_to(
             server,
             view::POOL,
@@ -3567,7 +3585,7 @@ fn nvidia_checks() {
             held += 1;
         }
         if let Some(rom) = memory::create(nvidia::ROM_PAGES, false) {
-            granted &= cap::mint(0, NV_ROM, cap::Object::Memory(rom), Rights::ALL).is_ok()
+            granted &= cap::mint(0, NV_ROM, cap::Object::Memory(memory::hold(rom)), Rights::ALL).is_ok()
                 && cap::grant(driver, NV_ROM, nvidia::ROM, Rights::READ_WRITE).is_ok();
             held += 1;
         }
@@ -4500,10 +4518,10 @@ fn start_gpu() -> Option<remote::RemoteRenderer> {
     )
     .is_ok()
         && cap::mint(0, GPU_DEVICE, cap::Object::PciDevice(index), Rights::ALL).is_ok()
-        && cap::mint(0, GPU_QUEUE, cap::Object::Memory(queue), Rights::ALL).is_ok()
-        && cap::mint(0, GPU_SCREEN, cap::Object::Memory(screen), Rights::ALL).is_ok()
-        && cap::mint(0, GPU_SHARED, cap::Object::Memory(shared), Rights::ALL).is_ok()
-        && cap::mint(0, GPU_ATLAS, cap::Object::Memory(atlas), Rights::ALL).is_ok()
+        && cap::mint(0, GPU_QUEUE, cap::Object::Memory(memory::hold(queue)), Rights::ALL).is_ok()
+        && cap::mint(0, GPU_SCREEN, cap::Object::Memory(memory::hold(screen)), Rights::ALL).is_ok()
+        && cap::mint(0, GPU_SHARED, cap::Object::Memory(memory::hold(shared)), Rights::ALL).is_ok()
+        && cap::mint(0, GPU_ATLAS, cap::Object::Memory(memory::hold(atlas)), Rights::ALL).is_ok()
         && line.is_none_or(|line| {
             cap::mint(0, GPU_IRQ, cap::Object::Interrupt(line), Rights::ALL).is_ok()
         });
@@ -4529,7 +4547,7 @@ fn start_gpu() -> Option<remote::RemoteRenderer> {
         && cap::grant(driver, GPU_SHARED, gpu::SHARED, Rights::READ).is_ok()
         && cap::grant(driver, GPU_ATLAS, gpu::ATLAS, Rights::READ_WRITE).is_ok();
     if let Some(scratch) = scratch {
-        let minted = cap::mint(0, GPU_SCRATCH, cap::Object::Memory(scratch), Rights::ALL);
+        let minted = cap::mint(0, GPU_SCRATCH, cap::Object::Memory(memory::hold(scratch)), Rights::ALL);
         let given = minted.and_then(|_| cap::grant(driver, GPU_SCRATCH, gpu::SCRATCH, Rights::READ_WRITE));
         if let Err(error) = given {
             println!("gpu        : glass scratch not given: {error:?}");

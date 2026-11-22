@@ -175,8 +175,10 @@ pub enum Object {
     Interrupt(usize),
     /// A run of frames, by its number in [`crate::memory`]. READ means may
     /// map it, WRITE may write it -- and may ask where it physically is,
-    /// which is what a device is told.
-    Memory(usize),
+    /// which is what a device is told. The [`Hold`](crate::memory::Hold)
+    /// is this capability's claim on it: the memory goes back when the last
+    /// claim and the last mapping do.
+    Memory(crate::memory::Hold),
     /// A file the bootloader loaded, by its place in [`crate::modules`].
     /// READ means may map it and read it. Nothing means may change it.
     Blob(usize),
@@ -216,7 +218,7 @@ impl core::fmt::Debug for Object {
             Object::PciDevice(index) => write!(f, "PciDevice({index})"),
             Object::DeviceMemory(index) => write!(f, "DeviceMemory({index})"),
             Object::Interrupt(index) => write!(f, "Interrupt({index})"),
-            Object::Memory(index) => write!(f, "Memory({index})"),
+            Object::Memory(held) => write!(f, "Memory({})", held.index()),
             Object::Blob(index) => write!(f, "Blob({index})"),
             Object::IoPorts { base, count } => write!(f, "IoPorts({base:#x}, {count})"),
             Object::Window(index) => write!(f, "Window({index})"),
@@ -611,7 +613,7 @@ pub fn memory_of(slot: CapPtr, required: Rights) -> Result<(usize, Rights), CapE
             return Err(CapError::InsufficientRights);
         }
         match *cap.object {
-            Object::Memory(index) => Ok((index, cap.rights)),
+            Object::Memory(ref held) => Ok((held.index(), cap.rights)),
             _ => Err(CapError::WrongType),
         }
     })

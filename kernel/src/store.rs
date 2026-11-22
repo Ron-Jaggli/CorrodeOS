@@ -58,7 +58,7 @@ pub fn start() -> bool {
     )
     .is_ok()
         && cap::mint(0, STORE_DEVICE, cap::Object::PciDevice(index), Rights::ALL).is_ok()
-        && cap::mint(0, STORE_QUEUE, cap::Object::Memory(queue), Rights::ALL).is_ok()
+        && cap::mint(0, STORE_QUEUE, cap::Object::Memory(memory::hold(queue)), Rights::ALL).is_ok()
         && cap::grant(driver, STORE_ENDPOINT, store::SERVE, Rights::READ).is_ok()
         && cap::grant(driver, crate::LOG_ENDPOINT, store::LOG, Rights::WRITE).is_ok()
         && cap::grant(driver, STORE_DEVICE, store::DEVICE, Rights::READ_WRITE).is_ok()

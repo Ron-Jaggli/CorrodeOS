@@ -596,6 +596,7 @@ pub fn reap() -> usize {
     for (stack, space, cspace) in taken {
         drop(cspace);
         if let Some(space) = space {
+            crate::memory::forget_space(&space);
             // SAFETY: `left` says its CPU has since installed another space,
             // no other CPU ever ran it, and taking it out of the record means
             // nothing will install or use it again.

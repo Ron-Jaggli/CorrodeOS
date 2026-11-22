@@ -52,7 +52,7 @@ pub fn start(events: cap::CapPtr) {
     let given = cap::mint(0, USB_DEVICE, cap::Object::PciDevice(index), Rights::ALL).is_ok()
         && cap::mint(0, USB_BAR, cap::Object::DeviceMemory(region), Rights::ALL).is_ok()
         && cap::mint(0, USB_IRQ, cap::Object::Interrupt(line), Rights::ALL).is_ok()
-        && cap::mint(0, USB_MEMORY, cap::Object::Memory(pages), Rights::ALL).is_ok()
+        && cap::mint(0, USB_MEMORY, cap::Object::Memory(memory::hold(pages)), Rights::ALL).is_ok()
         && cap::grant(driver, USB_DEVICE, xhci::DEVICE, Rights::READ_WRITE).is_ok()
         && cap::grant(driver, USB_BAR, xhci::BAR, Rights::READ_WRITE).is_ok()
         && cap::grant(driver, USB_IRQ, xhci::IRQ, Rights::READ).is_ok()

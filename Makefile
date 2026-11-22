@@ -1528,10 +1528,9 @@ WIN_KEYS := w i n spc slash p r o g r a m s slash r e a d e r slash r e a d e r 
 WIN_AGAIN_KEYS := c d spc slash p r o g r a m s slash r e a d e r ret \
                   w i n spc r e a d e r dot e x e ret
 WIN_BAD_KEYS := w i n spc slash e t c slash m o t d ret
-# Frames a `win` run may keep after its tasks are given back: its view's
-# memory objects (the shared page, the list, the view's 32-page heap) and
-# the kernel's tables mapping them. Objects are never freed yet.
-WIN_RUN_FRAMES ?= 48
+# Frames a `win` run may keep once the next one has started: none. Its
+# tasks are given back, and so is the memory it and its view shared.
+WIN_RUN_FRAMES ?= 0
 win-test: iso
 	@rm -f build/win.ppm build/win.png
 	@( sleep $(SHOT_DELAY); \
@@ -1567,10 +1566,13 @@ win-test: iso
 	    | awk '{ back += $$1 } END { exit back < 7 * 100 }' \
 	    && echo "win-test: each run gets back the last one's tasks   PASS" \
 	    || echo "win-test: each run gets back the last one's tasks   FAIL"
-	@grep -aoE '^desktop    : [0-9]+ frames free' build/win-lines.log | grep -oE '[0-9]+' \
-	    | awk 'NR > 1 && last - $$1 > $(WIN_RUN_FRAMES) { bad = 1 } { last = $$1 } END { exit bad || NR != 8 }' \
-	    && echo "win-test: a run costs at most its view's memory     PASS" \
-	    || echo "win-test: a run costs at most its view's memory     FAIL"
+	@grep -aoE '^desktop    : [0-9]+ frames free' build/win-lines.log | grep -oE '[0-9]+' | tail -n +2 \
+	    | awk 'NR > 1 && last - $$1 > $(WIN_RUN_FRAMES) { bad = 1 } { last = $$1 } END { exit bad || NR != 7 }' \
+	    && echo "win-test: a run keeps no memory once it is over     PASS" \
+	    || echo "win-test: a run keeps no memory once it is over     FAIL"
+	@test $$(grep -aoE ', [0-9]+ memory objects$$' build/win-lines.log | sort -u | wc -l) -eq 1 \
+	    && echo "win-test: the memory objects in use stay as many    PASS" \
+	    || echo "win-test: the memory objects in use stay as many    FAIL"
 	@test -s build/win.ppm && pnmtopng build/win.ppm > build/win.png 2>/dev/null && rm -f build/win.ppm; true
 
 TERMINAL_KEYS ?= e c tab h i ret \

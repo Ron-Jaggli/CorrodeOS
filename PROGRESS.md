@@ -2966,6 +2966,59 @@ the heap).
   before, plus win-test's two), none FAIL, no unhandled trap, no boot
   self-check failing; `./corrode test` 351 passed; clippy at 33.
 
+## 87. Memory objects are given back
+
+Section 86 gave back what a task alone had. What a task shared through a
+memory capability was still kept for good: the page a Windows program
+shares with its view, the view's list, and every page a task buys from
+its pool (the view's 32-page heap). So a `win` run still cost 36 frames
+and three of the 256 object numbers. Now a memory object goes back to the
+allocator when nothing has a use for it, and its number is used again.
+
+- **Who has a use for one** is counted on the object:
+  - capabilities naming it. `cap::Object::Memory` now holds a
+    `memory::Hold`, not a bare number: made with `memory::hold`, dropped
+    with the capability, whatever the way it goes (deleted, replaced, a
+    task reaped, a failed issue). Granting copies the `Arc`, not the
+    hold, so one hold stands for every copy, as it should;
+  - address spaces mapping it. `memory::map` counts a space once, however
+    often it maps the same object; `memory::forget_space` takes a finished
+    task's space off every object it maps, just before section 86's reap
+    tears it down;
+  - the kernel. `memory::create` makes an object the kernel keeps until it
+    says `memory::let_go`. Pool memory (`memory::allocate`) is let go at
+    once, being the task's alone; so are the view's page and list, once
+    `start_windows` has handed them out (or failed to).
+- **Kept for good**, as before: what the kernel still uses (a driver's
+  queues, the GPU's, the opened vault), and any object the kernel mapped
+  for itself (`in_kernel`). Taking a kernel mapping away needs every CPU
+  to forget it, and this kernel cannot make another CPU do that yet. The
+  view's list was the one such object made per run; it is now written
+  through the direct map instead, and not mapped in the kernel.
+- **Measured** (win-test, eight runs): the frames free after each start
+  are the same every time (96859 on the default GPU), and 7 memory
+  objects are in use each time. Before: 36 frames and 3 objects lost a
+  run.
+- **win-test**: the bound on a run's cost is now 0 frames, and a new
+  scored line checks the objects in use stay as many. With giving back
+  turned off, both FAIL.
+
+- **Choice:** the claim is in the capability's object (`Hold`), not
+  counted in `mint`/`issue`. Every way a capability is made goes through
+  `hold`, and every way it goes ends in `Drop`, so the count cannot drift
+  on a path nobody thought of (an issue that fails drops its object too).
+- **Choice:** an object's mappings are found by its fixed address. Every
+  task maps object N at the same place, so a space maps it exactly when
+  that address resolves to the object's first frame; no list of mappings
+  is kept.
+- **Open:** a driver told an object's physical address could have its
+  device write there after the object is given back. Drivers never end
+  today, and the memory they use is the kernel's (kept); a driver that
+  can end will need its device stopped first.
+- Verified: the whole suite on both GPUs, 89 checks PASS on each (88
+  before, plus win-test's object count), none FAIL, no unhandled trap, no
+  boot self-check failing; `./corrode test` 351 passed; clippy at 33.
+
 ## Loop state
 
 Started 2026-11-21T00:03:07-06:00. Cap: 30 hours (stop by
@@ -3116,7 +3169,7 @@ one task.
    frames only it had (its image, its stack, its page tables) and its
    capability slots. `win` run again and again keeps the free frames
    level; scored, both GPUs.
-11. [ ] Memory objects are given back when nothing holds or maps them
+11. [x] (section 87) Memory objects are given back when nothing holds or maps them
    any more: a `win` run then costs no frames at all (win-test's bound
    goes to 0), and the object table no longer fills up after ~100 runs.
 12. [ ] Wrap-up for the owner: what the vault run did, what to review and
