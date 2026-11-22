@@ -59,6 +59,16 @@ pub const STACK_TOP: u64 = STACK_BOTTOM + STACK_PAGES * PAGE;
 /// Stack given to a loaded program: 128 KiB. Compiled code keeps more on its
 /// stack than a page of hand-written assembly does.
 const PROGRAM_STACK_PAGES: u64 = 32;
+/// The most stack a Windows program is given: 1 MiB, Windows' own default
+/// reserve. It asks with `SizeOfStackReserve` (mingw writes 2 MiB, MSVC
+/// 1 MiB); it gets that, between [`PROGRAM_STACK_PAGES`] and this, all of it
+/// mapped at once, since nothing here grows a stack on demand.
+const MOST_STACK_PAGES: u64 = 256;
+
+/// Pages of stack for a Windows program that asks for `reserve` bytes.
+fn windows_stack_pages(reserve: u64) -> u64 {
+    reserve.div_ceil(PAGE).clamp(PROGRAM_STACK_PAGES, MOST_STACK_PAGES)
+}
 
 /// Where a user program's code and stack ended up, and the space they are in.
 #[derive(Clone, Copy)]
@@ -183,7 +193,7 @@ pub fn load(file: &[u8]) -> Result<Image, LoadError> {
     // As for an assembly program: the stack pointer a `call` would have
     // left, over a null return address. A compiled entry point expects
     // exactly that alignment.
-    build(elf.entry(), elf.segments(), |_, _| {}, &[], 8)
+    build(elf.entry(), elf.segments(), |_| {}, PROGRAM_STACK_PAGES, 8)
 }
 
 /// Build a fresh address space from a Windows program: a PE file, checked
@@ -197,7 +207,8 @@ pub fn load(file: &[u8]) -> Result<Image, LoadError> {
 /// from its entry point instead of exiting faults, and is stopped.
 pub fn load_pe(file: &[u8]) -> Result<Image, LoadError> {
     let pe = Pe::parse(file, layout::IMAGE_BASE..layout::IMAGE_END).map_err(LoadError::Pe)?;
-    build(pe.entry(), pe.segments(), |page, each| pe.fixups_in(page, each), &[], 8 + 32)
+    let stack_pages = windows_stack_pages(pe.stack_reserve());
+    build(pe.entry(), pe.segments(), |each| pe.moved_fixups(each), stack_pages, 8 + 32)
 }
 
 /// Build a fresh address space from a Windows program that imports from
@@ -207,9 +218,9 @@ pub fn load_pe(file: &[u8]) -> Result<Image, LoadError> {
 /// lie above it, so the two never share a page. kernel32's export table is
 /// at its base; every import the program names is looked up there, must
 /// name an address in kernel32's code, and is written into the program's
-/// import address table before that page is mapped -- so the table may be
-/// in read-only data, as linkers put it, and nothing is ever made writable
-/// to fill it in. An import kernel32 does not have refuses the program.
+/// import address table through the kernel's own map before the program
+/// runs -- so the table may be in read-only data, as linkers put it, and
+/// nothing is ever made writable to fill it in. An import kernel32 does not have refuses the program.
 pub fn load_windows(file: &[u8], kernel32: &[u8]) -> Result<Image, LoadError> {
     use corrode_abi::verdigris::{
         KERNEL32_BASE, PEB, START_ENTRY, START_TLS_CALLBACKS, TEB, TEB_PAGES, TLS_BLOCK, TLS_VECTOR,
@@ -242,7 +253,7 @@ pub fn load_windows(file: &[u8], kernel32: &[u8]) -> Result<Image, LoadError> {
     // the entry returns.
     let start = exports.find(b"verdigris", b"start").filter(in_code).ok_or(LoadError::NoExports)?;
     let mut fixups = alloc::vec::Vec::new();
-    pe.bind(|dll, name| exports.find(dll, name).filter(in_runtime), |fixup| fixups.push(Some(fixup)))
+    pe.bind(|dll, name| exports.find(dll, name).filter(in_runtime), |fixup| fixups.push(fixup))
         .map_err(LoadError::Pe)?;
     if pe.moved() {
         crate::println!(
@@ -254,8 +265,9 @@ pub fn load_windows(file: &[u8], kernel32: &[u8]) -> Result<Image, LoadError> {
     }
     let tls = pe.tls();
     // The TEB and PEB: zeroed pages of the program's own, with the fields
-    // Windows code reads without asking written before they are mapped.
-    let stack_base = STACK_BOTTOM + PROGRAM_STACK_PAGES * PAGE;
+    // Windows code reads without asking written before the program runs.
+    let stack_pages = windows_stack_pages(pe.stack_reserve());
+    let stack_base = STACK_BOTTOM + stack_pages * PAGE;
     for (address, value) in [
         (TEB + 0x08, stack_base),   // NT_TIB.StackBase: one past the top
         (TEB + 0x10, STACK_BOTTOM), // NT_TIB.StackLimit
@@ -270,7 +282,7 @@ pub fn load_windows(file: &[u8], kernel32: &[u8]) -> Result<Image, LoadError> {
         (WALL_UNIX, wall.map_or(0, |(unix, _)| unix as u64)),
         (WALL_AT, wall.map_or(0, |(_, at)| at)),
     ] {
-        fixups.push(Some(Fixup { address, value }));
+        fixups.push(Fixup { address, value });
     }
     let blocks = Segment { address: TEB, len: (TEB_PAGES + 1) * PAGE, data: &[], writable: true, executable: false };
     // The one thread's TLS block, made from the program's template.
@@ -284,30 +296,57 @@ pub fn load_windows(file: &[u8], kernel32: &[u8]) -> Result<Image, LoadError> {
     let mut image = build(
         start,
         pe.segments().chain(runtime.segments()).chain(core::iter::once(blocks)).chain(tls_block),
-        |page, each| pe.fixups_in(page, each),
-        &fixups,
+        // A move's fixups first, then the imports' and the kernel's own,
+        // which win where they meet: an import's slot is the import's.
+        |each| {
+            pe.moved_fixups(&mut *each);
+            fixups.iter().for_each(|fixup| each(*fixup));
+        },
+        stack_pages,
         8 + 32,
     )?;
     image.gs_base = TEB;
     Ok(image)
 }
 
-/// Map checked segments into a fresh address space with a stack, the
-/// stack pointer `below` bytes under the stack's top. Each fixup's eight
-/// bytes are written into its page before the page is mapped: first those
-/// `moved` gives for the page (a program loaded away from its preferred
-/// base), then `fixups`. The PE reader has checked each lies inside a
-/// segment and does not straddle two pages.
+/// An address space being built, given back whole -- every table, and
+/// every frame mapped in it -- unless the build finishes. A load that fails
+/// part way, out of memory, then leaves nothing behind.
+struct Unfinished {
+    space: Mapper,
+    done: bool,
+}
+
+impl Drop for Unfinished {
+    fn drop(&mut self) {
+        if !self.done {
+            // SAFETY: the space was made by this load and never installed on
+            // any CPU; nothing else has a copy of it, and this one is gone
+            // once dropped.
+            unsafe { self.space.release_user_half() };
+        }
+    }
+}
+
+/// Map checked segments into a fresh address space with a stack of
+/// `stack_pages`, the stack pointer `below` bytes under its top. Then
+/// `fixups` gives every fixup (a move's, then the imports', then the
+/// kernel's own), each written into the frame behind its address, in the
+/// order given: the reader has checked each lies inside a segment and does
+/// not straddle two pages. Each is written once, so the load's work grows
+/// with the fixups and the pages, never with the two multiplied.
 fn build<'a>(
     entry: u64,
     segments: impl Iterator<Item = Segment<'a>>,
-    moved: impl Fn(u64, &mut dyn FnMut(Fixup)),
-    fixups: &[Option<Fixup>],
+    fixups: impl FnOnce(&mut dyn FnMut(Fixup)),
+    stack_pages: u64,
     below: u64,
 ) -> Result<Image, LoadError> {
-    let mut space = paging::with_kernel_mapper(|kernel| kernel.fork_kernel_half())
+    let space = paging::with_kernel_mapper(|kernel| kernel.fork_kernel_half())
         .flatten()
         .ok_or(LoadError::OutOfMemory)?;
+    let mut unfinished = Unfinished { space, done: false };
+    let space = &mut unfinished.space;
 
     for segment in segments {
         // The segment's frames are copies, this space's alone.
@@ -343,34 +382,41 @@ fn build<'a>(
                 // because both ends were clamped to this one.
                 unsafe { space.write_frame(frame.addr(), (from - page) as usize, source) };
             }
-            let mut write = |fixup: Fixup| {
-                if (page..page + PAGE - 7).contains(&fixup.address) {
-                    // SAFETY: as above; the eight bytes end inside the page.
-                    unsafe {
-                        space.write_frame(
-                            frame.addr(),
-                            (fixup.address - page) as usize,
-                            &fixup.value.to_le_bytes(),
-                        )
-                    };
-                }
-            };
-            moved(page, &mut write);
-            fixups.iter().flatten().for_each(|fixup| write(*fixup));
 
             if !space.map_4k(page, frame.addr(), flags) {
+                // Not mapped, so the space will not give it back: this does.
+                //
+                // SAFETY: from the allocator just now, and in no table.
+                unsafe { frame::free(frame) };
                 return Err(LoadError::OutOfMemory);
             }
         }
     }
 
-    map_stack(&mut space, PROGRAM_STACK_PAGES).ok_or(LoadError::OutOfMemory)?;
+    // The fixups, through the frames behind the pages. Written with the
+    // kernel's direct map, so a page mapped read-only for ring 3 takes them
+    // too; nothing runs in this space yet.
+    fixups(&mut |fixup: Fixup| {
+        let page = fixup.address & !(PAGE - 1);
+        let offset = fixup.address - page;
+        if offset > PAGE - 8 {
+            return;
+        }
+        if let Some(frame) = space.translate(page) {
+            // SAFETY: a frame this load allocated, mapped OWNED at `page`
+            // in this space alone; the eight bytes end inside it.
+            unsafe { space.write_frame(frame, offset as usize, &fixup.value.to_le_bytes()) };
+        }
+    });
 
+    map_stack(space, stack_pages).ok_or(LoadError::OutOfMemory)?;
+
+    unfinished.done = true;
     Ok(Image {
         entry,
-        stack_top: STACK_BOTTOM + PROGRAM_STACK_PAGES * PAGE - below,
+        stack_top: STACK_BOTTOM + stack_pages * PAGE - below,
         stack_guard: STACK_GUARD,
-        space,
+        space: unfinished.space,
         gs_base: 0,
     })
 }

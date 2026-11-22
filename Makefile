@@ -170,7 +170,7 @@ FAULT_EXE := build/fault.exe
 HELLO_C_EXE := build/hello-c.exe
 # The C test corpus: each program checks itself against values written by
 # hand, prints "NAME: N of M checks passed", and exits with its failures.
-C_TESTS := args printf heap files strings stdout
+C_TESTS := args printf heap files strings stdout bigstack
 C_TEST_EXES := $(C_TESTS:%=build/c/%.exe)
 ROOT_FILES := $(shell find root 2>/dev/null)
 # With reader.exe at /programs/reader, spin.exe (which never ends) at
@@ -1617,7 +1617,7 @@ WIN_ARGS_KEYS := w i n spc slash p r o g r a m s slash c slash a r g s dot e x e
                  spc apostrophe apostrophe spc apostrophe a backslash shift-apostrophe b apostrophe \
                  spc apostrophe shift-c shift-semicolon backslash d i r spc n a m e backslash apostrophe \
                  spc apostrophe s a y spc shift-apostrophe h i shift-apostrophe apostrophe spc 7 ret
-WIN_CORPUS_KEYS := $(foreach p,args printf heap files strings stdout,w i n spc slash p r o g r a m s slash c slash $(shell echo $(p) | sed 's/./& /g') dot e x e ret)
+WIN_CORPUS_KEYS := $(foreach p,args printf heap files strings stdout bigstack,w i n spc slash p r o g r a m s slash c slash $(shell echo $(p) | sed 's/./& /g') dot e x e ret)
 # Frames a `win` run may keep once the next one has started: none. Its
 # tasks are given back, and so is the memory it and its view shared.
 WIN_RUN_FRAMES ?= 0
@@ -1700,7 +1700,7 @@ win-test: iso
 	    && grep -aqxF "$${w}args.exe: args: 2 of 2 checks passed" build/win-lines.log \
 	    && echo "win-test: args.exe: Windows' quoting whole, and exit codes PASS" \
 	    || echo "win-test: args.exe: Windows' quoting whole, and exit codes FAIL"
-	@w='terminal   : win: '; for n in printf heap files strings; do \
+	@w='terminal   : win: '; for n in printf heap files strings bigstack; do \
 	  grep -aqE "^$${w}$$n.exe: $$n: ([1-9][0-9]*) of \1 checks passed$$" build/win-lines.log \
 	    && grep -aqE "^$${w}$$n.exe ended after [0-9]+ lines$$" build/win-lines.log \
 	    && echo "win-test: $$n.exe: every check passed, exit code 0  PASS" \
@@ -1717,7 +1717,7 @@ win-test: iso
 	    && grep -aqE "^$${w}: long: (0123456789){10}" build/win-lines.log \
 	    && echo "win-test: stdout.exe: streams, a long line, a part line at exit PASS" \
 	    || { echo "win-test: stdout.exe: streams, a long line, a part line at exit FAIL"; grep -aE "^$${w}(: FAIL|: stdout:| ended)" build/win-lines.log | head -8; }
-	@test $$(grep -acE '^verdigris  : moved from 0x140000000 to 0x400000, [1-9][0-9]* relocations$$' build/win-lines.log) -eq 11 \
+	@test $$(grep -acE '^verdigris  : moved from 0x140000000 to 0x400000, [1-9][0-9]* relocations$$' build/win-lines.log) -eq 12 \
 	    && echo "win-test: it was moved from where its linker put it PASS" \
 	    || echo "win-test: it was moved from where its linker put it FAIL"
 	@grep -aqxF 'terminal   : win: /etc/motd: not a program Verdigris runs' build/win-lines.log \

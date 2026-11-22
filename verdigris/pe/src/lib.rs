@@ -10,7 +10,7 @@
 //! executable, not a DLL, with page-sized section alignment, that fits at
 //! its preferred base inside the range the caller allows -- or, if it
 //! carries base relocations, at the lowest base in that range that it fits
-//! at, every relocation then checked and applied (see [`Pe::fixups_in`],
+//! at, every relocation then checked and applied (see [`Pe::moved_fixups`],
 //! and below) -- whose sections lie
 //! inside the file and the image, in order, never both writable and
 //! executable, and whose entry point is in an executable section. It may
@@ -66,6 +66,7 @@ const SECTION_ALIGNMENT: usize = 32;
 const FILE_ALIGNMENT: usize = 36;
 const SIZE_OF_IMAGE: usize = 56;
 const SIZE_OF_HEADERS: usize = 60;
+const SIZE_OF_STACK_RESERVE: usize = 72;
 const DIRECTORY_COUNT: usize = 108;
 const DIRECTORIES: usize = 112;
 
@@ -86,6 +87,10 @@ pub const MAX_IMPORTS: usize = 4096;
 pub const MAX_TLS: u64 = 64 * 1024;
 /// Longest DLL or function name read, without its terminating zero.
 pub const MAX_NAME: usize = 63;
+/// Most addresses a moved program's relocations may name. Generous (a
+/// linker writes one per pointer in the image, and a program with a
+/// million of them is very large), and a bound on the loader's work.
+pub const MAX_RELOCATIONS: usize = 1 << 20;
 const DESCRIPTOR_LEN: usize = 20;
 const BY_ORDINAL: u64 = 1 << 63;
 
@@ -144,6 +149,9 @@ pub enum Error {
     /// unaligned page, a type other than `DIR64`, or an address outside a
     /// section or across a page.
     BadRelocations,
+    /// It must be moved, and its relocations name more than
+    /// [`MAX_RELOCATIONS`] addresses.
+    TooManyRelocations,
 }
 
 /// One function a program imports, and where its address goes.
@@ -168,7 +176,7 @@ pub struct Tls<'a> {
     pub callbacks: u64,
 }
 
-/// An 8-byte value to write at an address before the page is mapped.
+/// An 8-byte value to write at an address before the program runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fixup {
     pub address: u64,
@@ -190,6 +198,8 @@ pub struct Pe<'a> {
     /// the address of the header's `ImageBase`.
     relocations: &'a [u8],
     base_field: u64,
+    /// The stack it asks for (`SizeOfStackReserve`), in bytes.
+    stack_reserve: u64,
 }
 
 /// Each address the base relocation table `table` names, for an image at
@@ -427,6 +437,7 @@ impl<'a> Pe<'a> {
         let file_alignment = u32_at(header, FILE_ALIGNMENT)? as u64;
         let image_len = u32_at(header, SIZE_OF_IMAGE)? as u64;
         let headers_len = u32_at(header, SIZE_OF_HEADERS)? as u64;
+        let stack_reserve = u64_at(header, SIZE_OF_STACK_RESERVE)?;
         let directories = u32_at(header, DIRECTORY_COUNT)? as usize;
 
         if section_alignment != PAGE
@@ -563,7 +574,12 @@ impl<'a> Pe<'a> {
         } else {
             let table = file_at(&segments, base + relocation_table as u64, relocation_len as u64)
                 .map_err(|_| Error::BadRelocations)?;
+            let mut count = 0usize;
             each_relocation(table, base, |address| {
+                count += 1;
+                if count > MAX_RELOCATIONS {
+                    return Err(Error::TooManyRelocations);
+                }
                 let inside = segments[1..].iter().flatten().any(|segment| {
                     address >= segment.address && address + 8 <= segment.address + segment.len
                 });
@@ -585,6 +601,7 @@ impl<'a> Pe<'a> {
             delta: base.wrapping_sub(preferred),
             relocations,
             base_field: base + (optional + IMAGE_BASE) as u64,
+            stack_reserve,
         })
     }
 
@@ -658,26 +675,30 @@ impl<'a> Pe<'a> {
         count
     }
 
-    /// The fixups moving it puts in the page at `page`, given to `each`:
-    /// the header's `ImageBase` made the base it is at, and each address a
-    /// relocation names moved by as far as the image was. None if it was
-    /// not moved. Written before the page is mapped, as [`Pe::bind`]'s are,
-    /// and before them: an import's slot is the import's.
-    pub fn fixups_in(&self, page: u64, mut each: impl FnMut(Fixup)) {
+    /// Every fixup moving it makes, given to `each` in one walk of the
+    /// relocation table: the header's `ImageBase` made the base it is at,
+    /// then each address a relocation names, moved by as far as the image
+    /// was. None if it was not moved. Each lies inside a section (the
+    /// headers, for `ImageBase`) and inside one page, as `parse` checked.
+    /// They go before [`Pe::bind`]'s, which win at the same address: an
+    /// import's slot is the import's.
+    pub fn moved_fixups(&self, mut each: impl FnMut(Fixup)) {
         if self.delta == 0 {
             return;
         }
-        if (page..page + PAGE).contains(&self.base_field) {
-            each(Fixup { address: self.base_field, value: self.base });
-        }
+        each(Fixup { address: self.base_field, value: self.base });
         // Checked whole in `parse`, so nothing here can fail.
         let _ = each_relocation(self.relocations, self.base, |address| {
-            if address & !(PAGE - 1) == page {
-                let value = original(&self.segments, address).wrapping_add(self.delta);
-                each(Fixup { address, value });
-            }
+            let value = original(&self.segments, address).wrapping_add(self.delta);
+            each(Fixup { address, value });
             Ok(())
         });
+    }
+
+    /// The stack it asks for, in bytes: the header's `SizeOfStackReserve`.
+    /// The loader decides how much of it to give.
+    pub fn stack_reserve(&self) -> u64 {
+        self.stack_reserve
     }
 
     /// Where execution starts.

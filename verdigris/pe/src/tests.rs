@@ -688,7 +688,7 @@ fn relocatable(entries: &[u16]) -> Vec<u8> {
     let len = table.len() as u32;
     let mut file = build(
         0x1000,
-        0x4000,
+        0x3000 + len.div_ceil(0x1000) * 0x1000,
         &[
             Section { rva: 0x1000, virtual_len: 16, raw: vec![0xcc; 16], flags: TEXT },
             Section { rva: 0x2000, virtual_len: 0x100, raw: data, flags: DATA },
@@ -707,9 +707,14 @@ const DIR64_AT_8: u16 = 0xa008;
 const DIR64_IN_BSS: u16 = 0xa040;
 const PADDING: u16 = 0;
 
+/// The fixups moving `pe` makes in the page at `page`, in order.
 fn fixups(pe: &Pe, page: u64) -> Vec<Fixup> {
     let mut all = vec![];
-    pe.fixups_in(page, |fixup| all.push(fixup));
+    pe.moved_fixups(|fixup| {
+        if fixup.address & !0xfff == page {
+            all.push(fixup);
+        }
+    });
     all
 }
 
@@ -823,12 +828,10 @@ fn random_damage_to_relocations_never_panics() {
         }
         if let Ok(pe) = Pe::parse(&file, ALLOWED) {
             check_promises(&pe);
-            for page in pe.segments().flat_map(|segment| segment.pages().step_by(0x1000)) {
-                pe.fixups_in(page, |fixup| {
-                    assert!(fixup.address % 0x1000 <= 0x1000 - 8, "across a page");
-                    assert!(pe.segments().any(|s| fixup.address >= s.address && fixup.address + 8 <= s.address + s.len));
-                });
-            }
+            pe.moved_fixups(|fixup| {
+                assert!(fixup.address % 0x1000 <= 0x1000 - 8, "across a page");
+                assert!(pe.segments().any(|s| fixup.address >= s.address && fixup.address + 8 <= s.address + s.len));
+            });
         }
     }
 }
@@ -935,4 +938,51 @@ fn many_sections_are_allowed() {
     let file = build(0x1000, 0x1000 * (MAX_SECTIONS as u32 + 1), &sections);
     let pe = Pe::parse(&file, ALLOWED).expect("32 sections");
     assert_eq!(pe.segments().count(), MAX_SECTIONS + 1);
+}
+
+#[test]
+fn a_move_gives_every_fixup_in_one_walk() {
+    let file = relocatable(&[DIR64_AT_8, PADDING, DIR64_IN_BSS]);
+    let pe = Pe::parse(&file, ALLOWED).expect("moved");
+    let mut all = vec![];
+    pe.moved_fixups(|fixup| all.push(fixup));
+    let delta = BASE.wrapping_sub(LINKED_AT);
+    assert_eq!(
+        all,
+        [
+            Fixup { address: BASE + (OPTIONAL + IMAGE_BASE) as u64, value: BASE },
+            Fixup { address: BASE + 0x2008, value: BASE + 0x2000 },
+            Fixup { address: BASE + 0x2040, value: delta },
+        ]
+    );
+    // Not moved: none at all.
+    let pe = Pe::parse(&file, 0x1_0000_0000..0x2_0000_0000).expect("where it asked");
+    let mut count = 0;
+    pe.moved_fixups(|_| count += 1);
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn too_many_relocations_are_refused() {
+    let most = vec![DIR64_AT_8; MAX_RELOCATIONS];
+    let file = relocatable(&most);
+    let pe = Pe::parse(&file, ALLOWED).expect("the most allowed");
+    assert_eq!(pe.relocations(), MAX_RELOCATIONS);
+    let one_more = vec![DIR64_AT_8; MAX_RELOCATIONS + 1];
+    assert_eq!(refused(&relocatable(&one_more)), Error::TooManyRelocations);
+    // Padding is not an address, so it does not count.
+    let mut padded = vec![PADDING; 16];
+    padded.extend_from_slice(&most);
+    assert!(Pe::parse(&relocatable(&padded), ALLOWED).is_ok());
+}
+
+#[test]
+fn the_stack_a_program_asks_for_is_read() {
+    let mut file = hello();
+    assert_eq!(Pe::parse(&file, ALLOWED).unwrap().stack_reserve(), 0);
+    file[OPTIONAL + 72..OPTIONAL + 80].copy_from_slice(&0x20_0000u64.to_le_bytes());
+    assert_eq!(Pe::parse(&file, ALLOWED).unwrap().stack_reserve(), 0x20_0000);
+    // Whatever it says, it is only read: the loader decides what to give.
+    file[OPTIONAL + 72..OPTIONAL + 80].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert_eq!(Pe::parse(&file, ALLOWED).unwrap().stack_reserve(), u64::MAX);
 }
