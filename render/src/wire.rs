@@ -13,6 +13,7 @@
 //! taken as whatever number it is -- a rectangle anywhere at all is a
 //! rectangle the renderer clips, which it does for every command already.
 
+use crate::glass::{Glass, Material};
 use crate::{Color, Command, Rect};
 
 /// Bytes per command.
@@ -26,6 +27,16 @@ const BLEND_RECT: u8 = 3;
 const MASK: u8 = 4;
 const IMAGE: u8 = 5;
 const SCISSOR: u8 = 6;
+const GLASS: u8 = 7;
+const SHADOW: u8 = 8;
+const SCALED_MASK: u8 = 9;
+const SCALED_IMAGE: u8 = 10;
+
+/// Bits of a glass record's flags byte, and of an image's.
+const REGULAR: u8 = 1 << 0;
+const DARK: u8 = 1 << 1;
+const RIM: u8 = 1 << 2;
+const TRANSLUCENT: u8 = 1 << 0;
 
 /// Write a rectangle as four little-endian words: x, y, width, height.
 pub fn put_rect(rect: &Rect, out: &mut [u8; RECT]) {
@@ -50,11 +61,22 @@ pub fn get_rect(bytes: &[u8; RECT]) -> Rect {
 ///
 /// ```text
 ///   0       kind
-///   1..4    colour, r g b             (or, for an image, nothing)
-///   4..8    surface number            (image only)
-///   7       alpha                     (blend, mask, image)
+///   1..4    colour, r g b             (the tint, for glass; nothing, for an image)
+///   4..6    surface number            (image)
+///   6       flags: translucent        (image)
+///   4       flags: regular, dark, rim (glass)
+///   5       refraction                (glass)
+///   6       tint amount               (glass)
+///   1       lower corner radius       (image)
+///   7       alpha                     (blend, mask, image, glass)
 ///   8..24   rectangle                 (the source block, for mask and image)
 ///   24..32  x, y of where it goes     (mask and image)
+///   24..26  corner radius             (glass)
+///   24..26  corner radius             (shadow)
+///   8..24   rectangle it fills        (scaled mask)
+///   24..32  source block, x y w h as four u16 (scaled mask: the atlas is
+///           far smaller than 65536 a side)
+///   26      frost (glass), blur (shadow)
 /// ```
 pub fn encode(command: &Command, out: &mut [u8; RECORD]) {
     *out = [0; RECORD];
@@ -106,22 +128,87 @@ pub fn encode(command: &Command, out: &mut [u8; RECORD]) {
             rect(out, src);
             position(out, *x, *y);
         }
+        Command::ScaledMask {
+            rect: r,
+            src,
+            color: c,
+            alpha,
+        } => {
+            out[0] = SCALED_MASK;
+            color(out, c);
+            out[7] = *alpha;
+            rect(out, r);
+            // Out-of-range parts are clamped, not wrapped: the renderer clips
+            // to the atlas anyway.
+            let small = |value: i64| (value.clamp(0, u16::MAX as i64) as u16).to_le_bytes();
+            out[24..26].copy_from_slice(&small(src.x as i64));
+            out[26..28].copy_from_slice(&small(src.y as i64));
+            out[28..30].copy_from_slice(&small(src.width as i64));
+            out[30..32].copy_from_slice(&small(src.height as i64));
+        }
         Command::Image {
             x,
             y,
             src,
             surface,
             alpha,
+            translucent,
+            radius,
         } => {
             out[0] = IMAGE;
-            out[4..7].copy_from_slice(&surface.to_le_bytes()[..3]);
+            out[1] = *radius;
+            out[4..6].copy_from_slice(&surface.to_le_bytes()[..2]);
+            out[6] = if *translucent { TRANSLUCENT } else { 0 };
             out[7] = *alpha;
             rect(out, src);
             position(out, *x, *y);
         }
+        Command::ScaledImage {
+            rect: r,
+            surface,
+            alpha,
+            translucent,
+            radius,
+        } => {
+            out[0] = SCALED_IMAGE;
+            out[1] = *radius;
+            out[4..6].copy_from_slice(&surface.to_le_bytes()[..2]);
+            out[6] = if *translucent { TRANSLUCENT } else { 0 };
+            out[7] = *alpha;
+            rect(out, r);
+        }
         Command::Scissor { rect: r } => {
             out[0] = SCISSOR;
             rect(out, r);
+        }
+        Command::Glass {
+            rect: r,
+            glass,
+            alpha,
+        } => {
+            out[0] = GLASS;
+            color(out, &glass.tint);
+            out[4] = if glass.material == Material::Regular { REGULAR } else { 0 }
+                | if glass.dark { DARK } else { 0 }
+                | if glass.rim { RIM } else { 0 };
+            out[5] = glass.refraction;
+            out[6] = glass.tint_amount;
+            out[7] = *alpha;
+            rect(out, r);
+            out[24..26].copy_from_slice(&glass.radius.to_le_bytes());
+            out[26] = glass.frost;
+        }
+        Command::Shadow {
+            rect: r,
+            radius,
+            blur,
+            alpha,
+        } => {
+            out[0] = SHADOW;
+            out[7] = *alpha;
+            rect(out, r);
+            out[24..26].copy_from_slice(&radius.to_le_bytes());
+            out[26] = *blur;
         }
     }
 }
@@ -140,6 +227,20 @@ pub fn decode(bytes: &[u8; RECORD]) -> Option<Command> {
         CLEAR => Command::Clear { color },
         FILL_RECT => Command::FillRect { rect, color },
         BLEND_RECT => Command::BlendRect { rect, color, alpha },
+        SCALED_MASK => {
+            let small = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+            Command::ScaledMask {
+                rect,
+                src: Rect::new(
+                    small(24) as i32,
+                    small(26) as i32,
+                    small(28) as u32,
+                    small(30) as u32,
+                ),
+                color,
+                alpha,
+            }
+        }
         MASK => Command::Mask {
             x,
             y,
@@ -151,12 +252,44 @@ pub fn decode(bytes: &[u8; RECORD]) -> Option<Command> {
             x,
             y,
             src: rect,
-            // Three bytes: more surfaces than any renderer has, and the
-            // fourth is where alpha lives.
-            surface: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], 0]),
+            // Two bytes: more surfaces than any renderer has.
+            surface: u32::from_le_bytes([bytes[4], bytes[5], 0, 0]),
             alpha,
+            translucent: bytes[6] & TRANSLUCENT != 0,
+            radius: bytes[1],
+        },
+        SCALED_IMAGE => Command::ScaledImage {
+            rect,
+            surface: u32::from_le_bytes([bytes[4], bytes[5], 0, 0]),
+            alpha,
+            translucent: bytes[6] & TRANSLUCENT != 0,
+            radius: bytes[1],
         },
         SCISSOR => Command::Scissor { rect },
+        GLASS => Command::Glass {
+            rect,
+            glass: Glass {
+                material: if bytes[4] & REGULAR != 0 {
+                    Material::Regular
+                } else {
+                    Material::Clear
+                },
+                dark: bytes[4] & DARK != 0,
+                rim: bytes[4] & RIM != 0,
+                radius: u16::from_le_bytes([bytes[24], bytes[25]]),
+                refraction: bytes[5],
+                frost: bytes[26],
+                tint: color,
+                tint_amount: bytes[6],
+            },
+            alpha,
+        },
+        SHADOW => Command::Shadow {
+            rect,
+            radius: u16::from_le_bytes([bytes[24], bytes[25]]),
+            blur: bytes[26],
+            alpha,
+        },
         _ => return None,
     })
 }
@@ -195,14 +328,51 @@ mod tests {
                 color,
                 alpha: 255,
             },
+            Command::ScaledMask {
+                rect: Rect::new(-3, 700, 96, 72),
+                src: Rect::new(400, 300, 48, 36),
+                color,
+                alpha: 200,
+            },
             Command::Image {
                 x: 976,
                 y: 48,
                 src: Rect::new(0, 0, 256, 192),
                 surface: 7,
                 alpha: 1,
+                translucent: true,
+                radius: 12,
+            },
+            Command::ScaledImage {
+                rect: Rect::new(-40, 30, 900, 610),
+                surface: 3,
+                alpha: 222,
+                translucent: false,
+                radius: 9,
             },
             Command::Scissor { rect },
+            Command::Glass {
+                rect,
+                glass: crate::glass::Glass {
+                    tint: color,
+                    tint_amount: 90,
+                    radius: 999,
+                    frost: 40,
+                    ..crate::glass::Glass::regular(true)
+                },
+                alpha: 200,
+            },
+            Command::Glass {
+                rect,
+                glass: crate::glass::Glass::clear(false),
+                alpha: 255,
+            },
+            Command::Shadow {
+                rect,
+                radius: 300,
+                blur: 24,
+                alpha: 90,
+            },
         ];
         for command in commands {
             let back = round_trip(command).expect("decodes");
@@ -220,7 +390,8 @@ mod tests {
 
     #[test]
     fn a_record_that_is_not_a_command_is_refused() {
-        for kind in [0u8, 7, 0x80, 0xff] {
+        // The first kind past the last there is, and some far off.
+        for kind in [0u8, SCALED_IMAGE + 1, 0x80, 0xff] {
             let mut bytes = [0x5a; RECORD];
             bytes[0] = kind;
             assert!(decode(&bytes).is_none());

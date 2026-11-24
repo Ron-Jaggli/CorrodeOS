@@ -1,0 +1,15 @@
+[package]
+name = "corrode-kernel32"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kernel32"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+corrode-rt = { path = "../../user/rt" }
+corrode-pe = { path = "../pe" }

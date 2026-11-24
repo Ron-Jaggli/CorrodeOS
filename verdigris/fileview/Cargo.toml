@@ -1,0 +1,16 @@
+[package]
+name = "corrode-fileview"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fileview"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+corrode-rt = { path = "../../user/rt" }
+corrode-shell = { path = "../../shell" }
+corrode-view = { path = "../view" }

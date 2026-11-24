@@ -368,6 +368,8 @@ struct Screen {
     device: Device,
     renderer: SoftwareRenderer,
     info: SurfaceInfo,
+    /// Where the wallpaper is painted, if there was memory for it.
+    wallpaper: Option<&'static mut [u32]>,
 }
 
 fn open_screen(mut device: Device) -> Result<(Screen, u64), Error> {
@@ -502,11 +504,33 @@ fn open_screen(mut device: Device) -> Result<(Screen, u64), Error> {
         renderer.attach_mask_atlas(data, gpu::ATLAS_WIDTH);
     }
 
+    // Glass first, then the wallpaper, in the one block of scratch memory.
+    let mut wallpaper = None;
+    let screen_pixels = (info.width * info.height) as usize;
+    let glass = 3 * screen_pixels + 4096;
+    match Pages::map(gpu::SCRATCH) {
+        Ok(scratch) if scratch.len / 4 >= glass + screen_pixels => {
+            // SAFETY: mapped writable for the life of the task, and these
+            // are the only references to it that will ever exist, split so
+            // they do not overlap.
+            let all = unsafe {
+                core::slice::from_raw_parts_mut(scratch.base.cast::<u32>(), glass + screen_pixels)
+            };
+            let (glass, rest) = all.split_at_mut(glass);
+            renderer.attach_glass_scratch(glass);
+            wallpaper = Some(rest);
+            println!("glass and a wallpaper, in {} KiB of scratch", scratch.len / 1024);
+        }
+        Ok(scratch) => println!("{} KiB of scratch is too little for glass", scratch.len / 1024),
+        Err(error) => println!("no scratch for glass: {:?}", error),
+    }
+
     Ok((
         Screen {
             device,
             renderer,
             info,
+            wallpaper,
         },
         displays,
     ))
@@ -560,11 +584,27 @@ impl Screen {
     }
 }
 
+/// How many surfaces can be held at once: as many as the renderer shows.
+const HELD: usize = corrode_render::software::SURFACES;
+
+/// Which surface each of the slots from [`gpu::SURFACES`] holds.
+struct Held {
+    slots: [Option<u32>; HELD],
+}
+
+impl Held {
+    /// The first empty slot: its place in the list, and its capability slot.
+    fn free(&self) -> Option<(usize, usize)> {
+        let held = self.slots.iter().position(Option::is_none)?;
+        Some((held, gpu::SURFACES + held))
+    }
+}
+
 /// The kernel's request, done. Returns the words of the answer.
 fn serve(
     screen: &mut Option<Screen>,
     shared: &Pages,
-    surfaces: &mut usize,
+    surfaces: &mut Held,
     message: Message,
 ) -> Result<[u64; 4], Error> {
     let words = message.words;
@@ -607,14 +647,14 @@ fn serve(
 
     match message.label {
         gpu::SURFACE => {
-            let slot = gpu::SURFACES + *surfaces;
+            let (held, slot) = surfaces.free().ok_or(Error::Invalid)?;
             let mapped = corrode_rt::map_surface(slot)?;
             if mapped.pitch != mapped.width * 4 {
                 return Err(Error::Invalid);
             }
             // SAFETY: the kernel mapped `width * height` pixels at that
-            // address, readable, for as long as we hold the capability, and
-            // we never drop it.
+            // address, readable, for as long as we hold the capability. We
+            // drop it only on FORGET, after detaching the surface.
             unsafe {
                 screen.renderer.attach_surface(
                     words[0] as u32,
@@ -624,7 +664,25 @@ fn serve(
                 )
             }
             .map_err(|_| Error::Invalid)?;
-            *surfaces += 1;
+            // Sent again, resized: the new capability maps the same pages
+            // at the new size, and the old one is no longer needed.
+            let surface = words[0] as u32;
+            if let Some(old) = surfaces.slots.iter().position(|slot| *slot == Some(surface)) {
+                let _ = corrode_rt::delete(gpu::SURFACES + old);
+                surfaces.slots[old] = None;
+            }
+            surfaces.slots[held] = Some(surface);
+            Ok([0; 4])
+        }
+
+        // A window gone: stop drawing its surface, then let it go.
+        gpu::FORGET => {
+            let surface = words[0] as u32;
+            screen.renderer.detach_surface(surface);
+            if let Some(held) = surfaces.slots.iter().position(|slot| *slot == Some(surface)) {
+                let _ = corrode_rt::delete(gpu::SURFACES + held);
+                surfaces.slots[held] = None;
+            }
             Ok([0; 4])
         }
 
@@ -690,6 +748,31 @@ fn serve(
             Ok([0; 4])
         }
 
+        gpu::WALLPAPER => {
+            let (width, height) = (screen.info.width, screen.info.height);
+            let pixels = screen.wallpaper.as_deref_mut().ok_or(Error::Invalid)?;
+            corrode_theme::wallpaper::paint(
+                &corrode_theme::Theme::from_words(words),
+                pixels,
+                width,
+                height,
+            );
+            let base = pixels.as_ptr();
+            // SAFETY: `pixels` is `width * height` words of this task's
+            // memory, mapped for its life and only written here, between
+            // the frames that read it.
+            unsafe {
+                screen.renderer.attach_surface(
+                    corrode_render::software::SURFACES as u32 - 1,
+                    base,
+                    width,
+                    height,
+                )
+            }
+            .map_err(|_| Error::Invalid)?;
+            Ok([0; 4])
+        }
+
         _ => Err(Error::Invalid),
     }
 }
@@ -705,10 +788,14 @@ fn main() {
         }
     };
     let mut screen = None;
-    let mut surfaces = 0;
+    let mut surfaces = Held {
+        slots: [None; HELD],
+    };
 
     loop {
-        let into = gpu::SURFACES + surfaces;
+        // Where a surface sent with the call lands: a free slot, or the
+        // last one, which a SURFACE call will then refuse.
+        let into = surfaces.free().map_or(gpu::SURFACES + HELD - 1, |(_, slot)| slot);
         let received = match recv(gpu::SERVE, Some(into), Some(gpu::REPLY)) {
             Ok(received) => received,
             Err(error) => {

@@ -33,9 +33,16 @@
 //! them is the one thing that makes the glass stale without any formula
 //! having moved, so it has to be said: [`Scene::damage`]. The scene decides
 //! where the pixels go and when; it never looks at them.
+//!
+//! Or a pane of [`glass`](crate::glass), which shows what is under it, bent
+//! and frosted. A pane reads the pixels around it as well as under it, so
+//! when anything near one is repainted, all of it is, together with as far
+//! around it as it reads -- in one rectangle, so it never reads its own
+//! last frame.
 
 use crate::anim::{Animation, Fx};
 use crate::damage::Damage;
+use crate::glass::Glass;
 use crate::{Color, Command, CommandList, Rect, Renderer, SurfaceInfo};
 
 /// Commands recorded before a batch is submitted and recording starts again.
@@ -46,6 +53,10 @@ const BATCH: usize = 16;
 pub enum Content {
     /// The whole rectangle.
     Solid,
+    /// A block of the mask atlas stretched over the layer's rectangle, so
+    /// animating the layer's size grows or shrinks it rather than wiping
+    /// it. See [`Command::ScaledMask`].
+    ScaledMask { src: Rect },
     /// A block of the mask atlas, its top-left corner at the layer's. The
     /// layer's rectangle crops it, so animating the width wipes it in.
     Mask { src: Rect },
@@ -55,8 +66,27 @@ pub enum Content {
     /// the layer the surface does not cover. The layer's colour is not used.
     ///
     /// The layer must not outlast the surface: the scene takes it that an
-    /// opaque one hides what is under it.
-    Surface { id: u32, width: u32, height: u32 },
+    /// opaque one hides what is under it -- unless it is `translucent`, and
+    /// the top byte of each pixel says how transparent it is.
+    Surface {
+        id: u32,
+        width: u32,
+        height: u32,
+        translucent: bool,
+        /// Its lower corners are rounded to this.
+        radius: u8,
+        /// Drawn stretched to the layer's size rather than cropped by it,
+        /// with no limit on how large the layer is: a window zooming in.
+        /// At the surface's own size the two are the same.
+        stretch: bool,
+    },
+    /// The shadow of a rounded rectangle of corner `radius`, spreading
+    /// `blur` pixels outside it: the layer's rectangle is the shadow's
+    /// whole extent, the shape inset from it by `blur`.
+    Shadow { radius: u16, blur: u8 },
+    /// A pane of glass the size of the layer, over whatever is under it.
+    /// The layer's colour is not used; the pane's tint is.
+    Glass(Glass),
 }
 
 /// One rectangle of colour, in motion or not.
@@ -98,11 +128,60 @@ impl Layer {
         layer
     }
 
+    /// As [`Layer::mask`], but stretched to the layer's size as that
+    /// changes, rather than cropped by it.
+    pub const fn scaled_mask(x: i32, y: i32, src: Rect, color: Color) -> Self {
+        let mut layer = Self::solid(Rect::new(x, y, src.width, src.height), color);
+        layer.content = Content::ScaledMask { src };
+        layer
+    }
+
     /// The surface `id`, all `width` by `height` of it, with its top-left
     /// corner at `x`, `y`.
     pub const fn surface(x: i32, y: i32, id: u32, width: u32, height: u32) -> Self {
         let mut layer = Self::solid(Rect::new(x, y, width, height), Color::BLACK);
-        layer.content = Content::Surface { id, width, height };
+        layer.content = Content::Surface {
+            id,
+            width,
+            height,
+            translucent: false,
+            radius: 0,
+            stretch: false,
+        };
+        layer
+    }
+
+    /// As [`Layer::surface`], for a surface whose pixels say how transparent
+    /// they are.
+    pub const fn translucent_surface(x: i32, y: i32, id: u32, width: u32, height: u32) -> Self {
+        let mut layer = Self::surface(x, y, id, width, height);
+        layer.content = Content::Surface {
+            id,
+            width,
+            height,
+            translucent: true,
+            radius: 0,
+            stretch: false,
+        };
+        layer
+    }
+
+    /// The shadow of a `width` by `height` shape with corners of `radius`,
+    /// whose top left is at `x`, `y`, spreading `blur` pixels around it.
+    pub const fn shadow(x: i32, y: i32, width: u32, height: u32, radius: u16, blur: u8) -> Self {
+        let b = blur as i32;
+        let mut layer = Self::solid(
+            Rect::new(x - b, y - b, width + 2 * blur as u32, height + 2 * blur as u32),
+            Color::BLACK,
+        );
+        layer.content = Content::Shadow { radius, blur };
+        layer
+    }
+
+    /// A pane of `glass` covering `rect`.
+    pub const fn glass(rect: Rect, glass: Glass) -> Self {
+        let mut layer = Self::solid(rect, Color::BLACK);
+        layer.content = Content::Glass(glass);
         layer
     }
 
@@ -110,7 +189,12 @@ impl Layer {
         let whole = |animation: &Animation| animation.sample(now).value.round();
         // A surface has no pixels past its own edge to show.
         let (most_wide, most_tall) = match self.content {
-            Content::Surface { width, height, .. } => (width, height),
+            Content::Surface {
+                width,
+                height,
+                stretch: false,
+                ..
+            } => (width, height),
             _ => (u32::MAX, u32::MAX),
         };
         Shown {
@@ -186,7 +270,36 @@ impl Shown {
     /// else. A mask never is: it has holes by design. A surface is, because
     /// its pixels carry no transparency of their own.
     fn opaque(&self) -> bool {
-        self.alpha == 255 && !matches!(self.content, Content::Mask { .. })
+        self.alpha == 255
+            && match self.content {
+                Content::Solid => true,
+                Content::Surface {
+                    translucent,
+                    radius,
+                    ..
+                } => !translucent && radius == 0,
+                Content::Mask { .. }
+                | Content::ScaledMask { .. }
+                | Content::Glass(_)
+                | Content::Shadow { .. } => false,
+            }
+    }
+
+    /// For a pane of glass that is showing, everything it reads.
+    fn glass_reach(&self) -> Option<Rect> {
+        let Content::Glass(glass) = self.content else {
+            return None;
+        };
+        if self.alpha == 0 || self.rect.is_empty() {
+            return None;
+        }
+        let reach = glass.reach() as i32;
+        Some(Rect::new(
+            self.rect.x.saturating_sub(reach),
+            self.rect.y.saturating_sub(reach),
+            self.rect.width.saturating_add(2 * reach as u32),
+            self.rect.height.saturating_add(2 * reach as u32),
+        ))
     }
 }
 
@@ -213,8 +326,12 @@ pub struct Painted {
 /// Up to `N` layers over a background, in fixed storage.
 ///
 /// A new layer goes on top, and [`Scene::raise`] brings one to the top again.
-/// A removed layer's place is not reused, so an id never comes to mean a
-/// different layer.
+/// A removed layer's place is not reused while there is room elsewhere, so
+/// an id held past its layer's removal keeps meaning nothing for as long as
+/// it can. Once every place has been used, a new layer takes the place of
+/// one removed and already painted away: a desktop opens and closes windows
+/// for ever, and its scene must not fill up. Whoever removes a layer should
+/// drop its id.
 pub struct Scene<const N: usize> {
     screen: Rect,
     background: Color,
@@ -245,6 +362,36 @@ impl<const N: usize> Scene<N> {
         }
     }
 
+    /// [`Scene::new`], built where it will stay, on the heap. A scene of a
+    /// few hundred layers is too big to build on a kernel stack and move.
+    #[cfg(feature = "alloc")]
+    pub fn boxed(info: &SurfaceInfo, background: Color) -> alloc::boxed::Box<Self> {
+        let mut scene = alloc::boxed::Box::<Self>::new_uninit();
+        let at = scene.as_mut_ptr();
+        // SAFETY: `at` is valid for writes of a whole `Scene` and properly
+        // aligned, being a fresh allocation for one. Every field is written
+        // exactly once below -- the arrays element by element, through raw
+        // pointers so nothing reads the uninitialised memory -- before
+        // `assume_init` claims the scene is whole.
+        unsafe {
+            core::ptr::addr_of_mut!((*at).screen).write(Rect::new(0, 0, info.width, info.height));
+            core::ptr::addr_of_mut!((*at).background).write(background);
+            let layers = core::ptr::addr_of_mut!((*at).layers).cast::<Option<Layer>>();
+            let shown = core::ptr::addr_of_mut!((*at).shown).cast::<Shown>();
+            let redrawn = core::ptr::addr_of_mut!((*at).redrawn).cast::<Rect>();
+            let order = core::ptr::addr_of_mut!((*at).order).cast::<usize>();
+            for slot in 0..N {
+                layers.add(slot).write(None);
+                shown.add(slot).write(Shown::NOTHING);
+                redrawn.add(slot).write(NOWHERE);
+                order.add(slot).write(0);
+            }
+            core::ptr::addr_of_mut!((*at).len).write(0);
+            core::ptr::addr_of_mut!((*at).painted).write(false);
+            scene.assume_init()
+        }
+    }
+
     pub const fn screen(&self) -> Rect {
         self.screen
     }
@@ -252,7 +399,15 @@ impl<const N: usize> Scene<N> {
     /// Put `layer` on top of everything already here. `None` if full.
     pub fn add(&mut self, layer: Layer) -> Option<LayerId> {
         if self.len == N {
-            return None;
+            // A place whose layer is gone and whose last frame has painted
+            // over where it was: nothing of it is left on the glass.
+            let free = (0..N).find(|slot| {
+                self.layers[*slot].is_none() && self.shown[*slot] == Shown::NOTHING
+            })?;
+            self.layers[free] = Some(layer);
+            self.redrawn[free] = NOWHERE;
+            self.raise(LayerId(free));
+            return Some(LayerId(free));
         }
         self.layers[self.len] = Some(layer);
         self.order[self.len] = self.len;
@@ -303,6 +458,14 @@ impl<const N: usize> Scene<N> {
                 let shown = &self.shown[**slot];
                 self.layers[**slot].is_some() && shown.alpha > 0 && shown.rect.contains(&point)
             })
+            .map(|slot| LayerId(*slot))
+    }
+
+    /// Every layer there is, bottom first.
+    pub fn ids(&self) -> impl Iterator<Item = LayerId> + '_ {
+        self.order[..self.len]
+            .iter()
+            .filter(|slot| self.layers[**slot].is_some())
             .map(|slot| LayerId(*slot))
     }
 
@@ -362,7 +525,21 @@ impl<const N: usize> Scene<N> {
                 Some(layer) => layer.at(now),
                 None => Shown::NOTHING,
             };
-            let redrawn = core::mem::replace(redrawn, NOWHERE);
+            let mut redrawn = core::mem::replace(redrawn, NOWHERE);
+            // A surface stretched to another size: the client's rectangle
+            // is in its own pixels, not the layer's, and smoothing spreads
+            // it. The whole layer, rather than working out how far.
+            if let Content::Surface {
+                width,
+                height,
+                stretch: true,
+                ..
+            } = now_shown.content
+            {
+                if redrawn != NOWHERE && (now_shown.rect.width, now_shown.rect.height) != (width, height) {
+                    redrawn = EVERYWHERE;
+                }
+            }
             if now_shown == *shown {
                 // In the same place looking the same, as far as the scene can
                 // tell -- but its client says otherwise about part of it.
@@ -386,6 +563,30 @@ impl<const N: usize> Scene<N> {
                 }
             }
             *shown = now_shown;
+        }
+
+        // A pane touched by damage is repainted whole, with everything it
+        // reads. Growing the damage can touch another pane, so round again
+        // until nothing grows; each round adds a pane or stops.
+        loop {
+            let mut grew = false;
+            for shown in self.shown.iter() {
+                let Some(reach) = shown.glass_reach() else {
+                    continue;
+                };
+                let Some(reach) = reach.intersect(&self.screen) else {
+                    continue;
+                };
+                let touched = damage.rects().iter().any(|rect| rect.intersect(&reach).is_some());
+                let inside = damage.rects().iter().any(|rect| rect.contains(&reach));
+                if touched && !inside {
+                    damage.add(reach);
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
         }
 
         if damage.is_empty() {
@@ -443,6 +644,12 @@ impl<const N: usize> Scene<N> {
                     color: shown.color,
                     alpha,
                 },
+                (Content::ScaledMask { src }, alpha) => Command::ScaledMask {
+                    rect: shown.rect,
+                    src,
+                    color: shown.color,
+                    alpha,
+                },
                 (Content::Mask { src }, alpha) => Command::Mask {
                     x: shown.rect.x,
                     y: shown.rect.y,
@@ -457,11 +664,54 @@ impl<const N: usize> Scene<N> {
                     color: shown.color,
                     alpha,
                 },
-                (Content::Surface { id, .. }, alpha) => Command::Image {
+                (
+                    Content::Surface {
+                        id,
+                        width,
+                        height,
+                        translucent,
+                        radius,
+                        stretch: true,
+                    },
+                    alpha,
+                ) if (shown.rect.width, shown.rect.height) != (width, height) => Command::ScaledImage {
+                    rect: shown.rect,
+                    surface: id,
+                    alpha,
+                    translucent,
+                    radius,
+                },
+                (
+                    Content::Surface {
+                        id,
+                        translucent,
+                        radius,
+                        ..
+                    },
+                    alpha,
+                ) => Command::Image {
                     x: shown.rect.x,
                     y: shown.rect.y,
                     src: Rect::new(0, 0, shown.rect.width, shown.rect.height),
                     surface: id,
+                    alpha,
+                    translucent,
+                    radius,
+                },
+                (Content::Shadow { radius, blur }, alpha) => Command::Shadow {
+                    rect: Rect::new(
+                        shown.rect.x + blur as i32,
+                        shown.rect.y + blur as i32,
+                        shown.rect.width.saturating_sub(2 * blur as u32),
+                        shown.rect.height.saturating_sub(2 * blur as u32),
+                    ),
+                    radius,
+                    blur,
+                    alpha,
+                },
+                (Content::Glass(glass), alpha) => Command::Glass {
+                    rect: shown.rect,
+                    glass,
                     alpha,
                 },
             };
@@ -528,6 +778,28 @@ mod tests {
 
     fn fade(now: u64, from: i32, to: i32) -> Animation {
         Animation::ease(now, 100, Fx::from_int(from), Fx::from_int(to), Ease::Linear)
+    }
+
+    #[test]
+    fn a_full_scene_reuses_a_place_once_its_layer_is_painted_away() {
+        let mut scene = Scene::<2>::new(&INFO, GROUND);
+        let first = scene
+            .add(Layer::solid(Rect::new(0, 0, 4, 4), Color::WHITE))
+            .unwrap();
+        scene.add(Layer::solid(Rect::new(8, 0, 4, 4), Color::WHITE)).unwrap();
+        scene.frame(&mut Recorder::default(), 0).unwrap();
+        assert!(scene.add(Layer::solid(Rect::new(0, 8, 4, 4), Color::WHITE)).is_none());
+
+        scene.remove(first);
+        // Still on the glass until a frame paints where it was.
+        assert!(scene.add(Layer::solid(Rect::new(0, 8, 4, 4), Color::WHITE)).is_none());
+        scene.frame(&mut Recorder::default(), MS).unwrap();
+        let again = scene
+            .add(Layer::solid(Rect::new(0, 8, 4, 4), Color::WHITE))
+            .unwrap();
+        assert_eq!(again, first);
+        assert_eq!(scene.top(), Some(again));
+        assert_eq!(scene.ids().count(), 2);
     }
 
     #[test]
@@ -678,6 +950,8 @@ mod tests {
                 src,
                 surface,
                 alpha,
+                translucent: false,
+                radius: 0,
             } => Some((x, y, src, surface, alpha)),
             _ => None,
         });
@@ -1022,6 +1296,10 @@ mod tests {
                             id: random.below(2) as u32,
                             width: WINDOW.0,
                             height: WINDOW.1,
+                            translucent: false,
+                            radius: 0,
+                            // Now and then grown or shrunk to the layer.
+                            stretch: random.below(3) == 0,
                         };
                     }
                     ids.extend(scene.add(layer));

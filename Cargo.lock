@@ -7,10 +7,26 @@ name = "corrode-abi"
 version = "0.0.1"
 
 [[package]]
+name = "corrode-about"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+ "corrode-ui",
+]
+
+[[package]]
 name = "corrode-blob-reader"
 version = "0.0.1"
 dependencies = [
  "corrode-rt",
+]
+
+[[package]]
+name = "corrode-control"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+ "corrode-ui",
 ]
 
 [[package]]
@@ -29,6 +45,24 @@ name = "corrode-fault"
 version = "0.0.1"
 dependencies = [
  "corrode-rt",
+]
+
+[[package]]
+name = "corrode-files"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+ "corrode-shell",
+ "corrode-ui",
+]
+
+[[package]]
+name = "corrode-fileview"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+ "corrode-shell",
+ "corrode-view",
 ]
 
 [[package]]
@@ -54,8 +88,21 @@ dependencies = [
  "corrode-elf",
  "corrode-heap",
  "corrode-pci",
+ "corrode-pe",
  "corrode-render",
+ "corrode-seal",
+ "corrode-shell",
  "corrode-text",
+ "corrode-theme",
+ "corrode-vault",
+]
+
+[[package]]
+name = "corrode-kernel32"
+version = "0.0.1"
+dependencies = [
+ "corrode-pe",
+ "corrode-rt",
 ]
 
 [[package]]
@@ -63,6 +110,22 @@ name = "corrode-line"
 version = "0.0.1"
 dependencies = [
  "corrode-input",
+]
+
+[[package]]
+name = "corrode-lock"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+ "corrode-ui",
+]
+
+[[package]]
+name = "corrode-menu"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+ "corrode-ui",
 ]
 
 [[package]]
@@ -90,6 +153,13 @@ name = "corrode-pci"
 version = "0.0.1"
 
 [[package]]
+name = "corrode-pe"
+version = "0.0.1"
+dependencies = [
+ "corrode-elf",
+]
+
+[[package]]
 name = "corrode-ps2"
 version = "0.0.1"
 dependencies = [
@@ -108,6 +178,18 @@ dependencies = [
  "corrode-abi",
  "corrode-heap",
  "corrode-pci",
+]
+
+[[package]]
+name = "corrode-seal"
+version = "0.0.1"
+
+[[package]]
+name = "corrode-settings"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+ "corrode-ui",
 ]
 
 [[package]]
@@ -130,11 +212,34 @@ name = "corrode-text"
 version = "0.0.1"
 
 [[package]]
+name = "corrode-theme"
+version = "0.0.1"
+dependencies = [
+ "corrode-render",
+]
+
+[[package]]
 name = "corrode-ui"
 version = "0.0.1"
 dependencies = [
  "corrode-rt",
  "corrode-text",
+ "corrode-theme",
+]
+
+[[package]]
+name = "corrode-vault"
+version = "0.0.1"
+dependencies = [
+ "corrode-seal",
+ "corrode-theme",
+]
+
+[[package]]
+name = "corrode-view"
+version = "0.0.1"
+dependencies = [
+ "corrode-shell",
 ]
 
 [[package]]
@@ -145,10 +250,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "corrode-virtio-blk"
+version = "0.0.1"
+dependencies = [
+ "corrode-rt",
+ "corrode-theme",
+ "corrode-virtio",
+]
+
+[[package]]
 name = "corrode-virtio-gpu"
 version = "0.0.1"
 dependencies = [
  "corrode-render",
  "corrode-rt",
+ "corrode-theme",
  "corrode-virtio",
+]
+
+[[package]]
+name = "corrode-xhci"
+version = "0.0.1"
+dependencies = [
+ "corrode-input",
+ "corrode-rt",
 ]

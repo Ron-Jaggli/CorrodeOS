@@ -92,6 +92,30 @@ impl RemoteRenderer {
         .map(|_| ())
     }
 
+    /// Have the driver stop showing `surface` and drop its capability.
+    pub fn forget_surface(&mut self, surface: u32) -> Result<(), Error> {
+        call(
+            self.endpoint,
+            Message::from_word(gpu::FORGET, surface as u64),
+            None,
+        )
+        .map(|_| ())
+    }
+
+    /// Have the driver paint the wallpaper of the theme in `words` and show
+    /// it as the last surface.
+    pub fn wallpaper(&mut self, words: [u64; 4]) -> Result<(), Error> {
+        call(
+            self.endpoint,
+            Message {
+                label: gpu::WALLPAPER,
+                words,
+            },
+            None,
+        )
+        .map(|_| ())
+    }
+
     /// The shared memory, as bytes.
     fn shared(&mut self) -> &mut [u8] {
         // SAFETY: `memory::create` mapped `shared_len` bytes writable at

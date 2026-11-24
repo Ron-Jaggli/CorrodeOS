@@ -62,6 +62,9 @@ impl Rights {
     /// May use, and may pass on. The combination a task needs to be able to
     /// hand a capability to somebody else.
     pub const READ_GRANT: Rights = Rights(0b101);
+    /// To send, and to pass that on: a log a kernel service hands to the
+    /// programs it starts.
+    pub const WRITE_GRANT: Rights = Rights(0b110);
     pub const ALL: Rights = Rights(0b111);
 
     /// Interpret raw bits as a **mask**, for a narrowing operation.
@@ -172,8 +175,10 @@ pub enum Object {
     Interrupt(usize),
     /// A run of frames, by its number in [`crate::memory`]. READ means may
     /// map it, WRITE may write it -- and may ask where it physically is,
-    /// which is what a device is told.
-    Memory(usize),
+    /// which is what a device is told. The [`Hold`](crate::memory::Hold)
+    /// is this capability's claim on it: the memory goes back when the last
+    /// claim and the last mapping do.
+    Memory(crate::memory::Hold),
     /// A file the bootloader loaded, by its place in [`crate::modules`].
     /// READ means may map it and read it. Nothing means may change it.
     Blob(usize),
@@ -195,6 +200,10 @@ pub enum Object {
     /// in it -- map its pixels writable and commit them -- and READ means may
     /// wait for what happens to it: keys while it has focus, clicks on it.
     Window(usize),
+    /// Sealing with the secure core, under the key of holder `.0`: one key
+    /// per holder, made and kept in the secure core. WRITE means may seal,
+    /// READ may open what this holder sealed. See [`crate::seal`].
+    Sealer(u32),
 }
 
 impl core::fmt::Debug for Object {
@@ -209,10 +218,11 @@ impl core::fmt::Debug for Object {
             Object::PciDevice(index) => write!(f, "PciDevice({index})"),
             Object::DeviceMemory(index) => write!(f, "DeviceMemory({index})"),
             Object::Interrupt(index) => write!(f, "Interrupt({index})"),
-            Object::Memory(index) => write!(f, "Memory({index})"),
+            Object::Memory(held) => write!(f, "Memory({})", held.index()),
             Object::Blob(index) => write!(f, "Blob({index})"),
             Object::IoPorts { base, count } => write!(f, "IoPorts({base:#x}, {count})"),
             Object::Window(index) => write!(f, "Window({index})"),
+            Object::Sealer(holder) => write!(f, "Sealer({holder})"),
             Object::Pool(left) => write!(
                 f,
                 "Pool({} pages)",
@@ -242,6 +252,7 @@ pub enum ObjectKind {
     IoPorts = kind::IO_PORTS,
     Pool = kind::POOL,
     Window = kind::WINDOW,
+    Sealer = kind::SEALER,
 }
 
 impl Object {
@@ -261,6 +272,7 @@ impl Object {
             Object::IoPorts { .. } => ObjectKind::IoPorts,
             Object::Pool(_) => ObjectKind::Pool,
             Object::Window(_) => ObjectKind::Window,
+            Object::Sealer(_) => ObjectKind::Sealer,
         }
     }
 }
@@ -323,6 +335,10 @@ pub enum CapError {
     /// keeps to itself. Distinct from `InsufficientRights` because no right
     /// would have made it legal.
     Invalid,
+    /// A sealed message that does not check out.
+    Forged,
+    /// The secure core is not there to ask.
+    Unavailable,
 }
 
 impl CapError {
@@ -346,6 +362,8 @@ impl CapError {
             CapError::Refused => error::REFUSED,
             CapError::NoSpace => error::NO_SPACE,
             CapError::Invalid => error::INVALID,
+            CapError::Forged => error::FORGED,
+            CapError::Unavailable => error::UNAVAILABLE,
         }
     }
 }
@@ -394,6 +412,31 @@ impl CSpace {
     pub fn occupied(&self) -> usize {
         self.slots.iter().filter(|s| s.is_some()).count()
     }
+}
+
+/// What a finished task's capabilities leave that another task may be
+/// waiting on: the calls it was handed to answer, and the endpoints it
+/// could receive on.
+pub fn loose_ends(cspace: &CSpace) -> (Vec<crate::ipc::ReplyToken>, Vec<Arc<Object>>) {
+    let mut replies = Vec::new();
+    let mut endpoints = Vec::new();
+    for cap in cspace.slots.iter().flatten() {
+        match &*cap.object {
+            Object::Reply(token) => replies.push(*token),
+            Object::Endpoint(_) if cap.rights.contains(Rights::READ) => endpoints.push(Arc::clone(&cap.object)),
+            _ => {}
+        }
+    }
+    (replies, endpoints)
+}
+
+/// Whether `cspace` can receive on `endpoint`, that very object.
+pub fn can_receive(cspace: &CSpace, endpoint: &Arc<Object>) -> bool {
+    cspace
+        .slots
+        .iter()
+        .flatten()
+        .any(|cap| Arc::ptr_eq(&cap.object, endpoint) && cap.rights.contains(Rights::READ))
 }
 
 /// Create authority from nothing and place it in `task`'s capability space.
@@ -595,7 +638,23 @@ pub fn memory_of(slot: CapPtr, required: Rights) -> Result<(usize, Rights), CapE
             return Err(CapError::InsufficientRights);
         }
         match *cap.object {
-            Object::Memory(index) => Ok((index, cap.rights)),
+            Object::Memory(ref held) => Ok((held.index(), cap.rights)),
+            _ => Err(CapError::WrongType),
+        }
+    })
+    .ok_or(CapError::NoSuchTask)?
+}
+
+/// The holder a Sealer capability seals for. Requires `required`.
+pub fn sealer_of(slot: CapPtr, required: Rights) -> Result<u32, CapError> {
+    let current = task::current_id().ok_or(CapError::NoSuchTask)?;
+    task::with_cspace(current, |cspace| {
+        let cap = cspace.get(slot)?;
+        if !cap.rights.contains(required) {
+            return Err(CapError::InsufficientRights);
+        }
+        match *cap.object {
+            Object::Sealer(holder) => Ok(holder),
             _ => Err(CapError::WrongType),
         }
     })

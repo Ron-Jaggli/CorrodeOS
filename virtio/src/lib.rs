@@ -14,11 +14,12 @@
 //! it at a vector and play the device themselves.
 //!
 //! Layouts are from the Virtual I/O Device specification, version 1.2,
-//! sections 2.7 (split virtqueues), 4.1 (the PCI transport) and 5.7 (the
-//! GPU device).
+//! sections 2.7 (split virtqueues), 4.1 (the PCI transport), 5.2 (the
+//! block device) and 5.7 (the GPU device).
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod blk;
 pub mod gpu;
 pub mod pci;
 pub mod queue;

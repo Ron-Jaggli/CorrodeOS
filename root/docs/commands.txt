@@ -13,6 +13,16 @@ The shell:
 The system:
     uname uptime free caps whoami about sleep exit
 
+Windows programs (Verdigris):
+    win PATH [ARGS]  run one; it sees its own folder as C:\ and nothing
+                     else, and ARGS on its command line
+                     win /programs/reader/reader.exe one "two three"
+                     win /programs/dir/dir.exe *.exe
+                     One that never ends is stopped after 10 seconds.
+                     An exit code other than 0 is said, and so is a
+                     fault, as Windows names it:
+                     win /programs/fault/fault.exe
+
 Things that need permission first (see capabilities.txt):
     ps       the running tasks             grant ps
     kill ID  stop a task                   grant kill ID

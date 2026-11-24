@@ -35,6 +35,7 @@ pub mod vectors {
 }
 
 pub mod cpu;
+pub mod fpu;
 pub mod gdt;
 pub mod idt;
 pub mod ioapic;
@@ -181,10 +182,12 @@ pub unsafe fn enable_memory_protections() {
 
 /// Let SSE instructions execute on this CPU.
 ///
-/// The kernel is built soft-float and never emits them itself. Two things do
-/// need them: UEFI firmware, which the specification promises SSE, and the
-/// secure core, whose key lives in an XMM register precisely because nothing
-/// else on that core touches those registers.
+/// The kernel is built soft-float and the compiler never emits them. Three
+/// things use them by hand: UEFI firmware, which the specification promises
+/// SSE; the secure core, whose key lives in an XMM register precisely because
+/// nothing else on that core touches those registers; and the renderer's
+/// pixel loops, in the kernel and in ring 3, whose registers each task switch
+/// saves (see [`fpu`]). Every general CPU turns it on before its first task.
 ///
 /// # Safety
 /// Ring 0. Changes only the FPU/SSE control bits of CR0 and CR4.

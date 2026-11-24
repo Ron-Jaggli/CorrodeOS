@@ -38,6 +38,17 @@ pub struct Window {
     pub width: u32,
     pub height: u32,
     pub docked: bool,
+    pub translucent: bool,
+    pub resizable: bool,
+    pub popover: bool,
+    pub cover: bool,
+    pub menu: bool,
+    /// What its title bar says: up to eight bytes, unused ones zero.
+    title: [u8; 8],
+    /// What it says after the title: the program's to set, any time.
+    subtitle: [u8; 24],
+    /// The task that asked for it. When it finishes, the window goes.
+    owner: usize,
     events: VecDeque<(u64, [u64; 4])>,
     waiter: usize,
 }
@@ -55,17 +66,92 @@ pub fn set_screen(width: u32, height: u32) {
     SCREEN[1].store(height, Ordering::Relaxed);
 }
 
-/// Make a window and say its number. `None` if there is no surface left.
-pub fn open(width: u32, height: u32, docked: bool) -> Option<usize> {
+/// Make a window for task `owner` and say its number. `None` if there is
+/// no surface left.
+/// The titles the desktop's own programs use, and the program each belongs
+/// to. A title says which app a window is: the dock lights its dot, lists
+/// it in its menu, quits it, and a notification is shown under it. So only
+/// the program the launcher started under that name may use one.
+/// `CorrodeOS` is the desktop's own, and no program's.
+const RESERVED: [(&[u8], &str); 9] = [
+    (b"Terminal", "terminal"),
+    (b"Settings", "settings"),
+    (b"About", "about"),
+    (b"Files", "files"),
+    (b"Control", "control"),
+    (b"Lock", "lock"),
+    (b"Menu", "menu"),
+    (b"Panel", "panel"),
+    (b"CorrodeOS", ""),
+];
+
+/// The title a task called `program` gets when it asks for `asked`: what it
+/// asked for, cleaned to printable ASCII, unless that is another program's,
+/// in which case its own name.
+pub fn allowed_title(asked: u64, program: &str) -> [u8; 8] {
+    let cleaned = title_bytes_cleaned(asked);
+    let length = cleaned.iter().position(|byte| *byte == 0).unwrap_or(8);
+    // Compared whole: "CorrodeOS" is nine letters, so its first eight are
+    // what an eight-byte title would hold.
+    let taken = RESERVED.iter().find(|(title, _)| {
+        let title = &title[..title.len().min(8)];
+        title == &cleaned[..length]
+    });
+    match taken {
+        Some((_, owner)) if *owner != program => {
+            let mut own = [0u8; 8];
+            for (slot, byte) in own.iter_mut().zip(program.bytes().filter(|byte| (b' '..=b'~').contains(byte))) {
+                *slot = byte;
+            }
+            own
+        }
+        _ => cleaned,
+    }
+}
+
+fn title_bytes_cleaned(title: u64) -> [u8; 8] {
+    title.to_le_bytes().map(|byte| if (b' '..=b'~').contains(&byte) { byte } else { 0 })
+}
+
+pub fn open(width: u32, height: u32, flags: u64, asked_title: u64, owner: usize) -> Option<usize> {
+    let docked = flags & window::DOCKED != 0;
+    let translucent = flags & window::TRANSLUCENT != 0;
+    let cover = flags & window::COVER != 0 && !docked;
+    let popover = flags & window::POPOVER != 0 && !docked && !cover;
+    let menu = popover && flags & window::MENU != 0;
+    let resizable = flags & window::RESIZABLE != 0 && !docked && !popover && !cover;
     let (width, height) = if docked {
         (SCREEN[0].load(Ordering::Relaxed), height.clamp(16, 64))
+    } else if cover {
+        (
+            SCREEN[0].load(Ordering::Relaxed).min(window::MAX_WIDTH),
+            SCREEN[1].load(Ordering::Relaxed).min(window::MAX_HEIGHT),
+        )
     } else {
         (
             width.clamp(64, window::MAX_WIDTH),
             height.clamp(32, window::MAX_HEIGHT),
         )
     };
-    let surface = surface::create(width, height)?;
+    // A window that can be resized gets room for the whole screen: the
+    // largest the desktop will make it. So does a popover, which may ask
+    // to grow as what it shows does.
+    let room = if resizable || popover {
+        SCREEN[0].load(Ordering::Relaxed).min(window::MAX_WIDTH) as u64
+            * SCREEN[1].load(Ordering::Relaxed).min(window::MAX_HEIGHT) as u64
+    } else {
+        0
+    };
+    let program = task::name_of(owner).unwrap_or("");
+    let title = allowed_title(asked_title, program);
+    if title != title_bytes_cleaned(asked_title) {
+        crate::println!(
+            "desktop    : task {owner} ({program}) may not title a window {:?}; it is {:?}",
+            core::str::from_utf8(&title_bytes_cleaned(asked_title)).unwrap_or("").trim_end_matches('\0'),
+            core::str::from_utf8(&title).unwrap_or("").trim_end_matches('\0'),
+        );
+    }
+    let surface = surface::create_with_room(width, height, room)?;
     let index = without_interrupts(|| {
         let mut table = TABLE.lock();
         table.push(Window {
@@ -73,6 +159,15 @@ pub fn open(width: u32, height: u32, docked: bool) -> Option<usize> {
             width,
             height,
             docked,
+            translucent,
+            resizable,
+            popover,
+            cover,
+            menu,
+            // Printable ASCII only: a title is drawn, never interpreted.
+            title,
+            subtitle: [0; 24],
+            owner,
             events: VecDeque::new(),
             waiter: NOBODY,
         });
@@ -80,6 +175,130 @@ pub fn open(width: u32, height: u32, docked: bool) -> Option<usize> {
     });
     without_interrupts(|| NEW.lock().push(index));
     Some(index)
+}
+
+/// The live windows titled `title` (8 bytes, as stored), oldest first.
+fn titled(title: u64) -> Vec<usize> {
+    let title = title.to_le_bytes();
+    let matching: Vec<(usize, usize)> = without_interrupts(|| {
+        TABLE
+            .lock()
+            .iter()
+            .enumerate()
+            .filter(|(_, window)| window.title == title && !window.docked)
+            .map(|(index, window)| (index, window.owner))
+            .collect()
+    });
+    matching
+        .into_iter()
+        .filter(|(_, owner)| task::state_of(*owner) != Some(State::Finished))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// How many live windows are titled `title`, and the subtitle of the
+/// `which`th, as three words.
+pub fn list_titled(title: u64, which: usize) -> (usize, [u64; 3]) {
+    let all = titled(title);
+    let subtitle = all
+        .get(which)
+        .and_then(|index| without_interrupts(|| TABLE.lock().get(*index).map(|window| window.subtitle)))
+        .unwrap_or([0; 24]);
+    let word = |at: usize| u64::from_le_bytes(subtitle[at..at + 8].try_into().unwrap_or([0; 8]));
+    (all.len(), [word(0), word(8), word(16)])
+}
+
+/// Windows a dock menu asked to have brought forward.
+static RAISED: SpinLock<Vec<usize>> = SpinLock::new(Vec::new());
+/// Popovers that asked to be another size, and the size, for the painter.
+static GROWN: SpinLock<Vec<(usize, u32, u32)>> = SpinLock::new(Vec::new());
+
+/// `owner`'s popover asks to be `width` by `height`, as Control Center does
+/// when more notifications come. Only a popover may, and only its own
+/// program: other windows are sized by the person. Whether it was queued.
+pub fn grow(owner: usize, width: u32, height: u32) -> bool {
+    let index = without_interrupts(|| {
+        TABLE
+            .lock()
+            .iter()
+            .rposition(|window| window.owner == owner && window.popover)
+    });
+    let Some(index) = index else {
+        return false;
+    };
+    without_interrupts(|| GROWN.lock().push((index, width, height)));
+    true
+}
+
+/// Popovers to resize, for the painter.
+pub fn take_grown() -> Vec<(usize, u32, u32)> {
+    without_interrupts(|| core::mem::take(&mut *GROWN.lock()))
+}
+
+/// Ask the painter to bring the `which`th window titled `title` forward.
+pub fn raise_titled(title: u64, which: usize) -> bool {
+    let Some(index) = titled(title).get(which).copied() else {
+        return false;
+    };
+    without_interrupts(|| RAISED.lock().push(index));
+    true
+}
+
+/// Windows to bring forward, for the painter.
+pub fn take_raised() -> Vec<usize> {
+    without_interrupts(|| core::mem::take(&mut *RAISED.lock()))
+}
+
+/// Windows whose subtitle changed since the painter last looked.
+static RETITLED: SpinLock<Vec<usize>> = SpinLock::new(Vec::new());
+
+/// Give every window `owner` has its subtitle, from three words of text.
+/// How many windows that was.
+pub fn set_subtitle(owner: usize, words: [u64; 3]) -> usize {
+    let mut text = [0u8; 24];
+    for (chunk, word) in text.chunks_mut(8).zip(words) {
+        chunk.copy_from_slice(&word.to_le_bytes());
+    }
+    // As a title: printable ASCII only.
+    let text = text.map(|byte| if (b' '..=b'~').contains(&byte) { byte } else { 0 });
+    let changed: Vec<usize> = without_interrupts(|| {
+        let mut table = TABLE.lock();
+        table
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, window)| window.owner == owner && !window.docked && window.subtitle != text)
+            .map(|(index, window)| {
+                window.subtitle = text;
+                index
+            })
+            .collect()
+    });
+    let count = changed.len();
+    without_interrupts(|| RETITLED.lock().extend(changed));
+    count
+}
+
+/// Windows whose subtitle changed, for the painter to draw again.
+pub fn take_retitled() -> Vec<usize> {
+    without_interrupts(|| core::mem::take(&mut *RETITLED.lock()))
+}
+
+/// What a window's title bar shows: its title, and its subtitle if it has
+/// one.
+pub fn caption(index: usize) -> alloc::string::String {
+    let mut caption = title(index);
+    let subtitle = without_interrupts(|| TABLE.lock().get(index).map(|window| window.subtitle));
+    let subtitle: alloc::string::String = subtitle
+        .unwrap_or([0; 24])
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| *byte as char)
+        .collect();
+    if !subtitle.is_empty() {
+        caption.push_str(" - ");
+        caption.push_str(&subtitle);
+    }
+    caption
 }
 
 /// Windows the painter has not placed yet.
@@ -96,7 +315,132 @@ pub fn shape(index: usize) -> Option<(usize, u32, u32, bool)> {
     })
 }
 
+/// What a window's title bar says.
+pub fn title(index: usize) -> alloc::string::String {
+    let title = without_interrupts(|| TABLE.lock().get(index).map(|window| window.title));
+    title
+        .unwrap_or_default()
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| *byte as char)
+        .collect()
+}
+
+/// The title of the first window `owner` opened, if it has one.
+pub fn title_of_owner(owner: usize) -> Option<alloc::string::String> {
+    let index = without_interrupts(|| TABLE.lock().iter().position(|window| window.owner == owner))?;
+    Some(title(index)).filter(|title| !title.is_empty())
+}
+
+/// Ask every window titled `title` (8 bytes, as stored) whose program is
+/// still running to close. How many were asked.
+pub fn close_titled(title: u64) -> usize {
+    let title = title.to_le_bytes();
+    let matching: Vec<(usize, usize)> = without_interrupts(|| {
+        TABLE
+            .lock()
+            .iter()
+            .enumerate()
+            .filter(|(_, window)| window.title == title && !window.docked)
+            .map(|(index, window)| (index, window.owner))
+            .collect()
+    });
+    let mut asked = 0;
+    for (index, owner) in matching {
+        if task::state_of(owner) != Some(State::Finished) {
+            push(index, window::CLOSE, [0; 4]);
+            asked += 1;
+        }
+    }
+    asked
+}
+
+/// Whether a window is a popover: no title bar, under the menu bar.
+pub fn popover(index: usize) -> bool {
+    without_interrupts(|| TABLE.lock().get(index).is_some_and(|window| window.popover))
+}
+
+/// Whether a popover is a context menu, placed at the pointer.
+pub fn menu(index: usize) -> bool {
+    without_interrupts(|| TABLE.lock().get(index).is_some_and(|window| window.menu))
+}
+
+/// Whether any window covers the screen: the desktop is locked.
+pub fn locked() -> bool {
+    let owners: Vec<usize> = without_interrupts(|| {
+        TABLE.lock().iter().filter(|window| window.cover).map(|window| window.owner).collect()
+    });
+    owners.into_iter().any(|owner| task::state_of(owner) != Some(State::Finished))
+}
+
+/// Whether a window covers the screen, as the lock screen does.
+pub fn cover(index: usize) -> bool {
+    without_interrupts(|| TABLE.lock().get(index).is_some_and(|window| window.cover))
+}
+
+/// Whether the desktop may resize a window.
+pub fn resizable(index: usize) -> bool {
+    without_interrupts(|| TABLE.lock().get(index).is_some_and(|window| window.resizable))
+}
+
+/// Make a resizable window `width` by `height`, clamped to what windows
+/// may be, and tell its program. The size it got, if it could be resized.
+pub fn resize(index: usize, width: u32, height: u32) -> Option<(u32, u32)> {
+    let (width, height) = (
+        width.clamp(64, window::MAX_WIDTH),
+        height.clamp(32, window::MAX_HEIGHT),
+    );
+    // One lock at a time: the window's, then the surface's, then the
+    // window's again.
+    let surface = without_interrupts(|| {
+        let table = TABLE.lock();
+        table
+            .get(index)
+            .filter(|window| window.resizable || window.popover)
+            .map(|window| window.surface)
+    })?;
+    if !surface::resize(surface, width, height) {
+        return None;
+    }
+    without_interrupts(|| {
+        if let Some(window) = TABLE.lock().get_mut(index) {
+            window.width = width;
+            window.height = height;
+        }
+    });
+    push(index, window::RESIZE, [width as u64, height as u64, 0, 0]);
+    Some((width, height))
+}
+
+/// Whether a window's pixels say how transparent they are.
+pub fn translucent(index: usize) -> bool {
+    without_interrupts(|| TABLE.lock().get(index).is_some_and(|window| window.translucent))
+}
+
+/// Whether the program a window was opened for has finished -- exited or
+/// been stopped for a fault -- so nobody will draw in it again.
+///
+/// The surface is not given back: its frames are still mapped in the
+/// finished task, and nothing reclaims those yet.
+pub fn abandoned(index: usize) -> bool {
+    let owner = without_interrupts(|| TABLE.lock().get(index).map(|window| window.owner));
+    owner.is_some_and(|owner| task::state_of(owner) == Some(State::Finished))
+}
+
 /// Give a window an event, and wake its program if it is waiting.
+/// Tell every live window titled `title` (8 bytes, as stored) `label`.
+/// How many were told. Titles that say which program a window is are
+/// kept to that program (see `RESERVED`), so this reaches only it.
+pub fn tell_titled(title: &[u8], label: u64) -> usize {
+    let mut bytes = [0u8; 8];
+    bytes[..title.len().min(8)].copy_from_slice(&title[..title.len().min(8)]);
+    let windows = titled(u64::from_le_bytes(bytes));
+    for index in &windows {
+        push(*index, label, [0; 4]);
+    }
+    windows.len()
+}
+
 pub fn push(index: usize, label: u64, words: [u64; 4]) {
     let waiter = without_interrupts(|| {
         let mut table = TABLE.lock();

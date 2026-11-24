@@ -32,6 +32,7 @@ pub mod device;
 pub mod heap;
 pub mod log;
 pub mod sys;
+pub mod win;
 
 use abi::error;
 
@@ -52,6 +53,10 @@ pub enum Error {
     NoSpace,
     /// The capability is good and the request is not.
     Invalid,
+    /// A sealed message that does not check out.
+    Forged,
+    /// The secure core is not there to ask.
+    Unavailable,
     /// The kernel does not have that system call.
     BadSyscall,
     /// A status this runtime was built before.
@@ -72,6 +77,8 @@ impl Error {
             Error::Refused => error::REFUSED,
             Error::NoSpace => error::NO_SPACE,
             Error::Invalid => error::INVALID,
+            Error::Forged => error::FORGED,
+            Error::Unavailable => error::UNAVAILABLE,
             Error::BadSyscall => abi::STATUS_BAD_SYSCALL,
             Error::Unknown(code) => code,
         }
@@ -102,6 +109,8 @@ fn check(status: u64) -> Result<()> {
         error::REFUSED => Error::Refused,
         error::NO_SPACE => Error::NoSpace,
         error::INVALID => Error::Invalid,
+        error::FORGED => Error::Forged,
+        error::UNAVAILABLE => Error::Unavailable,
         abi::STATUS_BAD_SYSCALL => Error::BadSyscall,
         other => Error::Unknown(other),
     })
@@ -222,8 +231,20 @@ pub fn yield_now() {
 
 /// Stop, for good.
 pub fn exit() -> ! {
+    exit_with(0)
+}
+
+/// End this task, saying `code`: what a Windows program's `ExitProcess`
+/// gives, and the kernel passes on to whoever ran it.
+pub fn exit_with(code: u32) -> ! {
     loop {
-        sys::call(abi::SYS_EXIT, sys::Args::NONE);
+        sys::call(
+            abi::SYS_EXIT,
+            sys::Args {
+                rdi: u64::from(code),
+                ..sys::Args::NONE
+            },
+        );
         // Only reached on a kernel with no such call. Still never return:
         // there is nothing under `_start` to return to.
         yield_now();
@@ -407,6 +428,56 @@ pub fn physical(slot: usize, page: usize) -> Result<u64> {
     );
     check(out.rax)?;
     Ok(out.rdx)
+}
+
+/// Buy `pages` of fresh, zeroed memory from the pool in `pool`, and put the
+/// capability to it in `into`. Returns its length in bytes; map it to use it.
+pub fn alloc(pool: usize, pages: usize, into: usize) -> Result<usize> {
+    let out = sys::call(
+        abi::SYS_ALLOC,
+        sys::Args {
+            rdi: pool as u64,
+            rsi: pages as u64,
+            rdx: into as u64,
+            ..sys::Args::NONE
+        },
+    );
+    check(out.rax)?;
+    Ok(out.rdx as usize)
+}
+
+/// Seal the `len`-byte message at byte [`abi::seal::OVERHEAD`] of the first
+/// page of `memory`, with the sealer in `sealer`. The sealed message replaces
+/// it from byte 0; its length comes back.
+pub fn seal(sealer: usize, memory: usize, len: usize) -> Result<usize> {
+    let out = sys::call(
+        abi::SYS_SEAL,
+        sys::Args {
+            rdi: sealer as u64,
+            rsi: memory as u64,
+            rdx: len as u64,
+            ..sys::Args::NONE
+        },
+    );
+    check(out.rax)?;
+    Ok(out.rdx as usize)
+}
+
+/// Open the `len`-byte sealed message at byte 0 of the first page of
+/// `memory`. What was sealed comes back from byte [`abi::seal::OVERHEAD`],
+/// and its length is returned.
+pub fn unseal(sealer: usize, memory: usize, len: usize) -> Result<usize> {
+    let out = sys::call(
+        abi::SYS_UNSEAL,
+        sys::Args {
+            rdi: sealer as u64,
+            rsi: memory as u64,
+            rdx: len as u64,
+            ..sys::Args::NONE
+        },
+    );
+    check(out.rax)?;
+    Ok(out.rdx as usize)
 }
 
 /// Name the function a program starts in.

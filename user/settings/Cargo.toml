@@ -1,0 +1,15 @@
+[package]
+name = "corrode-settings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "settings"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+corrode-rt = { path = "../rt" }
+corrode-ui = { path = "../ui" }

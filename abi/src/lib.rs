@@ -72,7 +72,9 @@ pub const SYS_CONFIG_READ: u64 = 10;
 /// Write one. Needs WRITE, and the register has to be one a driver may
 /// write. `rsi` is the offset, `rdx` the width, `r10` the value.
 pub const SYS_CONFIG_WRITE: u64 = 11;
-/// Stop, for good. Takes nothing and does not return.
+/// Stop, for good. `rdi`'s low 32 bits are the exit code, passed on to
+/// whoever ran the task (a Windows program's `ExitProcess`). Does not
+/// return.
 pub const SYS_EXIT: u64 = 12;
 /// Where one page of a memory capability is in physical memory, for telling
 /// a device. Needs WRITE. `rsi` is the page; the address comes back in `rdx`.
@@ -103,6 +105,18 @@ pub const SYS_ALLOC: u64 = 18;
 /// `r9`. A label of zero means the deadline came first. A deadline of zero
 /// looks and returns at once; `u64::MAX` waits for ever.
 pub const SYS_WAIT: u64 = 19;
+/// Seal a message with the sealer in `rdi`, in the first page of the memory
+/// in `rsi`, which must be held READ and WRITE. Needs WRITE on the sealer.
+/// `rdx` is the message's length; it is read from byte [`seal::OVERHEAD`]
+/// of the page on. The sealed message, [`seal::OVERHEAD`] bytes longer,
+/// replaces it from byte 0, and its length comes back in `rdx`.
+pub const SYS_SEAL: u64 = 20;
+/// Undo `SYS_SEAL`: the sealed message is from byte 0, `rdx` long, and what
+/// was sealed comes back from byte [`seal::OVERHEAD`], its length in `rdx`.
+/// Needs READ on the sealer. Fails with [`error::FORGED`], and the page's
+/// first `rdx` bytes zeroed, if the message was changed or another sealer
+/// sealed it.
+pub const SYS_UNSEAL: u64 = 21;
 
 /// Slot argument meaning "nowhere".
 ///
@@ -148,6 +162,11 @@ pub mod error {
     pub const NO_SPACE: u64 = 9;
     /// The capability is good and the request is not.
     pub const INVALID: u64 = 10;
+    /// A sealed message that does not check out: changed, cut short, or
+    /// sealed by someone else.
+    pub const FORGED: u64 = 11;
+    /// The secure core is not there to ask.
+    pub const UNAVAILABLE: u64 = 12;
 }
 
 /// What a capability points at, as `SYS_IDENTIFY` reports it in bits 8 and
@@ -167,6 +186,17 @@ pub mod kind {
     pub const IO_PORTS: u8 = 12;
     pub const POOL: u8 = 13;
     pub const WINDOW: u8 = 14;
+    pub const SEALER: u8 = 15;
+}
+
+/// Sealed messages, as `SYS_SEAL` writes them: the nonce, the tag, then the
+/// ciphertext.
+pub mod seal {
+    /// Bytes before the message: a 12-byte nonce and a 16-byte tag.
+    pub const OVERHEAD: usize = 28;
+    /// The longest message one call seals: what the secure core's mailbox
+    /// carries.
+    pub const MOST: usize = 4032;
 }
 
 /// What every desktop program is handed, in the same slots, and what it may
@@ -187,6 +217,21 @@ pub mod app {
     /// For the terminal only: the files packed from `root/` at build time,
     /// a ustar archive, as a read-only blob.
     pub const FILES: usize = 6;
+    /// For Settings, Control Center and the menu only: a send-only endpoint
+    /// to the desktop shell, which takes the calls that reach past the
+    /// caller's own windows -- the look, other apps' windows, notifications.
+    pub const SHELL: usize = 7;
+    /// For Settings and the lock screen only: a sealer, with a key of the
+    /// program's own that never leaves the secure core.
+    pub const SEAL: usize = 8;
+    /// Where the terminal's `win`, and Files opening a Windows program,
+    /// take its output endpoint (`corrode_rt::win`).
+    pub const PROGRAM: usize = 9;
+    /// For the programs given the files (the terminal and Files) only: a
+    /// send-only endpoint to the window server's runner, which takes
+    /// [`window::RUN_TEXT`](super::window::RUN_TEXT) and
+    /// [`window::RUN`](super::window::RUN) as well as every window call.
+    pub const RUNNER: usize = 10;
 
     /// Pages in each program's pool.
     pub const POOL_PAGES: u64 = 256;
@@ -195,13 +240,32 @@ pub mod app {
 /// The window server: one call to open a window, and the events a window
 /// then receives.
 pub mod window {
-    /// A call: open a window `word 0` by `word 1` pixels. Word 2 is 1 for a
+    /// A call: open a window `word 0` by `word 1` pixels, titled with the
+    /// up to eight ASCII bytes of word 3, little-endian. Word 2 is 1 for a
     /// panel docked along the top of the screen -- as wide as the screen,
     /// whatever was asked, with no title bar and never covered. The answer
     /// carries the window's capability and says its size in words 0 and 1.
     pub const OPEN: u64 = 60;
     pub const OPENED: u64 = 61;
+    /// Flags, in word 2 of `OPEN`.
     pub const DOCKED: u64 = 1;
+    /// The top byte of each pixel says how transparent it is: 0 opaque,
+    /// 255 not there. A translucent window is drawn over glass where the
+    /// desktop has it, so a panel can be a pane rather than a slab.
+    pub const TRANSLUCENT: u64 = 2;
+    /// An `OPEN` flag: the program can draw at any size, so the desktop
+    /// may resize the window -- zoom fills the screen with it -- and says
+    /// so with [`RESIZE`].
+    pub const RESIZABLE: u64 = 4;
+    /// A popover: no title bar, under the right-hand end of the menu bar,
+    /// and told to close when anything else is clicked.
+    pub const POPOVER: u64 = 8;
+    /// A cover: the whole screen, above everything, with every key and
+    /// click while it is up. The lock screen is one.
+    pub const COVER: u64 = 16;
+    /// With POPOVER: a context menu, placed at the pointer where the
+    /// desktop was right-clicked instead of under the menu bar.
+    pub const MENU: u64 = 32;
 
     /// A key, while this window has the keyboard. Words as `ps2::LABEL_KEY`.
     pub const KEY: u64 = 62;
@@ -210,10 +274,118 @@ pub mod window {
     pub const BUTTON: u64 = 63;
     /// The window gained the keyboard (word 0 is 1) or lost it (0).
     pub const FOCUS: u64 = 64;
+    /// The close button on the window's title bar was clicked. A program
+    /// that wants to go should exit; its window goes with it. One that
+    /// ignores this keeps its window.
+    pub const CLOSE: u64 = 65;
+    /// The desktop's look, in the four words `corrode-theme` packs it
+    /// into. Sent when a window opens and whenever the look changes.
+    pub const THEME: u64 = 66;
+    /// To the window server: make this the desktop's look, in the same four
+    /// words as [`THEME`]. Every window is told, and the desktop restyles
+    /// itself. Answered with word 0 zero.
+    pub const SET_THEME: u64 = 67;
+    /// To docked windows: the window with the keyboard is now the one
+    /// titled word 0 (its eight ASCII bytes, little-endian), or none if 0.
+    /// What the menu bar shows as the app in front.
+    pub const ACTIVE: u64 = 68;
+    /// The window is now word 0 by word 1 pixels, `width * 4` bytes a row,
+    /// in the same mapping. Redraw all of it. Only to resizable windows.
+    pub const RESIZE: u64 = 69;
+    /// To docked windows: the wall clock. Word 0 is seconds since 1970 UTC
+    /// at the monotonic nanosecond in word 1; the time after that is that
+    /// plus how far the monotonic clock has run.
+    pub const CLOCK: u64 = 70;
+    /// The wheel turned over a window: word 0 is notches, toward the person
+    /// positive, as i64; words 1 and 2 where the pointer is in the window.
+    pub const SCROLL: u64 = 71;
+    /// To Files: show this file. The path is the four words' 32 bytes,
+    /// little-endian, NUL-padded; a longer path is not sent.
+    pub const REVEAL: u64 = 72;
+    /// A call: show a notification saying up to 32 bytes of ASCII, the four
+    /// words little-endian and NUL-padded, under the caller's window title.
+    /// The answer's word 0 is 0.
+    pub const NOTIFY: u64 = 73;
+    /// Ask for a recent notification: word 0 which (0 the newest), word 1
+    /// which part. Part 0 answers how many there are, the sender's title
+    /// (8 bytes) and how many seconds ago it came; part 1 its text, 32
+    /// bytes. Past the last, every word is zero but the count. Part 2
+    /// clears the list.
+    pub const HISTORY: u64 = 74;
+    /// To a popover: the pointer is over it, at x, y from its corner.
+    pub const HOVER: u64 = 75;
+    /// Ask what was last right-clicked: the kind (0 the desktop, 1 a dock
+    /// icon), the launcher's number for its program, whether it is
+    /// running, and its window title (8 bytes).
+    pub const CONTEXT: u64 = 76;
+    /// Close every window titled word 0 (8 bytes): Quit, from the dock.
+    /// Answers how many were asked to close.
+    pub const QUIT: u64 = 77;
+    /// Set what the caller's windows say after their title, as a terminal
+    /// names its folder: up to 24 bytes in words 0-2, unused ones zero.
+    pub const SUBTITLE: u64 = 78;
+    /// The windows titled word 0, for a dock icon's menu: word 1 picks
+    /// which. Answers the count, then that one's subtitle in words 1-3.
+    pub const LIST: u64 = 79;
+    /// Bring the window `LIST` would name (title in word 0, which in word
+    /// 1) to the front, and back from the dock if it was minimized.
+    pub const RAISE: u64 = 80;
+    /// The answer to a call the window server's own endpoint does not take:
+    /// one only the shell endpoint does, from a program that lacks it.
+    pub const DENIED: u64 = 81;
+    /// A call, from the lock screen and only it -- from anyone else the
+    /// answer is always no -- is this the passcode? Words 0..4 are its up
+    /// to 32 ASCII characters, little-endian, NUL-padded. All four zero
+    /// asks only whether there is a passcode at all, which costs no try
+    /// (a passcode is never empty). The
+    /// answer's word 0 is 1 for yes (or for no passcode set) and 0 for no;
+    /// word 1 is how many seconds until another try is taken, after too
+    /// many wrong ones.
+    pub const UNLOCK: u64 = 82;
+    /// A call: make the caller's popover word 0 by word 1 pixels, as
+    /// Control Center does when it has more to show. Only a popover, and
+    /// only its own: other windows are sized by the person. The answer's
+    /// word 0 is 1 if it will be; the window then hears [`RESIZE`].
+    pub const GROW: u64 = 83;
+    /// To Control Center: a notification was just posted, so the list it
+    /// shows is out of date. Nothing in the words; ask again.
+    pub const NOTIFIED: u64 = 84;
+    /// A call, from Settings and only it: is this, in words 0..4 as for
+    /// [`UNLOCK`], the passcode? The first step of changing it, under the
+    /// same limit on tries. The answer's word 0 is 1 for yes; word 1 the
+    /// seconds to wait after too many wrong tries; word 2 is 1 if there is
+    /// no vault, whose passcode is the only one that can be changed (the
+    /// boot medium's desktop.conf cannot be written).
+    pub const PASSCODE_CHECK: u64 = 85;
+    /// A call, from Settings and only it, within a minute of a yes to
+    /// [`PASSCODE_CHECK`] from the same task: make words 0..4 the
+    /// passcode. The vault is sealed again under it on the disk. The
+    /// answer's word 0 is 1 if it was.
+    pub const PASSCODE_SET: u64 = 86;
+    /// On the runner's endpoint ([`app::RUNNER`](super::app::RUNNER))
+    /// only: run a Windows program from the files, as the text sent before
+    /// it with [`RUN_TEXT`] says: its absolute
+    /// path, a line feed, and its arguments, quoted as on Windows. Its
+    /// view is its own folder alone, and `GetCommandLineW` gives it
+    /// `C:\NAME ARGUMENTS`.
+    /// The answer's word 0 is 1 if it started, with the program's output
+    /// endpoint to receive on: [`log`](super::log) messages, then
+    /// [`log::END`](super::log::END). Otherwise word 1 is a Windows error
+    /// number (2, the file is not there; 5, not on the runner's endpoint;
+    /// 193, `ERROR_BAD_EXE_FORMAT`).
+    pub const RUN: u64 = 87;
+    /// On the runner's endpoint only: up to 32 more bytes of the text for
+    /// the next [`RUN`], in the four words, zero-padded. Word 0 of the
+    /// answer is 1 if they were taken, 0 if the text would pass
+    /// [`RUN_TEXT_MOST`] or this is not the runner's endpoint.
+    pub const RUN_TEXT: u64 = 88;
+    pub const RUN_TEXT_MOST: usize = 2048;
+    /// The calls only the shell endpoint takes.
+    pub const SHELL_ONLY: [u64; 6] = [SET_THEME, QUIT, LIST, RAISE, HISTORY, CONTEXT];
 
     /// Most a window may be, either way.
-    pub const MAX_WIDTH: u32 = 1024;
-    pub const MAX_HEIGHT: u32 = 768;
+    pub const MAX_WIDTH: u32 = 1920;
+    pub const MAX_HEIGHT: u32 = 1200;
 }
 
 /// The launcher: start one of the programs the system was booted with.
@@ -223,6 +395,15 @@ pub mod launcher {
     pub const LAUNCH: u64 = 70;
     pub const LAUNCHED: u64 = 71;
     pub const TERMINAL: u64 = 1;
+    pub const SETTINGS: u64 = 2;
+    pub const ABOUT: u64 = 3;
+    pub const FILES: u64 = 4;
+    /// Control Center, the menu bar's quick settings.
+    pub const CONTROL: u64 = 5;
+    /// The lock screen.
+    pub const LOCK: u64 = 6;
+    /// The desktop's right-click menu.
+    pub const MENU: u64 = 7;
 }
 
 /// Rights, as bits: in the low byte of what `SYS_IDENTIFY` reports, and as
@@ -254,6 +435,20 @@ pub mod layout {
 pub mod log {
     pub const TEXT: u64 = 1;
     pub const LINE: u64 = 2;
+    /// The kernel, to whoever reads a program's output: it has ended, after
+    /// its last line. Word 0 says how: [`END_ENDED`], [`END_FAULTED`],
+    /// [`END_STOPPED`] or [`END_RUNNING`]; word 1 is then its exit code, or
+    /// the exception vector it faulted on. The log itself ignores it.
+    pub const END: u64 = 3;
+    /// It exited by itself, with the exit code in word 1.
+    pub const END_ENDED: u64 = 0;
+    /// It was still running when the kernel stopped waiting, and could not
+    /// be stopped: it was waiting in the kernel.
+    pub const END_RUNNING: u64 = 1;
+    /// It was still running at the deadline, and the kernel stopped it.
+    pub const END_STOPPED: u64 = 2;
+    /// It faulted, on the exception vector in word 1, and was stopped.
+    pub const END_FAULTED: u64 = 3;
     /// Bytes in one message.
     pub const CAPACITY: usize = 32;
 }
@@ -285,6 +480,126 @@ pub mod ps2 {
     /// The driver is up: word 0 is 1 if a keyboard answered, word 1 is 1 if a
     /// mouse did.
     pub const LABEL_READY: u64 = 52;
+    /// A pointer that knows where it is, not how far it went -- a tablet:
+    /// words 0 and 1 are the position across and down, each from 0 to
+    /// [`POINTER_AT_MAX`] for the far edge; word 2 the buttons held; word 3
+    /// the wheel, as for [`LABEL_POINTER`].
+    pub const LABEL_POINTER_AT: u64 = 53;
+    pub const POINTER_AT_MAX: u64 = 0x7fff;
+}
+
+/// Verdigris: Windows programs (see `verdigris/DESIGN.md`).
+pub mod verdigris {
+    /// Where Verdigris's kernel32 is linked, with its export table at this
+    /// very address. A Windows program's image must end below it.
+    pub const KERNEL32_BASE: u64 = 0x0800_0000;
+    /// A Windows program's first capability: the log, where its standard
+    /// output and error go.
+    pub const LOG: usize = 0;
+    /// Its view of the files, send-only: [`view`](super::view)'s calls.
+    /// Absent, the program has no files at all.
+    pub const VIEW: usize = 1;
+    /// The page it shares with its view, for paths and what is read.
+    pub const PAGE: usize = 2;
+}
+
+/// A Windows program's view of the files (`verdigris/DESIGN.md` section 4),
+/// served by `fileview`, one task per view. The program holds the view's
+/// endpoint send-only and one page shared with the service; the service
+/// holds the real tree and the list of what the program may see, which
+/// the program never holds.
+///
+/// Every answer is `[error, value, 0, 0]` under the call's own label
+/// (`NEXT`'s has two values more):
+/// `error` is a Windows error code (0 for none), as `GetLastError` gives
+/// it; what is not in the view is `ERROR_FILE_NOT_FOUND` (2) or
+/// `ERROR_PATH_NOT_FOUND` (3), as for a name that does not exist.
+pub mod view {
+    /// The endpoint it receives on.
+    pub const SERVE: usize = 0;
+    /// The real files: the archive, a blob.
+    pub const TREE: usize = 1;
+    /// The page it shares with the program.
+    pub const PAGE: usize = 2;
+    /// What the program may see, read-only: its own folder on the first
+    /// line, then one allowed path a line, `NUL` after the last.
+    pub const SPEC: usize = 3;
+    pub const LOG: usize = 4;
+    /// Where each call's reply capability goes.
+    pub const REPLY: usize = 5;
+    /// Memory to buy its heap from, and where the heap's capability goes.
+    pub const POOL: usize = 6;
+    pub const HEAP: usize = 7;
+    pub const HEAP_PAGES: usize = 32;
+
+    /// `[len, write, disposition, 0]`, the path in UTF-8 in the page's
+    /// first `len` bytes: open a file, as `CreateFileW`. `write` is 1 if
+    /// any right to change it was asked for. Answers the handle.
+    pub const OPEN: u64 = 1;
+    /// `[handle, len, 0, 0]`: up to `len` bytes (at most a page) from where
+    /// the handle is, into the page, and move on. Answers how many; 0 at
+    /// the end.
+    pub const READ: u64 = 2;
+    /// `[handle, 0, 0, 0]`: the file's size in bytes.
+    pub const SIZE: u64 = 3;
+    /// `[handle, 0, 0, 0]`: close it.
+    pub const CLOSE: u64 = 4;
+    /// The program is ending, sent, not called: the service ends too.
+    pub const DONE: u64 = 5;
+    /// `[len, 0, 0, 0]`, a path whose last name is a pattern (`*`, `?`) in
+    /// the page, as `FindFirstFileW` takes it: search, and answer a
+    /// handle to what was found. `CLOSE` closes it.
+    pub const SEARCH: u64 = 6;
+    /// `[handle, 0, 0, 0]`: the next entry a search found, its name in
+    /// UTF-8 in the page. Answers `[0, name's length, size, 1 if a
+    /// directory]`, or `ERROR_NO_MORE_FILES` (18) after the last.
+    pub const NEXT: u64 = 7;
+    /// `[0, 0, 0, 0]`: the current directory, as a `C:\` path in the
+    /// page. Answers its length. It starts as the program's own folder.
+    pub const GET_DIR: u64 = 8;
+    /// `[len, 0, 0, 0]`, a path in the page: make it the current
+    /// directory, which relative paths in every call start from.
+    pub const SET_DIR: u64 = 9;
+    /// `[len, 0, 0, 0]`, a path in the page: replaced by its full `C:\`
+    /// form, as `GetFullPathNameW` gives it. Answers the length. Asks
+    /// nothing of the files: whether the name is there is not said.
+    pub const FULL_PATH: u64 = 10;
+
+    /// Files a program may have open at once.
+    pub const HANDLES: usize = 16;
+    /// The longest path, in UTF-8 bytes.
+    pub const MOST_PATH: usize = 2048;
+    /// `ERROR_INVALID_HANDLE`, `ERROR_TOO_MANY_OPEN_FILES`,
+    /// `ERROR_FILENAME_EXCED_RANGE`: the service's own refusals.
+    pub const INVALID_HANDLE: u64 = 6;
+    pub const TOO_MANY_OPEN: u64 = 4;
+    pub const NAME_TOO_LONG: u64 = 206;
+    pub const NO_MORE_FILES: u64 = 18;
+}
+
+/// The USB host controller's driver, `xhci`: an xHCI controller, the
+/// keyboards and pointers on it, and what they say passed on to the
+/// compositor in the same messages as [`ps2`]'s.
+pub mod xhci {
+    /// The controller's configuration space.
+    pub const DEVICE: usize = 0;
+    /// Its registers, BAR 0.
+    pub const BAR: usize = 1;
+    /// Its interrupt (MSI-X or MSI message 0, on interrupter 0).
+    pub const IRQ: usize = 2;
+    /// Memory for its rings, contexts and buffers: [`MEMORY_PAGES`] pages.
+    pub const MEMORY: usize = 3;
+    /// A send-only endpoint to the compositor: [`ps2`]'s labels.
+    pub const EVENTS: usize = 4;
+    /// A send-only endpoint to the log.
+    pub const LOG: usize = 5;
+
+    pub const MEMORY_PAGES: usize = 32;
+
+    /// The PCI class of an xHCI controller: serial bus, USB, xHCI.
+    pub const CLASS: u8 = 0x0c;
+    pub const SUBCLASS: u8 = 0x03;
+    pub const PROG_IF: u8 = 0x30;
 }
 
 /// The boot-time conversation between the kernel and the `edu` driver, which
@@ -361,6 +676,45 @@ pub mod blob {
 /// rectangles to show, written into memory the two share; the driver draws
 /// them with the software renderer and has its device show the result. To
 /// the compositor it is a `Renderer` like any other.
+/// The settings store: a driver for a virtio block device, which keeps the
+/// desktop's theme in the disk's first sector. The desktop is its only
+/// client.
+pub mod store {
+    /// Where the driver's capabilities are.
+    ///
+    /// The endpoint the desktop calls, receive-only.
+    pub const SERVE: usize = 0;
+    pub const LOG: usize = 1;
+    pub const DEVICE: usize = 2;
+    /// Memory for the queue, its requests and one sector:
+    /// [`QUEUE_PAGES`] pages.
+    pub const QUEUE: usize = 3;
+    /// The device's memory BARs: BAR `n` is at `BARS + n`, if it has one.
+    pub const BARS: usize = 4;
+    /// Where the capability to answer a call lands.
+    pub const REPLY: usize = 10;
+    pub const QUEUE_PAGES: usize = 3;
+
+    /// The modern (virtio 1) block device's id, which QEMU gives with
+    /// `disable-legacy=on`, and the transitional one it gives by default.
+    pub const VIRTIO_BLK: u16 = 0x1042;
+    pub const VIRTIO_BLK_TRANSITIONAL: u16 = 0x1001;
+
+    /// Read the kept theme. The answer's words are its four words, and its
+    /// label [`crate::STATUS_OK`]; or a status of `Empty` if the disk has
+    /// none, or of why it could not be read.
+    pub const LOAD: u64 = 90;
+    /// Keep the theme in words 0..4. The answer's label is the status.
+    pub const SAVE: u64 = 91;
+    /// Read the sector numbered in word 0 into the queue memory's sector
+    /// page, where the kernel, which made that memory, reads it. The
+    /// answer's label is the status. For the vault (`corrode_vault`).
+    pub const READ: u64 = 92;
+    /// Write the queue memory's sector page, which the kernel filled, to
+    /// the sector numbered in word 0. The answer's label is the status.
+    pub const WRITE: u64 = 93;
+}
+
 pub mod gpu {
     /// Where the driver's capabilities are.
     ///
@@ -381,7 +735,12 @@ pub mod gpu {
     pub const BARS: usize = 8;
     /// Where the capability to answer a call lands.
     pub const REPLY: usize = 14;
-    /// Where the `n`th surface the kernel hands over lands.
+    /// Memory for the glass's scratch and the wallpaper's pixels:
+    /// [`SCRATCH_PAGES`] pages. Optional: without it, glass is a plain veil
+    /// and there is no wallpaper.
+    pub const SCRATCH: usize = 15;
+    /// Where the `n`th surface the kernel hands over lands: one slot for
+    /// each of the renderer's surfaces, 16 up to 47.
     pub const SURFACES: usize = 16;
 
     pub const QUEUE_PAGES: usize = 16;
@@ -389,7 +748,12 @@ pub mod gpu {
     /// Enough for 1920 by 1080.
     pub const SCREEN_PAGES: usize = 2048;
     pub const ATLAS_WIDTH: u32 = 1024;
-    pub const ATLAS_HEIGHT: u32 = 512;
+    /// Rows 512 to 767 are the dock's icons drawn at their magnified size,
+    /// and the 256 below them more windows' titles.
+    pub const ATLAS_HEIGHT: u32 = 1024;
+    /// Three screens for the glass, a little for its line buffer, and one
+    /// for the wallpaper.
+    pub const SCRATCH_PAGES: usize = 4 * SCREEN_PAGES + 4;
 
     /// Labels of the kernel's calls. The answer's label is zero for done,
     /// or an error code.
@@ -407,6 +771,12 @@ pub mod gpu {
     pub const UPLOAD: u64 = 4;
     /// Word 0 rectangles are in shared memory: show them.
     pub const PRESENT: u64 = 5;
+    /// Paint the wallpaper of the theme in the four words, and show it as
+    /// the renderer's last surface. Needs [`SCRATCH`].
+    pub const WALLPAPER: u64 = 6;
+    /// Stop showing surface word 0 and let go of its capability: its
+    /// window has closed, and the kernel will retire it.
+    pub const FORGET: u64 = 7;
 
     /// The PCI identity of a modern virtio GPU.
     pub const VIRTIO_VENDOR: u16 = 0x1af4;

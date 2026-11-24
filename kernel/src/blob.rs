@@ -62,12 +62,13 @@ pub fn map(slot: CapPtr) -> Result<Mapped, CapError> {
         let va = address + page * PAGE;
         // The module starts on a page boundary, so this is its own frame. The
         // tail of the last page is whatever the bootloader left after the
-        // file, and the length returned says where the file ends.
-        if !space.map_4k(
-            va,
-            module.physical + page * PAGE,
-            paging::USER | paging::NO_EXECUTE,
-        ) {
+        // file, and the length returned says where the file ends. A file the
+        // kernel made is in a memory object's frames instead.
+        let frame = match module.memory {
+            Some(object) => crate::memory::frame_of(object, page as usize).ok_or(CapError::Stale)?,
+            None => module.physical + page * PAGE,
+        };
+        if !space.map_4k(va, frame, paging::USER | paging::NO_EXECUTE) {
             return Err(CapError::NoSpace);
         }
         x86_64::flush_page(va);

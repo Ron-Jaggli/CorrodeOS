@@ -21,11 +21,17 @@
 
 #![cfg_attr(not(test), no_std)]
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
 pub mod anim;
 pub mod blend;
 pub mod damage;
+pub mod glass;
 pub mod scene;
 pub mod software;
+#[cfg(target_arch = "x86_64")]
+pub mod sse;
 pub mod wire;
 
 /// How pixels are packed in a surface's memory.
@@ -182,6 +188,18 @@ pub enum Command {
     /// into video memory that read is the expensive part, which is one of the
     /// two reasons a back buffer exists.
     BlendRect { rect: Rect, color: Color, alpha: u8 },
+    /// [`Command::Mask`], stretched: the block `src` of the atlas drawn to
+    /// fill `rect`, read between its pixels so it stays smooth. For icons
+    /// that grow, as the dock's do under the pointer.
+    ///
+    /// A `src` reaching outside the atlas is clipped to it, and what is
+    /// left is stretched over `rect`.
+    ScaledMask {
+        rect: Rect,
+        src: Rect,
+        color: Color,
+        alpha: u8,
+    },
     /// Put a colour through a stencil: a block of the mask atlas, where each
     /// byte says how much of its pixel to cover.
     ///
@@ -212,11 +230,49 @@ pub enum Command {
     ///
     /// Surface pixels are `0x00RRGGBB` whatever the screen's own layout is.
     /// A client draws without knowing what it is being shown on.
+    ///
+    /// A `translucent` surface uses the top byte too, as how transparent the
+    /// pixel is: 0 opaque, as every other surface's pixels are, and 255 not
+    /// there at all. That is what lets a panel be drawn over glass.
     Image {
         x: i32,
         y: i32,
         src: Rect,
         surface: u32,
+        alpha: u8,
+        translucent: bool,
+        /// Round the lower two corners to this radius. A window's body sits
+        /// under its title bar, so only its bottom corners are its own.
+        radius: u8,
+    },
+    /// As [`Command::Image`], but the whole surface stretched (or shrunk)
+    /// to fill `rect`, read smoothly between its pixels: a window zooming
+    /// in as it opens.
+    ScaledImage {
+        rect: Rect,
+        surface: u32,
+        alpha: u8,
+        translucent: bool,
+        /// Round the lower two corners of `rect` to this radius.
+        radius: u8,
+    },
+    /// The soft shadow of a rounded rectangle: `rect` is the shape, and the
+    /// shadow spreads `blur` pixels beyond it, at most `alpha` dark. Nothing
+    /// is drawn inside the shape itself, so a shadow never darkens a
+    /// translucent window it is under.
+    Shadow {
+        rect: Rect,
+        radius: u16,
+        blur: u8,
+        alpha: u8,
+    },
+    /// A pane of liquid glass over whatever is already inside `rect`: see
+    /// [`glass`]. Like [`Command::BlendRect`] it reads the target, and
+    /// further: up to [`glass::Glass::reach`] pixels around the rectangle,
+    /// which must be painted before it is.
+    Glass {
+        rect: Rect,
+        glass: glass::Glass,
         alpha: u8,
     },
     /// Confine every later command in this list, `Clear` included, to `rect`.

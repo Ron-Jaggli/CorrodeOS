@@ -25,9 +25,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use corrode_input::Key;
+use corrode_input::{modifier, Key};
 use corrode_line::{Editor, Outcome};
-use corrode_rt::abi::{app, kind, rights};
+use corrode_rt::abi::{app, kind, rights, window};
 use corrode_rt::println;
 use corrode_shell::{About, Fs, Host, Output, Shell};
 use corrode_ui::{line_height, width_of, Event, Rgb, Style, Window};
@@ -60,7 +60,7 @@ const SLOTS: usize = 16;
 
 /// The terminal's own commands, how to call them, and what they do. The
 /// shell lists them in `help` after its own.
-const COMMANDS: [About; 8] = [
+const COMMANDS: [About; 13] = [
     ("clear", "", "start with an empty window (or Ctrl+L)"),
     ("history", "", "the lines typed so far"),
     ("uptime", "", "time since the machine started"),
@@ -68,7 +68,12 @@ const COMMANDS: [About; 8] = [
     ("uname", "[-asrm]", "what system this is"),
     ("sleep", "SECONDS", "wait; Ctrl+C to stop early"),
     ("caps", "", "the capabilities this terminal holds"),
+    ("notify", "TEXT", "show TEXT as a notification"),
+    ("quit", "APP", "try to close APP's windows (the terminal may not)"),
+    ("seal", "", "try to seal with the secure core (the terminal may not)"),
+    ("win", "PATH [ARGS]", "run a Windows program; it sees its own folder alone"),
     ("about", "", "what this is"),
+    ("exit", "", "close this terminal"),
 ];
 
 struct Terminal {
@@ -84,6 +89,9 @@ struct Terminal {
     queued: Vec<String>,
     shell: Shell,
     fs: Fs<'static>,
+    /// How many lines back from the newest the view is scrolled: 0 follows
+    /// the output.
+    back: usize,
 }
 
 impl Terminal {
@@ -109,19 +117,44 @@ impl Terminal {
         }
     }
 
+    /// Rows of output above the prompt.
+    fn shown(&self) -> usize {
+        let rows = ((self.window.height as i32 - 2 * MARGIN) / self.line_height as i32).max(1);
+        rows as usize - 1
+    }
+
+    /// Scroll back by `by` lines (forward for negative), within what is
+    /// kept.
+    fn scroll(&mut self, by: i64) {
+        let most = self.lines.len().saturating_sub(self.shown());
+        self.back = (self.back as i64 + by).clamp(0, most as i64) as usize;
+        println!("{} lines back", self.back);
+    }
+
     fn draw(&mut self) {
         let (width, height) = (self.window.width, self.window.height);
         self.window.fill(0, 0, width, height, BACKGROUND);
-        let rows = ((height as i32 - 2 * MARGIN) / self.line_height as i32).max(1) as usize;
 
-        // The prompt is the last row; the newest lines fill the rest.
-        let shown = rows - 1;
-        let first = self.lines.len().saturating_sub(shown);
+        // The prompt is the last row; the newest lines fill the rest, or
+        // older ones when scrolled back.
+        let shown = self.shown();
+        self.back = self.back.min(self.lines.len().saturating_sub(shown));
+        let last = self.lines.len() - self.back;
+        let first = last.saturating_sub(shown);
         let mut y = MARGIN;
-        for index in first..self.lines.len() {
+        for index in first..last {
             let (text, color) = &self.lines[index];
             self.window.text(MARGIN, y, text, STYLE, *color);
             y += self.line_height as i32;
+        }
+        // While scrolled back, a thin scroller says where, as macOS's
+        // overlay one does.
+        if self.back > 0 {
+            let total = self.lines.len();
+            let length = height as i32 - 2 * MARGIN;
+            let thumb = (length as i64 * shown as i64 / total as i64).max(20) as i32;
+            let at = MARGIN + ((length - thumb) as i64 * first as i64 / (total - shown) as i64) as i32;
+            self.window.rounded(width as i32 - 7, at, 4, thumb as u32, 2, 0x8080_8088);
         }
         // A command is running: no prompt until it is done.
         if self.busy_until.is_some() {
@@ -149,6 +182,16 @@ impl Terminal {
     }
 
     fn key(&mut self, key: Key, text: Option<char>, modifiers: u8) {
+        // Shift+Page Up and Down page through what has scrolled away; any
+        // other key brings the prompt back into view first.
+        if modifiers & modifier::SHIFT != 0 && matches!(key, Key::PAGE_UP | Key::PAGE_DOWN) {
+            let page = self.shown().saturating_sub(1).max(1) as i64;
+            self.scroll(if key == Key::PAGE_UP { page } else { -page });
+            return;
+        }
+        if !is_modifier(key) {
+            self.back = 0;
+        }
         match self.editor.key(key, text, modifiers) {
             Outcome::Submit(line) if self.busy_until.is_some() => self.queued.push(line),
             Outcome::Submit(line) => self.run(&line),
@@ -160,7 +203,7 @@ impl Terminal {
             }
             Outcome::ClearScreen => self.lines.clear(),
             Outcome::Complete => {
-                let names = self.shell.names(&System::new(&[]));
+                let names = self.shell.names(&System::new(&[], "/"));
                 let choices = self.editor.complete(&names);
                 if !choices.is_empty() {
                     self.say(&choices.join("  "), QUIET);
@@ -183,9 +226,18 @@ impl Terminal {
     fn run(&mut self, line: &str) {
         println!("$ {}", line);
         self.say(&format!("{PROMPT_TEXT}{line}"), QUIET);
-        let mut system = System::new(self.editor.history());
+        let folder = String::from(self.shell.cwd());
+        let mut system = System::new(self.editor.history(), &folder);
         let printed = self.shell.run(line, &self.fs, &mut system);
-        let System { clear, sleep, .. } = system;
+        if self.shell.cwd() != folder {
+            corrode_ui::subtitle(self.shell.cwd());
+        }
+        let System {
+            clear, sleep, exit, ..
+        } = system;
+        if exit {
+            close();
+        }
         if clear {
             self.lines.clear();
         }
@@ -205,16 +257,21 @@ impl Terminal {
 /// here for it to do once the line has run.
 struct System<'a> {
     history: &'a [String],
+    /// Where relative paths start, for `win`.
+    cwd: &'a str,
     clear: bool,
     sleep: Option<u64>,
+    exit: bool,
 }
 
 impl<'a> System<'a> {
-    fn new(history: &'a [String]) -> Self {
+    fn new(history: &'a [String], cwd: &'a str) -> Self {
         System {
             history,
+            cwd,
             clear: false,
             sleep: None,
+            exit: false,
         }
     }
 }
@@ -279,10 +336,72 @@ impl Host for System<'_> {
                     1
                 }
             },
+            "exit" => {
+                self.exit = true;
+                0
+            }
             "caps" => {
                 caps(out);
                 0
             }
+            "notify" => {
+                let text = args[1..].join(" ");
+                if text.is_empty() {
+                    out.error("notify: say what");
+                    1
+                } else if corrode_ui::notify(&text).is_err() {
+                    out.error("notify: the desktop did not answer");
+                    1
+                } else {
+                    0
+                }
+            }
+            // The desktop's calls are not the terminal's to make: it holds
+            // no shell endpoint, and the window server's own refuses them.
+            // Both are tried, to show it.
+            "quit" => {
+                let Some(app_name) = args.get(1) else {
+                    out.error("quit: which app");
+                    return Some(1);
+                };
+                let mut word = [0u8; 8];
+                for (slot, byte) in word.iter_mut().zip(app_name.bytes()) {
+                    *slot = byte;
+                }
+                let message = corrode_rt::Message::new(window::QUIT, [u64::from_le_bytes(word), 0, 0, 0]);
+                match corrode_rt::call(app::SHELL, message, None) {
+                    Ok(_) => out.line("quit: the shell took it"),
+                    Err(error) => out.error(&format!("quit: no shell capability ({error:?})")),
+                }
+                match corrode_rt::call(app::WINDOWS, message, None) {
+                    Ok(answer) if answer.message.label == window::DENIED => {
+                        out.error("quit: the window server refused it")
+                    }
+                    Ok(_) => out.line("quit: the window server took it"),
+                    Err(error) => out.error(&format!("quit: {error:?}")),
+                }
+                1
+            }
+            // Sealing is Settings' and the lock screen's: the terminal holds
+            // no sealer, and the kernel says so before it looks at anything
+            // else.
+            "seal" => {
+                match corrode_rt::seal(app::SEAL, app::HEAP, 0) {
+                    Ok(_) => out.line("seal: the secure core took it"),
+                    Err(error) => {
+                        println!("seal: refused ({error:?})");
+                        out.error(&format!("seal: no sealer ({error:?})"));
+                    }
+                }
+                1
+            }
+            "win" => match rest.first() {
+                None => {
+                    out.error("win: which program");
+                    1
+                }
+                Some(path) => win(&corrode_shell::fs::resolve(self.cwd, path), &rest[1..], out),
+            },
             "about" => {
                 out.line("CorrodeOS terminal: a ring 3 program holding a window,");
                 out.line("a pool of memory, the log and the boot medium's files,");
@@ -292,6 +411,26 @@ impl Host for System<'_> {
             _ => return None,
         })
     }
+}
+
+/// Go, and take the window with us: the window manager drops a window
+/// whose program has finished.
+fn is_modifier(key: Key) -> bool {
+    matches!(
+        key,
+        Key::LEFT_SHIFT
+            | Key::RIGHT_SHIFT
+            | Key::LEFT_CTRL
+            | Key::RIGHT_CTRL
+            | Key::LEFT_ALT
+            | Key::RIGHT_ALT
+            | Key::CAPS_LOCK
+    )
+}
+
+fn close() -> ! {
+    println!("closed");
+    corrode_rt::exit();
 }
 
 /// Every capability this terminal holds, a slot to a line.
@@ -315,6 +454,7 @@ fn caps(out: &mut Output) {
             kind::IO_PORTS => "i/o ports",
             kind::POOL => "pool",
             kind::WINDOW => "window",
+            kind::SEALER => "sealer",
             _ => "unknown",
         };
         let mut letters = String::new();
@@ -332,6 +472,8 @@ fn caps(out: &mut Output) {
             app::WINDOW => "this window",
             app::HEAP => "the heap",
             app::FILES => "the files",
+            app::SHELL => "the desktop shell",
+            app::SEAL => "sealing, by the secure core",
             _ => "",
         };
         out.line(format!("{slot:>3}  {letters}  {name}  {what}").trim_end());
@@ -427,7 +569,7 @@ fn main() {
         println!("no memory for a heap");
         corrode_rt::exit();
     }
-    let window = match Window::open(WIDTH, HEIGHT, false) {
+    let window = match Window::open_titled(WIDTH, HEIGHT, window::RESIZABLE, "Terminal") {
         Ok(window) => window,
         Err(error) => {
             println!("no window: {:?}", error);
@@ -444,7 +586,9 @@ fn main() {
         queued: Vec::new(),
         shell: Shell::new(),
         fs: files(),
+        back: 0,
     };
+    corrode_ui::subtitle(terminal.shell.cwd());
     terminal.say("CorrodeOS terminal", PROMPT);
     let motd = terminal.fs.get("/etc/motd").map(|motd| motd.data);
     match motd.map(String::from_utf8_lossy) {
@@ -470,6 +614,11 @@ fn main() {
                 modifiers,
             } => terminal.key(Key(key), text, modifiers),
             Event::Focus(focused) => terminal.focused = focused,
+            // Toward the person scrolls down, toward the newest.
+            Event::Scroll { notches, .. } => terminal.scroll(-notches as i64 * 3),
+            Event::Close => close(),
+            // Everything is laid out from the window's size each time.
+            Event::Resize { width, height } => println!("resized to {}x{}", width, height),
             Event::Timeout => match terminal.busy_until {
                 Some(until) if corrode_rt::now_ns() >= until => terminal.finish(),
                 _ => continue,
@@ -479,3 +628,102 @@ fn main() {
         terminal.draw();
     }
 }
+
+/// `win PATH ARGS`: run the Windows program at `PATH` in the files, with
+/// `ARGS` as its command line, and show what it writes, line by line,
+/// until it ends. The desktop starts it (`window::RUN`) seeing its own
+/// folder alone, and hands this terminal the endpoint its output goes to;
+/// the kernel says when it has ended, however it ended. One still
+/// running after ten seconds is stopped.
+fn win(path: &str, args: &[String], out: &mut Output) -> i32 {
+    use corrode_rt::win::{self, Ended, NotStarted};
+
+    // The path, a line feed, and the arguments as Windows would have them
+    // quoted.
+    let mut text = format!("{path}\n");
+    for (index, arg) in args.iter().enumerate() {
+        if index > 0 {
+            text.push(' ');
+        }
+        text.push_str(&windows_quoted(arg));
+    }
+    let name = corrode_shell::fs::name_of(path);
+    let mut line = String::new();
+    let mut lines = 0;
+    let ended = win::run(&text, |piece, ends| {
+        line.push_str(piece);
+        if ends {
+            println!("win: {name}: {line}");
+            out.line(&line);
+            line.clear();
+            lines += 1;
+        }
+    });
+    let ended = match ended {
+        Ok(ended) => ended,
+        Err(error @ NotStarted::Refused(_)) => {
+            println!("win: {path}: {}", error.why());
+            out.error(&format!("win: {path}: {}", error.why()));
+            return 1;
+        }
+        Err(NotStarted::NoAnswer(error)) => {
+            out.error(&format!("win: the desktop did not answer ({error:?})"));
+            return 1;
+        }
+        Err(error) => {
+            out.error(&format!("win: {}", error.why()));
+            return 1;
+        }
+    };
+    if !line.is_empty() {
+        out.line(&line);
+    }
+    match ended {
+        Ended::Exited(0) => {
+            println!("win: {name} ended after {lines} lines");
+            0
+        }
+        Ended::Exited(code) => {
+            println!("win: {name} ended after {lines} lines, exit code {code}");
+            out.error(&format!("win: {name} ended after {lines} lines, exit code {code}"));
+            1
+        }
+        Ended::Faulted(vector) => {
+            let (what, code) = win::exception(vector);
+            println!("win: {name} faulted: {what} ({code:#x}), after {lines} lines");
+            out.error(&format!("win: {name} faulted: {what} ({code:#x})"));
+            1
+        }
+        Ended::StillRunning => {
+            out.error(&format!("win: {name} is still running; no more of it is shown"));
+            1
+        }
+        Ended::Stopped => {
+            println!("win: {name} ran 10 seconds and was stopped");
+            out.error(&format!("win: {name} ran 10 seconds and was stopped"));
+            1
+        }
+        Ended::Lost => {
+            out.error("win: its output was lost");
+            1
+        }
+    }
+}
+
+/// One argument as a Windows command line carries it: in quotes if it is
+/// empty or holds a space or tab, with a quote inside it after a `\`.
+fn windows_quoted(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return String::from(arg);
+    }
+    let mut quoted = String::from("\"");
+    for character in arg.chars() {
+        if character == '"' {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
+}
+

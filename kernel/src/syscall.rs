@@ -95,6 +95,7 @@ use crate::irq;
 use crate::memory;
 use crate::pci;
 use crate::ports;
+use crate::seal;
 use crate::surface;
 use crate::task;
 use crate::windows;
@@ -106,8 +107,8 @@ use corrode_render::Rect;
 pub use corrode_abi::{
     FROM_HARDWARE, NO_SLOT, STATUS_BAD_SYSCALL, STATUS_OK, SYS_ALLOC, SYS_CALL, SYS_CLOCK,
     SYS_COMMIT, SYS_CONFIG_READ, SYS_CONFIG_WRITE, SYS_COPY, SYS_DELETE, SYS_EXIT, SYS_IDENTIFY,
-    SYS_MAP, SYS_PHYSICAL, SYS_PORT_IN, SYS_PORT_OUT, SYS_RECV, SYS_REPLY, SYS_SEND, SYS_SLEEP,
-    SYS_WAIT, SYS_YIELD,
+    SYS_MAP, SYS_PHYSICAL, SYS_PORT_IN, SYS_PORT_OUT, SYS_RECV, SYS_REPLY, SYS_SEAL, SYS_SEND,
+    SYS_SLEEP, SYS_UNSEAL, SYS_WAIT, SYS_YIELD,
 };
 
 /// Every code selector seen entering this gate, OR-ed together.
@@ -354,6 +355,24 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
             Err(error) => frame.rax = error.code(),
         },
 
+        // The message is in a page of memory the caller holds, found through
+        // that capability: still no pointer from ring 3 is followed.
+        SYS_SEAL => match seal::seal(slot, frame.rsi as usize, frame.rdx) {
+            Ok(len) => {
+                frame.rax = STATUS_OK;
+                frame.rdx = len;
+            }
+            Err(error) => frame.rax = error.code(),
+        },
+
+        SYS_UNSEAL => match seal::unseal(slot, frame.rsi as usize, frame.rdx) {
+            Ok(len) => {
+                frame.rax = STATUS_OK;
+                frame.rdx = len;
+            }
+            Err(error) => frame.rax = error.code(),
+        },
+
         SYS_CLOCK => {
             frame.rax = STATUS_OK;
             frame.rdx = crate::time::now_ns();
@@ -367,7 +386,8 @@ pub fn dispatch(frame: &mut TrapFrame) -> *mut TrapFrame {
         }
 
         SYS_EXIT => {
-            task::finish_current();
+            // The code is the low 32 bits of rdi: a Windows exit code.
+            task::finish_current(task::Ending::Exited(frame.rdi as u32));
             return task::on_tick(frame as *mut TrapFrame);
         }
 

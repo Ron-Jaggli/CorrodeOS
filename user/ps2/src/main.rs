@@ -52,6 +52,8 @@ const CONFIG_TRANSLATE: u8 = 1 << 6;
 /// Device commands, and the byte a device answers one with.
 const SET_DEFAULTS: u8 = 0xf6;
 const ENABLE_REPORTING: u8 = 0xf4;
+const SET_RATE: u8 = 0xf3;
+const GET_ID: u8 = 0xf2;
 const ACK: u8 = 0xfa;
 
 /// How many times to look at the status register before giving up on it.
@@ -137,7 +139,16 @@ fn main() {
     controller.command(ENABLE_MOUSE);
     // A mouse starts silent. Defaults first, so a mouse some firmware left
     // in an odd mode is in the plain three-byte one, then ask it to talk.
-    let mouse = controller.to_mouse(SET_DEFAULTS) && controller.to_mouse(ENABLE_REPORTING);
+    let mouse = controller.to_mouse(SET_DEFAULTS);
+    // The IntelliMouse knock: sample rates 200, 100, 80 in a row, after
+    // which a mouse with a wheel says it is ID 3 and sends four bytes.
+    let wheel = mouse
+        && [200, 100, 80]
+            .iter()
+            .all(|rate| controller.to_mouse(SET_RATE) && controller.to_mouse(*rate))
+        && controller.to_mouse(GET_ID)
+        && controller.read() == Some(3);
+    let mouse = mouse && controller.to_mouse(ENABLE_REPORTING);
     controller.drain();
 
     // Interrupts on for both, and both ports' clocks running.
@@ -147,7 +158,11 @@ fn main() {
     println!(
         "keyboard {}, mouse {}",
         if keyboard { "up" } else { "not answering" },
-        if mouse { "up" } else { "not answering" }
+        match (mouse, wheel) {
+            (true, true) => "up with a wheel",
+            (true, false) => "up",
+            _ => "not answering",
+        }
     );
     let _ = send(
         EVENTS,
@@ -156,7 +171,7 @@ fn main() {
 
     let irq = Interrupt(IRQ);
     let mut keys = Keyboard::new();
-    let mut pointer = Mouse::new();
+    let mut pointer = if wheel { Mouse::with_wheel() } else { Mouse::new() };
     loop {
         if irq.wait().is_err() {
             println!("cannot wait for the interrupt; stopping");
@@ -182,7 +197,7 @@ fn main() {
                                 event.dx as i64 as u64,
                                 event.dy as i64 as u64,
                                 event.buttons as u64,
-                                0,
+                                event.wheel as i64 as u64,
                             ],
                         ),
                     );

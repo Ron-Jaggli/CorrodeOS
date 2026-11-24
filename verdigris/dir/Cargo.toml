@@ -1,0 +1,25 @@
+# dir.exe: a Windows program built by the Rust compiler and linked by
+# rust-lld, not written by hand. See src/main.rs and the Makefile's
+# DIR_EXE rule. Its own workspace: it is built for x86_64-pc-windows-msvc,
+# with `core` built from source, and is no part of the system's build.
+[package]
+name = "corrode-dir"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "dir"
+path = "src/main.rs"
+test = false
+bench = false
+
+[workspace]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"

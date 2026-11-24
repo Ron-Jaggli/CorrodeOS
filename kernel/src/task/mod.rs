@@ -18,10 +18,11 @@
 pub mod stack;
 pub mod user;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
-use crate::arch::x86_64::{self, cpu, cpu::MAX_CPUS, gdt, idt::TrapFrame, vectors};
+use crate::arch::x86_64::{self, cpu, cpu::MAX_CPUS, fpu::FpuState, gdt, idt::TrapFrame, vectors};
 use crate::cap::CSpace;
 use crate::sync::SpinLock;
 
@@ -51,6 +52,9 @@ pub struct Task {
     pub state: State,
     /// Stack pointer at which this task's `TrapFrame` sits while suspended.
     saved_rsp: u64,
+    /// Its x87 and SSE registers while suspended. Boxed so the image stays
+    /// put, and aligned, as the task list grows.
+    fpu: Box<FpuState>,
     /// How many times this task has been scheduled in.
     pub switches: u64,
     /// Everything this task is allowed to touch. A task with an empty cspace
@@ -112,6 +116,29 @@ pub struct Task {
     /// because they *are* the kernel -- separating them would buy nothing, as
     /// they can already reach every byte of it by construction.
     pub space: Option<crate::mm::paging::Mapper>,
+    /// The kernel stack from `stack::allocate`, until [`reap`] gives it
+    /// back. `None` for the tasks that run on a stack of their own.
+    pub stack: Option<stack::Stack>,
+    /// Finished, and its CPU has run on another task's stack since: nothing
+    /// is on its kernel stack or in its address space any more. Set by
+    /// [`on_tick`], which is where a CPU leaves a stack.
+    pub left: bool,
+    /// Asked to stop ([`stop`]): finished by its CPU at a tick that finds
+    /// it in ring 3.
+    pub stopping: bool,
+    /// How it finished, once it has.
+    pub ending: Ending,
+}
+
+/// How a task finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ending {
+    /// It exited, saying this code (0 for a kernel task that returned).
+    Exited(u32),
+    /// It faulted in ring 3, on this exception vector, and was stopped.
+    Faulted(u8),
+    /// It was asked to stop ([`stop`]) and was.
+    Stopped,
 }
 
 /// Slots per capability space.
@@ -182,6 +209,7 @@ pub fn init() {
             cpu: 0,
             is_idle: false,
             saved_rsp: 0,
+            fpu: Box::new(FpuState::INITIAL),
             switches: 1,
             cspace: CSpace::new(CSPACE_SLOTS),
             pending_in: None,
@@ -196,6 +224,10 @@ pub fn init() {
             kernel_stack_top: 0,
             user: false,
             space: None,
+            stack: None,
+            left: false,
+            stopping: false,
+            ending: Ending::Exited(0),
         }];
         let root = crate::mm::paging::kernel_root().unwrap_or(0);
         *guard = Some(Scheduler {
@@ -248,6 +280,7 @@ pub fn adopt_as_idle(cpu_index: usize, stack_top: u64) {
             is_idle: true,
             // Filled in by this CPU's first tick, exactly like task 0's.
             saved_rsp: 0,
+            fpu: Box::new(FpuState::INITIAL),
             switches: 1,
             cspace: CSpace::new(CSPACE_SLOTS),
             pending_in: None,
@@ -260,6 +293,10 @@ pub fn adopt_as_idle(cpu_index: usize, stack_top: u64) {
             kernel_stack_top: stack_top,
             user: false,
             space: None,
+            stack: None,
+            left: false,
+            stopping: false,
+            ending: Ending::Exited(0),
         });
 
         scheduler.current[cpu_index] = id;
@@ -361,12 +398,29 @@ pub fn spawn_program_on(
     spawn_inner(name, image.entry, Some(image), cpu_index).ok_or(user::LoadError::OutOfMemory)
 }
 
+/// Create a ring 3 task from a Windows program: a PE file already in memory
+/// (see `verdigris/DESIGN.md`). Like [`spawn_program`], it starts holding no
+/// capabilities at all.
+pub fn spawn_pe(name: &'static str, file: &[u8]) -> Result<usize, user::LoadError> {
+    let image = user::load_pe(file)?;
+    spawn_inner(name, image.entry, Some(image), next_cpu()).ok_or(user::LoadError::OutOfMemory)
+}
+
+/// Create a ring 3 task from a Windows program that imports from kernel32,
+/// with Verdigris's kernel32 in the same address space and the program's
+/// imports bound to it. It too starts holding no capabilities.
+pub fn spawn_windows(name: &'static str, file: &[u8], kernel32: &[u8]) -> Result<usize, user::LoadError> {
+    let image = user::load_windows(file, kernel32)?;
+    spawn_inner(name, image.entry, Some(image), next_cpu()).ok_or(user::LoadError::OutOfMemory)
+}
+
 fn spawn_inner(
     name: &'static str,
     entry_rip: u64,
     image: Option<user::Image>,
     cpu_index: usize,
 ) -> Option<usize> {
+    reap();
     let stack = stack::allocate()?;
     let user = image.is_some();
 
@@ -446,6 +500,7 @@ fn spawn_inner(
             cpu: cpu_index.min(MAX_CPUS - 1),
             is_idle: false,
             saved_rsp: frame_addr,
+            fpu: Box::new(FpuState::INITIAL),
             switches: 0,
             // Deliberately empty. A new task starts with no authority at all;
             // whatever it can do, its parent had to hand it explicitly.
@@ -460,6 +515,10 @@ fn spawn_inner(
             kernel_stack_top: stack.top,
             user,
             space: image.map(|image| image.space),
+            stack: Some(stack),
+            left: false,
+            stopping: false,
+            ending: Ending::Exited(0),
         });
         Some(id)
     })?;
@@ -530,9 +589,93 @@ pub fn hand_off(id: usize) {
     });
 }
 
-/// Mark the task on this CPU finished, and say which it was.
+/// Give back what finished tasks alone held, once nothing can be using it:
+/// their kernel stacks, their address spaces (the frames marked
+/// `paging::OWNED`, and the tables), and the capabilities in their slots.
+/// Their records stay, so their ids keep meaning the same task and say it
+/// finished. Returns the frames given back.
 ///
-/// For a task that has asked to stop, or has faulted in ring 3 and is being
+/// Called before every spawn, from a task, never from an interrupt: dropping
+/// capabilities touches the heap.
+pub fn reap() -> usize {
+    let mut taken = Vec::new();
+    x86_64::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let Some(scheduler) = guard.as_mut() else {
+            return;
+        };
+        for task in scheduler.tasks.iter_mut().filter(|task| task.left) {
+            if task.stack.is_none() && task.space.is_none() && task.cspace.occupied() == 0 {
+                continue;
+            }
+            let cspace = core::mem::replace(&mut task.cspace, CSpace::new(0));
+            taken.push((task.stack.take(), task.space.take(), cspace));
+        }
+    });
+    let mut freed = 0;
+    // Outside the scheduler lock: a capability dropped here may reach
+    // anything an object's owner does when its last holder goes.
+    for (stack, space, cspace) in taken {
+        // Who was waiting on it: callers it never answered, and senders to
+        // an endpoint nobody else can receive on. Told after its
+        // capabilities are gone, outside every lock.
+        let (replies, endpoints) = crate::cap::loose_ends(&cspace);
+        drop(cspace);
+        for token in replies {
+            crate::ipc::unanswerable(token);
+        }
+        for endpoint in endpoints.iter().filter(|endpoint| !anyone_can_receive(endpoint)) {
+            crate::ipc::orphan(endpoint);
+        }
+        if let Some(space) = space {
+            crate::memory::forget_space(&space);
+            // SAFETY: `left` says its CPU has since installed another space,
+            // no other CPU ever ran it, and taking it out of the record means
+            // nothing will install or use it again.
+            freed += unsafe { space.release_user_half() };
+        }
+        if let Some(stack) = stack {
+            stack::release(stack);
+        }
+    }
+    freed
+}
+
+/// Whether a task that has not finished can receive on `endpoint`.
+fn anyone_can_receive(endpoint: &alloc::sync::Arc<crate::cap::Object>) -> bool {
+    x86_64::without_interrupts(|| {
+        let guard = SCHEDULER.lock();
+        guard.as_ref().is_some_and(|scheduler| {
+            scheduler
+                .tasks
+                .iter()
+                .filter(|task| task.state != State::Finished)
+                .any(|task| crate::cap::can_receive(&task.cspace, endpoint))
+        })
+    })
+}
+
+/// Ask task `id` to stop: its CPU finishes it at the first tick that
+/// finds it running its own code, in ring 3. A task waiting in the kernel
+/// (on an endpoint, asleep) is not stopped until it is back in ring 3.
+/// Kernel tasks never are. False if there is no such user task.
+pub fn stop(id: usize) -> bool {
+    x86_64::without_interrupts(|| {
+        let mut guard = SCHEDULER.lock();
+        let Some(task) = guard.as_mut().and_then(|scheduler| scheduler.tasks.get_mut(id)) else {
+            return false;
+        };
+        if !task.user {
+            return false;
+        }
+        task.stopping = true;
+        true
+    })
+}
+
+/// Mark the task on this CPU finished, `how`, and say which it was.
+///
+/// For a task that has asked to exit, or has faulted in ring 3 and is being
 /// stopped. The caller is in a trap handler on that task's kernel stack and
 /// must hand back somebody else's frame straight afterwards: this only
 /// changes what the scheduler will pick.
@@ -540,7 +683,7 @@ pub fn hand_off(id: usize) {
 /// Nothing the task held is reclaimed -- not its frames, not its stack, not
 /// its capabilities -- and a task blocked on it stays blocked. Those are the
 /// same gaps as everywhere else, met from a new direction.
-pub fn finish_current() -> Option<(usize, &'static str)> {
+pub fn finish_current(how: Ending) -> Option<(usize, &'static str)> {
     x86_64::without_interrupts(|| {
         let this_cpu = cpu::index();
         let mut guard = SCHEDULER.lock();
@@ -548,6 +691,7 @@ pub fn finish_current() -> Option<(usize, &'static str)> {
         let current = scheduler.current[this_cpu];
         let task = scheduler.tasks.get_mut(current)?;
         task.state = State::Finished;
+        task.ending = how;
         Some((task.id, task.name))
     })
 }
@@ -604,8 +748,33 @@ pub fn on_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
     // Wake this CPU's sleepers whose time has come. Checked on every pass
     // through here, which is at least every tick, so a sleep ends within one
     // tick of its deadline.
+    // A task asked to stop is finished here, by its own CPU, and only if it
+    // was in ring 3: then it is in no kernel path, holds no lock, and waits
+    // on no endpoint, so nothing can wake it again. One in the kernel is
+    // left until a tick finds it out. The frame of one not running is the
+    // frame it was last stopped at, on its own stack.
+    for task in scheduler.tasks.iter_mut() {
+        if !task.stopping || task.cpu != this_cpu || task.state == State::Finished {
+            continue;
+        }
+        // SAFETY: `saved_rsp` is the trap frame on the task's own kernel
+        // stack: the one this tick took (`frame`, for `current`), or the one
+        // its last switch left.
+        let cs = unsafe { (*(task.saved_rsp as *const TrapFrame)).cs };
+        if cs & 3 == 3 && matches!(task.state, State::Ready | State::Running) {
+            task.state = State::Finished;
+            task.ending = Ending::Stopped;
+        }
+    }
+
     let now = crate::time::now_ns();
     for task in scheduler.tasks.iter_mut() {
+        // A finished task of this CPU's that is not the one whose stack this
+        // is: the CPU switched off it at an earlier tick (and put another
+        // address space in), and tasks never move to another CPU.
+        if task.cpu == this_cpu && task.state == State::Finished && task.id != current {
+            task.left = true;
+        }
         if task.cpu == this_cpu && task.state == State::Blocked {
             if let Some(due) = task.wake_at {
                 if due <= now {
@@ -650,6 +819,12 @@ pub fn on_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
     scheduler.current[this_cpu] = next;
     if next != current {
         scheduler.tasks[next].switches += 1;
+        // Nothing since the trap has touched an XMM register, so the CPU
+        // still holds the outgoing task's.
+        let (from, to) = pair_mut(&mut scheduler.tasks, current, next);
+        // SAFETY: every general CPU enables SSE before its first task, and
+        // each image is INITIAL or one `fxsave` wrote.
+        unsafe { x86_64::fpu::switch(&mut from.fpu, &to.fpu) };
     }
     scheduler.tasks[next].state = State::Running;
 
@@ -684,6 +859,17 @@ pub fn on_tick(frame: *mut TrapFrame) -> *mut TrapFrame {
     }
 
     scheduler.tasks[next].saved_rsp as *mut TrapFrame
+}
+
+/// Two different tasks, one to change and one to read.
+fn pair_mut(tasks: &mut [Task], a: usize, b: usize) -> (&mut Task, &Task) {
+    if a < b {
+        let (low, high) = tasks.split_at_mut(b);
+        (&mut low[a], &high[0])
+    } else {
+        let (low, high) = tasks.split_at_mut(a);
+        (&mut high[0], &low[b])
+    }
 }
 
 /// Copy out task status without allocating or holding the lock afterwards.
@@ -737,6 +923,15 @@ pub fn current_id() -> Option<usize> {
 /// Whether a task is new, runnable, blocked or finished.
 pub fn state_of(id: usize) -> Option<State> {
     x86_64::without_interrupts(|| Some(SCHEDULER.lock().as_ref()?.tasks.get(id)?.state))
+}
+
+/// How a task finished, if it has.
+pub fn ending_of(id: usize) -> Option<Ending> {
+    x86_64::without_interrupts(|| {
+        let guard = SCHEDULER.lock();
+        let task = guard.as_ref()?.tasks.get(id)?;
+        (task.state == State::Finished).then_some(task.ending)
+    })
 }
 
 /// What a task is called.

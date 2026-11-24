@@ -22,10 +22,18 @@
 //! enough. A device that insists on more than a page of contiguous memory
 //! needs a different allocator, and will get one when it shows up.
 //!
-//! # What is not here yet
+//! # When it is given back
 //!
-//! Memory is made by the kernel at boot for the driver that will use it,
-//! and never given back. There is no way for a task to ask for more.
+//! Memory a task bought from its pool, and memory the kernel made for a
+//! task and has said it is done with ([`let_go`]), goes back to the
+//! allocator once no capability names it ([`Hold`] counts them) and no
+//! address space maps it (counted by [`map`], and by [`forget_space`] as a
+//! finished task's space is torn down). Its number is used again.
+//!
+//! The rest is kept for good: what the kernel itself still uses (a driver's
+//! queues, the screen, the opened vault), and anything the kernel mapped
+//! for itself, since taking a kernel mapping away needs every CPU to forget
+//! it, and nothing here can make another CPU do that yet.
 
 use alloc::vec::Vec;
 
@@ -47,7 +55,7 @@ pub const USER_BASE: u64 = 0x0000_0200_0000_0000;
 /// Where the kernel keeps its own view of memory it shares with a task:
 /// four gigabytes above the heap, past the back buffer and the surfaces, in
 /// the same PML4 slot so every address space has it.
-const KERNEL_BASE: u64 = heap::HEAP_START as u64 + (4 << 30);
+pub(crate) const KERNEL_BASE: u64 = heap::HEAP_START as u64 + (4 << 30);
 
 /// Objects there can be. Each takes a gigabyte of address space here and in
 /// every task that maps it, and a PML4 slot has 512 of those.
@@ -60,6 +68,111 @@ struct Object {
     frames: Vec<u64>,
     /// Whether the kernel mapped it too, at [`kernel_address`].
     in_kernel: bool,
+    /// Capabilities naming it: [`Hold`]s alive.
+    holders: usize,
+    /// Address spaces it is mapped in.
+    mapped: usize,
+    /// The kernel still uses it: never given back while this is set.
+    kept: bool,
+    /// Given back; the number is free to be used again.
+    gone: bool,
+}
+
+impl Object {
+    /// Take its frames if nothing has a use for it any more.
+    fn release_if_unused(&mut self) -> Vec<u64> {
+        if self.gone || self.kept || self.in_kernel || self.holders > 0 || self.mapped > 0 {
+            return Vec::new();
+        }
+        self.gone = true;
+        core::mem::take(&mut self.frames)
+    }
+}
+
+/// Give frames taken from a released object back to the allocator. Done
+/// after the table's lock is dropped.
+fn give_back(frames: Vec<u64>) {
+    for frame in frames {
+        // SAFETY: the object owned them, and nothing names or maps it now.
+        unsafe { frame::free(frame::Frame::from_addr(frame)) };
+    }
+}
+
+/// One capability's claim on a memory object. What `cap::Object::Memory`
+/// holds: made with [`hold`], and dropping it is the capability going.
+pub struct Hold(usize);
+
+impl Hold {
+    pub fn index(&self) -> usize {
+        self.0
+    }
+}
+
+/// A claim on object `index`, for a capability about to be made to it.
+pub fn hold(index: usize) -> Hold {
+    without_interrupts(|| {
+        if let Some(object) = TABLE.lock().get_mut(index) {
+            object.holders += 1;
+        }
+    });
+    Hold(index)
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let frames = without_interrupts(|| {
+            let mut table = TABLE.lock();
+            let Some(object) = table.get_mut(self.0) else {
+                return Vec::new();
+            };
+            object.holders = object.holders.saturating_sub(1);
+            object.release_if_unused()
+        });
+        give_back(frames);
+    }
+}
+
+/// The kernel is done with object `index`, which it made with [`create`]:
+/// it goes when nothing else names or maps it either.
+pub fn let_go(index: usize) {
+    let frames = without_interrupts(|| {
+        let mut table = TABLE.lock();
+        let Some(object) = table.get_mut(index) else {
+            return Vec::new();
+        };
+        object.kept = false;
+        object.release_if_unused()
+    });
+    give_back(frames);
+}
+
+/// A finished task's address space is about to be torn down: every object
+/// mapped in it is mapped in one space fewer.
+pub fn forget_space(space: &paging::Mapper) {
+    let frames = without_interrupts(|| {
+        let mut table = TABLE.lock();
+        let mut frames = Vec::new();
+        for (index, object) in table.iter_mut().enumerate() {
+            let Some(first) = object.frames.first() else {
+                continue;
+            };
+            if object.mapped > 0 && space.translate(user_address(index)) == Some(*first) {
+                object.mapped -= 1;
+                frames.extend(object.release_if_unused());
+            }
+        }
+        frames
+    });
+    give_back(frames);
+}
+
+/// Objects in use, and the frames they hold.
+pub fn stats() -> (usize, usize) {
+    without_interrupts(|| {
+        let table = TABLE.lock();
+        let live = table.iter().filter(|object| !object.gone);
+        live.fold((0, 0), |(count, frames), object| (count + 1, frames + object.frames.len()))
+    })
 }
 
 /// Locked with interrupts off, as everything a system call reaches is.
@@ -79,7 +192,8 @@ pub fn user_address(index: usize) -> u64 {
 /// With `in_kernel`, the kernel maps it as well, writable, for memory it
 /// shares with the task that will hold it. `None` if it is too big, there
 /// are no numbers left, or frames are short. Like every `create`, this makes
-/// an object and no authority over it.
+/// an object and no authority over it. The kernel keeps it until it says
+/// otherwise ([`let_go`]).
 pub fn create(pages: usize, in_kernel: bool) -> Option<usize> {
     if pages == 0 || pages as u64 * PAGE > SPAN {
         return None;
@@ -91,15 +205,25 @@ pub fn create(pages: usize, in_kernel: bool) -> Option<usize> {
     }
 
     // The number first, so a kernel mapping has its address.
+    // A number given back is used again: every space that mapped it is gone.
     let index = without_interrupts(|| {
         let mut table = TABLE.lock();
+        let fresh = Object {
+            frames: Vec::new(),
+            in_kernel,
+            holders: 0,
+            mapped: 0,
+            kept: true,
+            gone: false,
+        };
+        if let Some(index) = table.iter().position(|object| object.gone) {
+            table[index] = fresh;
+            return Some(index);
+        }
         if table.len() >= OBJECTS {
             return None;
         }
-        table.push(Object {
-            frames: Vec::new(),
-            in_kernel,
-        });
+        table.push(fresh);
         Some(table.len() - 1)
     })?;
 
@@ -166,8 +290,13 @@ pub fn map(slot: CapPtr) -> Result<Mapped, CapError> {
     let address = user_address(index);
 
     without_interrupts(|| {
-        let table = TABLE.lock();
-        let object = table.get(index).ok_or(CapError::Stale)?;
+        let mut table = TABLE.lock();
+        let object = table.get_mut(index).ok_or(CapError::Stale)?;
+        // Counted once a space, however often it maps it.
+        let first = object.frames.first().copied();
+        if first.is_some() && space.translate(address) != first {
+            object.mapped += 1;
+        }
         for (page, frame) in object.frames.iter().enumerate() {
             let va = address + page as u64 * PAGE;
             if !space.map_4k(va, *frame, flags) {
@@ -202,7 +331,10 @@ pub fn allocate(pool: CapPtr, pages: u64, into: CapPtr) -> Result<u64, CapError>
         cap::pool_refund(pool, pages);
         return Err(CapError::NoSpace);
     };
-    cap::issue(into, cap::Object::Memory(index), Rights::ALL)?;
+    // The task's alone: it goes when the task's capabilities and mappings do.
+    let held = hold(index);
+    let_go(index);
+    cap::issue(into, cap::Object::Memory(held), Rights::ALL)?;
     Ok(pages * PAGE)
 }
 

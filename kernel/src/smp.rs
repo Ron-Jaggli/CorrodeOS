@@ -135,6 +135,10 @@ extern "C" fn ap_main(cpu: usize) -> ! {
         Role::General => {}
     }
 
+    // Before this CPU becomes a task: the switch saves and loads SSE state.
+    // SAFETY: ring 0; nothing on this CPU relies on SSE being off.
+    unsafe { x86_64::enable_sse() };
+
     lapic::enable_local();
 
     // Become a task, so there is something for the scheduler to switch away

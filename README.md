@@ -64,6 +64,9 @@ Then:
 ./corrode user-test   # boot and prove ring 3 cannot read kernel memory
 ./corrode input-test  # boot, type and move the mouse through QEMU, check what arrived
 ./corrode terminal-test # boot, open the terminal, edit and recall lines, read a file, to build/terminal.png
+./corrode verify-test # boot ISOs with a changed kernel, program and config: each refused
+./corrode vault-test  # the files sealed on the disk: lock screen first, wrong passcode, changed byte
+./corrode rekey-test  # change the passcode in Settings; the next boot takes only the new one
 ./corrode check       # cargo check
 ./corrode test        # render, text, gfx, pci, elf, virtio, nv, input, heap, line and shell unit tests, on the build host
 ./corrode specimen    # draw a sheet of the typeface to build/specimen.png
@@ -77,6 +80,186 @@ so the build genuinely doesn't need it), `MACHINE=pc` for QEMU's older board
 with no PCI Express, `GPU=virtio` to give QEMU a virtio GPU instead of its
 plain VGA (the compositor's frames then go through a ring 3 driver), and
 `QEMU_EXTRA='-device …'` to plug emulated devices in for one run.
+
+## Your files, encrypted: the vault
+
+Normally the files the terminal and Files see (`root/`, packed as a tar)
+ride on the ISO, readable by anyone who has it. With a vault they live on
+the disk instead, encrypted under your passcode, and the ISO carries only
+the kernel and the programs.
+
+```sh
+./corrode vault-disk VAULT_PASSCODE=Rust4ever   # seal root/ into build/vault.img
+./corrode run-vault                             # boot it
+```
+
+`VAULT_IMG=path` seals into another image. A passcode is 4 to 32
+printable characters: letters, digits and symbols, but no space and no
+`#`.
+
+What happens at boot:
+
+1. Limine checks every file it loads (the kernel and each program) against
+   a hash in its config, and the config against a hash built into Limine
+   itself. Anything changed after the build stops the boot. `verify-test`
+   proves it.
+2. The kernel finds the vault on the disk and puts the lock screen up first.
+   No program gets any files.
+3. The right passcode makes the key (PBKDF2-HMAC-SHA-256, 200 000 rounds)
+   and opens the files (AES-128-CCM). A wrong one, or a disk with a single
+   changed byte, opens nothing. Three wrong tries cost a 30-second wait.
+4. Then the terminal and Files get the files, and that passcode locks the
+   screen from then on.
+
+To change it, open Settings and use the last row, **Passcode**: the current
+passcode, then the new one twice. The files are encrypted again under the
+new one, written beside the old copy. The header that says which copy is
+current is written last, so a failure partway through still leaves the
+old passcode working.
+
+What it protects against, and what it doesn't:
+
+- **Someone with the disk** sees only ciphertext. How long that holds
+  depends on the passcode: four digits fall to a few hours of guessing,
+  while a long passcode with letters is far out of reach.
+- **Someone who swaps the boot medium** can't boot a changed kernel past
+  Limine's check, and a disk with a vault never takes its files from the
+  boot medium. Limine itself is the part that has to be trusted; on real
+  hardware, Secure Boot with your own key signs it.
+- **Not covered yet:**
+  - The opened files stay in memory until shutdown. Locking the screen
+    stops people at the keyboard; it does not encrypt them again.
+  - The files are read-only: the vault is sealed whole by `vault-disk`,
+    and changes made while running are not written back.
+  - There is no TPM and no recovery code. A forgotten passcode means the
+    files are gone.
+  - The CPU needs AES-NI. Without KVM, QEMU's plain `qemu64` model has
+    none; `NO_KVM=1 QEMU_EXTRA='-cpu max' ./corrode run-vault` emulates it.
+  - The theme kept in the disk's first sector is not encrypted. It is
+    only colours.
+
+## Customizing the desktop
+
+The desktop is liquid glass in the spirit of macOS Tahoe, with Plasma's
+habit of letting you change everything. There are three ways to change it,
+easiest first.
+
+**1. Settings, while it runs.** Click the cog in the dock. Every row applies
+at once to the whole desktop: wallpaper, glass, every window's frame and
+buttons, the dock, and the colours inside every open program. With a disk
+it is kept: `./corrode run` and `run-gui` attach `build/settings.img`, and
+whatever was last picked comes back next boot, over the file below (delete
+the image to go back to the file). Any other target boots without a disk,
+or give one with `STORE=path/to/image`; without one, a reboot goes back to
+the file, since the root filesystem is a read-only tar on the ISO.
+
+**2. `root/etc/desktop.conf`, for the look it boots with.** One `key =
+value` a line, `#` for comments. Edit it, then `./corrode iso` (or `./corrode
+run`). A line that makes no sense is skipped and the rest still apply, so a
+typo cannot break the desktop. The file explains every key; in short:
+
+| Key | Values | What it does |
+|---|---|---|
+| `preset` | `corrode` `tahoe` `tahoe-light` `breeze` `crystal` `plain` | Where to start; later lines override it |
+| `appearance` | `dark` `light` | Text, surfaces, wallpaper tone |
+| `accent` | `#rrggbb` | Focused title bars, highlights, the panel's name |
+| `glass` | `regular` `clear` `off` | Frosted, see-through-and-bent, or solid |
+| `refraction` | `0`-`120` | How hard the glass's edge bends what is behind it |
+| `frost` | `0`-`200` | How frosted `regular` glass is, in percent |
+| `tint` / `tint_amount` | `none` or `#rrggbb` / `0`-`255` | A colour wash over every pane, and how much |
+| `corner_radius` | pixels | Window corners |
+| `buttons` | `left` `right` | macOS's traffic lights, or Plasma's order on the right |
+| `wallpaper` | `aurora` `ribbons` `dunes` `gradient` | Drawn at boot from three colours |
+| `wallpaper_colors` | three `#rrggbb` | The wallpaper's colours |
+| `dock` / `dock_size` | `on` `off` / pixels | The dock and its icon size |
+| `bounce` | `on` `off` | Dock icons jump when they start something |
+| `magnify` | `on` `off`, or `100`-`200` | How big a dock icon grows under the pointer, in percent; `on` is 140 |
+| `shadows` | `on` `off` | Window shadows |
+| `animation_speed` | percent, `0` for none | Every animation's pace |
+| `timezone` | `UTC`, `+5`, `-8`, `+05:30` | The menu bar clock's offset from the machine's (UTC) clock |
+| `clock` | `24h` `12h` | The menu bar clock's hours |
+| `passcode` | 4 to 32 printable characters (letters, digits, symbols; no space, no `#`), or the hash `./corrode passcode-hash` writes | The lock screen (Alt+L) asks for it. Only the desktop checks it; three wrong tries in a row and it waits 30 s. `./corrode passcode-hash` rewrites one in the clear as a salted PBKDF2 hash, so the ISO no longer shows it. A few digits are easy to guess offline and keep a passer-by out, not a thief; a long one with letters is what holds up when someone has the files. With a vault (below) the vault's passcode is the lock screen's |
+
+A preset plus a line or two is usually all you need:
+
+```
+preset = breeze
+accent = #3daee9
+corner_radius = 6
+```
+
+**3. The code, for new presets or looks.** Presets are plain `Theme` values
+in `theme/src/lib.rs` (`PRESETS`). Add one there and it works in the file
+and in Settings' preset row. Wallpapers are integer-only functions in
+`theme/src/wallpaper.rs`. The glass itself is `render/src/glass.rs`, a
+fixed-point port of the optics of [Glass-HQ's liquid glass](https://liquid-glass.glassapp.dev)
+(MIT). `./corrode test` checks all three on the build host.
+
+### Using the desktop
+
+Shortcuts use Alt where macOS uses Cmd:
+
+| Keys | What they do |
+|---|---|
+| **Alt+Tab** / **Alt+Shift+Tab** | The window switcher: hold Alt, Tab to move along, let go to switch (it brings back minimized windows), Escape to cancel |
+| **Alt+Space** | Search apps and files: type, Up/Down, Return opens an app or shows a file in Files, Escape closes |
+| **Alt+Q**, **Alt+W**, **Alt+F4** | Close the window in front |
+| **Alt+M** / **Alt+Z** | Minimize / zoom the window in front |
+| **Alt+,** | Settings |
+| **Alt+L** | Lock the screen |
+| **Alt+Left** / **Alt+Right** / **Alt+Up** | Snap the window in front to the left or right half, or fill the screen |
+| **Alt+Down** | Put a snapped or zoomed window back |
+| **Alt+D** | Show the desktop: every window away, and again to bring them back |
+
+**Windows.** Drag a title bar to move a window, and its edges or corners
+to resize it. Drag it to the left or right edge of the screen to snap it to
+that half, or to the top to fill the screen; a glass preview shows where it
+will land. Dragging a snapped window away gives it back its size, and the
+green zoom button puts it back where it was. Double-click a title bar to zoom, as the
+green button does.
+
+**Control Center.** Click the clock at the right of the menu bar. Tiles
+for Dark Mode, Glass, the dock, shadows, motion and the 24-hour clock, the
+accent colours, Lock and a way into Settings, and below them the last three
+notifications. Arrow keys, Return/Space and Escape work too. Click anywhere
+else (or the clock again) to close it.
+
+**Menus.** Right-click the desktop for New Terminal, Open Files, Next
+Wallpaper, Light/Dark Appearance, Settings, Lock Screen and About.
+Right-click a dock icon for its open windows (by what each says after
+its title, such as a terminal's folder; pick one to bring it forward), New
+Window, and, while it runs, Quit (which closes all its windows). The item under the pointer lights up; Up/Down and
+Return work too.
+
+**Notifications** slide in at the top right with the sending program's
+name and dock icon, for four seconds or until clicked. From the terminal,
+`notify TEXT` sends one.
+
+**The lock screen** puts the whole desktop under glass with the date and
+time large; Return or the unlock button gets back. There are no accounts
+yet, so there is no password: it hides the screen rather than securing it.
+
+### For programs
+
+Programs follow the look on their own: a window is sent `window::THEME`
+when it opens and whenever the look changes (`Event::Theme` in the `ui`
+crate). Settings changes the look with `corrode_ui::set_theme`. `corrode_ui::notify(text)` posts a notification, and
+`corrode_ui::notifications()` reads back the recent ones. `corrode_ui::subtitle(text)`
+puts text after the window's title, as the terminal and Files show their
+folder ("Terminal - /etc", "Files - etc"); the dock and Quit still go by the title alone. Window flags
+choose the kind of window: `TRANSLUCENT` (glass behind the program's
+clear pixels), `RESIZABLE`, `POPOVER` (no title bar, under the menu bar,
+closed by a click elsewhere; with `MENU`, at the pointer instead) and
+`COVER` (the whole screen, above everything, with every key, as the lock
+screen is).
+
+Calls that reach past a program's own windows go to the **shell**
+endpoint (`app::SHELL`), which only Settings, Control Center and the menu
+are given: changing the look, quitting, listing and raising other apps'
+windows, reading notifications, and the menu's context
+(`window::SHELL_ONLY`). The window server's own endpoint, which every
+program holds, answers those with `window::DENIED`. In the terminal,
+`quit Settings` shows both refusals, and `caps` lists what it does hold.
 
 ## Layout
 
@@ -97,6 +280,7 @@ kernel/          the privileged kernel
   src/task/user.rs user address space — aliased code pages, user stacks
   src/smp.rs       starting the other CPUs, and setting one core aside
   src/secure_core.rs  that core: a key in a register, reached through a mailbox
+  src/seal.rs      sealing for Settings and the lock screen, by that core
   src/screen_log.rs   under hw-log, the boot log on the firmware's framebuffer
   src/efi_log.rs      under efi-log, the boot log kept in UEFI variables
   src/surface.rs   pixels a task draws and the compositor shows
@@ -106,6 +290,13 @@ kernel/          the privileged kernel
   src/ports.rs     I/O ports, read and written for whoever holds a range
   src/input.rs     keyboard and mouse events, and the window manager
   src/windows.rs   windows: a surface to draw in and a queue of events
+  src/dock.rs      the dock: icons, the bounce, the running dots, labels
+  src/switcher.rs  Alt+Tab's panel of windows
+  src/spotlight.rs Alt+Space: search for apps and files
+  src/banner.rs    a notification on screen
+  src/notify.rs    notifications waiting to be shown, and the last few
+  src/context.rs   what was right-clicked, for the menu program
+  src/rtc.rs       the CMOS clock, read once, for the menu bar's time
   src/modules.rs   files the bootloader left in RAM
   src/memory.rs    memory a task can map and tell a device about
   src/remote.rs    a Renderer that is a call to a driver in ring 3
@@ -124,6 +315,8 @@ render/          the rendering interface
   src/scene.rs     layers, and the least repainting that keeps up with them
   src/wire.rs      commands as bytes, for a renderer in another process
 gfx/             the 3D engine: integer-only, software, not yet on screen
+theme/           the desktop's look: Theme, presets, desktop.conf, wallpapers, the clock's format
+seal/            AES-CCM over any block cipher, for the secure core's sealing; host-tested
 text/            the text engine
   src/lib.rs       strings to coverage: measuring, placing, inking
   src/font.rs      the typeface, as pen strokes you can read and edit
@@ -135,9 +328,16 @@ user/            ring 3 programs, each an ELF file loaded as a Limine module
   ps2/             the keyboard and mouse driver
   ui/              a window to draw rectangles and text in, and its events
   terminal/        a terminal: corrode-shell, a few commands of its own, line editing, history
-  panel/           the bar along the top: a launcher button and a clock
+  panel/           the menu bar: a launcher button, the app in front, the clock
+  settings/        Settings: every part of the look, applied at once
+  about/           About CorrodeOS
+  files/           Files: places, a list, a preview
+  control/         Control Center: quick toggles, accents, recent notifications
+  lock/            the lock screen
+  menu/            the right-click menus, for the desktop and dock icons
   fault/           a program that faults on purpose
   virtio-gpu/      a display driver: the compositor's frames, on a virtio GPU
+  virtio-blk/      the disk: the theme in its first sector, and the vault's sectors for the kernel
   blob-reader/     reads 32 MiB it was handed at boot, and says what was in it
   nvidia/          NVIDIA stage one: identify the card, read its VBIOS, change nothing
   user.ld          where a program's segments go
@@ -148,12 +348,21 @@ input/           scancodes and mouse packets to key presses and movements
 line/            a prompt's line: cursor, history, Ctrl chords, Tab completion
 shell/           a shell: pipes, lists, variables, globs, and ls/cat/grep/sort and kin
 root/            the files the terminal can read, packed into a tar at build time
+vault/           the vault: that tar sealed on the disk under the passcode, as data and tests
 heap/            the allocator: the kernel's heap and every program's
+verdigris/       Windows programs on CorrodeOS: its own README.md and DESIGN.md
+  pe/              reading a PE file, tested on the build host against liars
+  view/            the pruned view of the files a Windows program sees
+  fileview/        the ring 3 service that serves one program's view
+  kernel32/        Verdigris's kernel32, in Rust
+  dir/             dir.exe, a Windows program built by rustc and rust-lld
+  scripts/         the test programs, written byte by byte or assembled
   src/lib.rs       headers, BARs, capability lists, MSI, what a driver may write
   src/mcfg.rs      the ACPI table that says where configuration space is
 boot/limine.conf lets Limine find the kernel
 docker/          the build environment
-scripts/         check-image.sh — guards against orphan sections
+scripts/         seal-iso.sh — packs every ISO with Limine checking a hash of each file
+                 check-image.sh — guards against orphan sections
                  flash-usb.sh — write a FEATURES=hw-log ISO to a USB stick, checking hard first
                  fetch-firmware.sh — NVIDIA GSP firmware into firmware/, never committed
 ```

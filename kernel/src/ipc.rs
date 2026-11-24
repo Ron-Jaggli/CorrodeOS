@@ -50,12 +50,19 @@
 //!
 //! # Known gaps
 //!
-//! A caller blocked in `call` waits forever if the server never replies. That
-//! is a real denial of service and the honest fix is a timeout or a fault
-//! handler capability, neither of which exists yet; it is recorded rather than
-//! papered over. Note what it is *not*: the caller chose that server by holding
-//! a capability to its endpoint, so this is a service you trusted failing you,
-//! not an attack any task can mount on any other.
+//! A caller blocked in `call` waits forever if a live server never replies.
+//! That is a real denial of service and the honest fix is a timeout or a
+//! fault handler capability, neither of which exists yet; it is recorded
+//! rather than papered over. Note what it is *not*: the caller chose that
+//! server by holding a capability to its endpoint, so this is a service you
+//! trusted failing you, not an attack any task can mount on any other.
+//!
+//! A server that has *ended* is another matter, and is answered: when a
+//! finished task is reaped (`task::reap`), each call it was handed and never
+//! answered is refused ([`unanswerable`]), and an endpoint only it could
+//! receive on is [`orphan`]ed -- whoever waits to send there is refused, and
+//! so is every later send that finds no receiver. A plain `send` refused
+//! that way still returns as if taken: it was never promised an answer.
 
 use alloc::collections::VecDeque;
 
@@ -162,6 +169,9 @@ struct EndpointState {
     senders: VecDeque<usize>,
     /// Tasks blocked in `recv`.
     receivers: VecDeque<usize>,
+    /// No task that has not finished can receive here, nor ever will: the
+    /// last that could was reaped. See [`orphan`].
+    orphaned: bool,
 }
 
 pub struct Endpoint {
@@ -289,6 +299,10 @@ fn rendezvous(
             }
             Ok(token.is_some())
         } else {
+            // Nobody will ever take it: refused now, not waited on for good.
+            if state.orphaned {
+                return Err(CapError::Refused);
+            }
             // Park the message on ourselves and block. Setting Blocked before
             // releasing the endpoint lock means a receiver cannot arrive, find
             // us queued, and wake us before we have actually parked anything.
@@ -426,6 +440,35 @@ fn deliver(receiver: usize, pending: PendingMessage) -> bool {
 /// structurally impossible is worse than declining it. Clearing `awaiting_reply`
 /// without delivering anything is what [`await_reply`] reads as a refusal, so
 /// the caller gets an error rather than waiting on an answer nobody can give.
+/// The call `token` names will never be answered: its server ended with it
+/// unanswered. The caller, if still waiting on it, is woken refused.
+pub fn unanswerable(token: ReplyToken) {
+    x86_64::without_interrupts(|| {
+        task::with_task(token.caller, |task| {
+            if task.awaiting_reply == Some(token.seq) {
+                task.awaiting_reply = None;
+                task.recv_slot = None;
+                task.state = State::Ready;
+            }
+        });
+    });
+}
+
+/// Nobody left can receive on the endpoint `object` is: refuse everyone
+/// waiting to send there, and every send that finds nobody from now on.
+pub fn orphan(object: &alloc::sync::Arc<Object>) {
+    let Object::Endpoint(ep) = &**object else {
+        return;
+    };
+    x86_64::without_interrupts(|| {
+        let mut state = ep.state.lock();
+        state.orphaned = true;
+        while let Some(&caller) = state.senders.front() {
+            refuse(&mut state, caller);
+        }
+    });
+}
+
 fn refuse(state: &mut EndpointState, caller: usize) {
     state.senders.pop_front();
     task::with_task(caller, |task| {

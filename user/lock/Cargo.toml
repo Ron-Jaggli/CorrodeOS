@@ -1,0 +1,15 @@
+[package]
+name = "corrode-lock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lock"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+corrode-rt = { path = "../rt" }
+corrode-ui = { path = "../ui" }

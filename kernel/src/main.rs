@@ -14,12 +14,22 @@ mod arch;
 mod blob;
 mod cap;
 mod device;
+mod dock;
+mod rtc;
+mod banner;
+mod context;
+mod notify;
+mod spotlight;
+mod switcher;
 #[cfg(feature = "efi-log")]
 mod efi_log;
+mod frames;
+mod store;
 mod input;
 mod ipc;
 mod irq;
 mod limine;
+mod look;
 mod memory;
 mod mm;
 mod modules;
@@ -28,6 +38,7 @@ mod ports;
 mod remote;
 #[cfg(feature = "hw-log")]
 mod screen_log;
+mod seal;
 mod secure_core;
 mod serial;
 mod smp;
@@ -36,9 +47,12 @@ mod sync;
 mod syscall;
 mod task;
 mod time;
+mod usb;
+mod vault;
+mod verdigris;
 mod windows;
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use arch::x86_64::{self, cpu, halt_forever, ioapic, lapic, pic, pit, vectors};
 use corrode_render::{
@@ -107,6 +121,11 @@ pub extern "C" fn kmain() -> ! {
 
     // Prove the trap path round-trips before trusting it with a real fault.
     x86_64::breakpoint();
+
+    // Before the first task: every switch saves and loads SSE state.
+    // SAFETY: ring 0; nothing on this CPU relies on SSE being off.
+    unsafe { x86_64::enable_sse() };
+    println!("sse        : on (saved per task)");
 
     report_memory();
     init_frames();
@@ -222,6 +241,8 @@ pub extern "C" fn kmain() -> ! {
     // Programs: ring 3 tasks that came from files rather than from the
     // kernel image. Then a device, driven by one.
     program_checks();
+    verdigris::checks();
+    orphan_checks();
     #[cfg(not(feature = "user-test"))]
     {
         device_checks();
@@ -1900,6 +1921,10 @@ extern "C" fn log_server() {
                 partial.len() - 1
             }
         };
+        // Only text: `log::END` and anything else are for other readers.
+        if !matches!(received.message.label, log::TEXT | log::LINE) {
+            continue;
+        }
         let line = &mut partial[index].1;
         if line.len() + text.len() <= LOG_LINE_MAX {
             line.push_str(text);
@@ -2028,12 +2053,27 @@ fn start_input() {
         granted && cap::slots_used(driver) == Some(5),
     );
     start_all(&[receiver, Some(driver)]);
+    // USB keyboards and pointers, if there is a controller, into the same
+    // endpoint.
+    usb::start(INPUT_ENDPOINT);
 }
 
 /// Bootstrap's ends of the window server's and the launcher's endpoints,
 /// with every right, to hand out send-only copies.
 const WINDOWS_ENDPOINT: cap::CapPtr = 64;
 const LAUNCHER_ENDPOINT: cap::CapPtr = 65;
+/// The desktop shell's: the window server's calls that act beyond the
+/// caller's own windows, for the few programs that are the desktop.
+/// Clear of the pool slots just below it (66-69).
+const SHELL_ENDPOINT: cap::CapPtr = 80;
+/// The runner's: the window server's calls that run a Windows program from
+/// the files (`window::RUN`), for the programs given the files.
+const RUNNER_ENDPOINT: cap::CapPtr = 81;
+/// The sealers: Settings' and the lock screen's, each with a key of its own
+/// in the secure core. 70 and up, clear of the pool's (66-69) and of the
+/// disk's (82-91, in `store`).
+const SETTINGS_SEALER: cap::CapPtr = 70;
+const LOCK_SEALER: cap::CapPtr = 71;
 /// Where bootstrap is given each window's surface -- at this slot plus the
 /// surface's number -- so the renderer can be shown it.
 const WINDOW_SURFACES: cap::CapPtr = 96;
@@ -2043,11 +2083,26 @@ const WINDOW_SURFACES: cap::CapPtr = 96;
 const SERVICE_ENDPOINT_SLOT: cap::CapPtr = 0;
 const SERVICE_REPLY_SLOT: cap::CapPtr = 1;
 const SERVICE_SPARE_SLOT: cap::CapPtr = 2;
+/// The window server's: the log, send-only, to hand the views of the
+/// programs the terminal runs; and where a run's view endpoint and page are
+/// while they are handed out.
+const SERVICE_LOG_SLOT: cap::CapPtr = 5;
+const SERVICE_VIEW_SLOT: cap::CapPtr = 6;
+const SERVICE_PAGE_SLOT: cap::CapPtr = 7;
 /// The launcher also holds what it gives the programs it starts.
 const LAUNCHER_WINDOWS_SLOT: cap::CapPtr = 3;
 const LAUNCHER_LOG_SLOT: cap::CapPtr = 4;
 /// The files from `root/`, for the terminal, if the boot medium has them.
 const LAUNCHER_FILES_SLOT: cap::CapPtr = 5;
+/// A send endpoint to itself, for Control Center to ask for Settings by.
+const LAUNCHER_SELF_SLOT: cap::CapPtr = 6;
+/// The shell's endpoint, to hand Settings, Control Center and the menu.
+const LAUNCHER_SHELL_SLOT: cap::CapPtr = 7;
+/// The sealers, to hand Settings and the lock screen, one each.
+const LAUNCHER_SETTINGS_SEALER: cap::CapPtr = 8;
+const LAUNCHER_LOCK_SEALER: cap::CapPtr = 9;
+/// The runner's endpoint, handed with the files.
+const LAUNCHER_RUNNER_SLOT: cap::CapPtr = 10;
 
 fn desktop_check(name: &str, ok: bool) {
     check("desktop", name, ok);
@@ -2060,16 +2115,271 @@ fn desktop_check(name: &str, ok: bool) {
 /// show it to the renderer. Placing the window, and everything after, is the
 /// painter's: this task only makes them.
 extern "C" fn window_server() {
+    serve(Serves::Windows);
+}
+
+/// The desktop shell: the same calls, and those that reach past the
+/// caller's windows, for whoever holds its endpoint.
+extern "C" fn shell_server() {
+    serve(Serves::Shell);
+}
+
+/// The runner: the same calls, and `window::RUN`, for whoever holds its
+/// endpoint -- the programs given the files to read.
+extern "C" fn runner_server() {
+    serve(Serves::Runner);
+}
+
+/// Which endpoint a window server task answers on, and so which calls it
+/// takes beyond the ones every window does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Serves {
+    Windows,
+    /// `window::SHELL_ONLY`.
+    Shell,
+    /// `window::RUN_TEXT` and `RUN`.
+    Runner,
+}
+
+/// Answer window calls on the endpoint in this task's service slot. Only
+/// the shell's takes `window::SHELL_ONLY`; the window server's answers
+/// those with `window::DENIED`, so holding a window is not holding the
+/// desktop.
+fn serve(serves: Serves) {
+    let (shell, runner) = (serves == Serves::Shell, serves == Serves::Runner);
     use corrode_abi::window;
 
+    // `window::RUN_TEXT` so far: whose, and what.
+    let mut run_text: Option<(usize, alloc::string::String)> = None;
     loop {
         let Ok(received) = ipc::recv(SERVICE_ENDPOINT_SLOT, None, Some(SERVICE_REPLY_SLOT)) else {
             return;
         };
         let words = received.message.words;
+        if !shell && window::SHELL_ONLY.contains(&received.message.label) {
+            println!(
+                "desktop    : refused call {} from task {}: it holds no shell capability",
+                received.message.label, received.from
+            );
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: window::DENIED,
+                    words: [0; 4],
+                },
+                None,
+            );
+            continue;
+        }
+        // A new look for the desktop: kept, and picked up by the painter on
+        // its next frame.
+        // A notification, filed under the sender's window title.
+        if received.message.label == window::GROW {
+            let size = |word: u64| word.min(u32::MAX as u64) as u32;
+            let queued = windows::grow(received.from, size(words[0]), size(words[1]));
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: window::GROW,
+                    words: [queued as u64, 0, 0, 0],
+                },
+                None,
+            );
+            continue;
+        }
+        if received.message.label == window::UNLOCK {
+            // Only the lock screen may try: anyone else could guess, or use
+            // up the tries and keep the person out.
+            let from_lock = task::name_of(received.from) == Some("lock");
+            let answer = if !from_lock {
+                println!("desktop    : task {} is not the lock screen; no passcode tries", received.from);
+                [0, 0, 0, 0]
+            } else if words == [0; 4] {
+                [!look::has_passcode() as u64, 0, 0, 0]
+            } else {
+                let was_sealed = vault::locked();
+                match look::try_passcode(passcode_of(words), time::now_ns()) {
+                    Ok(right) => {
+                        if !right {
+                            println!("desktop    : a wrong passcode from task {}", received.from);
+                        } else if was_sealed {
+                            give_files();
+                        }
+                        [right as u64, 0, 0, 0]
+                    }
+                    Err(wait) => [0, wait, 0, 0],
+                }
+            };
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: window::UNLOCK,
+                    words: answer,
+                },
+                None,
+            );
+            continue;
+        }
+        if matches!(received.message.label, window::PASSCODE_CHECK | window::PASSCODE_SET) {
+            let label = received.message.label;
+            let answer = change_passcode(received.from, label, words);
+            let _ = ipc::reply(SERVICE_REPLY_SLOT, ipc::Message { label, words: answer }, None);
+            continue;
+        }
+        if received.message.label == window::RUN_TEXT {
+            // Collected for the `RUN` after it, on the runner's endpoint
+            // alone: anywhere else nothing is kept, so no other program can
+            // spoil a run between its text and its `RUN`.
+            if runner && run_text.as_ref().is_none_or(|(from, _)| *from != received.from) {
+                run_text = Some((received.from, alloc::string::String::new()));
+            }
+            let raw = passcode_of(words);
+            let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
+            let taken = match (&mut run_text, core::str::from_utf8(&raw[..end])) {
+                (Some((_, text)), Ok(part)) if runner && text.len() + part.len() <= window::RUN_TEXT_MOST => {
+                    text.push_str(part);
+                    1
+                }
+                _ => 0,
+            };
+            let answer = ipc::Message { label: window::RUN_TEXT, words: [taken, 0, 0, 0] };
+            let _ = ipc::reply(SERVICE_REPLY_SLOT, answer, None);
+            continue;
+        }
+        if received.message.label == window::RUN && !runner {
+            println!(
+                "desktop    : refused to run a program for task {}: it holds no runner capability",
+                received.from
+            );
+            let answer = ipc::Message { label: window::RUN, words: [0, 5, 0, 0] };
+            let _ = ipc::reply(SERVICE_REPLY_SLOT, answer, None);
+            continue;
+        }
+        if received.message.label == window::RUN {
+            let text = run_text.take().filter(|(from, _)| *from == received.from).map(|(_, text)| text);
+            let (answer, transfer) = verdigris::run_windows(received.from, text.as_deref().unwrap_or(""));
+            let _ = ipc::reply(SERVICE_REPLY_SLOT, ipc::Message { label: window::RUN, words: answer }, transfer);
+            for slot in [SERVICE_SPARE_SLOT, SERVICE_VIEW_SLOT, SERVICE_PAGE_SLOT] {
+                let _ = cap::delete(slot);
+            }
+            continue;
+        }
+        if received.message.label == window::NOTIFY {
+            // Under the caller's window's title, which `windows::open` has
+            // already kept from being another app's; a caller with no window
+            // is named by its program, never as the desktop itself.
+            let from = windows::title_of_owner(received.from).unwrap_or_else(|| {
+                alloc::string::String::from(task::name_of(received.from).unwrap_or("A program"))
+            });
+            notify::post(from, notify::unpack(words));
+            // Control Center, if it is open, shows the list: now, not at
+            // its next look.
+            windows::tell_titled(b"Control", window::NOTIFIED);
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: window::NOTIFY,
+                    words: [0; 4],
+                },
+                None,
+            );
+            continue;
+        }
+        // A dock icon's menu, listing its app's windows or picking one.
+        if received.message.label == window::LIST || received.message.label == window::RAISE {
+            let answer = if received.message.label == window::LIST {
+                let (count, subtitle) = windows::list_titled(words[0], words[1] as usize);
+                [count as u64, subtitle[0], subtitle[1], subtitle[2]]
+            } else {
+                [windows::raise_titled(words[0], words[1] as usize) as u64, 0, 0, 0]
+            };
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: received.message.label,
+                    words: answer,
+                },
+                None,
+            );
+            continue;
+        }
+        // A program naming what its windows show, after their title.
+        if received.message.label == window::SUBTITLE {
+            let count = windows::set_subtitle(received.from, [words[0], words[1], words[2]]);
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: window::SUBTITLE,
+                    words: [count as u64, 0, 0, 0],
+                },
+                None,
+            );
+            continue;
+        }
+        // The menu program asking what it was opened for.
+        if received.message.label == window::CONTEXT || received.message.label == window::QUIT {
+            let answer = if received.message.label == window::CONTEXT {
+                context::get()
+            } else {
+                let asked = windows::close_titled(words[0]);
+                println!("desktop    : quit asked {} window(s) to close", asked);
+                [asked as u64, 0, 0, 0]
+            };
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: received.message.label,
+                    words: answer,
+                },
+                None,
+            );
+            continue;
+        }
+        // Control Center asking what has been said lately.
+        if received.message.label == window::HISTORY {
+            if words[1] == 2 {
+                notify::clear();
+                println!("notify     : recent notifications cleared");
+            }
+            let (count, entry) = notify::recent(words[0] as usize);
+            let answer = match (entry, words[1]) {
+                (Some((from, _, age)), 0) => [count as u64, notify::pack(&from)[0], age, 0],
+                (Some((_, text, _)), _) => notify::pack(&text),
+                (None, _) => [count as u64, 0, 0, 0],
+            };
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: window::HISTORY,
+                    words: answer,
+                },
+                None,
+            );
+            continue;
+        }
+        if received.message.label == window::SET_THEME {
+            look::set(corrode_theme::Theme::from_words(words));
+            let _ = ipc::reply(
+                SERVICE_REPLY_SLOT,
+                ipc::Message {
+                    label: window::SET_THEME,
+                    words: [0; 4],
+                },
+                None,
+            );
+            continue;
+        }
         let size = |word: u64| word.min(u32::MAX as u64) as u32;
         let opened = (received.message.label == window::OPEN)
-            .then(|| windows::open(size(words[0]), size(words[1]), words[2] == window::DOCKED))
+            .then(|| {
+                windows::open(
+                    size(words[0]),
+                    size(words[1]),
+                    words[2],
+                    words[3],
+                    received.from,
+                )
+            })
             .flatten();
 
         let Some(index) = opened else {
@@ -2122,17 +2432,56 @@ extern "C" fn launcher() {
         };
         let words = received.message.words;
         let status = match (received.message.label, words[0]) {
-            (launcher::LAUNCH, launcher::TERMINAL) => {
-                let files = cap::identify(LAUNCHER_FILES_SLOT)
-                    .is_ok()
-                    .then_some(LAUNCHER_FILES_SLOT);
-                match start_app(
-                    "terminal",
-                    LAUNCHER_WINDOWS_SLOT,
-                    LAUNCHER_LOG_SLOT,
-                    None,
-                    files,
-                ) {
+            (
+                launcher::LAUNCH,
+                program @ (launcher::TERMINAL
+                | launcher::SETTINGS
+                | launcher::ABOUT
+                | launcher::FILES
+                | launcher::CONTROL
+                | launcher::LOCK
+                | launcher::MENU),
+            ) => {
+                let name = match program {
+                    launcher::TERMINAL => "terminal",
+                    launcher::SETTINGS => "settings",
+                    launcher::FILES => "files",
+                    launcher::CONTROL => "control",
+                    launcher::LOCK => "lock",
+                    launcher::MENU => "menu",
+                    _ => "about",
+                };
+                // Control Center may ask for Settings, and so holds the
+                // launcher too -- able to send, not to give it on.
+                let launcher = matches!(program, launcher::CONTROL | launcher::MENU)
+                    .then_some(LAUNCHER_SELF_SLOT);
+                // The programs that are the desktop: they change the look,
+                // read notifications and act on other apps' windows.
+                let shell = matches!(program, launcher::SETTINGS | launcher::CONTROL | launcher::MENU)
+                    .then_some(LAUNCHER_SHELL_SLOT);
+                // One lock screen is enough.
+                if program == launcher::LOCK && crate::windows::locked() {
+                    let _ = ipc::reply(
+                        SERVICE_REPLY_SLOT,
+                        ipc::Message {
+                            label: launcher::LAUNCHED,
+                            words: [0, 0, 0, 0],
+                        },
+                        None,
+                    );
+                    continue;
+                }
+                // Only the terminal and Files read files.
+                let files = (matches!(program, launcher::TERMINAL | launcher::FILES)
+                    && cap::identify(LAUNCHER_FILES_SLOT).is_ok())
+                .then_some(LAUNCHER_FILES_SLOT);
+                // Sealing: Settings and the lock screen, each its own.
+                let sealer = match program {
+                    launcher::SETTINGS => Some(LAUNCHER_SETTINGS_SEALER),
+                    launcher::LOCK => Some(LAUNCHER_LOCK_SEALER),
+                    _ => None,
+                };
+                match start_app(name, LAUNCHER_WINDOWS_SLOT, LAUNCHER_LOG_SLOT, launcher, files, shell, sealer) {
                     Ok(_) => 0,
                     Err(error) => error.code(),
                 }
@@ -2160,6 +2509,8 @@ fn start_app(
     log_slot: cap::CapPtr,
     launcher_slot: Option<cap::CapPtr>,
     files_slot: Option<cap::CapPtr>,
+    shell_slot: Option<cap::CapPtr>,
+    sealer_slot: Option<cap::CapPtr>,
 ) -> Result<usize, cap::CapError> {
     use cap::{CapError, Object, Rights};
     use corrode_abi::app;
@@ -2170,8 +2521,18 @@ fn start_app(
     if let Some(slot) = launcher_slot {
         cap::grant(id, slot, app::LAUNCHER, Rights::WRITE)?;
     }
+    // Running a program from the files goes with the files: only the
+    // launcher hands them out, and holds the runner's endpoint to give with.
     if let Some(slot) = files_slot {
         cap::grant(id, slot, app::FILES, Rights::READ)?;
+        cap::grant(id, LAUNCHER_RUNNER_SLOT, app::RUNNER, Rights::WRITE)?;
+    }
+    if let Some(slot) = shell_slot {
+        cap::grant(id, slot, app::SHELL, Rights::WRITE)?;
+    }
+    // To seal and open, not to pass on.
+    if let Some(slot) = sealer_slot {
+        cap::grant(id, slot, app::SEAL, Rights::READ_WRITE)?;
     }
     cap::issue_to(
         id,
@@ -2200,8 +2561,26 @@ fn start_desktop() {
             Object::Endpoint(ipc::Endpoint::new()),
             Rights::ALL,
         )
+        .is_ok()
+        && cap::mint(
+            0,
+            SHELL_ENDPOINT,
+            Object::Endpoint(ipc::Endpoint::new()),
+            Rights::ALL,
+        )
+        .is_ok()
+        && cap::mint(
+            0,
+            RUNNER_ENDPOINT,
+            Object::Endpoint(ipc::Endpoint::new()),
+            Rights::ALL,
+        )
         .is_ok();
     desktop_check("mint the window server's and launcher's endpoints", minted);
+    let sealers = cap::mint(0, SETTINGS_SEALER, Object::Sealer(seal::SETTINGS), Rights::ALL).is_ok()
+        && cap::mint(0, LOCK_SEALER, Object::Sealer(seal::LOCK), Rights::ALL).is_ok();
+    desktop_check("mint a sealer for Settings and one for the lock screen", sealers);
+    seal_checks();
 
     // The pool's rules, from this side, on a pool of four pages.
     let pool_rules = cap::issue(
@@ -2218,32 +2597,143 @@ fn start_desktop() {
         && memory::allocate(BOOT_POOL, 1, BOOT_POOL_SPARE) == Ok(4096)
         && memory::allocate(WINDOWS_ENDPOINT, 1, BOOT_POOL_SPARE + 1) == Err(CapError::WrongType);
     desktop_check("a pool gives what it has and no more", pool_rules);
+    // Titles say which app a window is, so the desktop's own are its own.
+    let word = |text: &[u8]| {
+        let mut bytes = [0u8; 8];
+        bytes[..text.len()].copy_from_slice(text);
+        u64::from_le_bytes(bytes)
+    };
+    desktop_check(
+        "an app's own title is its own",
+        windows::allowed_title(word(b"Settings"), "settings") == *b"Settings"
+            && windows::allowed_title(word(b"Notes"), "fault") == *b"Notes\0\0\0",
+    );
+    desktop_check(
+        "but no app may take another's, or the desktop's",
+        windows::allowed_title(word(b"Settings"), "terminal") == *b"terminal"
+            && windows::allowed_title(word(b"Files"), "fault") == *b"fault\0\0\0"
+            && windows::allowed_title(word(b"CorrodeO"), "settings") == *b"settings",
+    );
 
     let server = task::spawn("windows", window_server);
+    let shell = task::spawn("shell", shell_server);
+    let runner = task::spawn("runner", runner_server);
     let launcher_task = task::spawn("launcher", launcher);
     let granted = server.is_some_and(|id| {
         cap::grant(id, WINDOWS_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
+    }) && shell.is_some_and(|id| {
+        cap::grant(id, SHELL_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
+    }) && runner.is_some_and(|id| {
+        cap::grant(id, RUNNER_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
+            // For the views of the programs it runs (`window::RUN`).
+            && cap::grant(id, LOG_ENDPOINT, SERVICE_LOG_SLOT, Rights::WRITE_GRANT).is_ok()
     }) && launcher_task.is_some_and(|id| {
         cap::grant(id, LAUNCHER_ENDPOINT, SERVICE_ENDPOINT_SLOT, Rights::READ).is_ok()
             && cap::grant(id, WINDOWS_ENDPOINT, LAUNCHER_WINDOWS_SLOT, Rights::ALL).is_ok()
             && cap::grant(id, LOG_ENDPOINT, LAUNCHER_LOG_SLOT, Rights::ALL).is_ok()
+            && cap::grant(id, LAUNCHER_ENDPOINT, LAUNCHER_SELF_SLOT, Rights::ALL).is_ok()
+            && cap::grant(id, SHELL_ENDPOINT, LAUNCHER_SHELL_SLOT, Rights::ALL).is_ok()
+            && cap::grant(id, RUNNER_ENDPOINT, LAUNCHER_RUNNER_SLOT, Rights::ALL).is_ok()
+            && cap::grant(id, SETTINGS_SEALER, LAUNCHER_SETTINGS_SEALER, Rights::ALL).is_ok()
+            && cap::grant(id, LOCK_SEALER, LAUNCHER_LOCK_SEALER, Rights::ALL).is_ok()
     });
     desktop_check("start the window server and the launcher", granted);
 
-    // The terminal's files. A boot medium without them still gets a
-    // terminal, with nothing to read.
-    if let (Some(id), Some((index, module))) = (launcher_task, modules::position("root.tar")) {
+    // The terminal's files come later, from `give_files`: whether they are
+    // the boot medium's or a vault's is known once the disk has been read.
+    if let Some(id) = launcher_task {
+        LAUNCHER_TASK.store(id, Ordering::Release);
+    }
+    if let Some(id) = server {
+        WINDOW_SERVER.store(id, Ordering::Release);
+    }
+    start_all(&[server, shell, runner, launcher_task]);
+}
+
+/// A passcode as `window::UNLOCK` and the change calls carry it.
+fn passcode_of(words: [u64; 4]) -> corrode_theme::passcode::Code {
+    let mut code = [0u8; corrode_theme::passcode::MOST];
+    for (bytes, word) in code.as_chunks_mut::<8>().0.iter_mut().zip(words) {
+        *bytes = word.to_le_bytes();
+    }
+    code
+}
+
+/// Which task proved the passcode for a change, and until when.
+static PROVEN: SpinLock<Option<(usize, u64)>> = SpinLock::new(None);
+const PROOF_NS: u64 = 60_000_000_000;
+
+/// `window::PASSCODE_CHECK` and `PASSCODE_SET`: Settings changes the
+/// vault's passcode, proving the old one first. Only Settings may: anyone
+/// else could guess, or use up the lock screen's tries.
+fn change_passcode(from: usize, label: u64, words: [u64; 4]) -> [u64; 4] {
+    use corrode_abi::window;
+    if task::name_of(from) != Some("settings") {
+        println!("desktop    : task {from} is not Settings; the passcode is not its to change");
+        return [0; 4];
+    }
+    if !vault::present() {
+        return [0, 0, 1, 0];
+    }
+    let now = time::now_ns();
+    if label == window::PASSCODE_CHECK {
+        return match look::try_passcode(passcode_of(words), now) {
+            Ok(true) => {
+                arch::x86_64::without_interrupts(|| *PROVEN.lock() = Some((from, now + PROOF_NS)));
+                [1, 0, 0, 0]
+            }
+            Ok(false) => {
+                println!("desktop    : a wrong passcode from Settings");
+                [0; 4]
+            }
+            Err(wait) => [0, wait, 0, 0],
+        };
+    }
+    // Set: only for the task that just proved it, once.
+    let proven = arch::x86_64::without_interrupts(|| PROVEN.lock().take());
+    let code = passcode_of(words);
+    let chars = corrode_theme::passcode::chars(&code);
+    if !proven.is_some_and(|(task, until)| task == from && now < until) {
+        println!("desktop    : a new passcode without the old one first; not changed");
+        return [0; 4];
+    }
+    if !corrode_theme::passcode::allowed(chars) || !vault::reseal(chars) {
+        return [0; 4];
+    }
+    look::set_passcode(code);
+    [1, 0, 0, 0]
+}
+
+/// The launcher, once started, for `give_files`.
+static LAUNCHER_TASK: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// The window server, once started: `store::start` lets it call the disk,
+/// which changing the vault's passcode needs.
+pub static WINDOW_SERVER: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Give the launcher the root directory, which it hands the terminal and
+/// Files: the boot medium's, or the vault's once it is open. A boot medium
+/// without them still gets a terminal, with nothing to read. Called by the
+/// painter after reading the disk, and again when the vault opens.
+fn give_files() {
+    let id = LAUNCHER_TASK.load(Ordering::Acquire);
+    if id == usize::MAX {
+        return;
+    }
+    if vault::locked() {
+        println!("files      : sealed on the disk until the passcode is given");
+        return;
+    }
+    if let Some((index, module)) = vault::root() {
         let given = cap::issue_to(
             id,
             LAUNCHER_FILES_SLOT,
-            Object::Blob(index),
-            Rights::READ_GRANT,
+            cap::Object::Blob(index),
+            cap::Rights::READ_GRANT,
         )
         .is_ok();
         desktop_check("give the launcher the terminal's files", given);
         println!("files      : root.tar, {} KiB", module.bytes.len() / 1024);
     }
-    start_all(&[server, launcher_task]);
 }
 
 /// Start the panel. Done by the painter once it knows the screen's size --
@@ -2259,12 +2749,122 @@ fn start_panel() {
         LOG_ENDPOINT,
         Some(LAUNCHER_ENDPOINT),
         None,
+        None,
+        None,
     );
+    // Four, and not the shell: the panel shows the desktop, it does not
+    // run it.
     desktop_check(
         "start the panel with four capabilities",
         panel.is_ok_and(|id| cap::slots_used(id) == Some(4)),
     );
 }
+
+/// Bootstrap's slots for the sealing checks: a pool of one page, the page,
+/// a read-only copy of Settings' sealer, and one left empty: 72 to 75.
+const SEAL_POOL: cap::CapPtr = 72;
+const SEAL_PAGE: cap::CapPtr = 73;
+const SEAL_READ_ONLY: cap::CapPtr = 74;
+const SEAL_NONE: cap::CapPtr = 75;
+
+fn seal_check(name: &str, ok: bool) {
+    check("seal", name, ok);
+}
+
+/// What a sealer lets its holder do and nothing more, by the same calls
+/// `SYS_SEAL` and `SYS_UNSEAL` make, from bootstrap's side.
+fn seal_checks() {
+    use cap::{CapError, Object, Rights};
+    use corrode_abi::seal::{MOST, OVERHEAD};
+
+    if secure_core::status().secure.is_none() {
+        println!("seal       : no secure core; sealing checks skipped");
+        return;
+    }
+    let made = cap::issue(
+        SEAL_POOL,
+        Object::Pool(core::sync::atomic::AtomicU64::new(1)),
+        Rights::ALL,
+    )
+    .is_ok()
+        && memory::allocate(SEAL_POOL, 1, SEAL_PAGE).is_ok()
+        && cap::copy(SETTINGS_SEALER, SEAL_READ_ONLY, Rights::READ).is_ok();
+    seal_check("make a page to seal in", made);
+    if !made {
+        return;
+    }
+    let Ok(page) = seal::page(SEAL_PAGE) else {
+        seal_check("find the page", false);
+        return;
+    };
+    // SAFETY: the page is a whole frame of memory bootstrap just made, mapped
+    // by the HHDM, and nothing else holds it.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(page, 4096) };
+    const PLAIN: &[u8] = b"a message for this boot only";
+    let len = PLAIN.len();
+    let write = |bytes: &mut [u8]| {
+        bytes.fill(0);
+        bytes[OVERHEAD..OVERHEAD + len].copy_from_slice(PLAIN);
+    };
+
+    // Without a sealer -- nothing there, or something else there -- nothing
+    // is sealed and the page is untouched.
+    write(bytes);
+    let refused = seal::seal(SEAL_NONE, SEAL_PAGE, len as u64) == Err(CapError::Empty)
+        && seal::seal(WINDOWS_ENDPOINT, SEAL_PAGE, len as u64) == Err(CapError::WrongType)
+        && seal::unseal(SEAL_NONE, SEAL_PAGE, (OVERHEAD + len) as u64) == Err(CapError::Empty)
+        && bytes[OVERHEAD..OVERHEAD + len] == *PLAIN
+        && bytes[..OVERHEAD] == [0; OVERHEAD];
+    seal_check("a program without a sealer is refused", refused);
+    let read_only = seal::seal(SEAL_READ_ONLY, SEAL_PAGE, len as u64)
+        == Err(CapError::InsufficientRights);
+    seal_check("and one that may only open cannot seal", read_only);
+
+    let sealed = seal::seal(SETTINGS_SEALER, SEAL_PAGE, len as u64);
+    let first: alloc::vec::Vec<u8> = bytes[..OVERHEAD + len].to_vec();
+    let hidden = sealed == Ok((OVERHEAD + len) as u64)
+        && !first.windows(8).any(|w| w == &PLAIN[..8]);
+    let opened = seal::unseal(SEAL_READ_ONLY, SEAL_PAGE, (OVERHEAD + len) as u64)
+        == Ok(len as u64)
+        && bytes[OVERHEAD..OVERHEAD + len] == *PLAIN;
+    seal_check("sealed, it is hidden; opened, it is back", hidden && opened);
+
+    write(bytes);
+    let again = seal::seal(SETTINGS_SEALER, SEAL_PAGE, len as u64).is_ok()
+        && bytes[..OVERHEAD + len] != first[..];
+    seal_check("the same message sealed twice looks different", again);
+
+    let tampered = |bytes: &mut [u8], at: usize| {
+        bytes[..OVERHEAD + len].copy_from_slice(&first);
+        bytes[at] ^= 1;
+        seal::unseal(SETTINGS_SEALER, SEAL_PAGE, (OVERHEAD + len) as u64) == Err(CapError::Forged)
+            && bytes[..OVERHEAD + len].iter().all(|&b| b == 0)
+    };
+    let forged = tampered(bytes, 0) && tampered(bytes, NONCE_AT_TAG) && tampered(bytes, OVERHEAD + 3);
+    bytes[..OVERHEAD + len].copy_from_slice(&first);
+    let short = seal::unseal(SETTINGS_SEALER, SEAL_PAGE, (OVERHEAD + len - 1) as u64)
+        == Err(CapError::Forged);
+    seal_check("a changed or cut message is refused, and nothing comes out", forged && short);
+
+    bytes[..OVERHEAD + len].copy_from_slice(&first);
+    let apart = seal::unseal(LOCK_SEALER, SEAL_PAGE, (OVERHEAD + len) as u64)
+        == Err(CapError::Forged);
+    seal_check("the lock screen cannot open what Settings sealed", apart);
+
+    let sizes = seal::seal(SETTINGS_SEALER, SEAL_PAGE, MOST as u64 + 1) == Err(CapError::Invalid)
+        && seal::unseal(SETTINGS_SEALER, SEAL_PAGE, OVERHEAD as u64 - 1) == Err(CapError::Invalid)
+        && seal::seal(SETTINGS_SEALER, SEAL_PAGE, MOST as u64) == Ok((OVERHEAD + MOST) as u64)
+        && seal::unseal(SETTINGS_SEALER, SEAL_PAGE, (OVERHEAD + MOST) as u64) == Ok(MOST as u64);
+    seal_check("the most the mailbox carries, and not a byte more", sizes);
+
+    bytes.fill(0);
+    let _ = cap::delete(SEAL_PAGE);
+    let _ = cap::delete(SEAL_POOL);
+    let _ = cap::delete(SEAL_READ_ONLY);
+}
+
+/// Where the tag starts in a sealed message.
+const NONCE_AT_TAG: usize = corrode_seal::NONCE;
 
 /// Bootstrap's pool, for the checks, and where its memory goes.
 const BOOT_POOL: cap::CapPtr = 66;
@@ -2393,6 +2993,64 @@ fn program_checks() {
         );
         // This line being printed at all is the other half.
         program_check("and the machine is not", true);
+    }
+}
+
+/// Where task 0 holds each check's endpoint while handing it out, and then
+/// no longer: a reader left in task 0 would keep the endpoint alive.
+const ORPHAN_ENDPOINT: cap::CapPtr = 78;
+/// The servers' and callers' own slots.
+const ORPHAN_SLOT: cap::CapPtr = 0;
+const ORPHAN_REPLY: cap::CapPtr = 1;
+
+/// How each check's caller came back: 0 not yet, 1 refused, 2 otherwise.
+static ORPHAN_CALLS: [core::sync::atomic::AtomicU64; 2] =
+    [core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)];
+
+/// A server that ends leaves no caller waiting for good: one that ended
+/// before taking a call, and one that took it and ended without answering.
+/// Both callers are refused once the servers are reaped (`task::reap`).
+fn orphan_checks() {
+    extern "C" fn quits() {}
+    extern "C" fn takes_and_quits() {
+        let _ = ipc::recv(ORPHAN_SLOT, None, Some(ORPHAN_REPLY));
+    }
+    fn caller(which: usize) {
+        let answer = ipc::call(ORPHAN_SLOT, ipc::Message::EMPTY, None, None);
+        let how = if matches!(answer, Err(cap::CapError::Refused)) { 1 } else { 2 };
+        ORPHAN_CALLS[which].store(how, core::sync::atomic::Ordering::SeqCst);
+    }
+    extern "C" fn calls_first() {
+        caller(0);
+    }
+    extern "C" fn calls_second() {
+        caller(1);
+    }
+    let cases: [(&str, extern "C" fn(), extern "C" fn()); 2] = [
+        ("a call to a server that ended unheard is refused", quits, calls_first),
+        ("a call taken and never answered is refused", takes_and_quits, calls_second),
+    ];
+    for (which, (name, server, client)) in cases.into_iter().enumerate() {
+        let (server, client) = (task::spawn("ipc-server", server), task::spawn("ipc-caller", client));
+        let (Some(server), Some(client)) = (server, client) else {
+            check("ipc", name, false);
+            continue;
+        };
+        let handed = cap::issue(ORPHAN_ENDPOINT, cap::Object::Endpoint(ipc::Endpoint::new()), cap::Rights::ALL).is_ok()
+            && cap::grant(server, ORPHAN_ENDPOINT, ORPHAN_SLOT, cap::Rights::READ).is_ok()
+            && cap::grant(client, ORPHAN_ENDPOINT, ORPHAN_SLOT, cap::Rights::WRITE).is_ok();
+        let _ = cap::delete(ORPHAN_ENDPOINT);
+        start_all(&[Some(server), Some(client)]);
+        // The server finishes (having taken the call, in the second case),
+        // its CPU leaves it, and it is reaped; then the caller must return.
+        let deadline = time::now_ns() + 2_000_000_000;
+        while ORPHAN_CALLS[which].load(core::sync::atomic::Ordering::SeqCst) == 0 && time::now_ns() < deadline {
+            if task::state_of(server) == Some(task::State::Finished) {
+                task::reap();
+            }
+            task::sleep_until(time::now_ns() + 10_000_000);
+        }
+        check("ipc", name, handed && ORPHAN_CALLS[which].load(core::sync::atomic::Ordering::SeqCst) == 1);
     }
 }
 
@@ -2595,7 +3253,7 @@ fn nvidia_checks() {
             held += 1;
         }
         if let Some(rom) = memory::create(nvidia::ROM_PAGES, false) {
-            granted &= cap::mint(0, NV_ROM, cap::Object::Memory(rom), Rights::ALL).is_ok()
+            granted &= cap::mint(0, NV_ROM, cap::Object::Memory(memory::hold(rom)), Rights::ALL).is_ok()
                 && cap::grant(driver, NV_ROM, nvidia::ROM, Rights::READ_WRITE).is_ok();
             held += 1;
         }
@@ -3344,10 +4002,13 @@ impl Renderer for Screen {
     }
 
     fn submit(&mut self, list: &corrode_render::CommandList<'_>) -> Result<(), ScreenError> {
-        match self {
+        let start = time::now_ns();
+        let result = match self {
             Screen::Software(renderer) => renderer.submit(list).map_err(ScreenError::Software),
             Screen::Remote(renderer) => renderer.submit(list).map_err(ScreenError::Remote),
-        }
+        };
+        frames::submitted(list, time::now_ns() - start);
+        result
     }
 
     fn upload_mask(&mut self, at: Rect, coverage: &[u8]) -> Result<(), ScreenError> {
@@ -3362,10 +4023,13 @@ impl Renderer for Screen {
     }
 
     fn present(&mut self, damage: &corrode_render::damage::Damage) -> Result<(), ScreenError> {
-        match self {
+        let start = time::now_ns();
+        let result = match self {
             Screen::Software(renderer) => renderer.present(damage).map_err(ScreenError::Software),
             Screen::Remote(renderer) => renderer.present(damage).map_err(ScreenError::Remote),
-        }
+        };
+        frames::presented(time::now_ns() - start);
+        result
     }
 }
 
@@ -3386,6 +4050,63 @@ impl Screen {
             Screen::Remote(renderer) => renderer.attach_surface(slot, index as u32).is_ok(),
         }
     }
+
+    /// Stop showing surface `index`, so it can be retired. False if the
+    /// remote renderer's driver did not answer, and it is kept.
+    fn forget_surface(&mut self, index: usize) -> bool {
+        match self {
+            Screen::Software(renderer) => {
+                renderer.detach_surface(index as u32);
+                true
+            }
+            Screen::Remote(renderer) => renderer.forget_surface(index as u32).is_ok(),
+        }
+    }
+
+    /// Paint `theme`'s wallpaper and show it to the renderer as surface
+    /// [`surface::WALLPAPER`]: here, or by the driver in its own memory
+    /// under the remote renderer. False where there is nowhere to paint it,
+    /// and the desktop keeps the plain background.
+    fn show_wallpaper(&mut self, theme: &corrode_theme::Theme) -> bool {
+        let renderer = match self {
+            Screen::Software(renderer) => renderer,
+            // The driver paints it, in its own memory.
+            Screen::Remote(renderer) => return renderer.wallpaper(theme.to_words()).is_ok(),
+        };
+        let info = renderer.surface_info();
+        let Some(pixels) = wallpaper_pixels(&info) else {
+            return false;
+        };
+        corrode_theme::wallpaper::paint(theme, pixels, info.width, info.height);
+        // SAFETY: `wallpaper_pixels` mapped them, page-aligned, from fresh
+        // frames overlapping nothing, and never unmaps them. The renderer
+        // reads them; only this function, on the painter, writes them.
+        unsafe {
+            renderer.attach_surface(
+                surface::WALLPAPER,
+                pixels.as_ptr(),
+                info.width,
+                info.height,
+            )
+        }
+        .is_ok()
+    }
+}
+
+/// Where the wallpaper's pixels live: past the glass scratch.
+const WALLPAPER_BASE: u64 = GLASS_SCRATCH_BASE + BACK_BUFFER_MAX as u64;
+
+/// The wallpaper's pixels, mapped the first time they are asked for.
+fn wallpaper_pixels(info: &SurfaceInfo) -> Option<&'static mut [u32]> {
+    static MAPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    let pixels = info.width as usize * info.height as usize;
+    if !MAPPED.load(core::sync::atomic::Ordering::Acquire) {
+        map_ram(WALLPAPER_BASE, pixels * 4)?;
+        MAPPED.store(true, core::sync::atomic::Ordering::Release);
+    }
+    // SAFETY: mapped above, writable, for `pixels` words, and only the
+    // painter ever asks for them, one borrow at a time.
+    Some(unsafe { core::slice::from_raw_parts_mut(WALLPAPER_BASE as *mut u32, pixels) })
 }
 
 /// The GPU driver's endpoint, the capabilities it is given, and the memory
@@ -3397,6 +4118,7 @@ const GPU_QUEUE: cap::CapPtr = 28;
 const GPU_SCREEN: cap::CapPtr = 29;
 const GPU_SHARED: cap::CapPtr = 30;
 const GPU_ATLAS: cap::CapPtr = 31;
+const GPU_SCRATCH: cap::CapPtr = 62;
 /// The device's BARs, at `GPU_BARS + n`.
 const GPU_BARS: cap::CapPtr = 32;
 /// A read-only copy of the screen memory, to check what that forbids.
@@ -3447,6 +4169,9 @@ fn start_gpu() -> Option<remote::RemoteRenderer> {
     let screen = memory::create(gpu::SCREEN_PAGES, true);
     let shared = memory::create(gpu::SHARED_PAGES, true);
     let atlas = memory::create(atlas_pages, false);
+    // Glass and a wallpaper, if there is memory for them: the driver works
+    // without, as plainly as before.
+    let scratch = memory::create(gpu::SCRATCH_PAGES, false);
     let (Some(queue), Some(screen), Some(shared), Some(atlas)) = (queue, screen, shared, atlas)
     else {
         gpu_check("make the driver's memory", false);
@@ -3461,10 +4186,10 @@ fn start_gpu() -> Option<remote::RemoteRenderer> {
     )
     .is_ok()
         && cap::mint(0, GPU_DEVICE, cap::Object::PciDevice(index), Rights::ALL).is_ok()
-        && cap::mint(0, GPU_QUEUE, cap::Object::Memory(queue), Rights::ALL).is_ok()
-        && cap::mint(0, GPU_SCREEN, cap::Object::Memory(screen), Rights::ALL).is_ok()
-        && cap::mint(0, GPU_SHARED, cap::Object::Memory(shared), Rights::ALL).is_ok()
-        && cap::mint(0, GPU_ATLAS, cap::Object::Memory(atlas), Rights::ALL).is_ok()
+        && cap::mint(0, GPU_QUEUE, cap::Object::Memory(memory::hold(queue)), Rights::ALL).is_ok()
+        && cap::mint(0, GPU_SCREEN, cap::Object::Memory(memory::hold(screen)), Rights::ALL).is_ok()
+        && cap::mint(0, GPU_SHARED, cap::Object::Memory(memory::hold(shared)), Rights::ALL).is_ok()
+        && cap::mint(0, GPU_ATLAS, cap::Object::Memory(memory::hold(atlas)), Rights::ALL).is_ok()
         && line.is_none_or(|line| {
             cap::mint(0, GPU_IRQ, cap::Object::Interrupt(line), Rights::ALL).is_ok()
         });
@@ -3489,6 +4214,16 @@ fn start_gpu() -> Option<remote::RemoteRenderer> {
         && cap::grant(driver, GPU_SCREEN, gpu::SCREEN, Rights::READ_WRITE).is_ok()
         && cap::grant(driver, GPU_SHARED, gpu::SHARED, Rights::READ).is_ok()
         && cap::grant(driver, GPU_ATLAS, gpu::ATLAS, Rights::READ_WRITE).is_ok();
+    if let Some(scratch) = scratch {
+        let minted = cap::mint(0, GPU_SCRATCH, cap::Object::Memory(memory::hold(scratch)), Rights::ALL);
+        let given = minted.and_then(|_| cap::grant(driver, GPU_SCRATCH, gpu::SCRATCH, Rights::READ_WRITE));
+        if let Err(error) = given {
+            println!("gpu        : glass scratch not given: {error:?}");
+        }
+        granted &= given.is_ok();
+    } else {
+        println!("gpu        : no memory for glass -- it will be a plain veil");
+    }
     if line.is_some() {
         granted &= cap::grant(driver, GPU_IRQ, gpu::IRQ, Rights::READ).is_ok();
     }
@@ -3501,7 +4236,7 @@ fn start_gpu() -> Option<remote::RemoteRenderer> {
             bars += 1;
         }
     }
-    let expected = 7 + bars + line.map_or(0, |_| 1);
+    let expected = 7 + bars + line.map_or(0, |_| 1) + scratch.map_or(0, |_| 1);
     gpu_check(
         "the driver holds its device, its memory, and nothing else",
         granted && cap::slots_used(driver) == Some(expected),
@@ -3630,6 +4365,14 @@ fn init_software_renderer() -> Option<SoftwareRenderer> {
         None => println!("backbuffer : none -- drawing straight onto the screen"),
     }
 
+    match map_glass_scratch(&info) {
+        Some(scratch) => {
+            println!("glass      : {} KiB to blur in", scratch.len() * 4 / 1024);
+            renderer.attach_glass_scratch(scratch);
+        }
+        None => println!("glass      : no room to blur in -- panes are a plain veil"),
+    }
+
     // Somewhere to keep stencils -- text, for now. Off the kernel heap, and
     // never freed: the renderer holds it for as long as there is a screen.
     let atlas = alloc::vec![0u8; (ATLAS_WIDTH * ATLAS_HEIGHT) as usize];
@@ -3644,9 +4387,10 @@ fn init_software_renderer() -> Option<SoftwareRenderer> {
     Some(renderer)
 }
 
-/// The mask atlas: room for the boot screen's two lines of text.
-const ATLAS_WIDTH: u32 = 1024;
-const ATLAS_HEIGHT: u32 = 512;
+/// The mask atlas: room for the boot screen's two lines of text, and the
+/// desktop's stencils. The same size as the GPU driver's.
+const ATLAS_WIDTH: u32 = corrode_abi::gpu::ATLAS_WIDTH;
+const ATLAS_HEIGHT: u32 = corrode_abi::gpu::ATLAS_HEIGHT;
 
 /// Where the back buffer is mapped: a gigabyte above the heap, in the same
 /// PML4 slot. That slot is populated before any user address space is forked,
@@ -3662,7 +4406,25 @@ const BACK_BUFFER_RESERVE: usize = 1024;
 
 /// Map ordinary RAM to compose frames in.
 fn map_back_buffer(info: &SurfaceInfo) -> Option<*mut u8> {
-    let bytes = SoftwareRenderer::back_buffer_len(info);
+    map_ram(BACK_BUFFER_BASE, SoftwareRenderer::back_buffer_len(info))
+}
+
+/// Where glass works: just past the largest back buffer.
+const GLASS_SCRATCH_BASE: u64 = BACK_BUFFER_BASE + BACK_BUFFER_MAX as u64;
+
+/// Map the renderer room for glass to blur in: three screens of pixels, so
+/// a pane as large as the screen still fits, and a line over.
+fn map_glass_scratch(info: &SurfaceInfo) -> Option<&'static mut [u32]> {
+    let pixels = 3 * info.width as usize * info.height as usize + 4096;
+    let base = map_ram(GLASS_SCRATCH_BASE, pixels * 4)?;
+    // SAFETY: `map_ram` mapped `pixels * 4` writable bytes there from frames
+    // fresh off the allocator, overlapping nothing, and the mapping is never
+    // removed. This slice is the only way to them.
+    Some(unsafe { core::slice::from_raw_parts_mut(base.cast::<u32>(), pixels) })
+}
+
+/// Map `bytes` of fresh RAM at `base`, writable, never executable.
+fn map_ram(base: u64, bytes: usize) -> Option<*mut u8> {
     if bytes == 0 || bytes > BACK_BUFFER_MAX {
         return None;
     }
@@ -3680,7 +4442,7 @@ fn map_back_buffer(info: &SurfaceInfo) -> Option<*mut u8> {
         let frame = mm::frame::alloc()?;
         let mapped = mm::paging::with_kernel_mapper(|mapper| {
             mapper.map_4k(
-                BACK_BUFFER_BASE + i * 4096,
+                base + i * 4096,
                 frame.addr(),
                 mm::paging::WRITABLE | mm::paging::NO_EXECUTE | mm::paging::GLOBAL,
             )
@@ -3689,7 +4451,7 @@ fn map_back_buffer(info: &SurfaceInfo) -> Option<*mut u8> {
             return None;
         }
     }
-    Some(BACK_BUFFER_BASE as *mut u8)
+    Some(base as *mut u8)
 }
 
 /// Side of the white corner markers.
@@ -3829,7 +4591,10 @@ fn label_layer(screen: Rect, src: Rect, y: i32, color: Color, at: u64) -> Layer 
 /// Nothing here advances per frame. Every moving quantity is a formula held by
 /// a layer in the scene, and the scene works out what went stale.
 struct Stage {
-    scene: Scene<48>,
+    /// Room for a full house: seven layers a window (shadow, frame, three
+    /// buttons, title, body) for each of the renderer's 31 window surfaces,
+    /// and the dock, the bar and the rest around them.
+    scene: alloc::boxed::Box<Scene<320>>,
     block: LayerId,
     veil: LayerId,
     /// Where the veil rests when it is showing.
@@ -3839,7 +4604,7 @@ struct Stage {
 impl Stage {
     fn new(renderer: &mut impl Renderer, now: u64) -> Option<Self> {
         let info = &renderer.surface_info();
-        let mut scene = Scene::new(info, BACKGROUND);
+        let mut scene = Scene::boxed(info, BACKGROUND);
         let (width, height) = (info.width, info.height);
         let middle = (height / 2) as i32;
         let full_bar = (height / 8).max(1) as i32;
@@ -4283,6 +5048,9 @@ impl Window {
     }
 }
 
+/// How long the boot screen shows before the desktop fades in over it.
+const DESKTOP_DELAY_MS: u64 = 1200;
+
 /// Paint what moved, then sleep until the next interrupt.
 ///
 /// There is no animation task behind this and no frame timer. The loop wakes
@@ -4290,6 +5058,28 @@ impl Window {
 /// things are at the current nanosecond, and writes only the pixels that
 /// answer changed.
 fn render_loop(renderer: &mut Screen) -> ! {
+    // The disk first: if it keeps the root directory sealed, the boot
+    // medium's files are not read at all.
+    let disk = store::start();
+    if disk && vault::probe() {
+        vault::self_check();
+        // The painter is not Settings: it may not set a passcode, whatever
+        // it sends.
+        let painter = task::current_id().unwrap_or(0);
+        let refused = change_passcode(painter, corrode_abi::window::PASSCODE_SET, [0x3131_3131_3131_3131; 4]);
+        check("vault", "only Settings may change the passcode", refused == [0; 4]);
+    }
+    look::load();
+    // A theme kept from an earlier boot wins over the file: it is what was
+    // last picked.
+    if disk {
+        if let Some(theme) = store::load() {
+            look::set(theme);
+            look::set_kept();
+        }
+    }
+    give_files();
+    rtc::init();
     let Some(mut stage) = Stage::new(renderer, time::now_ns()) else {
         println!("scene      : no room for the boot screen's layers");
         idle_loop()
@@ -4298,12 +5088,57 @@ fn render_loop(renderer: &mut Screen) -> ! {
     if window.is_none() {
         println!("window     : none -- no memory for a surface or its task");
     }
-    let mut desk = input::Desk::new(renderer, &mut stage.scene);
+    // The desktop comes up over the boot screen: the wallpaper fades in once
+    // the name is on screen, and the boot screen's layers go once it is
+    // covered.
+    let theme = look::current();
+    let mut seen_changes = look::changes();
+    let mut wallpaper_layer = None;
+    let boot: alloc::vec::Vec<LayerId> = stage.scene.ids().collect();
+    let desktop_at = time::now_ns() + DESKTOP_DELAY_MS * 1_000_000;
+    let fade = theme.ms(700);
+    if renderer.show_wallpaper(&theme) {
+        let screen = stage.scene.screen();
+        let mut wallpaper = Layer::surface(
+            0,
+            0,
+            surface::WALLPAPER,
+            screen.width,
+            screen.height,
+        );
+        wallpaper.opacity = Animation::ease(desktop_at, fade, Fx::ZERO, Fx::from_int(255), Ease::Out);
+        wallpaper_layer = stage.scene.add(wallpaper);
+        if wallpaper_layer.is_none() {
+            println!("desktop    : no room for the wallpaper");
+        }
+    } else {
+        println!("desktop    : no wallpaper on this renderer");
+    }
+    let mut retire_at = Some(desktop_at + fade as u64 * 1_000_000);
+    let mut desk = input::Desk::new(renderer, &mut *stage.scene);
+    // Both renderers can be shown a surface again at a new size: the
+    // remote one's driver maps it afresh.
+    desk.allow_resize(true);
     {
         let screen = stage.scene.screen();
         windows::set_screen(screen.width, screen.height);
     }
     start_panel();
+    // A sealed root directory: the lock screen is the first thing shown.
+    if vault::locked() {
+        let asked = ipc::call(
+            LAUNCHER_ENDPOINT,
+            ipc::Message {
+                label: corrode_abi::launcher::LAUNCH,
+                words: [corrode_abi::launcher::LOCK, 0, 0, 0],
+            },
+            None,
+            None,
+        );
+        if asked.is_err() {
+            println!("vault      : no launcher to put the lock screen up");
+        }
+    }
     let screen = stage.scene.screen().area();
 
     // A renderer that fails paints nothing, which is what the counters below
@@ -4347,7 +5182,21 @@ fn render_loop(renderer: &mut Screen) -> ! {
     loop {
         let now = time::now_ns();
 
-        loop {
+        // The wallpaper covers the boot screen now: take it away, and stop
+        // its script, so nothing moves behind the desktop.
+        if retire_at.is_some_and(|at| now >= at) {
+            retire_at = None;
+            for id in &boot {
+                stage.scene.remove(*id);
+            }
+            if let Some(layer) = window.as_ref().and_then(|window| window.layer) {
+                stage.scene.remove(layer);
+            }
+            desk.hide_line(&mut *stage.scene);
+            println!("desktop    : up");
+        }
+
+        while retire_at.is_some() {
             let due = cycle_start + SCRIPT[next_step].at_ms * 1_000_000;
             if now < due {
                 break;
@@ -4363,7 +5212,7 @@ fn render_loop(renderer: &mut Screen) -> ! {
         // Has the window's client drawn anything? One lock and a compare;
         // the client itself is not asked and need not be running.
         if let Some(window) = window.as_mut() {
-            window.poll(&mut stage.scene, now);
+            window.poll(&mut *stage.scene, now);
         }
 
         // Windows programs have asked for since the last look: shown to the
@@ -4373,14 +5222,60 @@ fn render_loop(renderer: &mut Screen) -> ! {
                 continue;
             };
             if renderer.show_surface(surface, WINDOW_SURFACES + surface) {
-                desk.manage(index, &mut stage.scene, now);
+                desk.manage(renderer, index, &mut *stage.scene, now);
             } else {
                 println!("desktop    : the renderer cannot show window {index}");
             }
         }
 
+        // Title bars whose program has given them something new to say.
+        for index in windows::take_retitled() {
+            desk.retitle(renderer, index, &mut *stage.scene, now);
+        }
+        for (index, width, height) in windows::take_grown() {
+            desk.grow(index, &mut *stage.scene, (width, height));
+        }
+        for index in windows::take_raised() {
+            desk.raise(index, &mut *stage.scene, now);
+        }
+
+        // A new look, from Settings: a new wallpaper, and everything on it
+        // restyled.
+        let changes = look::changes();
+        if changes != seen_changes {
+            seen_changes = changes;
+            let theme = look::current();
+            if renderer.show_wallpaper(&theme) {
+                if let Some(id) = wallpaper_layer {
+                    let screen = stage.scene.screen();
+                    stage
+                        .scene
+                        .damage(id, Rect::new(0, 0, screen.width, screen.height));
+                }
+            }
+            desk.restyle(renderer, &mut *stage.scene, theme);
+            println!("theme      : changed");
+            store::save(&theme);
+        }
+
         // What the keyboard and mouse have done since the last look.
-        desk.poll(renderer, &mut stage.scene, now);
+        desk.poll(renderer, &mut *stage.scene, now);
+
+        // Closed windows' surfaces, freed for the next window. Their layers
+        // left the scene this poll and are painted away below; the renderer
+        // forgets them now, so it never reads them again. Under the remote
+        // renderer the driver holds them mapped, so they stay as they are.
+        for resized in desk.take_resized() {
+            if !renderer.show_surface(resized, WINDOW_SURFACES + resized) {
+                println!("desktop    : the renderer cannot show surface {resized} resized");
+            }
+        }
+        for closed in desk.take_closed() {
+            if renderer.forget_surface(closed) {
+                let _ = cap::delete(WINDOW_SURFACES + closed);
+                surface::retire(closed);
+            }
+        }
 
         let result = frame(&mut stage, renderer, now);
         wakeups += 1;

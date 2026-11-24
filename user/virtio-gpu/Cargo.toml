@@ -13,4 +13,5 @@ bench = false
 [dependencies]
 corrode-rt = { path = "../rt" }
 corrode-render = { path = "../../render" }
+corrode-theme = { path = "../../theme" }
 corrode-virtio = { path = "../../virtio" }

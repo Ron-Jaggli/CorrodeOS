@@ -31,7 +31,9 @@
 //! naked assembly. See [`create`].
 
 use corrode_abi::layout;
-use corrode_elf::Elf;
+use corrode_elf::{Elf, Segment};
+use corrode_pe::exports::Exports;
+use corrode_pe::{Fixup, Pe};
 
 use crate::mm::frame;
 use crate::mm::paging::{self, Mapper};
@@ -135,7 +137,7 @@ fn map_stack(space: &mut Mapper, pages: u64) -> Option<()> {
         if !space.map_4k(
             STACK_BOTTOM + i * PAGE,
             frame.addr(),
-            paging::USER | paging::WRITABLE | paging::NO_EXECUTE,
+            paging::USER | paging::WRITABLE | paging::NO_EXECUTE | paging::OWNED,
         ) {
             return None;
         }
@@ -149,6 +151,10 @@ fn map_stack(space: &mut Mapper, pages: u64) -> Option<()> {
 pub enum LoadError {
     /// The file is not a program this kernel will run, and why.
     Format(corrode_elf::Error),
+    /// The file is not a Windows program this kernel will run, and why.
+    Pe(corrode_pe::Error),
+    /// Verdigris's kernel32 has no export table at its base.
+    NoExports,
     /// Not enough frames for its memory or the page tables to map it.
     OutOfMemory,
 }
@@ -170,13 +176,90 @@ pub enum LoadError {
 /// on the file, and nothing needs it yet.
 pub fn load(file: &[u8]) -> Result<Image, LoadError> {
     let elf = Elf::parse(file, layout::IMAGE_BASE..layout::IMAGE_END).map_err(LoadError::Format)?;
+    // As for an assembly program: the stack pointer a `call` would have
+    // left, over a null return address. A compiled entry point expects
+    // exactly that alignment.
+    build(elf.entry(), elf.segments(), |_, _| {}, &[], 8)
+}
 
+/// Build a fresh address space from a Windows program: a PE file, checked
+/// whole by [`Pe::parse`] before a frame is taken, exactly as [`load`] does
+/// for ELF, and mapped by the same code.
+///
+/// The one difference is the stack. A Windows function is entered with
+/// 32 bytes of "shadow space" above its return address for it to spill its
+/// four register arguments into, and with the stack pointer 8 below a
+/// 16-byte boundary. The return address is null: a program that returns
+/// from its entry point instead of exiting faults, and is stopped.
+pub fn load_pe(file: &[u8]) -> Result<Image, LoadError> {
+    let pe = Pe::parse(file, layout::IMAGE_BASE..layout::IMAGE_END).map_err(LoadError::Pe)?;
+    build(pe.entry(), pe.segments(), |page, each| pe.fixups_in(page, each), &[], 8 + 32)
+}
+
+/// Build a fresh address space from a Windows program that imports from
+/// kernel32, and Verdigris's kernel32 (see `verdigris/DESIGN.md`).
+///
+/// The program must end below `KERNEL32_BASE` and kernel32, an ELF file,
+/// lie above it, so the two never share a page. kernel32's export table is
+/// at its base; every import the program names is looked up there, must
+/// name an address in kernel32's code, and is written into the program's
+/// import address table before that page is mapped -- so the table may be
+/// in read-only data, as linkers put it, and nothing is ever made writable
+/// to fill it in. An import kernel32 does not have refuses the program.
+pub fn load_windows(file: &[u8], kernel32: &[u8]) -> Result<Image, LoadError> {
+    let base = corrode_abi::verdigris::KERNEL32_BASE;
+    let pe = Pe::parse(file, layout::IMAGE_BASE..base).map_err(LoadError::Pe)?;
+    let runtime = Elf::parse(kernel32, base..layout::IMAGE_END).map_err(LoadError::Format)?;
+    let exports = runtime
+        .segments()
+        .find(|segment| segment.address == base && !segment.writable && !segment.executable)
+        .and_then(|segment| Exports::parse(segment.data))
+        .ok_or(LoadError::NoExports)?;
+    let in_code = |address: &u64| {
+        runtime.segments().any(|segment| {
+            segment.executable && (segment.address..segment.address + segment.len).contains(address)
+        })
+    };
+    let fixups = pe
+        .bind(|dll, name| exports.find(dll, name).filter(in_code))
+        .map_err(LoadError::Pe)?;
+    if pe.moved() {
+        crate::println!(
+            "verdigris  : moved from {:#x} to {:#x}, {} relocations",
+            pe.preferred_base(),
+            pe.base(),
+            pe.relocations()
+        );
+    }
+    build(
+        pe.entry(),
+        pe.segments().chain(runtime.segments()),
+        |page, each| pe.fixups_in(page, each),
+        &fixups,
+        8 + 32,
+    )
+}
+
+/// Map checked segments into a fresh address space with a stack, the
+/// stack pointer `below` bytes under the stack's top. Each fixup's eight
+/// bytes are written into its page before the page is mapped: first those
+/// `moved` gives for the page (a program loaded away from its preferred
+/// base), then `fixups`. The PE reader has checked each lies inside a
+/// segment and does not straddle two pages.
+fn build<'a>(
+    entry: u64,
+    segments: impl Iterator<Item = Segment<'a>>,
+    moved: impl Fn(u64, &mut dyn FnMut(Fixup)),
+    fixups: &[Option<Fixup>],
+    below: u64,
+) -> Result<Image, LoadError> {
     let mut space = paging::with_kernel_mapper(|kernel| kernel.fork_kernel_half())
         .flatten()
         .ok_or(LoadError::OutOfMemory)?;
 
-    for segment in elf.segments() {
-        let mut flags = paging::USER;
+    for segment in segments {
+        // The segment's frames are copies, this space's alone.
+        let mut flags = paging::USER | paging::OWNED;
         if segment.writable {
             flags |= paging::WRITABLE;
         }
@@ -208,6 +291,20 @@ pub fn load(file: &[u8]) -> Result<Image, LoadError> {
                 // because both ends were clamped to this one.
                 unsafe { space.write_frame(frame.addr(), (from - page) as usize, source) };
             }
+            let mut write = |fixup: Fixup| {
+                if (page..page + PAGE - 7).contains(&fixup.address) {
+                    // SAFETY: as above; the eight bytes end inside the page.
+                    unsafe {
+                        space.write_frame(
+                            frame.addr(),
+                            (fixup.address - page) as usize,
+                            &fixup.value.to_le_bytes(),
+                        )
+                    };
+                }
+            };
+            moved(page, &mut write);
+            fixups.iter().flatten().for_each(|fixup| write(*fixup));
 
             if !space.map_4k(page, frame.addr(), flags) {
                 return Err(LoadError::OutOfMemory);
@@ -218,11 +315,8 @@ pub fn load(file: &[u8]) -> Result<Image, LoadError> {
     map_stack(&mut space, PROGRAM_STACK_PAGES).ok_or(LoadError::OutOfMemory)?;
 
     Ok(Image {
-        entry: elf.entry(),
-        // As for an assembly program: the stack pointer a `call` would have
-        // left, over a null return address. A compiled entry point expects
-        // exactly that alignment.
-        stack_top: STACK_BOTTOM + PROGRAM_STACK_PAGES * PAGE - 8,
+        entry,
+        stack_top: STACK_BOTTOM + PROGRAM_STACK_PAGES * PAGE - below,
         stack_guard: STACK_GUARD,
         space,
     })
